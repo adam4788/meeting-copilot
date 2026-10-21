@@ -37,6 +37,8 @@ hermes plugins enable meeting-copilot-live --no-allow-tool-override
 
 Installation copies only this plugin into the active `HERMES_HOME`, backing up an existing copy. It does not start recording or change your model configuration. Close/detach the pane before reinstalling. Use the default profile; other profiles are not yet supported.
 
+**Backend updates:** an in-process gateway may keep an already-mounted backend in memory even after plugin disable/enable. After updating, restart that gateway **when its other sessions are idle**; do not assume a hot-reloaded pane means the Python backend was refreshed. Host-isolated deployments can pick up a changed content-addressed API module without that restart.
+
 1. Open the **Meeting Copilot** pane in the desktop layout.
 2. Start recording in Meetily, then choose that active recording in the pane.
 3. Select a project for file evidence, or leave it on past sessions only.
