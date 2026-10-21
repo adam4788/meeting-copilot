@@ -26,7 +26,18 @@ class MeetilyTests(unittest.TestCase):
         target = folder / name
         temp = folder / ('.' + name + '.tmp')
         temp.write_text(json.dumps(value), encoding='utf-8')
-        os.replace(temp, target)
+        # Windows MoveFileEx replacement can briefly fail while a reader has the
+        # destination open, even with FILE_SHARE_DELETE. Emulate a robust writer:
+        # retry only transient Windows sharing/access errors, with a hard deadline.
+        deadline = time.monotonic() + 1
+        while True:
+            try:
+                os.replace(temp, target)
+                break
+            except PermissionError as exc:
+                if os.name != 'nt' or getattr(exc, 'winerror', None) not in (5, 32) or time.monotonic() >= deadline:
+                    raise
+                time.sleep(.005)
 
     def recording(self, name='synthetic', status='recording'):
         folder = self.root / name
@@ -62,6 +73,29 @@ class MeetilyTests(unittest.TestCase):
         self.assertEqual(seen[0]['id'], seen[1]['id'])
         self.assertEqual(seen[1]['text'], 'Corrected synthetic words')
         self.assertTrue(any(s['status'] == 'listening' for s in statuses))
+
+    def test_open_snapshot_permits_source_rename_while_reading(self):
+        folder = self.recording()
+        self.snapshot(folder, [self.segment(text='Before rename')])
+        path = folder / 'transcripts.json'
+        with self.bridge._open_snapshot(path) as reader:
+            path.rename(folder / 'previous.json')
+            self.snapshot(folder, [self.segment(text='New snapshot')])
+            old = json.loads(reader.read())
+        self.assertEqual(old['segments'][0]['text'], 'Before rename')
+        self.assertEqual(self.bridge._read(folder, 'transcripts.json')['segments'][0]['text'], 'New snapshot')
+
+    def test_snapshot_handle_is_closed_before_json_parsing(self):
+        folder = self.recording()
+        self.snapshot(folder, [self.segment(text='Before replacement')])
+        parse = json.loads
+        def parser(raw):
+            self.snapshot(folder, [self.segment(text='After replacement')])
+            return parse(raw)
+        with patch('meetily.json.loads', side_effect=parser):
+            old = self.bridge._read(folder, 'transcripts.json')
+        self.assertEqual(old['segments'][0]['text'], 'Before replacement')
+        self.assertEqual(self.bridge._read(folder, 'transcripts.json')['segments'][0]['text'], 'After replacement')
 
     def test_invalid_segment_types_fail_closed(self):
         folder = self.recording()

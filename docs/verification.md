@@ -4,7 +4,7 @@ This records exercised checks, not promised features. The project is an early de
 
 ## Deterministic checks
 
-`npm test` runs the Python unittest suite and desktop JavaScript syntax check. The local run exercised 51 tests, with three skips: two explicitly opt-in hardware checks and one Windows symlink-privilege check. The Windows junction test passed. GitHub CI independently runs the deterministic suite on Windows and Linux, Python 3.11 and 3.12; see the actual Actions run for current status.
+`npm test` runs the Python unittest suite and desktop JavaScript syntax check. The local run exercised 53 tests, with three skips: two explicitly opt-in hardware checks and one Windows symlink-privilege check. The Windows junction test passed. GitHub CI independently runs the deterministic suite on Windows and Linux, Python 3.11 and 3.12; see the actual Actions run for current status.
 
 Covered behaviors include capture consent, paused startup, bounded transcript memory, corrected-segment upserts, recording-switch isolation, discard of cleared in-flight answers, read-only sessions, best-effort secret exclusion/redaction, path traversal/reparse rejection, explicit-query-only web search, and serialized start/pause lifecycle operations.
 

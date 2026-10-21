@@ -43,12 +43,46 @@ class MeetilyBridge:
             raise ValueError('Recording must be a direct non-linked child directory')
         return folder
 
+    @staticmethod
+    def _open_snapshot(path):
+        """Read without preventing Meetily's atomic replacement on Windows."""
+        if os.name != 'nt':
+            return path.open('rb')
+        import ctypes
+        from ctypes import wintypes
+        import msvcrt
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        create = kernel.CreateFileW
+        create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                           wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        create.restype = wintypes.HANDLE
+        close = kernel.CloseHandle
+        close.argtypes = [wintypes.HANDLE]
+        close.restype = wintypes.BOOL
+        # GENERIC_READ; SHARE_READ|SHARE_WRITE|SHARE_DELETE; OPEN_EXISTING;
+        # OPEN_REPARSE_POINT avoids following a link swapped in after lstat.
+        handle = create(str(path), 0x80000000, 0x7, None, 3, 0x00200000, None)
+        if handle == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY | os.O_NOINHERIT)
+        except Exception:
+            close(handle)
+            raise
+        try:
+            if getattr(os.fstat(fd), 'st_file_attributes', 0) & 0x400:
+                raise ValueError('Linked recording files are not supported')
+            return os.fdopen(fd, 'rb')  # stream owns and closes the handle
+        except Exception:
+            os.close(fd)
+            raise
+
     def _read(self, folder, name):
         folder = self._folder(folder.name)
         path = folder / name
         if not self._plain(path):
             raise ValueError('Linked recording files are not supported')
-        with path.open('rb') as source:
+        with self._open_snapshot(path) as source:
             raw = source.read(self.MAX_BYTES + 1)
         if len(raw) > self.MAX_BYTES:
             raise ValueError('Recording JSON exceeds 8 MiB limit')
