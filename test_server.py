@@ -204,6 +204,72 @@ class ServerTests(unittest.TestCase):
         state.audio_status({'status': 'error', 'error': 'unsupported_schema'})
         self.assertFalse(state.status()['listening'])
 
+    def test_paused_capture_callbacks_cannot_restore_context(self):
+        import server
+        class Capture:
+            def start(self, on_segment, on_status):
+                self.segment, self.status = on_segment, on_status
+            def stop(self):
+                pass  # A bounded stop may return before a worker finishes.
+        capture = Capture()
+        state = server.MeetingState(audio_factory=lambda: capture)
+        state.start(True, backend='native')
+        state.pause()
+        capture.segment({'text': 'Late text from detached capture'})
+        capture.status({'state': 'error', 'error': 'Late capture failure'})
+        self.assertEqual(list(state.segments), [])
+        self.assertIsNone(state.status()['error'])
+        self.assertEqual(state.status()['capture']['message'], 'Paused')
+
+    def test_previous_capture_callbacks_cannot_change_new_meeting(self):
+        import server
+        class Bridge:
+            def __init__(self):
+                self.callbacks = []
+            def attach(self, recording_id, on_segment, on_status):
+                self.callbacks.append((on_segment, on_status))
+                on_segment({'text': recording_id})
+            def stop(self):
+                pass
+        bridge = Bridge()
+        state = server.MeetingState(bridge_factory=lambda: bridge)
+        try:
+            state.start(True, recording_id='first')
+            old_segment, old_status = bridge.callbacks[0]
+            state.pause()
+            state.start(True, recording_id='second')
+            old_segment({'text': 'Late first meeting text'})
+            old_status({'status': 'completed', 'error': 'Late first meeting error'})
+            self.assertEqual([s['text'] for s in state.segments], ['second'])
+            self.assertTrue(state.listening)
+            self.assertIsNone(state.status()['error'])
+            bridge.callbacks[1][0]({'text': 'Current meeting text'})
+            self.assertEqual(state.segments[-1]['text'], 'Current meeting text')
+        finally:
+            state.pause()
+
+    def test_clear_keeps_current_capture_callbacks_active(self):
+        import server
+        class Bridge:
+            def attach(self, recording_id, on_segment, on_status):
+                self.segment = on_segment
+            def stop(self):
+                pass
+        bridge = Bridge()
+        state = server.MeetingState(bridge_factory=lambda: bridge)
+        app = FastAPI()
+        app.include_router(server.make_router(state))
+        with TestClient(app) as client:
+            try:
+                state.start(True, recording_id='first')
+                bridge.segment({'text': 'Before clear'})
+                self.assertEqual(client.post('/clear').status_code, 200)
+                bridge.segment({'text': 'After clear'})
+                self.assertEqual([s['text'] for s in state.segments], ['After clear'])
+                self.assertTrue(state.listening)
+            finally:
+                state.pause()
+
     def test_devices_endpoint_uses_instance_without_starting_capture(self):
         import server
         class Capture:
