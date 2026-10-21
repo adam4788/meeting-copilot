@@ -1,0 +1,10 @@
+{
+  "name": "meeting-copilot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "python -m unittest discover -v && node --check desktop/plugin.js",
+    "check": "node --check desktop/plugin.js"
+  }
+}

@@ -1,0 +1,102 @@
+import { createElement as h, useState, useEffect } from 'react';
+import { host, useQuery, useQueryClient, Button, Input, Textarea, Badge, PALETTE_AREA } from '@hermes/plugin-sdk';
+
+const ID = 'meeting-copilot-live';
+const muted = { color: 'var(--ui-text-secondary)', fontSize: 12, lineHeight: 1.5 };
+const card = { border: '1px solid var(--ui-stroke-secondary)', borderRadius: 10, padding: 14, minWidth: 0, boxSizing: 'border-box' };
+const selectStyle = { padding: 8, borderRadius: 6, width: '100%', maxWidth: '100%', minWidth: 0, color: 'var(--ui-text-primary)', background: 'var(--ui-surface-primary)', border: '1px solid var(--ui-stroke-secondary)' };
+
+export default {
+  id: ID,
+  name: 'Meeting Copilot',
+  description: 'Live answers grounded in your projects, prior sessions, and optional web research.',
+  version: '0.1.0',
+  register(ctx) {
+    const api = (path, body) => ctx.rest(path, body === undefined ? {} : { method: 'POST', body });
+    function MeetingPane() {
+      const qc = useQueryClient();
+      const [project, setProject] = useState('');
+      const [question, setQuestion] = useState('');
+      const [web, setWeb] = useState('');
+      const [consent, setConsent] = useState(false);
+      const [backend, setBackend] = useState('meetily');
+      const [recording, setRecording] = useState('');
+      const [error, setError] = useState('');
+      const [pending, setPending] = useState(false);
+      const [showTranscript, setShowTranscript] = useState(false);
+      const status = useQuery({ queryKey: [ID, 'status'], queryFn: () => api('/status'), refetchInterval: 2500, retry: 1 });
+      const projects = useQuery({ queryKey: [ID, 'projects'], queryFn: () => api('/projects'), staleTime: 60000, refetchInterval: query => query.state.error ? 5000 : false, retry: 3 });
+      const recordings = useQuery({ queryKey: [ID, 'recordings'], queryFn: () => api('/recordings'), refetchInterval: backend === 'meetily' ? 5000 : false, enabled: backend === 'meetily', retry: 1 });
+      const data = status.data || {};
+      const busy = pending || data.busy;
+      useEffect(() => () => { api('/pause', {}).catch(() => {}); }, []);
+      async function act(path, body = {}) {
+        setPending(true); setError('');
+        try { await api(path, body); await qc.invalidateQueries({ queryKey: [ID, 'status'] }); }
+        catch (e) { setError(String(e.message || e)); }
+        finally { setPending(false); }
+      }
+      const entries = Array.isArray(projects.data) ? projects.data : (projects.data?.projects || []);
+      const result = data.result;
+      const transcript = data.segments || [];
+      return h('div', { style: { padding: 16, display: 'flex', flexDirection: 'column', gap: 14, height: '100%', minWidth: 0, width: '100%', boxSizing: 'border-box', overflowY: 'auto', overflowX: 'hidden', overflowWrap: 'anywhere', color: 'var(--ui-text-primary)' } },
+        h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
+          h('strong', { style: { fontSize: 17 } }, 'Meeting Copilot'),
+          h(Badge, null, data.listening ? 'Listening' : 'Paused')),
+        h('p', { style: { ...muted, margin: 0 } }, 'Your projects and past sessions first. Web research only when you supply a public search query.'),
+        h('label', { style: { display: 'grid', gap: 6 } }, h('strong', null, 'Meeting context'),
+          h('select', { value: project, onChange: e => setProject(e.target.value), style: selectStyle },
+            h('option', { value: '' }, 'Past sessions only — choose a project for files'),
+            ...entries.map(p => { const value = typeof p === 'string' ? p : (p.path || p.name); return h('option', { value, key: value }, typeof p === 'string' ? p.split(/[\\/]/).pop() : (p.name || value)); }))),
+        projects.error && h('div', { role: 'alert', style: muted }, `Project lookup unavailable: ${projects.error.message}`),
+        h('section', { style: card },
+          h('label', { style: { display: 'grid', gap: 6, paddingBottom: 10 } }, h('strong', null, 'Transcript source'),
+            h('select', { value: backend, disabled: data.listening, onChange: e => setBackend(e.target.value), style: selectStyle },
+              h('option', { value: 'meetily' }, 'Meetily — use your existing recording'),
+              h('option', { value: 'native' }, 'Native Windows capture — experimental'))),
+          backend === 'meetily' && h('div', { style: { display: 'grid', gap: 8, paddingBottom: 12 } },
+            h('span', { style: muted }, 'Start recording in Meetily, then choose the active meeting here. Only the explicitly selected transcript is read.'),
+            h('select', { value: recording, disabled: data.listening, onChange: e => setRecording(e.target.value), style: selectStyle },
+              h('option', { value: '' }, 'Choose an active Meetily recording…'),
+              ...(Array.isArray(recordings.data) ? recordings.data : []).filter(r => r.status === 'recording').map(r => h('option', { value: r.id, key: r.id }, r.title || r.id))),
+            recordings.error && h('span', { role: 'alert', style: muted }, `Meetily lookup unavailable: ${recordings.error.message}`),
+            h('span', { style: muted }, 'Meetily manages its own saved recordings and transcripts. Pausing here detaches the copilot; it does not stop Meetily recording.')),
+          h('label', { style: { ...muted, display: 'flex', gap: 8 } },
+            h('input', { type: 'checkbox', checked: consent, onChange: e => setConsent(e.target.checked) }),
+            'I have permission to capture/read this meeting and use its context with my configured model.'),
+          h('div', { style: { display: 'flex', gap: 8, marginTop: 12 } },
+            h(Button, { disabled: pending || (!data.listening && (!consent || (backend === 'meetily' && !recording))), onClick: () => act(data.listening ? '/pause' : '/start', { consent, backend, recording_id: recording || null }) }, data.listening ? (data.backend === 'meetily' ? 'Detach' : 'Pause listening') : (backend === 'meetily' ? 'Attach to Meetily' : 'Start listening')),
+            h(Button, { variant: 'secondary', disabled: pending, onClick: () => act('/clear') }, 'Clear meeting')),
+          h('p', { style: { ...muted, marginBottom: 0 } }, 'No additional audio files · copilot detaches/pauses if this pane disconnects.'),
+          data.capture && h('div', { style: muted }, data.capture.message || data.capture.state || '')),
+        h('label', { style: { display: 'grid', gap: 6 } }, h('strong', null, 'What should I say?'),
+          h(Textarea, { value: question, onChange: e => setQuestion(e.target.value), placeholder: 'Leave blank to answer the latest question, or type a question…', rows: 3 })),
+        h('div', { style: { display: 'flex', gap: 8 } },
+          h(Button, { disabled: busy, onClick: () => act('/assist', { question, project: project || null }) }, busy ? 'Checking your sources…' : 'Suggest answer'),
+          h(Button, { variant: 'secondary', disabled: !result?.answer, onClick: async () => { try { await navigator.clipboard.writeText(result.answer); } catch (e) { setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, 'Copy')),
+        h('details', null, h('summary', { style: { cursor: 'pointer', ...muted } }, 'Research online'),
+          h('div', { style: { display: 'grid', gap: 8, paddingTop: 10 } },
+            h(Input, { value: web, onChange: e => setWeb(e.target.value), placeholder: 'Public query — no client names or meeting details' }),
+            h('span', { style: muted }, 'Only this query goes to web search. Your selected context still goes to your configured answer model.'),
+            h(Button, { variant: 'secondary', disabled: busy || !web.trim(), onClick: () => act('/assist', { question, project: project || null, web_query: web.trim() }) }, 'Check sources + web'))),
+        (error || data.error || status.error) && h('div', { role: 'alert', style: card }, error || data.error || `Backend unavailable: ${status.error?.message}. Check installation and plugin enablement.`),
+        result && h('section', { style: card, 'aria-live': 'polite' },
+          h('div', { style: { display: 'flex', justifyContent: 'space-between' } }, h('strong', null, 'Suggested answer'), h('span', { style: muted }, Number.isFinite(result.elapsed_seconds) ? `${result.elapsed_seconds.toFixed(1)}s` : '')),
+          h('div', { style: { whiteSpace: 'pre-wrap', lineHeight: 1.65, paddingTop: 10 } }, result.answer),
+          ...(result.warnings || []).map((w, i) => h('p', { key: `warning-${i}`, style: muted }, w)),
+          h('details', { style: { marginTop: 12 } }, h('summary', { style: { cursor: 'pointer', ...muted } }, `Evidence · ${(result.sources || []).length} sources`),
+            ...(result.sources || []).map((s, i) => h('div', { key: s.id || i, style: { ...muted, paddingTop: 8, overflowWrap: 'anywhere' } },
+              h('strong', null, `[${i + 1}] ${s.title || s.source || 'Source'}`),
+              /^https?:\/\//.test(s.source || '') ? h('a', { href: s.source, target: '_blank', rel: 'noopener noreferrer', style: { display: 'block', color: 'var(--ui-accent)' } }, s.source) : h('div', null, s.source),
+              s.updated_at && h('div', null, `Updated: ${typeof s.updated_at === 'number' ? new Date(s.updated_at * 1000).toLocaleString() : s.updated_at}`),
+              h('div', { style: { whiteSpace: 'pre-wrap' } }, (s.text || '').slice(0, 900)))))),
+        h('details', { open: showTranscript, onToggle: e => setShowTranscript(e.currentTarget.open) },
+          h('summary', { style: { cursor: 'pointer', ...muted } }, `Live transcript · ${transcript.length} segments`),
+          h('div', { style: { maxHeight: 260, overflowY: 'auto', paddingTop: 8 } }, ...transcript.slice(-30).map((s, i) => h('p', { key: `${i}-${s.timestamp}`, style: muted }, h('strong', null, `${s.speaker}: `), s.text)))),
+        h('p', { style: { ...muted, marginTop: 'auto' } }, 'Read-only assistance. Nothing is spoken, posted, or changed for you. Check suggestions before using them.'));
+    }
+    ctx.register({ id: 'pane', area: 'panes', title: 'Meeting Copilot', data: { placement: 'right', width: '440px' }, render: () => h(MeetingPane) });
+    ctx.register({ id: 'meeting-help', area: PALETTE_AREA, data: { title: 'Meeting Copilot: usage', run: () => host.notify({ kind: 'info', message: 'Open the Meeting Copilot pane. Choose a project, confirm consent, then Start listening. Use Suggest answer when needed.' }) } });
+    return () => { api('/pause', {}).catch(() => {}); };
+  },
+};
