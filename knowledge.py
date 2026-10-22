@@ -157,7 +157,7 @@ class KnowledgeEngine:
         if web_query is not None and web_query.strip():
             mode, query = 'explicit', web_query
         elif web_fallback:
-            plan = plan_web(question, transcript, sources, [p['name'] for p in self.projects()], self._complete)
+            plan = plan_web(_clean(question), _clean(transcript), sources, [p['name'] for p in self.projects()], self._complete)
             if plan['needed']:
                 mode, query = 'automatic', plan['query']
             elif plan['reason'] == 'planner_unavailable':

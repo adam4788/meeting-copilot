@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import tempfile
@@ -161,6 +162,30 @@ class KnowledgeTests(unittest.TestCase):
         answers = iter([planner, 'Answer [1].'])
         with patch.object(self.engine, '_complete', side_effect=lambda m: next(answers)),              patch.object(self.engine, '_web', return_value=web) as search:
             return self.engine.answer('Orchid', web_fallback=True, **kw), search
+
+    def test_credentials_redacted_from_planner_and_answer_payloads(self):
+        question = 'Explain Kubernetes ingress. password=syntheticQuestionPassword API_KEY=syntheticQuestionApiToken'
+        transcript = 'Discuss public routing. password=syntheticTranscriptPassword access_token=syntheticTranscriptApiToken'
+        secrets = ('syntheticQuestionPassword', 'syntheticQuestionApiToken',
+                   'syntheticTranscriptPassword', 'syntheticTranscriptApiToken')
+        with patch.object(self.engine, '_complete', side_effect=[
+                '{"needs_web":false,"query":""}', 'Insufficient evidence.']) as complete, \
+                patch.object(self.engine, '_web', side_effect=AssertionError('no web search')) as web:
+            result = self.engine.answer(question, transcript=transcript, web_fallback=True)
+        self.assertEqual(result['answer'], 'Insufficient evidence.')
+        self.assertFalse(result['web_search']['used'])
+        web.assert_not_called()
+        self.assertEqual(complete.call_count, 2)
+        for stage, call in zip(('planner', 'answer'), complete.call_args_list):
+            with self.subTest(stage=stage):
+                messages = call.args[0]
+                payload = json.loads(messages[1]['content'])
+                for secret in secrets:
+                    self.assertNotIn(secret, json.dumps(messages))
+                self.assertEqual(payload['question'],
+                                 'Explain Kubernetes ingress. password=[REDACTED] API_KEY=[REDACTED]')
+                self.assertEqual(payload['transcript'],
+                                 'Discuss public routing. password=[REDACTED] access_token=[REDACTED]')
 
     def test_automatic_web_fallback_uses_planned_public_query(self):
         result, search = self._fallback('{"needs_web":true,"query":"Kubernetes ingress annotations"}')

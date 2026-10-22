@@ -4,9 +4,9 @@ This records exercised checks, not promised features. The project is an early de
 
 ## Deterministic checks
 
-`npm test` runs the Python unittest suite and desktop JavaScript syntax check. The local run exercised 53 tests, with three skips: two explicitly opt-in hardware checks and one Windows symlink-privilege check. The Windows junction test passed. GitHub CI independently runs the deterministic suite on Windows and Linux, Python 3.11 and 3.12; see the actual Actions run for current status.
+`npm test` runs the Python unittest suite, desktop JavaScript syntax check, and Node pane-contract tests. Test totals evolve; use each run's printed counts rather than assuming a fixed suite size. Local Windows runs have three skips: two explicitly opt-in hardware checks and one symlink-privilege check. The Windows junction test passed. GitHub CI independently runs the deterministic suite on Windows and Linux, Python 3.11 and 3.12; see the actual Actions run for current status.
 
-Covered behaviors include capture consent, paused startup, bounded transcript memory, corrected-segment upserts, recording-switch isolation, discard of cleared in-flight answers, read-only sessions, best-effort secret exclusion/redaction, path traversal/reparse rejection, explicit-query-only web search, and serialized start/pause lifecycle operations.
+Covered behaviors include capture consent, paused startup, bounded transcript memory, corrected-segment upserts, recording-switch isolation, discard of cleared in-flight answers, read-only sessions, best-effort secret exclusion/redaction, path traversal/reparse rejection, bounded all-project retrieval, automatic fallback planning and fail-closed query checks, explicit-query precedence, UI opt-out/capability gating, and serialized start/pause lifecycle operations. Pane-contract tests use React/SDK stand-ins; they are not visual acceptance tests.
 
 An independent review found a start/pause race, incompatible terminal-status shapes, and a device endpoint instance-method error. Each was reproduced and fixed with regression tests before publication.
 
@@ -19,6 +19,7 @@ An independent review found a start/pause race, incompatible terminal-status sha
 - Real prior-session retrieval returned matches without treating tool messages as proof.
 - A real authenticated answer request returned a sourced answer in 2.991 seconds. A separate initial call took 10.882 seconds. Individual observations, not latency guarantees.
 - An explicit public web query returned Microsoft documentation URLs and a sourced answer in 5.439 seconds. No transcript-derived query was sent.
+- Automatic web fallback was exercised with only a public Kubernetes probes question and empty synthetic project/session roots. It drafted a generic query, retrieved three web sources, and returned a cited answer in 18.357 seconds. The configured search provider failed authentication, but the host's built-in keyless rescue succeeded. This does not establish reliability of that configured provider or guarantee future fallback availability.
 - Test answers were cleared and capture was left paused.
 
 ## Not yet established

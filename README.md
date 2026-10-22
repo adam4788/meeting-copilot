@@ -11,12 +11,12 @@ Get short, speakable answer suggestions during Teams or Zoom calls, grounded in 
 - Explicit start, pause, and consent controls. Capture never starts at import or installation.
 - Read your explicitly selected active Meetily transcript; retain the Windows audio pipeline you already trust. Native Windows capture is an experimental fallback.
 - Local transcription; this project writes no additional raw audio recordings. Meetily retains its own recording behavior.
-- Project and past-session retrieval first, with visible evidence.
-- Optional web research using a public query you explicitly enter—not a transcript-derived query.
+- Select one project, **All projects + sessions**, or sessions only, with visible evidence. All-project scope covers up to 100 eligible project folders, not your whole computer.
+- **Automatic web fallback is on by default.** When local evidence is insufficient, the configured model can draft a filtered generic public query. Turn it off for sensitive calls; filtering is best effort, not a privacy guarantee. A query you enter explicitly overrides automatic planning.
 - Read-only answer generation through your configured model. No agent tools or external-system mutations.
 - In-memory transcript buffer and a capture heartbeat that stops listening when the pane disconnects.
 
-**Privacy boundary:** local transcription does not mean fully local answers. The question, bounded transcript, and selected source snippets are sent to your configured answer model. Use a locally hosted model if those must remain on-device. Search providers receive the explicit web query. See [SECURITY.md](SECURITY.md).
+**Privacy boundary:** local transcription does not mean fully local answers. The question, bounded transcript, and selected source snippets are sent to your configured answer model, including the fallback planner when enabled. Use a locally hosted model if those must remain on-device. Search providers receive either the filtered model-drafted query or the query you explicitly enter. All-project scope can mix unrelated project context; review evidence before sharing. See [SECURITY.md](SECURITY.md).
 
 ## Status
 
@@ -41,10 +41,10 @@ Installation copies only this plugin into the active `HERMES_HOME`, backing up a
 
 1. Open the **Meeting Copilot** pane in the desktop layout.
 2. Start recording in Meetily, then choose that active recording in the pane.
-3. Select a project for file evidence, or leave it on past sessions only.
+3. Choose **Search scope**: one project, **All projects + sessions**, or **Past sessions only**.
 4. Confirm permission and click **Attach to Meetily**.
 5. Click **Suggest answer** for the latest question, or type a specific question.
-6. For online research, expand **Research online** and enter a public query explicitly.
+6. **Automatic web fallback** is checked by default; uncheck it to prevent automatically planned searches. To override it, expand **Search online with a specific query** and enter a public query explicitly.
 
 **Detach** stops the copilot reading, not Meetily recording. **Clear meeting** clears the copilot's buffer/result but does not delete Meetily's files or undo requests already sent to a provider.
 
@@ -56,8 +56,8 @@ Use Python 3.11+ and Node.js 20+:
 
 ```sh
 python -m pip install -r requirements-dev.txt
-python -m unittest discover -v
-node --check desktop/plugin.js
+npm test
+npm run check
 ```
 
 Audio dependencies are optional for unit tests and non-Windows development. Runtime audio installation and desktop installation are documented below as those paths are verified.

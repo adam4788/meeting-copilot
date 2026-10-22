@@ -26,7 +26,8 @@ Project root discovery: explicit argument, `MEETING_COPILOT_PROJECT_ROOT`, then
 `~/Documents/Projects`. Hermes home discovery: explicit argument, `HERMES_HOME`,
 then `%LOCALAPPDATA%/hermes` on Windows or `~/.hermes` elsewhere. Only the default
 profile is supported. Project selection must resolve to one direct child of the
-project root. With no selected project, only prior sessions are searched.
+project root. With no selected project, only prior sessions are searched unless
+`all_projects=True` is explicitly enabled.
 
 ## Retrieval and limits
 
@@ -57,7 +58,9 @@ assistant claim nor a user request proves an action happened.
 top-`limit` preselection) plus sessions; it cannot be combined with `project`.
 `web_fallback=True` (the server default) runs `web_policy.plan_web` after local retrieval:
 one model call decides whether local evidence suffices and, if not, drafts a generic
-public query; unsafe/invalid output or errors mean no search. An explicit `web_query`
+public query; unsafe/invalid output or errors mean no search. The synchronous
+engine API keeps `web_fallback=False` unless explicitly enabled; the desktop/API
+defaults it to true. An explicit `web_query`
 always takes precedence. Results include `web_search: {used, mode, query}`.
 
 ## Privacy and online boundary
