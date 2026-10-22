@@ -51,11 +51,21 @@ excluded. Inactive/hidden entries are excluded where those schema fields exist.
 Prior assistant statements are explicitly labeled **unverified**; neither an
 assistant claim nor a user request proves an action happened.
 
+## Scope and web fallback
+
+`all_projects=True` searches every eligible direct child project (max 100, per-project
+top-`limit` preselection) plus sessions; it cannot be combined with `project`.
+`web_fallback=True` (the server default) runs `web_policy.plan_web` after local retrieval:
+one model call decides whether local evidence suffices and, if not, drafts a generic
+public query; unsafe/invalid output or errors mean no search. An explicit `web_query`
+always takes precedence. Results include `web_search: {used, mode, query}`.
+
 ## Privacy and online boundary
 
-Local file/session retrieval runs before any optional web request. Nothing
-constructs a web query from a question, transcript or local evidence. Only the
-caller-supplied, nonblank `web_query` is passed, unchanged, to Hermes
+Local file/session retrieval runs before any optional web request. No query is
+built by string-copying the question, transcript or evidence; with fallback
+enabled the model drafts a filtered generic query (best effort, see Scope above).
+An explicit nonblank `web_query` is passed, unchanged, to Hermes
 `tools.web_tools.web_search_tool(query, limit=3)`. That field must come from an
 explicit user action, never from a model. Web sources are search descriptions,
 not downloaded or verified pages. No web extraction or link following occurs.

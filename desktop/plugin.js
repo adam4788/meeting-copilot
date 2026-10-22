@@ -10,7 +10,7 @@ export default {
   id: ID,
   name: 'Meeting Copilot',
   description: 'Live answers grounded in your projects, prior sessions, and optional web research.',
-  version: '0.1.0',
+  version: '0.2.0',
   register(ctx) {
     const api = (path, body) => ctx.rest(path, body === undefined ? {} : { method: 'POST', body });
     function MeetingPane() {
@@ -24,11 +24,15 @@ export default {
       const [error, setError] = useState('');
       const [pending, setPending] = useState(false);
       const [showTranscript, setShowTranscript] = useState(false);
+      const [webFallback, setWebFallback] = useState(true);
       const status = useQuery({ queryKey: [ID, 'status'], queryFn: () => api('/status'), refetchInterval: 2500, retry: 1 });
       const projects = useQuery({ queryKey: [ID, 'projects'], queryFn: () => api('/projects'), staleTime: 60000, refetchInterval: query => query.state.error ? 5000 : false, retry: 3 });
       const recordings = useQuery({ queryKey: [ID, 'recordings'], queryFn: () => api('/recordings'), refetchInterval: backend === 'meetily' ? 5000 : false, enabled: backend === 'meetily', retry: 1 });
       const data = status.data || {};
       const busy = pending || data.busy;
+      const allProjects = project === '__all_projects__';
+      const scope = { project: allProjects ? null : project || null, all_projects: allProjects, web_fallback: webFallback };
+      const unsupported = (allProjects && !data.capabilities?.all_projects) || (webFallback && !data.capabilities?.automatic_web_fallback);
       useEffect(() => () => { api('/pause', {}).catch(() => {}); }, []);
       async function act(path, body = {}) {
         setPending(true); setError('');
@@ -43,12 +47,15 @@ export default {
         h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
           h('strong', { style: { fontSize: 17 } }, 'Meeting Copilot'),
           h(Badge, null, data.listening ? 'Listening' : 'Paused')),
-        h('p', { style: { ...muted, margin: 0 } }, 'Your projects and past sessions first. Web research only when you supply a public search query.'),
-        h('label', { style: { display: 'grid', gap: 6 } }, h('strong', null, 'Meeting context'),
+        h('p', { style: { ...muted, margin: 0 } }, 'Your projects and past sessions first. Automatic public web fallback is on by default when local evidence is insufficient.'),
+        h('label', { style: { display: 'grid', gap: 6 } }, h('strong', null, 'Search scope'),
           h('select', { value: project, onChange: e => setProject(e.target.value), style: selectStyle },
-            h('option', { value: '' }, 'Past sessions only — choose a project for files'),
+            h('option', { value: '' }, 'Past sessions only'),
+            h('option', { value: '__all_projects__', disabled: !data.capabilities?.all_projects }, 'All projects + sessions'),
             ...entries.map(p => { const value = typeof p === 'string' ? p : (p.path || p.name); return h('option', { value, key: value }, typeof p === 'string' ? p.split(/[\\/]/).pop() : (p.name || value)); }))),
         projects.error && h('div', { role: 'alert', style: muted }, `Project lookup unavailable: ${projects.error.message}`),
+        allProjects && h('p', { style: { ...muted, margin: 0 } }, 'Searches supported text files across up to 100 eligible project folders plus past sessions, not your whole computer. Evidence can include unrelated projects; review it before sharing.'),
+        unsupported && h('p', { role: 'alert', style: muted }, 'These options need the updated backend. Restart the gateway when other sessions are idle, then reopen this pane.'),
         h('section', { style: card },
           h('label', { style: { display: 'grid', gap: 6, paddingBottom: 10 } }, h('strong', null, 'Transcript source'),
             h('select', { value: backend, disabled: data.listening, onChange: e => setBackend(e.target.value), style: selectStyle },
@@ -72,17 +79,21 @@ export default {
         h('label', { style: { display: 'grid', gap: 6 } }, h('strong', null, 'What should I say?'),
           h(Textarea, { value: question, onChange: e => setQuestion(e.target.value), placeholder: 'Leave blank to answer the latest question, or type a question…', rows: 3 })),
         h('div', { style: { display: 'flex', gap: 8 } },
-          h(Button, { disabled: busy, onClick: () => act('/assist', { question, project: project || null }) }, busy ? 'Checking your sources…' : 'Suggest answer'),
+          h(Button, { disabled: busy || unsupported, onClick: () => act('/assist', { question, ...scope }) }, busy ? 'Checking your sources…' : 'Suggest answer'),
           h(Button, { variant: 'secondary', disabled: !result?.answer, onClick: async () => { try { await navigator.clipboard.writeText(result.answer); } catch (e) { setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, 'Copy')),
-        h('details', null, h('summary', { style: { cursor: 'pointer', ...muted } }, 'Research online'),
+        h('label', { style: { ...muted, display: 'flex', gap: 8 } },
+          h('input', { type: 'checkbox', checked: webFallback, onChange: e => setWebFallback(e.target.checked) }), 'Automatic web fallback'),
+        h('p', { style: { ...muted, margin: 0 } }, 'If needed, the model drafts a generic public query. Filtering is best-effort, not a privacy guarantee; turn this off for sensitive calls. Selected context still goes to your configured answer model.'),
+        h('details', null, h('summary', { style: { cursor: 'pointer', ...muted } }, 'Search online with a specific query'),
           h('div', { style: { display: 'grid', gap: 8, paddingTop: 10 } },
             h(Input, { value: web, onChange: e => setWeb(e.target.value), placeholder: 'Public query — no client names or meeting details' }),
-            h('span', { style: muted }, 'Only this query goes to web search. Your selected context still goes to your configured answer model.'),
-            h(Button, { variant: 'secondary', disabled: busy || !web.trim(), onClick: () => act('/assist', { question, project: project || null, web_query: web.trim() }) }, 'Check sources + web'))),
+            h('span', { style: muted }, 'This explicit query overrides automatic fallback for this request. Do not include private details.'),
+            h(Button, { variant: 'secondary', disabled: busy || unsupported || !web.trim(), onClick: () => act('/assist', { question, ...scope, web_query: web.trim() }) }, 'Check sources + web'))),
         (error || data.error || status.error) && h('div', { role: 'alert', style: card }, error || data.error || `Backend unavailable: ${status.error?.message}. Check installation and plugin enablement.`),
         result && h('section', { style: card, 'aria-live': 'polite' },
           h('div', { style: { display: 'flex', justifyContent: 'space-between' } }, h('strong', null, 'Suggested answer'), h('span', { style: muted }, Number.isFinite(result.elapsed_seconds) ? `${result.elapsed_seconds.toFixed(1)}s` : '')),
           h('div', { style: { whiteSpace: 'pre-wrap', lineHeight: 1.65, paddingTop: 10 } }, result.answer),
+          result.web_search?.used && h('p', { style: muted }, `${result.web_search.mode === 'automatic' ? 'Automatic web fallback' : 'Explicit web search'}: ${result.web_search.query}`),
           ...(result.warnings || []).map((w, i) => h('p', { key: `warning-${i}`, style: muted }, w)),
           h('details', { style: { marginTop: 12 } }, h('summary', { style: { cursor: 'pointer', ...muted } }, `Evidence · ${(result.sources || []).length} sources`),
             ...(result.sources || []).map((s, i) => h('div', { key: s.id || i, style: { ...muted, paddingTop: 8, overflowWrap: 'anywhere' } },
@@ -96,7 +107,7 @@ export default {
         h('p', { style: { ...muted, marginTop: 'auto' } }, 'Read-only assistance. Nothing is spoken, posted, or changed for you. Check suggestions before using them.'));
     }
     ctx.register({ id: 'pane', area: 'panes', title: 'Meeting Copilot', data: { placement: 'right', width: '440px' }, render: () => h(MeetingPane) });
-    ctx.register({ id: 'meeting-help', area: PALETTE_AREA, data: { title: 'Meeting Copilot: usage', run: () => host.notify({ kind: 'info', message: 'Open the Meeting Copilot pane. Choose a project, confirm consent, then Start listening. Use Suggest answer when needed.' }) } });
+    ctx.register({ id: 'meeting-help', area: PALETTE_AREA, data: { title: 'Meeting Copilot: usage', run: () => host.notify({ kind: 'info', message: 'Open Meeting Copilot. Choose one project, All projects + sessions, or sessions only. Web fallback is on by default and can be disabled. Confirm consent and attach your recording, then Suggest answer.' }) } });
     return () => { api('/pause', {}).catch(() => {}); };
   },
 };

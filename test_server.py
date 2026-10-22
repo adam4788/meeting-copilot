@@ -96,6 +96,39 @@ class ServerTests(unittest.TestCase):
             self.assertIsNone(state.result)
             self.assertEqual(observed, ['expected-profile'])
 
+    def test_all_projects_request_retrieves_multiple_projects(self):
+        import server
+        import tempfile
+        import time
+        from pathlib import Path
+        from unittest.mock import patch
+        from knowledge import KnowledgeEngine
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects, home = root / 'Projects', root / 'home'
+            projects.mkdir()
+            home.mkdir()
+            for name in ('alpha', 'beta'):
+                folder = projects / name
+                folder.mkdir()
+                (folder / 'notes.md').write_text(f'Orchid approval for {name}.', encoding='utf-8')
+            engine = KnowledgeEngine(projects, home)
+            state = server.MeetingState(engine_factory=lambda: engine)
+            app = FastAPI()
+            app.include_router(server.make_router(state))
+            with patch.object(engine, '_complete', return_value='Both projects require approval [1] [2].'), patch.object(engine, '_web', side_effect=AssertionError('no web consent')), TestClient(app) as client:
+                response = client.post('/assist', json={'question': 'Orchid approval', 'all_projects': True})
+                self.assertEqual(response.status_code, 200)
+                for _ in range(100):
+                    data = client.get('/status').json()
+                    if not data['busy']:
+                        break
+                    time.sleep(.01)
+                self.assertIsNone(data['error'])
+                sources = data['result']['sources']
+                self.assertEqual({Path(s['source']).parent.name for s in sources}, {'alpha', 'beta'})
+                self.assertTrue(client.get('/status').json()['capabilities']['all_projects'])
+
     def test_buffer_is_bounded(self):
         import server
         state = server.MeetingState()

@@ -122,6 +122,65 @@ class KnowledgeTests(unittest.TestCase):
         self.assertIsNone(call.call_args.kwargs['tools'])
         self.assertEqual(call.call_args.kwargs['timeout'], 30)
 
+    def test_all_scope_discloses_cross_project_context_and_limits(self):
+        (self.project / 'notes.md').write_text('Orchid approval.', encoding='utf-8')
+        with patch.object(self.engine, '_complete', return_value='Approval [1].'):
+            result = self.engine.answer('Orchid', all_projects=True)
+        self.assertTrue(any('100' in w and 'unrelated projects' in w for w in result['warnings']))
+
+    def test_all_scope_preserves_exclusions_and_sessions(self):
+        self.test_sessions_readonly_excludes_tools_and_labels_claims()
+        beta = self.projects / 'beta'
+        beta.mkdir()
+        (beta / 'notes.md').write_text('Orchid public approval. API_KEY=syntheticvalue', encoding='utf-8')
+        (self.project / 'notes.md').write_text('Orchid alpha approval.', encoding='utf-8')
+        (beta / 'auth.txt').write_text('Orchid excluded secret', encoding='utf-8')
+        private = self.projects / '.hidden'
+        private.mkdir()
+        (private / 'notes.md').write_text('Orchid excluded hidden', encoding='utf-8')
+        (self.root / 'outside.md').write_text('Orchid excluded outside', encoding='utf-8')
+        hits = self.engine.search('Orchid', all_projects=True)
+        self.assertEqual(len(hits), 4)
+        self.assertTrue(any(h['source'].startswith('session:') for h in hits))
+        self.assertFalse(any('excluded' in h['text'] or 'syntheticvalue' in h['text'] for h in hits))
+        self.assertEqual({Path(h['source']).parent.name for h in hits if not h['source'].startswith('session:')}, {'alpha', 'beta'})
+        self.assertEqual(len(self.engine.search('Orchid', all_projects=True, limit=1)), 1)
+        with self.assertRaises(ValueError):
+            self.engine.search('Orchid', project='alpha', all_projects=True)
+
+    def test_all_scope_bounds_project_count(self):
+        for i in range(101):
+            (self.projects / f'project-{i:03}').mkdir()
+        with patch.object(self.engine, '_files', return_value=[]) as scan:
+            self.engine.search('Orchid', all_projects=True)
+        self.assertEqual(scan.call_count, 100)
+
+    def _fallback(self, planner, **kw):
+        (self.project / 'notes.md').write_text('Orchid approval.', encoding='utf-8')
+        web = [dict(id='w', title='Doc', source='https://example.com', text='Public doc', updated_at=None)]
+        answers = iter([planner, 'Answer [1].'])
+        with patch.object(self.engine, '_complete', side_effect=lambda m: next(answers)),              patch.object(self.engine, '_web', return_value=web) as search:
+            return self.engine.answer('Orchid', web_fallback=True, **kw), search
+
+    def test_automatic_web_fallback_uses_planned_public_query(self):
+        result, search = self._fallback('{"needs_web":true,"query":"Kubernetes ingress annotations"}')
+        search.assert_called_once_with('Kubernetes ingress annotations')
+        self.assertEqual(result['web_search'], {'used': True, 'mode': 'automatic', 'query': 'Kubernetes ingress annotations'})
+
+    def test_automatic_web_fallback_skips_when_local_sufficient_or_planner_fails(self):
+        for planner in ('{"needs_web":false,"query":""}', 'not json'):
+            result, search = self._fallback(planner)
+            search.assert_not_called()
+            self.assertFalse(result['web_search']['used'])
+
+    def test_explicit_query_overrides_automatic_planner(self):
+        (self.project / 'notes.md').write_text('Orchid approval.', encoding='utf-8')
+        with patch.object(self.engine, '_complete', return_value='A [1].') as llm, patch.object(self.engine, '_web', return_value=[]) as search:
+            result = self.engine.answer('Orchid', web_query='public docs', web_fallback=True)
+        search.assert_called_once_with('public docs')
+        self.assertEqual(llm.call_count, 1)
+        self.assertEqual(result['web_search']['mode'], 'explicit')
+
     def test_hidden_project_cannot_be_selected(self):
         hidden = self.projects / '.private'
         hidden.mkdir()

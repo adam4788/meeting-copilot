@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import shutil
 
-FILES = ('server.py', 'knowledge.py', 'audio.py', 'meetily.py')
+FILES = ('server.py', 'knowledge.py', 'web_policy.py', 'audio.py', 'meetily.py')
 
 
 def install(source, home):

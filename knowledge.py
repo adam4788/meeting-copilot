@@ -8,6 +8,11 @@ import json
 import threading
 from contextlib import closing
 
+try:
+    from .web_policy import plan_web
+except ImportError:  # top-level use (tests, scripts)
+    from web_policy import plan_web
+
 
 _DENIED = re.compile(r'(auth|credential|secret|password|token|config|\.env)', re.I)
 _SKIP_DIRS = {'node_modules', 'venv', 'env', 'build', 'dist', '__pycache__', 'profiles'}
@@ -139,15 +144,28 @@ class KnowledgeEngine:
                      source=str(row.get('url', '')), text=_clean(str(row.get('description', '')))[:1500],
                      updated_at=None) for row in data.get('data', {}).get('web', [])[:3]]
 
-    def answer(self, question, transcript='', project=None, web_query=None):
+    def answer(self, question, transcript='', project=None, web_query=None, all_projects=False, web_fallback=False):
         started = time.monotonic()
         # Blank-button assistance must retrieve the actual conversation topic, not just the UI's generic instruction.
         retrieval_query = f'{question} {transcript[-2000:]}' if transcript else question
-        sources = self.search(retrieval_query, project=project, limit=6)
+        sources = self.search(retrieval_query, project=project, limit=6, all_projects=all_projects)
         warnings = ['Selected snippets and bounded transcript may be sent to the configured model provider.']
+        if all_projects:
+            warnings.append('All-project scope searches up to 100 eligible project folders with per-project limits; evidence may include unrelated projects. Review sources before sharing.')
+        web = {'used': False}
+        mode, query = None, None
         if web_query is not None and web_query.strip():
+            mode, query = 'explicit', web_query
+        elif web_fallback:
+            plan = plan_web(question, transcript, sources, [p['name'] for p in self.projects()], self._complete)
+            if plan['needed']:
+                mode, query = 'automatic', plan['query']
+            elif plan['reason'] == 'planner_unavailable':
+                warnings.append('Automatic web fallback skipped: planner unavailable.')
+        if query:
             try:
-                sources.extend(self._web(web_query))
+                sources.extend(self._web(query))
+                web = {'used': True, 'mode': mode, 'query': query}
             except Exception as exc:
                 warnings.append(f'Web search failed ({type(exc).__name__}); using local evidence only.')
         system = ('You are a read-only meeting copilot. Answer concisely using only the supplied evidence and transcript. '
@@ -168,26 +186,41 @@ class KnowledgeEngine:
             warnings.append(f'Model request failed ({type(exc).__name__}).')
         if not sources:
             warnings.append('No matching local/session evidence found; transcript alone is not independent verification.')
-        return {'answer': text, 'sources': sources, 'elapsed_seconds': round(time.monotonic() - started, 3), 'warnings': warnings}
+        return {'answer': text, 'sources': sources, 'elapsed_seconds': round(time.monotonic() - started, 3), 'warnings': warnings, 'web_search': web}
 
-    def search(self, question, project=None, limit=6):
+    @staticmethod
+    def _rank(docs, terms, limit):
+        # The transient FTS index is memory-only; never writes project files.
+        with closing(sqlite3.connect(':memory:')) as index:
+            index.execute('CREATE VIRTUAL TABLE docs USING fts5(text)')
+            index.executemany('INSERT INTO docs(rowid,text) VALUES (?,?)', [(i + 1, d['text']) for i, d in enumerate(docs)])
+            query = ' OR '.join('"' + term + '"' for term in terms)
+            rows = index.execute('SELECT rowid FROM docs WHERE docs MATCH ? ORDER BY bm25(docs) LIMIT ?', (query, limit)).fetchall()
+        return [docs[row[0] - 1].copy() for row in rows]
+
+    def search(self, question, project=None, limit=6, all_projects=False):
+        if all_projects and project:
+            raise ValueError('Choose all projects or one project, not both')
         limit = max(0, min(int(limit), 20))
         terms = list(dict.fromkeys(term for term in re.findall(r'\w{2,}', question.lower()) if term not in _STOPWORDS))[:20]
         if not terms or not limit:
             return []
         with self._lock:
             docs = []
-            if project:
+            if all_projects:
+                for entry in self.projects()[:100]:
+                    selected = Path(entry['path'])
+                    folder = selected.resolve()
+                    if folder.parent != self.project_root or selected.is_symlink():
+                        continue
+                    # Preselect per project so the combined index stays bounded
+                    # and an early, large project cannot crowd out later ones.
+                    docs.extend(self._rank(self._files(folder), terms, limit))
+            elif project:
                 selected = self.project_root / project
                 folder = selected.resolve()
                 if folder.parent != self.project_root or selected.is_symlink() or selected.name.startswith('.') or _DENIED.search(selected.name) or selected.name.lower() in _SKIP_DIRS:
                     raise ValueError('Select one direct child project')
                 docs.extend(self._files(folder))
             docs.extend(self._sessions(terms))
-            # The transient FTS index is memory-only; never writes project files.
-            with closing(sqlite3.connect(':memory:')) as index:
-                index.execute('CREATE VIRTUAL TABLE docs USING fts5(text)')
-                index.executemany('INSERT INTO docs(rowid,text) VALUES (?,?)', [(i + 1, d['text']) for i, d in enumerate(docs)])
-                query = ' OR '.join('"' + term + '"' for term in terms)
-                rows = index.execute('SELECT rowid FROM docs WHERE docs MATCH ? ORDER BY bm25(docs) LIMIT ?', (query, limit)).fetchall()
-            return [docs[row[0] - 1].copy() for row in rows]
+            return self._rank(docs, terms, limit)

@@ -9,7 +9,8 @@
 - A configured answer provider receives the question, bounded recent transcript,
   and retrieved source snippets. This may be a hosted provider. Local transcription
   is **not** a promise that answer generation stays local.
-- Public search receives only the query explicitly entered by the user.
+- Public search receives either the query the user explicitly enters or, when **automatic web fallback** is on (default), a short generic query drafted by your configured model when local evidence looks insufficient. Drafted queries are filtered for URLs, emails, IPs, paths, secret-like text and project names, and fail closed on any error. This filtering is best effort, not DLP: **turn the fallback off for sensitive calls.**
+- **All projects + sessions** scope reads up to 100 eligible project folders under the project root (never the whole computer); evidence from unrelated projects may reach the configured model.
 - Project/session access is read-only. No model tools, automatic speech, chat
   messages, or business-system writes are granted.
 - The desktop integration uses the host's authenticated plugin API. Do not expose

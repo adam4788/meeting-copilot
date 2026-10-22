@@ -10,6 +10,8 @@ from pydantic import BaseModel, Field
 class AssistRequest(BaseModel):
     question: str = Field(default='', max_length=4000)
     project: str | None = Field(default=None, max_length=1000)
+    all_projects: bool = False
+    web_fallback: bool = True
     web_query: str | None = Field(default=None, max_length=300)
 
 
@@ -154,8 +156,10 @@ class MeetingState:
                     self.engine = module.KnowledgeEngine()
             return self.engine
 
-    def assist(self, question, project=None, web_query=None):
+    def assist(self, question, project=None, web_query=None, all_projects=False, web_fallback=True):
         from fastapi import HTTPException
+        if all_projects and project:
+            raise HTTPException(400, 'Choose all projects or one project, not both.')
         with self.lock:
             if self.busy:
                 raise HTTPException(409, 'An answer is already being prepared.')
@@ -169,7 +173,7 @@ class MeetingState:
 
         def work():
             try:
-                result = self.get_engine().answer(question, transcript=transcript, project=project, web_query=web_query)
+                result = self.get_engine().answer(question, transcript=transcript, project=project, web_query=web_query, all_projects=all_projects, web_fallback=web_fallback)
                 with self.lock:
                     if generation == self.generation:
                         self.result = result
@@ -190,7 +194,8 @@ class MeetingState:
         with self.lock:
             self.last_seen = time.monotonic()
             return {'listening': self.listening, 'segments': list(self.segments), 'error': self.error or self.capture_error,
-                    'busy': self.busy, 'result': self.result, 'capture': self.capture_info, 'backend': self.backend}
+                    'busy': self.busy, 'result': self.result, 'capture': self.capture_info, 'backend': self.backend,
+                    'capabilities': {'all_projects': True, 'automatic_web_fallback': True}}
 
 
 def make_router(state):
@@ -218,7 +223,7 @@ def make_router(state):
 
     @router.post('/assist')
     def assist(body: AssistRequest):
-        return state.assist(body.question, body.project, body.web_query)
+        return state.assist(body.question, body.project, body.web_query, body.all_projects, body.web_fallback)
 
     @router.get('/projects')
     def projects():
