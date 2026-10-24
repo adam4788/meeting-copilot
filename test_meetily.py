@@ -59,6 +59,11 @@ class MeetilyTests(unittest.TestCase):
             time.sleep(.005)
         self.fail('Timed out waiting for adapter')
 
+    def test_macos_default_matches_meetily_snapshot_folder(self):
+        with patch('sys.platform', 'darwin'), patch('meetily.Path.home', return_value=self.root):
+            self.assertEqual(MeetilyBridge.default_root(), self.root / 'Movies' / 'meetily-recordings')
+            self.assertEqual(MeetilyBridge(root=self.root).root, self.root)
+
     def test_live_snapshot_correction_and_dedup(self):
         folder = self.recording()
         self.snapshot(folder, [self.segment()])
@@ -221,7 +226,7 @@ class MeetilyTests(unittest.TestCase):
         self.write(prefs, 'recording_preferences.json', {'save_folder': str(self.root / 'recordings'), 'unrelated': 'ignored'})
         from types import SimpleNamespace
         fake_os = SimpleNamespace(name='nt', environ={'APPDATA': str(self.root)})
-        with patch('meetily.os', fake_os):
+        with patch('meetily.os', fake_os), patch('sys.platform', 'win32'):
             self.assertEqual(MeetilyBridge.default_root(), self.root / 'recordings')
             (prefs / 'recording_preferences.json').write_text('{', encoding='utf-8')
             self.assertEqual(MeetilyBridge.default_root(), Path.home() / 'Music' / 'meetily-recordings')

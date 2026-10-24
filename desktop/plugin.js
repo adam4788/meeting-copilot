@@ -1,5 +1,5 @@
 import { createElement as h, useState, useEffect } from 'react';
-import { host, useQuery, useQueryClient, Button, Input, Textarea, Badge, PALETTE_AREA } from '@hermes/plugin-sdk';
+import { host, useValue, useQuery, useQueryClient, Button, Input, Textarea, Badge, PALETTE_AREA } from '@hermes/plugin-sdk';
 
 const ID = 'meeting-copilot-live';
 const muted = { color: 'var(--ui-text-secondary)', fontSize: 12, lineHeight: 1.5 };
@@ -106,8 +106,30 @@ export default {
           h('div', { style: { maxHeight: 260, overflowY: 'auto', paddingTop: 8 } }, ...transcript.slice(-30).map((s, i) => h('p', { key: `${i}-${s.timestamp}`, style: muted }, h('strong', null, `${s.speaker}: `), s.text)))),
         h('p', { style: { ...muted, marginTop: 'auto' } }, 'Read-only assistance. Nothing is spoken, posted, or changed for you. Check suggestions before using them.'));
     }
-    ctx.register({ id: 'pane', area: 'panes', title: 'Meeting Copilot', data: { placement: 'right', width: '440px' }, render: () => h(MeetingPane) });
-    ctx.register({ id: 'meeting-help', area: PALETTE_AREA, data: { title: 'Meeting Copilot: usage', run: () => host.notify({ kind: 'info', message: 'Open Meeting Copilot. Choose one project, All projects + sessions, or sessions only. Web fallback is on by default and can be disabled. Confirm consent and attach your recording, then Suggest answer.' }) } });
+    const paneId = `${ID}:pane`;
+    const visibility = typeof host.paneVisibility === 'function' ? host.paneVisibility(paneId) : null;
+    const registerPane = () => ctx.register({ id: 'pane', area: 'panes', title: 'Meeting Copilot', data: { placement: 'right', width: '440px' }, render: () => h(MeetingPane) });
+    let removePane = registerPane();
+    const openPane = () => {
+      if (!removePane) removePane = registerPane();
+      if (typeof host.revealPane === 'function') host.revealPane(paneId);
+      else host.notify({ kind: 'error', message: 'Update Hermes Desktop to reopen contributed panes.' });
+    };
+    const togglePane = () => {
+      // Read current host state on click, not a potentially stale render closure.
+      if (visibility?.get() && typeof removePane === 'function') {
+        removePane();
+        removePane = null;
+      } else openPane();
+    };
+    function StatusButton() {
+      const visible = visibility ? useValue(visibility) : false;
+      const title = `${visible ? 'Hide' : 'Open'} Meeting Copilot`;
+      return h('button', { type: 'button', title, 'aria-label': title, 'aria-pressed': visible, className: 'px-1.5 text-[0.6875rem] text-(--ui-text-secondary) hover:text-(--ui-text-primary)', onClick: togglePane }, 'Meeting Copilot');
+    }
+    ctx.register({ id: 'opener', area: 'statusBar.right', order: 130, render: () => h(StatusButton) });
+    ctx.register({ id: 'open', area: PALETTE_AREA, data: { id: `${ID}.open`, label: 'Open Meeting Copilot', keywords: ['meeting', 'copilot', 'show', 'restore'], run: openPane } });
+    ctx.register({ id: 'meeting-help', area: PALETTE_AREA, data: { label: 'Meeting Copilot: usage', run: () => host.notify({ kind: 'info', message: 'Open Meeting Copilot. Choose one project, All projects + sessions, or sessions only. Web fallback is on by default and can be disabled. Confirm consent and attach your recording, then Suggest answer.' }) } });
     return () => { api('/pause', {}).catch(() => {}); };
   },
 };

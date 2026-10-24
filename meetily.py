@@ -4,6 +4,7 @@ import math
 import os
 from pathlib import Path
 import stat
+import sys
 import threading
 
 
@@ -17,6 +18,10 @@ class MeetilyBridge:
 
     @classmethod
     def default_root(cls):
+        if sys.platform == 'darwin':
+            # Meetily v0.4.1's snapshot saver uses its platform default directly,
+            # rather than the optional recording export preference.
+            return Path.home() / 'Movies' / 'meetily-recordings'
         if os.name == 'nt' and os.environ.get('APPDATA'):
             try:
                 path = Path(os.environ['APPDATA']) / 'com.meetily.ai' / 'recording_preferences.json'

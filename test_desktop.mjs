@@ -9,9 +9,17 @@ function pane(scope, supported = true, fallback = true, web = '') {
   let registered;
   let stateIndex = 0;
   const requests = [];
+  const contributions = [];
+  const revealed = [];
+  let visible = false;
+  const visibility = { get: () => visible };
   const ctx = {
     rest: async (path, options = {}) => { requests.push({ path, ...options }); return {}; },
-    register: item => { if (item.area === 'panes') registered = item; },
+    register: item => {
+      contributions.push(item);
+      if (item.area === 'panes') registered = item;
+      return () => { contributions.splice(contributions.indexOf(item), 1); if (item.area === 'panes') visible = false; };
+    },
   };
   const h = (type, props, ...children) => typeof type === 'function'
     ? type(props || {}) : { type, props: props || {}, children: children.flat(Infinity) };
@@ -25,13 +33,50 @@ function pane(scope, supported = true, fallback = true, web = '') {
     useQuery: options => ({ data: options.queryKey[1] === 'status'
       ? { capabilities: supported ? { all_projects: true, automatic_web_fallback: true } : undefined }
       : options.queryKey[1] === 'projects' ? [{ name: 'alpha', path: '/projects/alpha' }] : [] }),
-    host: {}, Button: 'button', Input: 'input', Textarea: 'textarea', Badge: 'badge', PALETTE_AREA: 'palette',
+    useValue: atom => atom.get(),
+    host: { paneVisibility: () => visibility, revealPane: id => { revealed.push(id); visible = true; } }, Button: 'button', Input: 'input', Textarea: 'textarea', Badge: 'badge', PALETTE_AREA: 'palette',
   });
-  return { tree: registered.render(), requests };
+  return { tree: registered.render(), requests, contributions, revealed };
 }
 function nodes(tree) {
   return tree && typeof tree === 'object' ? [tree, ...(tree.children || []).flatMap(nodes)] : [];
 }
+
+test('native opener restores the namespaced pane without capture requests', () => {
+  const { contributions, revealed, requests } = pane('');
+  const open = contributions.find(c => c.area === 'palette' && c.data.label === 'Open Meeting Copilot');
+  assert.ok(open, 'A real open command must be discoverable in Cmd+K');
+  open.data.run();
+  assert.deepEqual(revealed, ['meeting-copilot-live:pane']);
+  assert.equal(requests.length, 0);
+});
+
+test('status bar reopens the pane without starting capture', () => {
+  const { contributions, revealed, requests } = pane('');
+  const entry = contributions.find(c => c.area === 'statusBar.right');
+  assert.ok(entry, 'An always-available status bar opener must exist');
+  const button = entry.render();
+  assert.equal(button.props.title, 'Open Meeting Copilot');
+  button.props.onClick();
+  assert.deepEqual(revealed, ['meeting-copilot-live:pane']);
+  assert.equal(requests.length, 0);
+});
+
+test('status bar toggles open, hide, and reopen without capture changes', () => {
+  const { contributions, requests } = pane('');
+  const entry = contributions.find(c => c.area === 'statusBar.right');
+  entry.render().props.onClick();
+  const shown = entry.render();
+  assert.equal(shown.props.title, 'Hide Meeting Copilot');
+  assert.equal(shown.props['aria-pressed'], true);
+  shown.props.onClick();
+  assert.equal(contributions.filter(c => c.area === 'panes').length, 0);
+  assert.equal(entry.render().props.title, 'Open Meeting Copilot');
+  entry.render().props.onClick();
+  assert.equal(contributions.filter(c => c.area === 'panes').length, 1);
+  assert.equal(entry.render().props['aria-pressed'], true);
+  assert.equal(requests.length, 0);
+});
 
 test('all projects option sends an explicit scope without a selected project', async () => {
   const { tree, requests } = pane('__all_projects__');

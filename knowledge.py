@@ -28,7 +28,12 @@ def _clean(text):
 
 class KnowledgeEngine:
     def __init__(self, project_root=None, hermes_home=None):
-        self.project_root = Path(project_root or os.environ.get('MEETING_COPILOT_PROJECT_ROOT', Path.home() / 'Documents' / 'Projects')).resolve()
+        # Keep the existing Documents layout when present; also support the common
+        # macOS/Linux ~/Projects layout without requiring gateway environment edits.
+        default_root = Path.home() / 'Documents' / 'Projects'
+        if not default_root.is_dir() and (Path.home() / 'Projects').is_dir():
+            default_root = Path.home() / 'Projects'
+        self.project_root = Path(project_root or os.environ.get('MEETING_COPILOT_PROJECT_ROOT') or default_root).resolve()
         default_home = Path(os.environ.get('LOCALAPPDATA', Path.home() / 'AppData' / 'Local')) / 'hermes' if os.name == 'nt' else Path.home() / '.hermes'
         self.hermes_home = Path(hermes_home or os.environ.get('HERMES_HOME', default_home)).resolve()
         if 'profiles' in {part.lower() for part in self.hermes_home.parts} or any(os.environ.get(key, '').lower() not in ('', 'default') for key in ('HERMES_PROFILE_NAME', 'HERMES_PROFILE')):

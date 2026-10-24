@@ -22,6 +22,18 @@ class KnowledgeTests(unittest.TestCase):
         self.home.mkdir()
         self.engine = KnowledgeEngine(self.projects, self.home)
 
+    def test_default_project_root_finds_home_projects_on_mac(self):
+        with patch.dict(os.environ, {'MEETING_COPILOT_PROJECT_ROOT': ''}), patch('knowledge.Path.home', return_value=self.root):
+            engine = KnowledgeEngine(hermes_home=self.home)
+        self.assertEqual(engine.project_root, self.projects.resolve())
+        self.assertEqual(engine.projects()[0]['name'], 'alpha')
+
+    def test_existing_documents_projects_keeps_precedence(self):
+        legacy = self.root / 'Documents' / 'Projects'
+        legacy.mkdir(parents=True)
+        with patch.dict(os.environ, {'MEETING_COPILOT_PROJECT_ROOT': ''}), patch('knowledge.Path.home', return_value=self.root):
+            self.assertEqual(KnowledgeEngine(hermes_home=self.home).project_root, legacy.resolve())
+
     def test_selected_project_text_search(self):
         (self.project / 'README.md').write_text('Orchid deployment needs a blue approval.', encoding='utf-8')
         self.assertEqual(self.engine.projects()[0]['name'], 'alpha')
