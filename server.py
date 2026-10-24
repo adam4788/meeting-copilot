@@ -36,6 +36,7 @@ class MeetingState:
         self.busy = False
         self.result = None
         self.generation = 0
+        self.capture_generation = 0
         self.lock = threading.RLock()
         self.lifecycle_lock = threading.RLock()
         self.capture_error = None
@@ -104,15 +105,27 @@ class MeetingState:
                 self.capture_info = {}
                 self.generation += 1
                 self.session_key = session_key
+            self.capture_generation += 1
+            capture_generation = self.capture_generation
             self.backend = backend
             self.listening = True
             self.error = None
             self.last_seen = time.monotonic()
+        # Stops are bounded: a previous worker may still return after detach/restart.
+        # Check the lease and apply each callback under the same lock so it cannot
+        # race with pause or contaminate a newly selected recording.
+        def deliver(callback, value):
+            with self.lock:
+                if capture_generation == self.capture_generation:
+                    callback(value)
+
+        on_segment = lambda value: deliver(self.add_segment, value)
+        on_status = lambda value: deliver(self.audio_status, value)
         try:
             if backend == 'meetily':
-                self.get_bridge().attach(recording_id, on_segment=self.add_segment, on_status=self.audio_status)
+                self.get_bridge().attach(recording_id, on_segment=on_segment, on_status=on_status)
             else:
-                self.audio.start(on_segment=self.add_segment, on_status=self.audio_status)
+                self.audio.start(on_segment=on_segment, on_status=on_status)
         except Exception as exc:
             self.pause()
             raise HTTPException(503, f'Audio could not start: {type(exc).__name__}: {str(exc)[:300]}') from exc
@@ -138,11 +151,14 @@ class MeetingState:
         with self.lifecycle_lock:
             with self.lock:
                 self.listening = False
+                self.capture_generation += 1
                 audio = self.audio if self.backend == 'native' else self.bridge
             if audio:
                 audio.stop()
             with self.lock:
                 self.capture_error = None
+                self.capture_info = {'status': 'idle', 'backend': self.backend,
+                                     'message': 'Not attached' if self.backend == 'meetily' else 'Paused'}
             return {'listening': False}
 
     def get_engine(self):
