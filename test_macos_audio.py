@@ -118,6 +118,37 @@ class GatewayTests(unittest.TestCase):
             with patch.dict(os.environ, {'MEETING_COPILOT_AUDIO_PYTHON': '/missing/interpreter'}):
                 with self.assertRaises(RuntimeError): worker_python(root)
 
+    def test_worker_env_never_inherits_launcher_pythonpath(self):
+        from macos_audio import worker_env
+        with patch.dict(os.environ, {'PYTHONPATH': '/host/venv-3.14/site-packages', 'PYTHONHOME': '/host'}):
+            env = worker_env()
+            self.assertNotIn('PYTHONPATH', env)
+            self.assertNotIn('PYTHONHOME', env)
+            self.assertEqual(env.get('PATH'), os.environ.get('PATH'))
+
+    def test_worker_spawn_uses_hermetic_env(self):
+        import subprocess
+        import sys
+        import threading
+        from macos_audio import MacOSAudioCapture
+        real_popen = subprocess.Popen
+        seen = {}
+        script = "print('{\"type\":\"status\",\"state\":\"running\"}',flush=True);import time;time.sleep(30)"
+        def factory(cmd, **kw):
+            seen.update(kw.get('env') or {})
+            return real_popen([sys.executable, '-c', script], **kw)
+        started = threading.Event()
+        with patch.dict(os.environ, {'MEETING_COPILOT_AUDIO_PYTHON': sys.executable,
+                                      'PYTHONPATH': '/host/venv-3.14/site-packages',
+                                      'PYTHONHOME': '/host'}), \
+                patch('subprocess.Popen', factory):
+            capture = MacOSAudioCapture()
+            capture.start(print, lambda value: started.set() if value['state'] == 'running' else None)
+            self.assertTrue(started.wait(5))
+            capture.stop()
+        self.assertNotIn('PYTHONPATH', seen)
+        self.assertNotIn('PYTHONHOME', seen)
+
     def test_worker_error_is_sanitized_and_callbacks_are_contained(self):
         import subprocess
         import sys

@@ -87,6 +87,13 @@ def validate(model, source, language):
         raise ValueError('English-only models require language=en')
 
 
+def worker_env():
+    """Hermetic env for the isolated worker: never inherit the launcher's
+    PYTHONPATH/PYTHONHOME (e.g. Hermes's own 3.14 site-packages), which would
+    shadow the audio-runtime's 3.12 packages and break model loading."""
+    return {k: v for k, v in os.environ.items() if k not in ('PYTHONPATH', 'PYTHONHOME')}
+
+
 class MacOSAudioCapture:
     def __init__(self, model_size='base.en', source='microphone', language='en'):
         validate(model_size, source, language)
@@ -156,7 +163,8 @@ class MacOSAudioCapture:
             if self._cancel.is_set():
                 return
             process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                       stderr=subprocess.DEVNULL, start_new_session=True)
+                                       stderr=subprocess.DEVNULL, start_new_session=True,
+                                       env=worker_env())
             with self._lock:
                 self._process = process
             assert process.stdout is not None
