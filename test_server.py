@@ -471,5 +471,7 @@ class OverlayRequestScopeTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as ctx:
             state.overlay_show({'project': 'demo'})
         self.assertEqual(ctx.exception.status_code, 503)
-        self.assertIn('executable', str(ctx.exception.detail))
+        import sys
+        expected = 'executable' if sys.platform in ('darwin', 'linux') else 'not supported'
+        self.assertIn(expected, str(ctx.exception.detail))
         self.assertIsNone(state.overlay)
