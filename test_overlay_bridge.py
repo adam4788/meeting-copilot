@@ -1,8 +1,48 @@
 """Overlay bridge tests; stdlib only, no GUI, network, devices, or permissions."""
 import json
 import unittest
+from contextlib import contextmanager
 
 import overlay_bridge as bridge
+
+
+class _SlotProcess:
+    """Fake helper process: no real spawn, works on every platform.
+
+    poll() None means alive; terminate()/kill() mark it exited. stdin/stdout
+    are None so snapshots record to `pushed` and no reader thread starts.
+    """
+
+    def __init__(self, exit_code=None):
+        self.stdin = None
+        self.stdout = None
+        self._exit_code = exit_code
+
+    def poll(self):
+        return self._exit_code
+
+    def terminate(self):
+        self._exit_code = 0
+
+    def kill(self):
+        self._exit_code = 0
+
+    def wait(self, timeout=None):
+        return self._exit_code if self._exit_code is not None else 0
+
+
+@contextmanager
+def _fake_overlay_spawn():
+    """Fake a live overlay helper: no real subprocess on any platform."""
+    from unittest.mock import patch as _patch
+
+    def fake_start(self):
+        self.process = _SlotProcess()
+        return self.process
+
+    with _patch.object(bridge.OverlayBridge, '_helper_available', lambda self: True), \
+            _patch.object(bridge.OverlayBridge, 'start_helper', fake_start):
+        yield
 
 
 class SnapshotTests(unittest.TestCase):
@@ -318,7 +358,6 @@ class BridgeLifecycleTests(ClickTests):
     """Status pump, fail-closed show, single-writer ordering, cleanup."""
 
     def test_status_pump_keeps_streaming_through_pause_switch_and_late_events(self):
-        import sys as _sys
         import time
         seen = {'status': {'segments': [], 'listening': True}}
         transport = bridge.BackendTransport.__new__(bridge.BackendTransport)
@@ -328,9 +367,9 @@ class BridgeLifecycleTests(ClickTests):
             return dict(seen['status'])
 
         transport._poll = poll
-        overlay = bridge.OverlayBridge(helper=_sys.executable, transport=transport, poll_interval=0.02)
-        overlay.helper_args = ['-c', 'import sys\nfor line in sys.stdin: pass']
-        result = overlay.show_overlay()
+        overlay = bridge.OverlayBridge(helper=None, transport=transport, poll_interval=0.02)
+        with _fake_overlay_spawn():
+            result = overlay.show_overlay()
         try:
             self.assertTrue(result.get('shown'), result)
             seen['status'] = {'segments': [{'speaker': 'm', 'text': 'Who decides?'}],
@@ -637,8 +676,11 @@ class BridgeLifecycleTests(ClickTests):
         Uses the real MeetingState + BackendTransport (not an HTTP fake): the
         pane scope flows through /overlay/show, the click creates a request
         slot, and streamed chunks land on the clicked row only.
+
+        Portable: the helper spawn is faked with a slot process (no real
+        subprocess), so the full pane/show/click/status lifecycle runs on
+        every platform, including Windows CI.
         """
-        import sys
         import time
         import server as real_server
         deltas = ['Two ', 'reviewers.']
@@ -656,26 +698,16 @@ class BridgeLifecycleTests(ClickTests):
         state = real_server.MeetingState(engine_factory=lambda: FakeEngine())
         state.add_segment({'speaker': 'remote', 'text': 'Who approves?'})
         state.listening = True
-        import sys as _sys2
-        real_helper_path = state._overlay_helper_path
-        state._overlay_helper_path = lambda: _sys2.executable
-        import overlay_bridge as _bridge2
-        real_bridge_init = _bridge2.OverlayBridge.__init__
-
-        def patched_init(self, helper=None, transport=None, scope=None, poll_interval=0.25,
-                         assist_timeout=90.0):
-            real_bridge_init(self, helper=_sys2.executable, transport=transport, scope=scope,
-                             poll_interval=0.01, assist_timeout=assist_timeout)
-            self.helper_args = ['-c', 'import sys\nfor line in sys.stdin: pass']
 
         shown = None
+        real_helper_path = state._overlay_helper_path
+        state._overlay_helper_path = lambda: '/fake/macos_overlay_for_test'
         try:
-            _bridge2.OverlayBridge.__init__ = patched_init
-            shown = state.overlay_show({'project': 'demo', 'answer_provider': 'meta',
-                                        'answer_model': 'muse-spark-1.3',
-                                        'web_fallback': True})
+            with _fake_overlay_spawn():
+                shown = state.overlay_show({'project': 'demo', 'answer_provider': 'meta',
+                                            'answer_model': 'muse-spark-1.3',
+                                            'web_fallback': True})
         finally:
-            _bridge2.OverlayBridge.__init__ = real_bridge_init
             state._overlay_helper_path = real_helper_path
         self.assertTrue(shown['shown'])
         transport = bridge.BackendTransport(state)
@@ -687,8 +719,6 @@ class BridgeLifecycleTests(ClickTests):
         current_scope = {'project': 'demo', 'answer_provider': 'meta',
                          'answer_model': 'muse-spark-1.3', 'web_fallback': True}
         state.overlay_scope(current_scope)
-        if sys.platform == 'win32':
-            self.skipTest('helper spawn is covered on macOS/Linux CI')
         row_deadline = time.monotonic() + 10
         clicked = False
         while time.monotonic() < row_deadline:

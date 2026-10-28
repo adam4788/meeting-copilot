@@ -580,13 +580,13 @@ class OverlayBridge:
     def _helper_available(self):
         """Fail closed: only a prepared executable helper may launch a window."""
         import os as _os
+        if sys.platform not in ('darwin', 'linux'):
+            return False
         helper = self.helper_path
         if not helper or not isinstance(helper, str):
             return False
         if not _os.path.isfile(helper):
             return False
-        if sys.platform == 'win32':
-            return True
         return _os.access(helper, _os.X_OK)
 
     def helper_status(self):
@@ -596,6 +596,9 @@ class OverlayBridge:
         if not self.helper_path:
             return {'available': False,
                     'error': 'Overlay helper is not prepared on this backend; run prepare_macos.py.'}
+        if sys.platform not in ('darwin', 'linux'):
+            return {'available': False,
+                    'error': f'Overlay helper is not supported on this platform: {self.helper_path}'}
         return {'available': False,
                 'error': f'Overlay helper is not executable: {self.helper_path}'}
 

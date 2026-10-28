@@ -427,11 +427,12 @@ class OverlayRequestScopeTests(unittest.TestCase):
 
     def test_overlay_show_hide_scope_lifecycle(self):
         import server
-        import sys as _sys
+        from test_overlay_bridge import _fake_overlay_spawn
         state = server.MeetingState(engine_factory=lambda: None)
-        state._overlay_helper_path = lambda: _sys.executable
-        first = state.overlay_show({'project': 'demo', 'answer_provider': 'meta',
-                                    'answer_model': 'muse-spark-1.3', 'injected': 'drop'})
+        state._overlay_helper_path = lambda: '/fake/macos_overlay_for_test'
+        with _fake_overlay_spawn():
+            first = state.overlay_show({'project': 'demo', 'answer_provider': 'meta',
+                                        'answer_model': 'muse-spark-1.3', 'injected': 'drop'})
         self.assertTrue(first['shown'])
         self.assertIsNotNone(state.overlay)
         again = state.overlay_show({'project': 'demo'})
@@ -444,6 +445,7 @@ class OverlayRequestScopeTests(unittest.TestCase):
 
     def test_overlay_show_fails_closed_without_helper_and_reports_capability(self):
         import server
+        from test_overlay_bridge import _fake_overlay_spawn
         state = server.MeetingState(engine_factory=lambda: None)
         state._overlay_helper_path = lambda: None
         from fastapi import HTTPException
@@ -454,9 +456,9 @@ class OverlayRequestScopeTests(unittest.TestCase):
         # Capabilities reflect the failure: no silent success.
         self.assertFalse(state.status()['capabilities']['overlay'])
         # Reopen works once a helper is prepared: no orphan, correct status.
-        import sys as _sys2
-        state._overlay_helper_path = lambda: _sys2.executable
-        reopened = state.overlay_show({'project': 'demo'})
+        state._overlay_helper_path = lambda: '/fake/macos_overlay_for_test'
+        with _fake_overlay_spawn():
+            reopened = state.overlay_show({'project': 'demo'})
         self.assertTrue(reopened['shown'])
         self.assertIsNotNone(state.overlay)
         state.overlay_hide()
