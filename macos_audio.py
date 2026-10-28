@@ -38,11 +38,25 @@ def worker_python(root):
     raise RuntimeError(ERRORS['runtime'])
 
 
+# SIGKILL does not exist on Windows; fall back to a second terminate there.
+_SIGKILL = getattr(signal, 'SIGKILL', signal.SIGTERM)
+
+
+def _signal_group(process, sig):
+    """Signal the whole process group on POSIX; the process itself on Windows."""
+    if os.name == 'posix':
+        os.killpg(process.pid, sig)
+    elif sig is _SIGKILL and _SIGKILL is not signal.SIGTERM:
+        process.kill()
+    else:
+        process.terminate()
+
+
 def terminate_group(process, timeout=1.0):
     """Always signal the group, even when the worker has exited leaving a helper."""
     try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
+        _signal_group(process, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError, AttributeError):
         pass
     try:
         process.wait(timeout=max(0, timeout))
@@ -50,8 +64,8 @@ def terminate_group(process, timeout=1.0):
         pass
     # A child may ignore TERM even if its parent already exited.
     try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
+        _signal_group(process, _SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError, AttributeError):
         pass
     try:
         process.wait(timeout=.2)
