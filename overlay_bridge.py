@@ -167,6 +167,10 @@ class BackendTransport:
         self._state = state
         self._poll = poll
         self._poll_context = None
+        # Capture the authorized pane/show/scope context HERE (construction
+        # happens on the pane's explicit action thread, before native click
+        # and answer-worker threads exist). Click/native threads never inherit
+        # it, so this is the only explicit propagation path.
         try:
             import contextvars as _contextvars
             self._poll_context = _contextvars.copy_context()
@@ -175,26 +179,53 @@ class BackendTransport:
 
     def assist(self, question, scope, row_id):
         # Propagate the authorized pane/show/scope context explicitly into the
-        # click-driven answer worker thread. Never store auth: re-read the
-        # captured context here, and only inside the pane-context runner.
+        # click-driven answer worker thread. Native click handlers run on
+        # overlay threads that never inherit the pane request context, so
+        # run the backend call under an explicitly captured context. Never
+        # store auth: re-read the captured context here, and only inside the
+        # pane-context runner.
         import contextvars as _contextvars
         scope = dict(scope or {})
         authoritative = getattr(self._state, 'overlay_scope_value', None)
         if isinstance(authoritative, dict) and authoritative:
             scope = dict(authoritative)
+        caller_context = None
         try:
-            pane_context = _contextvars.copy_context()
+            candidate = self._poll_context
+            if candidate is not None:
+                caller_context = candidate
         except Exception:
-            pane_context = None
+            caller_context = None
+        if caller_context is None:
+            # No pane context was captured (constructed off the pane thread):
+            # fail closed in the caller instead of running under an inherited
+            # default. Documented in docs/verification.md.
+            raise RuntimeError('overlay context is not from the pane action; re-show the overlay and retry')
+        # Enter the pane context in THIS thread so the snapshot below captures
+        # captures the pane's values (click/native threads never inherit them).
+        pane_values = {}
+        for var in caller_context:
+            try:
+                pane_values[var] = caller_context[var]
+            except Exception:
+                continue
         result_holder = {}
 
         def _call():
+            for var, value in pane_values.items():
+                try:
+                    var.set(value)
+                except Exception:
+                    continue
             result_holder['result'] = self._state.assist(
                 question, scope.get('project'), scope.get('web_query'),
                 bool(scope.get('all_projects', False)),
                 bool(scope.get('web_fallback', True)),
                 scope.get('answer_provider'), scope.get('answer_model'),
                 row_id=row_id)
+
+        caller_context.run(_call)
+        result = result_holder.get('result')
         request_id = result.get('request_id') if isinstance(result, dict) else None
         if not request_id:
             raise RuntimeError('backend did not accept the question')
@@ -211,7 +242,10 @@ class BackendTransport:
 
     def poll_status(self):
         if self._poll is not None:
-            return self._poll()
+            poll = self._poll
+            if self._poll_context is not None:
+                return self._poll_context.run(poll)
+            return poll()
         return self._state.status()
 
 
@@ -233,6 +267,7 @@ class OverlayBridge:
     def __init__(self, helper=None, transport=None, scope=None, poll_interval=0.25,
                  assist_timeout=90.0):
         self.helper_path = helper
+        self.helper_args = []
         self.transport = transport
         self.scope = dict(scope or {})
         self.poll_interval = poll_interval
@@ -280,11 +315,6 @@ class OverlayBridge:
                     self._cancel_locked(request_id)
                 self.request_by_row = {}
         return self.push()
-
-    def _click_generation(self):
-        # Reservation attribution: the pause counter at click time. The ask
-        # worker cancels instead of launching when the generation moved.
-        return self.paused_generation
 
     def update(self, status):
         if not isinstance(status, dict):
@@ -635,7 +665,8 @@ class OverlayBridge:
 
     def _start_poller_locked(self):
         # One bounded status pump per overlay lifetime; no extra launch paths.
-        import contextvars as _contextvars
+        # The pane context is captured here (the pane's explicit action thread)
+        # because the pump thread never inherits it.
         poll = getattr(self.transport, 'poll_status', None)
         if poll is None:
             return
@@ -643,7 +674,12 @@ class OverlayBridge:
             existing = self._poller
             if existing is not None and existing.is_alive():
                 return
-            pane_context = _contextvars.copy_context()
+            pane_context = None
+            try:
+                import contextvars as _contextvars
+                pane_context = _contextvars.copy_context()
+            except Exception:
+                pane_context = None
             self._poller_seq += 1
             worker = threading.Thread(target=self._poll_loop,
                                       args=(pane_context, poll, self._poller_seq),
@@ -667,7 +703,10 @@ class OverlayBridge:
                     except Exception:
                         break
                 try:
-                    status = pane_context.run(poll)
+                    if pane_context is not None:
+                        status = pane_context.run(poll)
+                    else:
+                        status = poll()
                 except Exception as exc:
                     with self.lock:
                         self.message = f'Backend unreachable: {type(exc).__name__}'
@@ -726,14 +765,32 @@ class OverlayBridge:
                 try:
                     process_snapshot.stdin.write(data)
                 except (BrokenPipeError, OSError, ValueError):
+                    self._broken_pipe_shutdown(process_snapshot)
                     return False
                 try:
                     process_snapshot.stdin.flush()
                 except (BrokenPipeError, OSError, ValueError):
+                    self._broken_pipe_shutdown(process_snapshot)
                     return False
                 return True
         except (BrokenPipeError, OSError, ValueError):
             return False
+
+    def _broken_pipe_shutdown(self, failed_process):
+        # Broken stdin means the helper exited: stop pumps/readers and reap so
+        # no later push resurrects writes to a dead pipe, without taking
+        # _stdin_lock inside the reader path (the old stop()-under-lock hang).
+        current = self.process
+        if current is not None and failed_process is not None and current is not failed_process:
+            return
+        self.stopping = True
+        with self._poller_lock:
+            self._poller_seq += 1
+            self._poller = None
+        try:
+            self._reap_locked(failed_process if failed_process is not None else current)
+        except OSError:
+            pass
 
     def push(self):
         """Render current state; headless (helper=None) records for tests."""

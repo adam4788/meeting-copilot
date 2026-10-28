@@ -253,6 +253,39 @@ class AnswerStreamTests(KnowledgeTests):
             with self.assertRaisesRegex(NotImplementedError, 'streaming_unsupported'):
                 engine.answer_stream('What does Orchid require?')
 
+    def test_answer_stream_header_carries_citations_and_no_paid_duplicate(self):
+        import json as _json
+        self.project.mkdir(exist_ok=True)
+        (self.project / 'notes.md').write_text('Orchid requires review.', encoding='utf-8')
+        deltas = iter(['Orchid ', 'requires review [1].'])
+        complete = Mock(return_value='unused')
+        complete.stream_chunks = Mock(return_value=deltas)
+        with patch.object(self.engine, '_complete', complete):
+            out_header, chunks = self.engine.answer_stream(
+                'What does Orchid require?', project='alpha', web_fallback=True)
+            received = list(chunks)
+        self.assertEqual(received, ['Orchid ', 'requires review [1].'])
+        self.assertEqual(out_header['model_route'], 'hermes-configured')
+        self.assertTrue(out_header['streaming'])
+        self.assertFalse(out_header['completed_only'])
+        self.assertTrue(out_header['sources'], 'streaming must carry retrieval citations')
+        self.assertIn('web_search', out_header)
+        self.assertIn('elapsed_seconds', out_header)
+        # Same single-paid-call contract as answer(): one planner call at most
+        # (it returns local_sufficient here), then exactly one streaming model
+        # invocation and zero non-streaming complete() answer calls.
+        planner_mark = 'Decide whether the supplied local project/session evidence'
+        planner_calls = [c for c in complete.call_args_list
+                         if planner_mark in str(c.args[0][0].get('content', ''))]
+        self.assertEqual(len(planner_calls), 1)
+        answer_calls = [c for c in complete.call_args_list if c not in planner_calls]
+        self.assertEqual(answer_calls, [])
+        complete.stream_chunks.assert_called_once()
+        messages = complete.stream_chunks.call_args.args[0]
+        payload = _json.loads(messages[1]['content'])
+        self.assertTrue(any('Orchid requires review' in s.get('text', '')
+                            for s in payload['evidence']))
+
     def test_answer_reports_streaming_capability_honestly(self):
         self.project.mkdir(exist_ok=True)
         (self.project / 'notes.md').write_text('Orchid requires review.', encoding='utf-8')

@@ -444,15 +444,33 @@ class MeetingState:
                     overlay_status = self.overlay.helper_status()
                 except Exception:
                     overlay_status = None
-            overlay_available = True
-            if isinstance(overlay_status, dict):
-                overlay_available = bool(overlay_status.get('available', True))
+            overlay = self.overlay
+            overlay_available = self._overlay_capability_available(overlay, overlay_status)
             return {'listening': self.listening, 'segments': list(self.segments), 'error': self.error or self.capture_error,
                     'busy': self.busy, 'result': self.result, 'requests': {e['request_id']: dict(e) for e in live},
                     'capture': self.capture_info, 'backend': self.backend, 'generation': self.generation,
                     'capture_generation': self.capture_generation,
                     'capabilities': {'all_projects': True, 'automatic_web_fallback': True, 'independent_models': True, 'macos_transcription': True,
                                      'overlay': overlay_available, 'overlay_stream': True, 'overlay_cancel': True}}
+
+    def _overlay_capability_available(self, overlay, overlay_status):
+        # With no bridge yet, capability reflects whether a helper could
+        # start; once shown, it reflects the live bridge's availability.
+        if overlay is None:
+            try:
+                path = self._overlay_helper_path()
+            except Exception:
+                return False
+            if not path or not isinstance(path, str):
+                return False
+            import os as _os
+            import sys as _sys
+            if _sys.platform not in ('darwin', 'linux'):
+                return False
+            return _os.path.isfile(path) and _os.access(path, _os.X_OK)
+        if isinstance(overlay_status, dict):
+            return bool(overlay_status.get('available', True))
+        return True
 
 
 def _unavailable(message):

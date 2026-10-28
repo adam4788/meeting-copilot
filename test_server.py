@@ -427,7 +427,9 @@ class OverlayRequestScopeTests(unittest.TestCase):
 
     def test_overlay_show_hide_scope_lifecycle(self):
         import server
+        import sys as _sys
         state = server.MeetingState(engine_factory=lambda: None)
+        state._overlay_helper_path = lambda: _sys.executable
         first = state.overlay_show({'project': 'demo', 'answer_provider': 'meta',
                                     'answer_model': 'muse-spark-1.3', 'injected': 'drop'})
         self.assertTrue(first['shown'])
@@ -438,4 +440,34 @@ class OverlayRequestScopeTests(unittest.TestCase):
         self.assertTrue(scoped['shown'])
         self.assertEqual(state.overlay_scope_value, {'project': 'alpha'})
         self.assertEqual(state.overlay_hide(), {'shown': False})
+        self.assertIsNone(state.overlay)
+
+    def test_overlay_show_fails_closed_without_helper_and_reports_capability(self):
+        import server
+        state = server.MeetingState(engine_factory=lambda: None)
+        state._overlay_helper_path = lambda: None
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException) as ctx:
+            state.overlay_show({'project': 'demo'})
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertIsNone(state.overlay)
+        # Capabilities reflect the failure: no silent success.
+        self.assertFalse(state.status()['capabilities']['overlay'])
+        # Reopen works once a helper is prepared: no orphan, correct status.
+        import sys as _sys2
+        state._overlay_helper_path = lambda: _sys2.executable
+        reopened = state.overlay_show({'project': 'demo'})
+        self.assertTrue(reopened['shown'])
+        self.assertIsNotNone(state.overlay)
+        state.overlay_hide()
+
+    def test_overlay_show_reports_unavailable_helper_status(self):
+        import server
+        state = server.MeetingState(engine_factory=lambda: None)
+        state._overlay_helper_path = lambda: '/nonexistent/macos_overlay_for_test'
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException) as ctx:
+            state.overlay_show({'project': 'demo'})
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertIn('executable', str(ctx.exception.detail))
         self.assertIsNone(state.overlay)

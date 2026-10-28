@@ -98,13 +98,14 @@ class ClickTests(unittest.TestCase):
     def test_click_is_the_only_path_to_assist_and_never_duplicates_busy(self):
         calls = []
         overlay = bridge.OverlayBridge(transport=self._slot_transport(calls), scope={'project': 'demo'})
-        overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}], 'listening': True})
+        overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}],
+                        'listening': True, 'generation': 0, 'capture_generation': 0})
         row_id = next(iter(overlay.questions))
         self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
         self.assertFalse(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))  # busy
         self.assertFalse(overlay.on_click_line(json.dumps({'type': 'click', 'id': 'unknown'})))
         for _thread in list(overlay.threads):
-            _thread.join(timeout=30)
+            _thread.join(timeout=10)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]['question'], 'Who approves?')
         self.assertEqual(calls[0]['scope']['project'], 'demo')
@@ -145,13 +146,14 @@ class ClickTests(unittest.TestCase):
 
         overlay = bridge.OverlayBridge(transport=SlotTransport(), poll_interval=0.01)
         overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves alpha?'},
-                                      {'speaker': 'm', 'text': 'Who approves beta?'}], 'listening': True})
+                                      {'speaker': 'm', 'text': 'Who approves beta?'}],
+                        'listening': True, 'generation': 0, 'capture_generation': 0})
         rows = list(overlay.questions)
         self.assertEqual(len(rows), 2)
         for row_id in rows:
             self.assertTrue(overlay.on_click_line(__import__('json').dumps({'type': 'click', 'id': row_id})))
         for thread in list(overlay.threads):
-            thread.join(timeout=30)
+            thread.join(timeout=10)
         got = sorted(overlay.answers[row_id]['answer'] for row_id in rows)
         self.assertEqual(got, ['alpha-one', 'beta-two'])
         self.assertEqual({c['row_id'] for c in calls}, set(rows))
@@ -159,7 +161,8 @@ class ClickTests(unittest.TestCase):
     def test_wrong_slot_row_id_cancels_without_misattribution(self):
         calls = []
         overlay = bridge.OverlayBridge(transport=self._slot_transport(calls), scope={})
-        overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}], 'listening': True})
+        overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}],
+                        'listening': True, 'generation': 0, 'capture_generation': 0})
         row_id = next(iter(overlay.questions))
 
         class CrossWired:
@@ -174,7 +177,7 @@ class ClickTests(unittest.TestCase):
         overlay.transport = CrossWired()
         self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
         for _thread in list(overlay.threads):
-            _thread.join(timeout=30)
+            _thread.join(timeout=10)
         self.assertNotIn('WRONG', str(overlay.answers[row_id].get('answer')))
         self.assertFalse(overlay.answers[row_id]['busy'])
         self.assertTrue(any(entry.get('cancelled') == 'r-x' for entry in calls))
@@ -191,11 +194,11 @@ class ClickTests(unittest.TestCase):
                 raise AssertionError('no clicks means no slot polling')
 
         overlay = bridge.OverlayBridge(transport=FailingTransport())
-        overlay.update({'segments': [{'speaker': 'm', 'text': 'Ready?'}], 'listening': True})
+        overlay.update({'segments': [{'speaker': 'm', 'text': 'Ready?'}], 'listening': True, 'generation': 0, 'capture_generation': 0})
         row_id = next(iter(overlay.questions))
         self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
         for _thread in list(overlay.threads):
-            _thread.join(timeout=30)
+            _thread.join(timeout=10)
         self.assertFalse(overlay.answers[row_id]['busy'])
         self.assertIn('failed', (overlay.message or '').lower())
 
@@ -221,14 +224,14 @@ class ClickTests(unittest.TestCase):
                 raise AssertionError('no global polling')
 
         overlay = bridge.OverlayBridge(transport=HangingTransport(), scope={'project': 'old'})
-        overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}], 'listening': True})
+        overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}], 'listening': True, 'generation': 0, 'capture_generation': 0})
         row_id = next(iter(overlay.questions))
         self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
         self.assertTrue(entered.wait(5))
         overlay.set_scope({'project': 'new', 'answer_provider': 'meta', 'answer_model': 'muse-spark-1.3'})
         release.set()
         for _thread in list(overlay.threads):
-            _thread.join(timeout=30)
+            _thread.join(timeout=10)
         self.assertEqual(overlay.scope['project'], 'new')
         self.assertFalse(overlay.answers.get(row_id, {}).get('busy'))
         self.assertEqual(calls[0].get('project'), 'old')
@@ -252,13 +255,13 @@ class ClickTests(unittest.TestCase):
                 raise AssertionError('no global polling')
 
         overlay = bridge.OverlayBridge(transport=SlowTransport(), poll_interval=0.01)
-        overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}], 'listening': True})
+        overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}], 'listening': True, 'generation': 0, 'capture_generation': 0})
         row_id = next(iter(overlay.questions))
         self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
         self.assertTrue(started.wait(5))
         self.assertTrue(overlay.cancel_row(row_id))
         for _thread in list(overlay.threads):
-            _thread.join(timeout=30)
+            _thread.join(timeout=10)
         self.assertFalse(overlay.answers[row_id]['busy'])
         self.assertFalse(overlay.cancel_row(row_id))
 
@@ -278,7 +281,7 @@ class ClickTests(unittest.TestCase):
     def test_broken_pipe_stops_bridge_and_bounded_queues_hold(self):
         import io
         overlay = bridge.OverlayBridge(transport=self._slot_transport([]))
-        overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}], 'listening': True})
+        overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}], 'listening': True, 'generation': 0, 'capture_generation': 0})
 
         class BrokenStdin(io.StringIO):
             def write(self, data):
@@ -311,8 +314,244 @@ class ClickTests(unittest.TestCase):
         self.assertIsNone(overlay.process)
 
 
-class StreamingProtocolTests(unittest.TestCase):
-    """Deterministic fake-provider streaming: distinct chunks, order, errors, cancel."""
+class BridgeLifecycleTests(ClickTests):
+    """Status pump, fail-closed show, single-writer ordering, cleanup."""
+
+    def test_status_pump_keeps_streaming_through_pause_switch_and_late_events(self):
+        import sys as _sys
+        import time
+        seen = {'status': {'segments': [], 'listening': True}}
+        transport = bridge.BackendTransport.__new__(bridge.BackendTransport)
+        transport._state, transport._poll, transport._poll_context = None, None, None
+
+        def poll():
+            return dict(seen['status'])
+
+        transport._poll = poll
+        overlay = bridge.OverlayBridge(helper=_sys.executable, transport=transport, poll_interval=0.02)
+        overlay.helper_args = ['-c', 'import sys\nfor line in sys.stdin: pass']
+        result = overlay.show_overlay()
+        try:
+            self.assertTrue(result.get('shown'), result)
+            seen['status'] = {'segments': [{'speaker': 'm', 'text': 'Who decides?'}],
+                              'listening': True, 'generation': 0}
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                with overlay.lock:
+                    questions = dict(overlay.questions)
+                    segments = list(overlay.segments)
+                if questions and any('Who decides?' in q for q in questions.values()):
+                    break
+                time.sleep(0.02)
+            with overlay.lock:
+                questions = dict(overlay.questions)
+                segments = list(overlay.segments)
+            self.assertTrue(questions, 'status pump never delivered new segments')
+            self.assertTrue(any('Who decides?' in s.get('text', '') for s in segments))
+        finally:
+            overlay.hide_overlay()
+            overlay.stop()
+            self.assertIsNone(overlay.process)
+
+    def test_headless_pump_reaches_overlay_without_scope_change(self):
+        # Offline repro from the review: fake helper/transport, show-equivalent
+        # pump running, mutate segments, later snapshot must contain them
+        # without changing scope.
+        import time
+        seen = {'status': {'segments': [], 'listening': True, 'generation': 0}}
+        transport = bridge.BackendTransport.__new__(bridge.BackendTransport)
+        transport._state, transport._poll, transport._poll_context = None, None, None
+
+        def poll():
+            return dict(seen['status'])
+
+        transport._poll = poll
+        overlay = bridge.OverlayBridge(helper=None, transport=transport, poll_interval=0.02)
+        overlay.update(dict(seen['status']))
+        overlay._start_poller_locked()
+        try:
+            self.assertIsNone(overlay.process)
+            self.assertIsNotNone(overlay._poller)
+            seen['status'] = {'segments': [{'speaker': 'm', 'text': 'Who decides offline?'}],
+                              'listening': True, 'generation': 1}
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                with overlay.lock:
+                    questions = dict(overlay.questions)
+                if questions and any('offline' in q for q in questions.values()):
+                    break
+                time.sleep(0.02)
+            with overlay.lock:
+                questions = dict(overlay.questions)
+                latest = overlay.pushed[-1] if overlay.pushed else {}
+            self.assertTrue(questions, 'status pump never delivered segments')
+            flat = __import__('json').dumps(latest)
+            self.assertIn('offline', flat, 'later snapshot missing mutated segment')
+        finally:
+            overlay.stop()
+            self.assertIsNone(overlay.process)
+
+    def test_show_reports_unavailable_for_missing_executable(self):
+        import time
+        overlay = bridge.OverlayBridge(helper='/nonexistent/macos_overlay_for_test',
+                                       transport=self._slot_transport([]))
+        result = overlay.show_overlay()
+        self.assertIsInstance(result, dict)
+        self.assertFalse(result.get('shown'))
+        self.assertFalse(result.get('available', True))
+        self.assertTrue(result.get('error'))
+        self.assertIsNone(overlay.process)
+        self.assertIsNone(overlay._poller)
+        overlay.stop()
+        self.assertIsNone(overlay.process)
+        status = overlay.helper_status()
+        self.assertFalse(status.get('available'))
+        self.assertTrue(status.get('error'))
+
+    def test_show_reports_unavailable_on_unsupported_platform(self):
+        import sys as _sys
+        real_platform = _sys.platform
+        overlay = bridge.OverlayBridge(helper='/bin/true', transport=self._slot_transport([]))
+        try:
+            _sys.platform = 'win32'
+            result = overlay.show_overlay()
+        finally:
+            _sys.platform = real_platform
+        self.assertFalse(result.get('shown'))
+        self.assertFalse(result.get('available', True))
+        self.assertIsNone(overlay.process)
+        self.assertIsNone(overlay._poller)
+        overlay.stop()
+
+    def test_paused_backend_rejects_clicks_and_meeting_switch_retires_rows(self):
+        import time
+        transport = self._slot_transport([])
+        overlay = bridge.OverlayBridge(transport=transport, poll_interval=0.01)
+        overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}],
+                        'listening': True, 'generation': 0, 'capture_generation': 0})
+        row_id = next(iter(overlay.questions))
+        # Pause: rows retire, clicks rejected, no request reserved.
+        overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}],
+                        'listening': False, 'generation': 0, 'capture_generation': 1})
+        self.assertFalse(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
+        self.assertEqual(overlay.request_by_row.get(row_id), None)
+        # Resume on a new meeting revision: stale rows stay retired until the
+        # new revision renders them.
+        overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves still?'}],
+                        'listening': True, 'generation': 2, 'capture_generation': 2})
+        row_id = next(iter(overlay.questions))
+        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
+        overlay.set_scope({'project': 'other'})
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            with overlay.lock:
+                if not overlay.request_by_row and not any(
+                        s.get('busy') for s in overlay.answers.values()):
+                    break
+            time.sleep(0.02)
+        for thread in list(overlay.threads):
+            thread.join(timeout=10)
+        self.assertFalse(any(s.get('busy') for s in overlay.answers.values()))
+        overlay.stop()
+
+    def test_stale_scope_reservation_cancels_new_request_without_orphan(self):
+        import time
+        cancels = []
+
+        class SlowScope:
+            def assist(self, question, scope, row_id):
+                time.sleep(0.05)
+                return 'r-stale'
+
+            def assist_request(self, request_id):
+                time.sleep(0.5)
+                return {'request_id': request_id, 'status': 'streaming', 'answer': ''}
+
+            def cancel(self, request_id):
+                cancels.append(request_id)
+
+        overlay = bridge.OverlayBridge(transport=SlowScope(), poll_interval=0.01)
+        overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}],
+                        'listening': True, 'generation': 0, 'capture_generation': 0})
+        row_id = next(iter(overlay.questions))
+        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
+        time.sleep(0.02)  # let the worker pass transport.assist, then switch scope
+        overlay.set_scope({'project': 'switched'})
+        for thread in list(overlay.threads):
+            thread.join(timeout=10)
+        self.assertEqual(cancels, ['r-stale'])
+        self.assertFalse(overlay.answers.get(row_id, {}).get('busy'))
+        overlay.stop()
+
+    def test_late_answer_events_cannot_resurrect_retired_rows(self):
+        import time
+        late = {'fire': False}
+
+        class LateTransport:
+            def assist(self, question, scope, row_id):
+                return 'r-late'
+
+            def assist_request(self, request_id):
+                if not late['fire']:
+                    time.sleep(0.02)
+                    return {'request_id': request_id, 'status': 'streaming',
+                            'answer': '', 'streaming': True, 'completed_only': False}
+                return {'request_id': request_id, 'row_id': 'gone-row', 'status': 'done',
+                        'answer': 'STALE', 'streaming': False, 'completed_only': True}
+
+            def cancel(self, request_id):
+                pass
+
+        overlay = bridge.OverlayBridge(transport=LateTransport(), poll_interval=0.01)
+        overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}],
+                        'listening': True, 'generation': 0, 'capture_generation': 0})
+        row_id = next(iter(overlay.questions))
+        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
+        overlay.set_scope({'project': 'next-meeting'})
+        late['fire'] = True
+        for thread in list(overlay.threads):
+            thread.join(timeout=10)
+        self.assertNotIn('STALE', __import__('json').dumps(overlay.answers))
+        self.assertFalse(any(s.get('busy') for s in overlay.answers.values()))
+        overlay.stop()
+
+    def test_contextvars_propagate_from_pane_to_answer_worker_without_leaks(self):
+        import contextvars
+        sentinel = contextvars.ContextVar('meeting-test-auth2')
+        token = sentinel.set('pane-secret-value')
+        try:
+            seen = {}
+
+            class LeakCheckState:
+                overlay_scope_value = {}
+
+                def assist(self, *args, **kwargs):
+                    seen['ctx'] = sentinel.get()
+                    seen['kwargs'] = dict(kwargs)
+                    return {'request_id': 'r-ctx'}
+
+                def status(self):
+                    return {'segments': [], 'listening': True}
+
+            transport = bridge.BackendTransport(LeakCheckState())
+            self.assertNotIn('pane-secret-value', repr(vars(transport)))
+            overlay = bridge.OverlayBridge(transport=transport, poll_interval=0.01)
+            overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}],
+                            'listening': True, 'generation': 0, 'capture_generation': 0})
+            row_id = next(iter(overlay.questions))
+            self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
+            for thread in list(overlay.threads):
+                thread.join(timeout=10)
+            self.assertEqual(seen.get('ctx'), 'pane-secret-value')
+            self.assertEqual(seen.get('kwargs', {}).get('row_id'), row_id)
+            self.assertNotIn('pane-secret-value', repr(vars(overlay)))
+            # Impossible environments (no copy_context) fail closed, documented.
+            overlay.stop()
+        finally:
+            sentinel.reset(token)
+
+    def _slot_transport(self, *args, **kwargs):
+        return super()._slot_transport(*args, **kwargs)
 
     def test_fake_provider_streams_distinct_chunks_in_order(self):
         import threading
@@ -344,7 +583,7 @@ class StreamingProtocolTests(unittest.TestCase):
                 raise AssertionError('streaming rows poll their own slot')
 
         overlay = bridge.OverlayBridge(transport=FakeStreamingTransport(), poll_interval=0.01)
-        overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}], 'listening': True})
+        overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}], 'listening': True, 'generation': 0, 'capture_generation': 0})
         row_id = next(iter(overlay.questions))
         seen_streaming = []
 
@@ -357,7 +596,7 @@ class StreamingProtocolTests(unittest.TestCase):
         overlay.push = spy_push
         self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
         for thread in list(overlay.threads):
-            thread.join(timeout=30)
+            thread.join(timeout=10)
         overlay.push = original_push
         self.assertEqual(overlay.answers[row_id]['answer'], 'Two reviewers must approve.')
         self.assertFalse(overlay.answers[row_id]['busy'])
@@ -369,19 +608,8 @@ class StreamingProtocolTests(unittest.TestCase):
             self.assertTrue(later.startswith(earlier) and len(later) > len(earlier))
 
     def test_completed_only_provider_reports_honestly_without_chunked_fakes(self):
-        class CompletedOnly:
-            def assist(self, question, scope, row_id):
-                return 'r-1'
-            def assist_request(self, request_id):
-                return {'request_id': request_id, 'row_id': 'row', 'status': 'done',
-                        'answer': 'Final answer.', 'streaming': False, 'completed_only': True}
-            def cancel(self, request_id):
-                pass
-            def poll_status(self):
-                raise AssertionError('no global polling')
-
-        overlay = bridge.OverlayBridge(transport=CompletedOnly(), poll_interval=0.01)
         real_row = [None]
+
         class CompletedOnly:
             def assist(self, question, scope, row_id):
                 real_row[0] = row_id
@@ -395,11 +623,11 @@ class StreamingProtocolTests(unittest.TestCase):
                 raise AssertionError('no global polling')
 
         overlay = bridge.OverlayBridge(transport=CompletedOnly(), poll_interval=0.01)
-        overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}], 'listening': True})
+        overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}], 'listening': True, 'generation': 0, 'capture_generation': 0})
         row_id = next(iter(overlay.questions))
         self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
         for thread in list(overlay.threads):
-            thread.join(timeout=30)
+            thread.join(timeout=10)
         self.assertEqual(overlay.answers[row_id]['answer'], 'Final answer.')
         self.assertTrue(overlay.answers[row_id]['completed_only'])
 
@@ -413,26 +641,47 @@ class StreamingProtocolTests(unittest.TestCase):
         import sys
         import time
         import server as real_server
-        chunks = iter(['Two ', 'reviewers.'])
+        deltas = ['Two ', 'reviewers.']
 
         class FakeEngine:
             def answer_stream(self, question, **kwargs):
                 captured.append({'question': question, 'kwargs': kwargs})
                 header = {'model_route': 'fake/test', 'sources': [], 'warnings': [],
                           'web_search': {'used': False}}
-                return header, chunks
+                return header, iter(list(deltas))
             def answer(self, question, **kwargs):
                 raise AssertionError('streaming engine must use answer_stream')
 
         captured = []
         state = real_server.MeetingState(engine_factory=lambda: FakeEngine())
         state.add_segment({'speaker': 'remote', 'text': 'Who approves?'})
-        shown = state.overlay_show({'project': 'demo', 'answer_provider': 'meta',
-                                    'answer_model': 'muse-spark-1.3',
-                                    'web_fallback': True})
+        state.listening = True
+        import sys as _sys2
+        real_helper_path = state._overlay_helper_path
+        state._overlay_helper_path = lambda: _sys2.executable
+        import overlay_bridge as _bridge2
+        real_bridge_init = _bridge2.OverlayBridge.__init__
+
+        def patched_init(self, helper=None, transport=None, scope=None, poll_interval=0.25,
+                         assist_timeout=90.0):
+            real_bridge_init(self, helper=_sys2.executable, transport=transport, scope=scope,
+                             poll_interval=0.01, assist_timeout=assist_timeout)
+            self.helper_args = ['-c', 'import sys\nfor line in sys.stdin: pass']
+
+        shown = None
+        try:
+            _bridge2.OverlayBridge.__init__ = patched_init
+            shown = state.overlay_show({'project': 'demo', 'answer_provider': 'meta',
+                                        'answer_model': 'muse-spark-1.3',
+                                        'web_fallback': True})
+        finally:
+            _bridge2.OverlayBridge.__init__ = real_bridge_init
+            state._overlay_helper_path = real_helper_path
         self.assertTrue(shown['shown'])
         transport = bridge.BackendTransport(state)
-        overlay = bridge.OverlayBridge(transport=transport, poll_interval=0.01)
+        overlay = state.overlay
+        self.assertIsNotNone(overlay)
+        assert overlay is not None
         overlay.update(state.status())
         row_id = next(iter(overlay.questions))
         current_scope = {'project': 'demo', 'answer_provider': 'meta',
@@ -440,9 +689,21 @@ class StreamingProtocolTests(unittest.TestCase):
         state.overlay_scope(current_scope)
         if sys.platform == 'win32':
             self.skipTest('helper spawn is covered on macOS/Linux CI')
-        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
+        row_deadline = time.monotonic() + 10
+        clicked = False
+        while time.monotonic() < row_deadline:
+            try:
+                clicked = overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id}))
+            except AssertionError:
+                raise
+            except Exception:
+                clicked = False
+            if clicked:
+                break
+            time.sleep(0.05)
+        self.assertTrue(clicked)
         for thread in list(overlay.threads):
-            thread.join(timeout=30)
+            thread.join(timeout=10)
         self.assertEqual(overlay.answers[row_id]['answer'], 'Two reviewers.')
         self.assertFalse(overlay.answers[row_id]['busy'])
         self.assertEqual(captured[0]['question'], 'Who approves?')
@@ -470,12 +731,12 @@ class StreamingProtocolTests(unittest.TestCase):
         cancelled = []
         real_row = [None]
         overlay = bridge.OverlayBridge(transport=Never(), poll_interval=0.01, assist_timeout=0.05)
-        overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}], 'listening': True})
+        overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}], 'listening': True, 'generation': 0, 'capture_generation': 0})
         row_id = next(iter(overlay.questions))
         real_row[0] = row_id
         self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
         for thread in list(overlay.threads):
-            thread.join(timeout=30)
+            thread.join(timeout=10)
         self.assertEqual(cancelled, ['r-1'])
         self.assertFalse(overlay.answers[row_id]['busy'])
         self.assertIn('timed out', (overlay.message or '').lower())
