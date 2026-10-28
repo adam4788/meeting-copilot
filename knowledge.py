@@ -246,6 +246,12 @@ class KnowledgeEngine:
         `streaming_unsupported` message when the selected/default route cannot
         stream, so callers show completed-only honestly instead of faking it.
         """
+        # Same single-paid-call contract as answer(): one planner call at most,
+        # one _web call at most, and exactly one streaming model invocation.
+        # The header carries the same retrieval/citation/web-fallback truth so
+        # completed-only rows never claim streaming, and streamed rows never
+        # claim local-only evidence.
+        started = time.monotonic()
         retrieval_query = f'{question} {transcript[-2000:]}' if transcript else question
         sources = self.search(retrieval_query, project=project, limit=6, all_projects=all_projects)
         complete = self._complete
@@ -300,7 +306,9 @@ class KnowledgeEngine:
             except Exception as exc:
                 warnings.append(f'Web search failed ({type(exc).__name__}); using local evidence only.')
         messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)}]
-        header = {'model_route': model_route, 'sources': sources, 'warnings': warnings, 'web_search': web}
+        header = {'model_route': model_route, 'sources': sources, 'warnings': warnings, 'web_search': web,
+                  'elapsed_seconds': round(time.monotonic() - started, 3),
+                  'streaming': True, 'completed_only': False}
         try:
             chunks = stream_fn(messages)
         except NotImplementedError:
