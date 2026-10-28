@@ -2,8 +2,15 @@
 import importlib
 import os
 from pathlib import Path
+import sys
 import unittest
 from unittest.mock import patch
+
+
+def _scratch_dir():
+    scratch = Path.home() / '.hermes/cache/scratch'
+    scratch.mkdir(parents=True, exist_ok=True)
+    return scratch
 
 
 class GatewayTests(unittest.TestCase):
@@ -96,7 +103,7 @@ class GatewayTests(unittest.TestCase):
     def test_runtime_discovery_is_explicit_and_never_falls_back_to_host_python(self):
         from macos_audio import worker_python
         import tempfile
-        with tempfile.TemporaryDirectory(dir=str(Path.home() / '.hermes/cache/scratch')) as temp:
+        with tempfile.TemporaryDirectory(dir=str(_scratch_dir())) as temp:
             root = Path(temp)
             with patch.dict(os.environ, {}, clear=True):
                 with self.assertRaises(RuntimeError): worker_python(root)
@@ -187,8 +194,14 @@ class WorkerTests(unittest.TestCase):
                 self.count = len(samples)
                 return iter([NS(text='Independent speech')]), None
         model = Model()
-        with patch('audio_worker.emit', outputs.append), patch('audio_worker.subprocess.Popen', lambda c, **kw: real_popen([sys.executable, '-c', script], **kw)):
-            run_capture(model, 'microphone', 'en', helper=Path('/fixture'))
+        # The framed payload (~340KB) exceeds Linux's single-argument limit,
+        # so run it from a temp file instead of `python -c`.
+        import tempfile
+        with tempfile.TemporaryDirectory() as helper_dir:
+            helper_script = Path(helper_dir) / 'frames.py'
+            helper_script.write_text(script)
+            with patch('audio_worker.emit', outputs.append), patch('audio_worker.subprocess.Popen', lambda c, **kw: real_popen([sys.executable, str(helper_script)], **kw)):
+                run_capture(model, 'microphone', 'en', helper=Path('/fixture'))
         segments = [e for e in outputs if e['type'] == 'segment']
         self.assertEqual(segments[0]['text'], 'Independent speech')
         self.assertEqual(model.count, 64000)
@@ -223,13 +236,15 @@ class WorkerTests(unittest.TestCase):
         result = subprocess.run([sys.executable, str(root / 'audio_worker.py'), '--model', '/untrusted'], capture_output=True, timeout=5)
         self.assertNotEqual(result.returncode, 0)
 
+    @unittest.skipUnless(sys.platform == 'darwin' and Path('/usr/bin/swiftc').exists(),
+                         'macOS Swift helper compile requires darwin and swiftc')
     def test_native_helper_compiles_and_check_only_never_records(self):
         import subprocess
         import tempfile
         root = Path(__file__).resolve().parent
         import plistlib
         import json
-        with tempfile.TemporaryDirectory(dir=str(Path.home() / '.hermes/cache/scratch')) as temp:
+        with tempfile.TemporaryDirectory(dir=str(_scratch_dir())) as temp:
             binary = Path(temp) / 'macos_capture'
             info = Path(temp) / 'Info.plist'
             info.write_bytes(plistlib.dumps({'CFBundleIdentifier': 'ai.nous.meeting-copilot.audio',
