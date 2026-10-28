@@ -31,7 +31,7 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {})
     useEffect: () => {},
     useQueryClient: () => ({ invalidateQueries: async () => {} }),
     useQuery: options => ({ data: options.queryKey[1] === 'status'
-      ? { capabilities: supported ? { all_projects: true, automatic_web_fallback: true, independent_models: true, macos_transcription: true } : undefined }
+      ? { capabilities: supported ? { all_projects: true, automatic_web_fallback: true, independent_models: true, macos_transcription: true, overlay: true, overlay_stream: true, overlay_cancel: true } : undefined }
       : options.queryKey[1] === 'projects' ? [{ name: 'alpha', path: '/projects/alpha' }]
       : options.queryKey[1] === 'models' ? { providers: [{ id: 'openai-codex', label: 'Codex', models: [{ id: 'gpt-test', label: 'Test model' }] }] } : [] }),
     useValue: atom => atom.get(),
@@ -156,4 +156,50 @@ test('automatic web fallback can be disabled and explicit web query remains sepa
   await buttons.find(n => n.children.includes('Check sources + web')).props.onClick();
   assert.equal(requests.at(-1).body.web_query, 'public product documentation');
   assert.equal(requests.at(-1).body.web_fallback, false);
+});
+
+test('overlay section shows explicitly, syncs current scope, and warns about screen share', async () => {
+  const { tree } = pane('alpha');
+  const text = JSON.stringify(tree);
+  assert.match(text, /Meeting overlay/);
+  assert.match(text, /Show overlay/);
+  assert.match(text, /may be visible in screen shares/);
+  const buttons = nodes(tree).filter(n => n.type === 'button');
+  const show = buttons.find(n => (Array.isArray(n.children) ? n.children.join('') : String(n.children || '')) === 'Show overlay');
+  assert.ok(show, 'explicit Show overlay action must exist');
+  assert.equal(show.props.disabled, false);
+  await show.props.onClick();
+});
+
+test('overlay scope sync posts current pane settings and nothing else starts capture', async () => {
+  const { tree, requests } = pane('alpha');
+  const buttons = nodes(tree).filter(n => n.type === 'button');
+  const show = buttons.find(n => (Array.isArray(n.children) ? n.children.join('') : String(n.children || '')) === 'Show overlay');
+  const sync = buttons.find(n => (Array.isArray(n.children) ? n.children.join('') : String(n.children || '')) === 'Sync scope');
+  assert.ok(show && sync, 'Show and Sync scope actions must exist');
+  await show.props.onClick();
+  await sync.props.onClick();
+  const overlayCalls = requests.filter(r => r.path.startsWith('/overlay/'));
+  assert.ok(overlayCalls.length >= 1);
+  assert.ok(overlayCalls.every(r => r.path.startsWith('/overlay/')));
+  assert.ok(requests.every(r => r.path !== '/start' && r.path !== '/assist'));
+  const shown = overlayCalls.find(r => r.path === '/overlay/show');
+  assert.ok(shown && JSON.stringify(shown.body || shown).includes('alpha'));
+});
+
+test('overlay button is disabled when the backend lacks overlay capability', () => {
+  const { tree } = pane('alpha', false);
+  const buttons = nodes(tree).filter(n => n.type === 'button');
+  const show = buttons.find(n => (Array.isArray(n.children) ? n.children.join('') : String(n.children || '')) === 'Show overlay');
+  assert.ok(show, 'Show overlay action must render even when unsupported');
+  assert.equal(show.props.disabled, true);
+});
+
+test('pane uses only approved theme vars and no resurrected scope controls', () => {
+  const source = readFileSync(new URL('./desktop/plugin.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /--ui-surface-/);
+  assert.doesNotMatch(source, /\/overlay-bridge|--base-url|UrllibTransport/);
+  assert.match(source, /\/overlay\/show/);
+  assert.match(source, /\/overlay\/hide/);
+  assert.match(source, /\/overlay\/scope/);
 });

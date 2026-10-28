@@ -86,6 +86,12 @@ def selected_completion(provider, model):
     call_llm has a recovery ladder (including first-resolution fallback), so explicit
     selections instead use its authoritative resolver and provider wire builder.
     Credentials/endpoints are resolved only by Hermes, never accepted from a request.
+
+    Streaming: `stream_chunks(messages)` yields provider-native incremental text
+    deltas where supported (SSE `stream=True` on OpenAI-compatible chat routes,
+    SSE content deltas on the Meta Model API). Completed-only providers raise
+    NotImplementedError with `streaming_unsupported` so callers can report
+    completed-only honestly instead of faking streaming.
     """
     provider, model = validate_selection(provider, model)
     if provider == 'meta':
@@ -116,4 +122,115 @@ def selected_completion(provider, model):
         except Exception:
             raise RuntimeError('Selected answer model failed') from None
 
+    def stream_chunks(messages):
+        """Yield provider-native incremental deltas. Completed chunks rejected.
+
+        Responses are provider OpenAI-compatible SSE frames (`stream=True`)
+        parsed incrementally; a response that only contains a completed payload
+        raises NotImplementedError('streaming_unsupported...') so the caller
+        renders completed-only honestly instead of chunking a finished string.
+        """
+        import json as _json
+        try:
+            from agent.auxiliary_client import resolve_provider_client, _build_call_kwargs
+            client, resolved_model = resolve_provider_client(provider=provider, model=model)
+            if client is None or resolved_model != model:
+                raise RuntimeError('Unavailable exact route')
+            kwargs = _build_call_kwargs(
+                provider, model, messages, max_tokens=600, tools=None, timeout=30,
+                reasoning_config={'effort': 'low'},
+                base_url=str(getattr(client, 'base_url', '') or ''),
+            )
+            kwargs['stream'] = True
+            try:
+                response = client.chat.completions.create(**kwargs)
+            except TypeError as exc:
+                # Explicit no-silent-fallback: kwargs shape is Hermes-owned; a
+                # stream-rejecting signature is completed-only, not an error.
+                raise NotImplementedError('streaming_unsupported:provider-rejects-stream') from exc
+            deltas = extract_openai_sse_deltas(response)
+            if deltas is None:
+                raise NotImplementedError('streaming_unsupported:completed-only-response')
+            for delta in deltas:
+                yield delta
+        except NotImplementedError:
+            raise
+        except Exception:
+            raise RuntimeError('Selected answer model failed') from None
+
+    complete.stream_chunks = stream_chunks  # type: ignore[attr-defined]
     return complete
+
+
+def extract_openai_sse_deltas(response):
+    """Pull incremental `content` deltas from an SSE stream, or None.
+
+    Returns a list of non-empty text deltas in arrival order, or None when the
+    payload only carries a completed answer (honest completed-only signal so
+    callers never fake streaming by chunking a finished string). Raises
+    RuntimeError for malformed/empty streams. Accepts: an iterable of SSE
+    text chunks (requests-style `iter_lines`), a raw SSE text body, or an
+    OpenAI-style object with `choices[0].message.content` (completed-only).
+    """
+    import json as _json
+
+    def deltas_from_text(text):
+        deltas = []
+        for line in str(text).splitlines():
+            line = line.strip()
+            if not line or line.startswith(':'):
+                continue
+            if line.startswith('data:'):
+                line = line[5:].strip()
+            if line == '[DONE]':
+                break
+            try:
+                payload = _json.loads(line)
+            except ValueError:
+                raise RuntimeError('Selected answer model failed')
+            if not isinstance(payload, dict):
+                continue
+            for choice in payload.get('choices', []) if isinstance(payload.get('choices'), list) else []:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get('delta')
+                if isinstance(delta, dict) and isinstance(delta.get('content'), str) and delta['content']:
+                    deltas.append(delta['content'])
+        return deltas
+
+    if isinstance(response, (str, bytes)):
+        raw = response.decode('utf-8', errors='replace') if isinstance(response, bytes) else response
+        if 'data:' in raw or '[DONE]' in raw or '"delta"' in raw:
+            deltas = deltas_from_text(raw)
+            return deltas or None
+        return None
+    lines = None
+    if hasattr(response, 'iter_lines'):
+        try:
+            lines = [c.decode('utf-8', errors='replace') if isinstance(c, bytes) else str(c)
+                     for c in response.iter_lines()]
+        except Exception:
+            raise RuntimeError('Selected answer model failed') from None
+        text = '\n'.join(lines)
+        if 'data:' in text or '[DONE]' in text or '"delta"' in text:
+            return deltas_from_text(text) or None
+        return None
+    if hasattr(response, '__iter__') and not hasattr(response, 'choices'):
+        try:
+            chunks = list(response)
+        except Exception:
+            raise RuntimeError('Selected answer model failed') from None
+        joined = []
+        for chunk in chunks:
+            joined.append(chunk.decode('utf-8', errors='replace') if isinstance(chunk, bytes) else str(chunk))
+        text = ''.join(joined)
+        if 'data:' in text or '[DONE]' in text or '"delta"' in text:
+            return deltas_from_text(text) or None
+        return None
+    choices = getattr(response, 'choices', None)
+    if isinstance(choices, (list, tuple)) and choices:
+        message = getattr(choices[0], 'message', None)
+        content = getattr(message, 'content', None)
+        if isinstance(content, str) and content.strip():
+            return None  # completed-only object: report honestly, never chunk
+    return None

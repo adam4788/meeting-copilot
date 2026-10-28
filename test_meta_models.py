@@ -137,3 +137,58 @@ class MetaModelTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class MetaStreamingTests(unittest.TestCase):
+    def test_sse_deltas_stream_in_order_and_report_completion_honestly(self):
+        module = meta_module()
+        frames = [('data: {"choices":[{"delta":{"content":"Two "}}]}\n\n').encode(),
+                  ('data: {"choices":[{"delta":{"content":"reviewers."}}]}\n\n').encode(),
+                  b'data: [DONE]\n\n']
+
+        class FakeStream:
+            def __init__(self, pieces):
+                self._pieces = list(pieces)
+            def read(self, size=-1):
+                return self._pieces.pop(0) if self._pieces else b''
+            def close(self):
+                pass
+
+        with patch.dict(os.environ, {'MODEL_API_KEY': 'test-key-12345'}):
+            with patch('urllib.request.urlopen', return_value=FakeStream(frames)):
+                chunks = list(module.meta_completion('muse-spark-1.2').stream_chunks(
+                    [{'role': 'user', 'content': 'hi'}]))
+        self.assertEqual(chunks, ['Two ', 'reviewers.'])
+
+    def test_split_frames_reassemble_and_errors_stay_sanitized(self):
+        module = meta_module()
+        pieces = [b'data: {"choices":[{"delta":{"content":"Two', b' rev', b'iewers."}}]}\n\ndata: [DONE]\n\n']
+
+        class FakeStream:
+            def read(self, size=-1):
+                return pieces.pop(0) if pieces else b''
+            def close(self):
+                pass
+
+        with patch.dict(os.environ, {'MODEL_API_KEY': 'test-key-12345'}):
+            with patch('urllib.request.urlopen', return_value=FakeStream()):
+                chunks = list(module.meta_completion().stream_chunks([{'role': 'user', 'content': 'hi'}]))
+        self.assertEqual(chunks, ['Two reviewers.'])
+        with patch.dict(os.environ, {'MODEL_API_KEY': 'test-key-12345'}):
+            with patch('urllib.request.urlopen', side_effect=TimeoutError('slow')):
+                with self.assertRaisesRegex(RuntimeError, '^Meta Model API request failed'):
+                    list(module.meta_completion().stream_chunks([{'role': 'user', 'content': 'hi'}]))
+
+    def test_completed_payload_without_deltas_reports_honestly(self):
+        module = meta_module()
+
+        class FakeCompleted:
+            def read(self, size=-1):
+                return b''
+            def close(self):
+                pass
+
+        with patch.dict(os.environ, {'MODEL_API_KEY': 'test-key-12345'}):
+            with patch('urllib.request.urlopen', return_value=FakeCompleted()):
+                with self.assertRaisesRegex(NotImplementedError, 'streaming_unsupported'):
+                    list(module.meta_completion().stream_chunks([{'role': 'user', 'content': 'hi'}]))

@@ -9,7 +9,8 @@ import shutil
 
 FILES = ('server.py', 'knowledge.py', 'web_policy.py', 'audio.py', 'meetily.py',
          'macos_audio.py', 'audio_worker.py', 'model_selection.py', 'meta_models.py',
-         'native/macos_capture.swift', 'requirements-macos-audio.txt')
+         'overlay_bridge.py',
+         'native/macos_capture.swift', 'native/macos_overlay.swift', 'requirements-macos-audio.txt')
 
 
 def install(source, home):

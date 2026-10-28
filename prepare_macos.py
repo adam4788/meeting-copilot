@@ -16,7 +16,8 @@ def prepare(home, run=subprocess.run):
     if not uv or not swiftc:
         raise RuntimeError('Install uv and Apple Command Line Tools before preparing audio.')
     core = Path(home).expanduser().resolve() / 'plugins/meeting-copilot-live/dashboard/core'
-    for name in ('audio_worker.py', 'native/macos_capture.swift', 'requirements-macos-audio.txt'):
+    for name in ('audio_worker.py', 'overlay_bridge.py', 'native/macos_capture.swift',
+                 'native/macos_overlay.swift', 'requirements-macos-audio.txt'):
         if not (core / name).is_file():
             raise FileNotFoundError('Install this version with python install.py first.')
     runtime = core / 'audio-runtime'
@@ -35,7 +36,9 @@ def prepare(home, run=subprocess.run):
     run([swiftc, '-parse-as-library', str(core / 'native/macos_capture.swift'), '-O', '-o', str(helper),
          '-Xlinker', '-sectcreate', '-Xlinker', '__TEXT', '-Xlinker', '__info_plist', '-Xlinker', str(info)], check=True)
     run(['/usr/bin/codesign', '--force', '--sign', '-', '--identifier', 'com.adam.meeting-copilot.capture', str(helper)], check=True)
-    return {'runtime': str(python), 'helper': str(helper), 'capture_started': False}
+    overlay = core / 'macos_overlay'
+    run([swiftc, '-parse-as-library', str(core / 'native/macos_overlay.swift'), '-O', '-o', str(overlay)], check=True)
+    return {'runtime': str(python), 'helper': str(helper), 'overlay': str(overlay), 'capture_started': False}
 
 
 if __name__ == '__main__':

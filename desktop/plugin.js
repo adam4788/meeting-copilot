@@ -4,7 +4,7 @@ import { host, useValue, useQuery, useQueryClient, Button, Input, Textarea, Badg
 const ID = 'meeting-copilot-live';
 const muted = { color: 'var(--ui-text-secondary)', fontSize: 12, lineHeight: 1.5 };
 const card = { border: '1px solid var(--ui-stroke-secondary)', borderRadius: 10, padding: 14, minWidth: 0, boxSizing: 'border-box', background: 'var(--ui-bg-card)' };
-const selectStyle = { padding: 8, borderRadius: 6, width: '100%', maxWidth: '100%', minWidth: 0, color: 'var(--ui-text-primary)', background: 'var(--ui-surface-primary)', border: '1px solid var(--ui-stroke-secondary)' };
+const selectStyle = { padding: 8, borderRadius: 6, width: '100%', maxWidth: '100%', minWidth: 0, color: 'var(--ui-text-primary)', background: 'var(--ui-bg-card)', border: '1px solid var(--ui-stroke-secondary)' };
 
 export default {
   id: ID,
@@ -15,20 +15,30 @@ export default {
     const api = (path, body) => ctx.rest(path, body === undefined ? {} : { method: 'POST', body });
     function MeetingPane() {
       const qc = useQueryClient();
-      const [project, setProject] = useState('');
+      const loadScope = () => { try { return JSON.parse(typeof localStorage !== 'undefined' ? localStorage.getItem('meeting-copilot.scope') || '{}' : '{}'); } catch (e) { return {}; } };
+      const saved = loadScope();
+      const [project, setProject] = useState(saved.project || '');
       const [question, setQuestion] = useState('');
-      const [web, setWeb] = useState('');
+      const [web, setWeb] = useState(saved.web || '');
       const [consent, setConsent] = useState(false);
-      const [backend, setBackend] = useState('meetily');
+      const [backend, setBackend] = useState(saved.backend || 'meetily');
       const [recording, setRecording] = useState('');
       const [error, setError] = useState('');
       const [pending, setPending] = useState(false);
       const [showTranscript, setShowTranscript] = useState(false);
-      const [webFallback, setWebFallback] = useState(true);
-      const [transcriptionModel, setTranscriptionModel] = useState('base.en');
-      const [audioSource, setAudioSource] = useState('microphone');
-      const [answerProvider, setAnswerProvider] = useState('');
-      const [answerModel, setAnswerModel] = useState('');
+      const [webFallback, setWebFallback] = useState(saved.webFallback !== undefined ? saved.webFallback : true);
+      const [transcriptionModel, setTranscriptionModel] = useState(saved.transcriptionModel || 'base.en');
+      const [audioSource, setAudioSource] = useState(saved.audioSource || 'microphone');
+      const [answerProvider, setAnswerProvider] = useState(saved.answerProvider || '');
+      const [answerModel, setAnswerModel] = useState(saved.answerModel || '');
+      const [overlayOn, setOverlayOn] = useState(false);
+      const [overlayMsg, setOverlayMsg] = useState('');
+      const [copied, setCopied] = useState(false);
+      useEffect(() => {
+        try {
+          if (typeof localStorage !== 'undefined') localStorage.setItem('meeting-copilot.scope', JSON.stringify({ project, backend, web, webFallback, transcriptionModel, audioSource, answerProvider, answerModel }));
+        } catch (e) {}
+      }, [project, backend, web, webFallback, transcriptionModel, audioSource, answerProvider, answerModel]);
       const status = useQuery({ queryKey: [ID, 'status'], queryFn: () => api('/status'), refetchInterval: 2500, retry: 1 });
       const projects = useQuery({ queryKey: [ID, 'projects'], queryFn: () => api('/projects'), staleTime: 60000, refetchInterval: query => query.state.error ? 5000 : false, retry: 3 });
       const recordings = useQuery({ queryKey: [ID, 'recordings'], queryFn: () => api('/recordings'), refetchInterval: backend === 'meetily' ? 5000 : false, enabled: backend === 'meetily', retry: 1 });
@@ -40,7 +50,7 @@ export default {
       const allProjects = project === '__all_projects__';
       const scope = { project: allProjects ? null : project || null, all_projects: allProjects, web_fallback: webFallback, ...(answerProvider && answerModel ? { answer_provider: answerProvider, answer_model: answerModel } : {}) };
       const unsupported = (allProjects && !data.capabilities?.all_projects) || (webFallback && !data.capabilities?.automatic_web_fallback) || (answerProvider && (!answerModel || !data.capabilities?.independent_models));
-      useEffect(() => () => { api('/pause', {}).catch(() => {}); }, []);
+      useEffect(() => () => { api('/overlay/hide', {}).catch(() => {}); }, []);
       async function act(path, body = {}) {
         setPending(true); setError('');
         try { await api(path, body); await qc.invalidateQueries({ queryKey: [ID, 'status'] }); }
@@ -99,12 +109,32 @@ export default {
           modelCatalog.error && h('p', { role: 'alert', style: muted }, 'Model catalog unavailable. Use the configured model or check provider setup.'),
           h('p', { style: muted }, 'Answer selection applies only to this copilot request; it does not change your chat model. Transcription remains local.')),
         h('label', { style: { display: 'grid', gap: 6 } }, h('strong', null, 'What should I say?'),
-          h(Textarea, { value: question, onChange: e => setQuestion(e.target.value), placeholder: 'Leave blank to answer the latest question, or type a question…', rows: 3 })),
+          h(Textarea, { value: question, onChange: e => setQuestion(e.target.value), placeholder: 'Leave blank to answer the latest question, or type a question… (⌘/Ctrl+Enter to send)', rows: 3, onKeyDown: e => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !busy && !unsupported) act('/assist', { question, ...scope }); } })),
         h('div', { style: { display: 'flex', gap: 8 } },
           h(Button, { disabled: busy || unsupported, onClick: () => act('/assist', { question, ...scope }) }, busy ? 'Checking your sources…' : 'Suggest answer'),
-          h(Button, { variant: 'secondary', disabled: !result?.answer, onClick: async () => { try { await navigator.clipboard.writeText(result.answer); } catch (e) { setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, 'Copy')),
+          h(Button, { variant: 'secondary', disabled: !result?.answer, onClick: async () => { try { await navigator.clipboard.writeText(result.answer); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch (e) { setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, copied ? 'Copied ✓' : 'Copy')),
         h('label', { style: { ...muted, display: 'flex', gap: 8 } },
           h('input', { type: 'checkbox', checked: webFallback, onChange: e => setWebFallback(e.target.checked) }), 'Automatic web fallback'),
+        h('section', { style: card },
+          h('strong', null, 'Meeting overlay (macOS)'),
+          h('p', { style: { ...muted, marginBottom: 0 } }, 'Display-only window: tap a question row to stream an answer into that row. No capture starts and no question is sent until you tap. The overlay may be visible in screen shares.'),
+          overlayMsg && h('p', { role: 'status', style: muted }, overlayMsg),
+          h('div', { style: { display: 'flex', gap: 8, paddingTop: 8 } },
+            h(Button, { variant: overlayOn ? 'secondary' : undefined, disabled: pending || !data.capabilities?.overlay, onClick: async () => {
+              setPending(true); setOverlayMsg('');
+              try {
+                if (overlayOn) { await api('/overlay/hide', {}); setOverlayOn(false); }
+                else { await api('/overlay/show', { scope }); setOverlayOn(true); setOverlayMsg('Overlay shown. Tap a row to stream its answer; it hides again automatically.'); }
+                await qc.invalidateQueries({ queryKey: [ID, 'status'] });
+              } catch (e) { setOverlayMsg(String(e.message || e)); }
+              finally { setPending(false); }
+            } }, overlayOn ? 'Hide overlay' : 'Show overlay'),
+            h(Button, { variant: 'secondary', disabled: pending || !overlayOn, onClick: async () => {
+              setPending(true); setOverlayMsg('');
+              try { await api('/overlay/scope', { scope }); setOverlayMsg('Overlay scope updated to current settings.'); }
+              catch (e) { setOverlayMsg(String(e.message || e)); }
+              finally { setPending(false); }
+            } }, 'Sync scope'))),
         h('p', { style: { ...muted, margin: 0 } }, 'If needed, the model drafts a generic public query. Filtering is best-effort, not a privacy guarantee; turn this off for sensitive calls. Selected context still goes to your configured answer model.'),
         h('details', null, h('summary', { style: { cursor: 'pointer', ...muted } }, 'Search online with a specific query'),
           h('div', { style: { display: 'grid', gap: 8, paddingTop: 10 } },

@@ -254,3 +254,188 @@ class ServerTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class OverlayRequestScopeTests(unittest.TestCase):
+    def _streaming_engine(self, seen, chunks_per_call):
+        class Engine:
+            def answer_stream(self, question, **kwargs):
+                seen.append({'question': question, 'kwargs': dict(kwargs)})
+                chunks = list(chunks_per_call)
+                header = {'model_route': 'fake/test', 'sources': [{'title': 't', 'text': 'x'}],
+                          'warnings': [], 'web_search': {'used': False}}
+                return header, iter(chunks)
+            def answer(self, question, **kwargs):
+                raise AssertionError('streaming path must use answer_stream')
+        return Engine()
+
+    def test_second_click_while_busy_returns_409_with_owner(self):
+        import server
+        import threading
+        import time
+        entered = threading.Event()
+        release = threading.Event()
+        class SlowEngine:
+            def answer_stream(self, *a, **k):
+                raise NotImplementedError('streaming_unsupported:x')
+            def answer(self, question, **kwargs):
+                entered.set()
+                release.wait(5)
+                return {'answer': 'slow', 'sources': [], 'warnings': [],
+                        'web_search': {'used': False}, 'model_route': 'x',
+                        'streaming': False, 'completed_only': True}
+        state = server.MeetingState(engine_factory=lambda: SlowEngine())
+        first = state.assist('first question')
+        self.assertTrue(entered.wait(5))
+        try:
+            state.assist('second question')
+            self.fail('expected 409')
+        except Exception as exc:
+            self.assertEqual(getattr(exc, 'status_code', None), 409)
+            self.assertIn(first['request_id'], str(exc.detail))
+        state.cancel_assist(first['request_id'])
+        release.set()
+        for _ in range(100):
+            if not state.busy:
+                break
+            time.sleep(.01)
+        self.assertFalse(state.busy)
+
+    def test_streaming_chunks_accumulate_on_own_request_slot_only(self):
+        import server
+        import time
+        seen = []
+        state = server.MeetingState(engine_factory=lambda: self._streaming_engine(seen, ['alpha-', 'one']))
+        response = state.assist('Who approves?', request_id='r-1', row_id='row-1')
+        self.assertEqual(response['request_id'], 'r-1')
+        for _ in range(200):
+            entry = state.assist_request('r-1')
+            if entry['status'] == 'done':
+                break
+            time.sleep(.01)
+        entry = state.assist_request('r-1')
+        self.assertEqual(entry['answer'], 'alpha-one')
+        self.assertEqual(entry['row_id'], 'row-1')
+        self.assertTrue(entry['streaming'])
+        self.assertFalse(entry['completed_only'])
+        self.assertEqual(entry['model_route'], 'fake/test')
+        self.assertEqual(seen[0]['question'], 'Who approves?')
+
+    def test_completed_only_engine_reports_honestly_on_request_slot(self):
+        import server
+        import time
+        class CompletedEngine:
+            def answer_stream(self, *a, **k):
+                raise NotImplementedError('streaming_unsupported:completed-only-response')
+            def answer(self, question, **kwargs):
+                return {'answer': 'Final.', 'sources': [], 'warnings': [],
+                        'web_search': {'used': False}, 'model_route': 'x',
+                        'streaming': False, 'completed_only': True}
+        state = server.MeetingState(engine_factory=CompletedEngine)
+        request_id = state.assist('Who approves?')['request_id']
+        for _ in range(200):
+            if state.assist_request(request_id)['status'] == 'done':
+                break
+            time.sleep(.01)
+        entry = state.assist_request(request_id)
+        self.assertEqual(entry['answer'], 'Final.')
+        self.assertTrue(entry['completed_only'])
+        self.assertFalse(entry['streaming'])
+
+    def test_cancel_stops_stream_and_marks_slot_cancelled(self):
+        import server
+        import threading
+        import time
+        entered = threading.Event()
+        release = threading.Event()
+        class HangingEngine:
+            def answer_stream(self, question, **kwargs):
+                entered.set()
+                release.wait(5)
+                return {'model_route': 'x', 'sources': [], 'warnings': [],
+                        'web_search': {'used': False}}, iter([])
+            def answer(self, question, **kwargs):
+                raise AssertionError('cancel path uses the stream entrypoint')
+        state = server.MeetingState(engine_factory=HangingEngine)
+        request_id = state.assist('Who approves?')['request_id']
+        self.assertTrue(entered.wait(5))
+        result = state.cancel_assist(request_id)
+        self.assertEqual(result['status'], 'cancelled')
+        release.set()
+        self.assertEqual(state.assist_request(request_id)['status'], 'cancelled')
+
+    def test_clear_and_pause_cancel_inflight_and_bump_generation(self):
+        import server
+        import threading
+        import time
+        entered = threading.Event()
+        release = threading.Event()
+        class HangingEngine:
+            def answer_stream(self, *a, **k):
+                raise NotImplementedError('streaming_unsupported:x')
+            def answer(self, question, **kwargs):
+                entered.set()
+                release.wait(5)
+                return {'answer': 'stale', 'sources': [], 'warnings': [],
+                        'web_search': {'used': False}, 'model_route': 'x',
+                        'streaming': False, 'completed_only': True}
+        state = server.MeetingState(engine_factory=HangingEngine)
+        request_id = state.assist('Who approves?')['request_id']
+        self.assertTrue(entered.wait(5))
+        state.pause()
+        self.assertEqual(state.assist_request(request_id)['status'], 'cancelled')
+        self.assertFalse(state.busy)
+        release.set()
+
+    def test_unknown_request_id_returns_404(self):
+        import server
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        state = server.MeetingState()
+        app = FastAPI()
+        app.include_router(server.make_router(state))
+        with TestClient(app) as client:
+            self.assertEqual(client.get('/assist/nope').status_code, 404)
+            self.assertEqual(client.post('/assist/cancel', json={'request_id': 'nope'}).status_code, 404)
+
+    def test_request_table_is_bounded_and_never_drops_live_slots(self):
+        import server
+        import time
+        class FastEngine:
+            def answer_stream(self, *a, **k):
+                raise NotImplementedError('streaming_unsupported:x')
+            def answer(self, question, **kwargs):
+                return {'answer': 'ok', 'sources': [], 'warnings': [],
+                        'web_search': {'used': False}, 'model_route': 'x',
+                        'streaming': False, 'completed_only': True}
+        state = server.MeetingState(engine_factory=FastEngine)
+        ids = [state.assist(f'q{i}')['request_id'] for i in range(3)]
+        for rid in ids:
+            for _ in range(200):
+                if state.assist_request(rid)['status'] == 'done':
+                    break
+                time.sleep(.005)
+        for i in range(10):
+            state.assist(f'extra {i}')
+            for _ in range(200):
+                if not state.busy:
+                    break
+                time.sleep(.005)
+        self.assertLessEqual(len(state.requests), 8)
+        done = [e for e in state.requests.values() if e['status'] == 'done']
+        self.assertTrue(done)
+
+    def test_overlay_show_hide_scope_lifecycle(self):
+        import server
+        state = server.MeetingState(engine_factory=lambda: None)
+        first = state.overlay_show({'project': 'demo', 'answer_provider': 'meta',
+                                    'answer_model': 'muse-spark-1.3', 'injected': 'drop'})
+        self.assertTrue(first['shown'])
+        self.assertIsNotNone(state.overlay)
+        again = state.overlay_show({'project': 'demo'})
+        self.assertTrue(again['reused'])
+        scoped = state.overlay_scope({'project': 'alpha'})
+        self.assertTrue(scoped['shown'])
+        self.assertEqual(state.overlay_scope_value, {'project': 'alpha'})
+        self.assertEqual(state.overlay_hide(), {'shown': False})
+        self.assertIsNone(state.overlay)

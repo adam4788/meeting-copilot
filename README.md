@@ -22,6 +22,8 @@ Get short, speakable answer suggestions during Teams or Zoom calls, grounded in 
 
 Deterministic checks, synthetic-file macOS transcription and explicit answer-model routing have been exercised. Live independent microphone/system capture still needs user-approved permission and device testing. See the [verification notes](docs/verification.md); do not infer production readiness from passing unit tests.
 
+A macOS overlay exists (`native/macos_overlay.swift` and `overlay_bridge.py`), launched only by the pane's Show overlay action after you start listening. It streams real incremental answers into the tapped question row using your current pane settings (project/sessions, web fallback, answer provider/model); nothing is captured or sent until you tap. `sharingType = .none` is best-effort only: Apple documents it as legacy, so assume the overlay may appear in a screen share. No visual or Zoom/Meet screen-share test has been performed.
+
 ## Install and use
 
 Prerequisites: a configured Hermes Desktop/Agent 0.22+ installation and Python 3.11+. Meetily 0.4.1 is optional for the JSON attachment mode; the adapter is unofficial and future versions may require changes.

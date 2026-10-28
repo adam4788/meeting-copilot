@@ -11,7 +11,8 @@ class PreparationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             core = Path(tmp) / 'plugins/meeting-copilot-live/dashboard/core'
             (core / 'native').mkdir(parents=True)
-            for name in ('audio_worker.py', 'native/macos_capture.swift', 'requirements-macos-audio.txt'):
+            for name in ('audio_worker.py', 'overlay_bridge.py', 'native/macos_capture.swift',
+                         'native/macos_overlay.swift', 'requirements-macos-audio.txt'):
                 (core / name).write_text('synthetic')
             calls = []
             def run(argv, **kwargs):
@@ -20,9 +21,14 @@ class PreparationTests(unittest.TestCase):
             with patch('prepare_macos.sys.platform', 'darwin'), patch('prepare_macos.shutil.which', side_effect=lambda x: '/tools/' + x):
                 result = prepare_macos.prepare(tmp, run=run)
             self.assertFalse(result['capture_started'])
-            compiler = next(argv for argv in calls if argv[0].endswith('swiftc'))
-            self.assertIn('-parse-as-library', compiler)
-            self.assertIn('__info_plist', compiler)
+            self.assertTrue(result['overlay'].endswith('macos_overlay'))
+            compilers = [argv for argv in calls if argv[0].endswith('swiftc')]
+            self.assertEqual(len(compilers), 2)
+            capture_compile = next(argv for argv in compilers if any('macos_capture.swift' in a for a in argv))
+            self.assertIn('-parse-as-library', capture_compile)
+            self.assertIn('__info_plist', capture_compile)
+            overlay_compile = next(argv for argv in compilers if any('macos_overlay.swift' in a for a in argv))
+            self.assertIn('-parse-as-library', overlay_compile)
             self.assertTrue((core / 'native/CaptureInfo.plist').is_file())
             self.assertFalse(any('--start' in argv for argv in calls))
             self.assertFalse(any('audio_worker.py' in argv for argv in calls))

@@ -126,6 +126,9 @@ class KnowledgeSelectionTests(unittest.TestCase):
         self.assertEqual(engine._complete.call_count, 2)
         selected.assert_not_called()
 
+    _aux = None
+    _calls = None
+
     def test_concurrent_selected_and_default_requests_never_share_routes(self):
         from concurrent.futures import ThreadPoolExecutor
         import threading
@@ -180,3 +183,75 @@ class KnowledgeSelectionTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class StreamingSelectionTests(ModelSelectionTests):
+    def _catalog(self, module):
+        module.available_models = lambda: {'providers': [
+            {'id': 'provider-one', 'label': 'One', 'models': [{'id': 'model-one', 'label': 'One'}]}]}
+
+    def _hermes(self, frames=None, completed=None, reject_stream=False):
+        import sys
+        from types import SimpleNamespace
+        calls = []
+        frames = frames or []
+        completed = completed or {'text': 'X'}
+
+        def resolver(provider, model):
+            def create(**kwargs):
+                calls.append(dict(kwargs))
+                if kwargs.get('stream') and not reject_stream:
+                    return list(frames)
+                if kwargs.get('stream') and reject_stream:
+                    raise TypeError('stream unsupported')
+                text = completed['text']
+                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))])
+            return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))), model
+        def builder(provider, model, messages, **kwargs):
+            return {'model': model, 'messages': messages}
+        auxiliary = SimpleNamespace(resolve_provider_client=resolver, _build_call_kwargs=builder,
+                                    call_llm=Mock(side_effect=AssertionError('no default routing')))
+        self._aux, self._calls = auxiliary, calls
+        return auxiliary
+
+    def test_sse_frames_yield_distinct_ordered_deltas(self):
+        import sys
+        frames = ['data: {"choices":[{"delta":{"content":"Two "}}]}\n\n',
+                  'data: {"choices":[{"delta":{"content":"reviewers."}}]}\n\n', 'data: [DONE]\n\n']
+        aux = self._hermes(frames=frames)
+        module = self.module()
+        self._catalog(module)
+        with patch.dict(sys.modules, {'agent.auxiliary_client': aux}):
+            complete = module.selected_completion('provider-one', 'model-one')
+            deltas = list(complete.stream_chunks([{'role': 'user', 'content': 'hi'}]))
+        self.assertEqual(deltas, ['Two ', 'reviewers.'])
+        self.assertTrue(self._calls[0]['stream'])
+        self.assertEqual(self._calls[0]['model'], 'model-one')
+
+    def test_completed_only_response_reports_honestly(self):
+        import sys
+        from types import SimpleNamespace
+        aux = self._hermes(completed={'text': 'Final answer.'})
+        module = self.module()
+        self._catalog(module)
+        with patch.dict(sys.modules, {'agent.auxiliary_client': aux}):
+            complete = module.selected_completion('provider-one', 'model-one')
+            with self.assertRaisesRegex(NotImplementedError, 'streaming_unsupported'):
+                list(complete.stream_chunks([{'role': 'user', 'content': 'hi'}]))
+
+    def test_stream_rejecting_signature_reports_honestly(self):
+        import sys
+        aux = self._hermes(frames=[], reject_stream=True)
+        module = self.module()
+        self._catalog(module)
+        with patch.dict(sys.modules, {'agent.auxiliary_client': aux}):
+            complete = module.selected_completion('provider-one', 'model-one')
+            with self.assertRaisesRegex(NotImplementedError, 'streaming_unsupported'):
+                list(complete.stream_chunks([{'role': 'user', 'content': 'hi'}]))
+
+    def test_extract_rejects_malformed_and_chunked_completed_strings(self):
+        from types import SimpleNamespace
+        with self.assertRaises(RuntimeError):
+            self.module().extract_openai_sse_deltas('data: not-json\n\n')
+        completed = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='Final'))])
+        self.assertIsNone(self.module().extract_openai_sse_deltas(completed))

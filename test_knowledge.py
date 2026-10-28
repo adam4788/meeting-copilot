@@ -4,7 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from knowledge import KnowledgeEngine
 
@@ -228,3 +228,45 @@ class KnowledgeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class AnswerStreamTests(KnowledgeTests):
+    def test_answer_stream_reuses_retrieval_and_yields_provider_deltas(self):
+        self.project.mkdir(exist_ok=True)
+        (self.project / 'notes.md').write_text('Orchid requires review.', encoding='utf-8')
+        deltas = iter(['Orchid ', 'requires review [1].'])
+        header = {'model_route': 'fake/test', 'sources': [], 'warnings': [],
+                  'web_search': {'used': False}}
+        complete = Mock(return_value='unused')
+        complete.stream_chunks = Mock(return_value=deltas)
+        with patch.object(self.engine, '_complete', complete):
+            out_header, chunks = self.engine.answer_stream('What does Orchid require?', project='alpha')
+            received = list(chunks)
+        self.assertEqual(received, ['Orchid ', 'requires review [1].'])
+        self.assertEqual(out_header['model_route'], 'hermes-configured')
+
+    def test_answer_stream_completed_only_route_raises_honestly(self):
+        def plain(messages):
+            return 'Final.'
+        with patch.object(KnowledgeEngine, '_complete', plain):
+            engine = KnowledgeEngine(self.projects, self.home)
+            with self.assertRaisesRegex(NotImplementedError, 'streaming_unsupported'):
+                engine.answer_stream('What does Orchid require?')
+
+    def test_answer_reports_streaming_capability_honestly(self):
+        self.project.mkdir(exist_ok=True)
+        (self.project / 'notes.md').write_text('Orchid requires review.', encoding='utf-8')
+        streaming = Mock(return_value='Review is required [1].')
+        streaming.stream_chunks = Mock(return_value=iter(['x']))
+        with patch.object(self.engine, '_complete', streaming), patch.object(self.engine, '_web', side_effect=AssertionError('no consent')):
+            result = self.engine.answer('What does Orchid require?', project='alpha')
+        self.assertTrue(result['streaming'])
+        self.assertFalse(result['completed_only'])
+        def plain(messages):
+            return 'Review is required [1].'
+        with patch.object(KnowledgeEngine, '_complete', plain), patch.object(self.engine, '_web', side_effect=AssertionError('no consent')):
+            fresh = KnowledgeEngine(self.projects, self.home)
+            with patch.object(fresh, '_web', side_effect=AssertionError('no consent')):
+                result = fresh.answer('What does Orchid require?', project='alpha')
+        self.assertFalse(result['streaming'])
+        self.assertTrue(result['completed_only'])

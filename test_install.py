@@ -8,7 +8,7 @@ import install
 
 class InstallerTests(unittest.TestCase):
     def test_independent_runtime_files_are_in_install_manifest(self):
-        self.assertTrue({'macos_audio.py', 'audio_worker.py', 'model_selection.py', 'meta_models.py', 'native/macos_capture.swift', 'requirements-macos-audio.txt'} <= set(install.FILES))
+        self.assertTrue({'macos_audio.py', 'audio_worker.py', 'model_selection.py', 'meta_models.py', 'overlay_bridge.py', 'native/macos_capture.swift', 'native/macos_overlay.swift', 'requirements-macos-audio.txt'} <= set(install.FILES))
 
     def test_missing_source_fails_before_mutating_profile(self):
         with tempfile.TemporaryDirectory() as tmp:

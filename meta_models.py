@@ -56,4 +56,77 @@ def meta_completion(model=None):
             raise RuntimeError('Meta Model API returned no text answer')
         return text.strip()
 
+    def stream_chunks(messages):
+        """Yield provider-native incremental SSE content deltas in arrival order.
+
+        Uses the Meta OpenAI-compatible SSE route (`stream: true`). Responses
+        that only carry a completed payload raise
+        NotImplementedError('streaming_unsupported...') so callers show
+        completed-only honestly instead of faking streaming.
+        """
+        body = json.dumps({'model': model, 'messages': messages, 'max_tokens': 600,
+                           'stream': True}).encode('utf-8')
+        request = urllib.request.Request(
+            META_BASE_URL + '/chat/completions', data=body,
+            headers={'Authorization': 'Bearer ' + key.strip(), 'Content-Type': 'application/json',
+                     'Accept': 'text/event-stream'})
+        try:
+            response = urllib.request.urlopen(request, timeout=30)
+        except Exception as exc:
+            raise RuntimeError(f'Meta Model API request failed ({type(exc).__name__})') from None
+        deltas = []
+        leftover = ''
+        try:
+            while True:
+                piece = response.read(4096)
+                if not piece:
+                    chunk, leftover = leftover, ''
+                else:
+                    chunk = leftover + piece.decode('utf-8', errors='replace')
+                    leftover = ''
+                    if not chunk.endswith('\n'):
+                        split = chunk.rfind('\n')
+                        if split == -1:
+                            leftover = chunk
+                            continue
+                        leftover, chunk = chunk[split + 1:], chunk[:split + 1]
+                done = False
+                for line in chunk.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith(':'):
+                        continue
+                    if line.startswith('data:'):
+                        line = line[5:].strip()
+                    if line == '[DONE]':
+                        done = True
+                        break
+                    try:
+                        payload = json.loads(line)
+                    except ValueError:
+                        raise RuntimeError('Meta Model API returned no text answer') from None
+                    if not isinstance(payload, dict):
+                        continue
+                    choices = payload.get('choices')
+                    if not isinstance(choices, list):
+                        continue
+                    for choice in choices:
+                        if not isinstance(choice, dict):
+                            continue
+                        delta = choice.get('delta')
+                        content = delta.get('content') if isinstance(delta, dict) else None
+                        if isinstance(content, str) and content:
+                            deltas.append(content)
+                            yield content
+                if done or not piece:
+                    break
+            if not deltas:
+                # No incremental frames arrived: honest completed-only signal.
+                raise NotImplementedError('streaming_unsupported:completed-only-response')
+        finally:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+    complete.stream_chunks = stream_chunks  # type: ignore[attr-defined]
     return complete
