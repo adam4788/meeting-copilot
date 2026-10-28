@@ -13,16 +13,22 @@ class AssistRequest(BaseModel):
     all_projects: bool = False
     web_fallback: bool = True
     web_query: str | None = Field(default=None, max_length=300)
+    answer_provider: str | None = Field(default=None, max_length=100)
+    answer_model: str | None = Field(default=None, max_length=200)
 
 
 class CaptureRequest(BaseModel):
     consent: bool = False
-    backend: Literal['meetily', 'native'] = 'meetily'
+    backend: Literal['meetily', 'native', 'macos'] = 'meetily'
     recording_id: str | None = Field(default=None, max_length=500)
+    transcription_model: Literal['tiny.en', 'base.en', 'small.en'] = 'base.en'
+    audio_source: Literal['microphone', 'system', 'both'] = 'microphone'
 
 
 class MeetingState:
-    def __init__(self, engine_factory=None, audio_factory=None, bridge_factory=None):
+    def __init__(self, engine_factory=None, audio_factory=None, bridge_factory=None, macos_factory=None):
+        self.macos_factory = macos_factory
+        self.audio_options = None
         self.bridge_factory = bridge_factory
         self.bridge = None
         self.backend = None
@@ -36,6 +42,7 @@ class MeetingState:
         self.busy = False
         self.result = None
         self.generation = 0
+        self.capture_generation = 0
         self.lock = threading.RLock()
         self.lifecycle_lock = threading.RLock()
         self.capture_error = None
@@ -69,24 +76,34 @@ class MeetingState:
                     self.bridge = module.MeetilyBridge()
             return self.bridge
 
-    def get_audio(self):
+    def get_audio(self, backend='native', transcription_model='base.en', audio_source='microphone'):
         with self.lock:
-            if self.audio is None:
-                if self.audio_factory:
+            options = (backend, transcription_model, audio_source)
+            if self.audio is None or self.audio_options != options:
+                if backend == 'macos':
+                    if self.macos_factory:
+                        factory = self.macos_factory
+                    else:
+                        import importlib
+                        module = importlib.import_module(f'{__package__}.macos_audio' if __package__ else 'macos_audio')
+                        factory = module.MacOSAudioCapture
+                    self.audio = factory(model_size=transcription_model, source=audio_source)
+                elif self.audio_factory:
                     self.audio = self.audio_factory()
                 else:
                     import importlib
                     module = importlib.import_module(f'{__package__}.audio' if __package__ else 'audio')
                     self.audio = module.AudioCapture()
+                self.audio_options = options
             return self.audio
 
-    def start(self, consent, backend='meetily', recording_id=None):
+    def start(self, consent, backend='meetily', recording_id=None, transcription_model='base.en', audio_source='microphone'):
         # Serialize the actual backend operation, not merely the UI state transition.
         # Status/segment callbacks take only self.lock, so stop/join cannot deadlock them.
         with self.lifecycle_lock:
-            return self._start(consent, backend, recording_id)
+            return self._start(consent, backend, recording_id, transcription_model, audio_source)
 
-    def _start(self, consent, backend='meetily', recording_id=None):
+    def _start(self, consent, backend='meetily', recording_id=None, transcription_model='base.en', audio_source='microphone'):
         from fastapi import HTTPException
         if not consent:
             raise HTTPException(400, 'Confirm participant consent and audio capture before starting.')
@@ -95,9 +112,9 @@ class MeetingState:
         with self.lock:
             if self.listening:
                 return {'listening': True}
-            if backend == 'native':
-                self.get_audio()
-            session_key = (backend, recording_id if backend == 'meetily' else None)
+            if backend in ('native', 'macos'):
+                self.get_audio(backend, transcription_model, audio_source)
+            session_key = (backend, recording_id if backend == 'meetily' else (transcription_model, audio_source))
             if self.session_key != session_key:
                 self.segments.clear()
                 self.result = None
@@ -108,11 +125,21 @@ class MeetingState:
             self.listening = True
             self.error = None
             self.last_seen = time.monotonic()
+            self.capture_generation += 1
+            capture_generation = self.capture_generation
+        def segment_callback(segment):
+            with self.lock:
+                if self.listening and self.capture_generation == capture_generation:
+                    self.add_segment(segment)
+        def status_callback(info):
+            with self.lock:
+                if self.listening and self.capture_generation == capture_generation:
+                    self.audio_status(info)
         try:
             if backend == 'meetily':
-                self.get_bridge().attach(recording_id, on_segment=self.add_segment, on_status=self.audio_status)
+                self.get_bridge().attach(recording_id, on_segment=segment_callback, on_status=status_callback)
             else:
-                self.audio.start(on_segment=self.add_segment, on_status=self.audio_status)
+                self.audio.start(on_segment=segment_callback, on_status=status_callback)
         except Exception as exc:
             self.pause()
             raise HTTPException(503, f'Audio could not start: {type(exc).__name__}: {str(exc)[:300]}') from exc
@@ -138,11 +165,13 @@ class MeetingState:
         with self.lifecycle_lock:
             with self.lock:
                 self.listening = False
-                audio = self.audio if self.backend == 'native' else self.bridge
+                self.capture_generation += 1
+                audio = self.audio if self.backend in ('native', 'macos') else self.bridge
             if audio:
                 audio.stop()
             with self.lock:
                 self.capture_error = None
+                self.capture_info = {'state': 'stopped', 'backend': self.backend, 'message': 'Paused / detached', 'error': None}
             return {'listening': False}
 
     def get_engine(self):
@@ -156,7 +185,7 @@ class MeetingState:
                     self.engine = module.KnowledgeEngine()
             return self.engine
 
-    def assist(self, question, project=None, web_query=None, all_projects=False, web_fallback=True):
+    def assist(self, question, project=None, web_query=None, all_projects=False, web_fallback=True, answer_provider=None, answer_model=None):
         from fastapi import HTTPException
         if all_projects and project:
             raise HTTPException(400, 'Choose all projects or one project, not both.')
@@ -173,7 +202,10 @@ class MeetingState:
 
         def work():
             try:
-                result = self.get_engine().answer(question, transcript=transcript, project=project, web_query=web_query, all_projects=all_projects, web_fallback=web_fallback)
+                options = {}
+                if answer_provider is not None or answer_model is not None:
+                    options = {'answer_provider': answer_provider, 'answer_model': answer_model}
+                result = self.get_engine().answer(question, transcript=transcript, project=project, web_query=web_query, all_projects=all_projects, web_fallback=web_fallback, **options)
                 with self.lock:
                     if generation == self.generation:
                         self.result = result
@@ -195,7 +227,7 @@ class MeetingState:
             self.last_seen = time.monotonic()
             return {'listening': self.listening, 'segments': list(self.segments), 'error': self.error or self.capture_error,
                     'busy': self.busy, 'result': self.result, 'capture': self.capture_info, 'backend': self.backend,
-                    'capabilities': {'all_projects': True, 'automatic_web_fallback': True}}
+                    'capabilities': {'all_projects': True, 'automatic_web_fallback': True, 'independent_models': True, 'macos_transcription': True}}
 
 
 def make_router(state):
@@ -207,7 +239,7 @@ def make_router(state):
 
     @router.post('/start')
     def start(body: CaptureRequest):
-        return state.start(body.consent, body.backend, body.recording_id)
+        return state.start(body.consent, body.backend, body.recording_id, body.transcription_model, body.audio_source)
 
     @router.get('/recordings')
     def recordings():
@@ -217,13 +249,22 @@ def make_router(state):
     def pause():
         return state.pause()
 
+    @router.get('/models')
+    def models():
+        import importlib
+        module = importlib.import_module(f'{__package__}.model_selection' if __package__ else 'model_selection')
+        return module.available_models()
+
     @router.get('/devices')
-    def devices():
-        return state.get_audio().devices()
+    def devices(backend: Literal['native', 'macos'] = 'native'):
+        # Enumeration must never replace the active capture object: /pause must
+        # still target the process that actually owns the microphone/system stream.
+        probe = MeetingState(audio_factory=state.audio_factory, macos_factory=state.macos_factory)
+        return probe.get_audio(backend=backend).devices()
 
     @router.post('/assist')
     def assist(body: AssistRequest):
-        return state.assist(body.question, body.project, body.web_query, body.all_projects, body.web_fallback)
+        return state.assist(body.question, body.project, body.web_query, body.all_projects, body.web_fallback, body.answer_provider, body.answer_model)
 
     @router.get('/projects')
     def projects():

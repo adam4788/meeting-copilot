@@ -7,6 +7,9 @@ import install
 
 
 class InstallerTests(unittest.TestCase):
+    def test_independent_runtime_files_are_in_install_manifest(self):
+        self.assertTrue({'macos_audio.py', 'audio_worker.py', 'model_selection.py', 'meta_models.py', 'native/macos_capture.swift', 'requirements-macos-audio.txt'} <= set(install.FILES))
+
     def test_missing_source_fails_before_mutating_profile(self):
         with tempfile.TemporaryDirectory() as tmp:
             source, home = Path(tmp) / 'source', Path(tmp) / 'profile'
@@ -22,6 +25,7 @@ class InstallerTests(unittest.TestCase):
             home.mkdir()
             (home / 'config.yaml').write_text('plugins: {enabled: [existing]}\n', encoding='utf-8')
             for name in install.FILES:
+                (source / name).parent.mkdir(parents=True, exist_ok=True)
                 (source / name).write_text('# Synthetic fixture\n', encoding='utf-8')
             (source / 'desktop/plugin.js').write_text('export default {};\n', encoding='utf-8')
             original = (home / 'config.yaml').read_bytes()

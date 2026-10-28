@@ -1,0 +1,5 @@
+# Isolated CPython 3.12 (macOS arm64); never install into the Hermes interpreter.
+faster-whisper==1.2.1
+# PyAV 19 removed metadata_errors used by faster-whisper 1.2.1 decoding.
+av>=11,<17
+numpy>=1.26,<3

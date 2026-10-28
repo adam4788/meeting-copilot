@@ -5,7 +5,7 @@ import vm from 'node:vm';
 
 // Exercise the real uncompiled pane with lightweight React/SDK stand-ins.
 // This checks rendering/request contracts, not visual acceptance.
-function pane(scope, supported = true, fallback = true, web = '') {
+function pane(scope, supported = true, fallback = true, web = '', settings = {}) {
   let registered;
   let stateIndex = 0;
   const requests = [];
@@ -27,12 +27,13 @@ function pane(scope, supported = true, fallback = true, web = '') {
     .replace(/^import .*;\r?\n/gm, '').replace('export default', 'const plugin =');
   vm.runInNewContext(source + '\nplugin.register(ctx);', {
     ctx, h,
-    useState: initial => { const i = stateIndex++; return [i === 0 ? scope : i === 2 ? web : initial === true ? fallback : initial, () => {}]; },
+    useState: initial => { const i = stateIndex++; const overrides = { 0: scope, 2: web, ...settings }; return [Object.hasOwn(overrides, i) ? overrides[i] : initial === true ? fallback : initial, () => {}]; },
     useEffect: () => {},
     useQueryClient: () => ({ invalidateQueries: async () => {} }),
     useQuery: options => ({ data: options.queryKey[1] === 'status'
-      ? { capabilities: supported ? { all_projects: true, automatic_web_fallback: true } : undefined }
-      : options.queryKey[1] === 'projects' ? [{ name: 'alpha', path: '/projects/alpha' }] : [] }),
+      ? { capabilities: supported ? { all_projects: true, automatic_web_fallback: true, independent_models: true, macos_transcription: true } : undefined }
+      : options.queryKey[1] === 'projects' ? [{ name: 'alpha', path: '/projects/alpha' }]
+      : options.queryKey[1] === 'models' ? { providers: [{ id: 'openai-codex', label: 'Codex', models: [{ id: 'gpt-test', label: 'Test model' }] }] } : [] }),
     useValue: atom => atom.get(),
     host: { paneVisibility: () => visibility, revealPane: id => { revealed.push(id); visible = true; } }, Button: 'button', Input: 'input', Textarea: 'textarea', Badge: 'badge', PALETTE_AREA: 'palette',
   });
@@ -55,8 +56,9 @@ test('status bar reopens the pane without starting capture', () => {
   const { contributions, revealed, requests } = pane('');
   const entry = contributions.find(c => c.area === 'statusBar.right');
   assert.ok(entry, 'An always-available status bar opener must exist');
-  const button = entry.render();
+  const button = nodes(entry.render()).find(n => n.type === 'button');
   assert.equal(button.props.title, 'Open Meeting Copilot');
+  assert.equal(typeof button.props.onContextMenu, 'function', 'Right-click must offer the restart menu');
   button.props.onClick();
   assert.deepEqual(revealed, ['meeting-copilot-live:pane']);
   assert.equal(requests.length, 0);
@@ -65,17 +67,50 @@ test('status bar reopens the pane without starting capture', () => {
 test('status bar toggles open, hide, and reopen without capture changes', () => {
   const { contributions, requests } = pane('');
   const entry = contributions.find(c => c.area === 'statusBar.right');
-  entry.render().props.onClick();
-  const shown = entry.render();
+  const first = nodes(entry.render()).find(n => n.type === 'button');
+  first.props.onClick();
+  const shown = nodes(entry.render()).find(n => n.type === 'button');
   assert.equal(shown.props.title, 'Hide Meeting Copilot');
   assert.equal(shown.props['aria-pressed'], true);
   shown.props.onClick();
   assert.equal(contributions.filter(c => c.area === 'panes').length, 0);
-  assert.equal(entry.render().props.title, 'Open Meeting Copilot');
-  entry.render().props.onClick();
+  assert.equal(nodes(entry.render()).find(n => n.type === 'button').props.title, 'Open Meeting Copilot');
+  nodes(entry.render()).find(n => n.type === 'button').props.onClick();
   assert.equal(contributions.filter(c => c.area === 'panes').length, 1);
-  assert.equal(entry.render().props['aria-pressed'], true);
+  assert.equal(nodes(entry.render()).find(n => n.type === 'button').props['aria-pressed'], true);
   assert.equal(requests.length, 0);
+});
+
+test('restart command pauses capture and reopens exactly one pane', async () => {
+  const { contributions, revealed, requests } = pane('');
+  const restart = contributions.find(c => c.area === 'palette' && c.data.label === 'Restart Meeting Copilot');
+  assert.ok(restart, 'A restart command must be discoverable in Cmd+K');
+  await restart.data.run();
+  assert.ok(requests.some(r => r.path === '/pause'), 'Restart must pause capture first');
+  assert.equal(contributions.filter(c => c.area === 'panes').length, 1, 'Restart must leave exactly one pane registration');
+  assert.deepEqual(revealed, ['meeting-copilot-live:pane']);
+});
+
+test('independent transcription sends explicit local model/source and consent', async () => {
+  const { tree, requests } = pane('', true, false, '', { 3: true, 4: 'macos', 10: 'tiny.en', 11: 'microphone' });
+  const local = nodes(tree).find(n => n.type === 'option' && n.props.value === 'macos');
+  assert.ok(local, 'Independent macOS capture must be selectable');
+  const start = nodes(tree).find(n => n.type === 'button' && n.children.includes('Start listening'));
+  await start.props.onClick();
+  const body = requests.find(r => r.path === '/start').body;
+  assert.equal(body.backend, 'macos');
+  assert.equal(body.transcription_model, 'tiny.en');
+  assert.equal(body.audio_source, 'microphone');
+  assert.equal(body.consent, true);
+});
+
+test('answer model selection is explicit and separate from transcription', async () => {
+  const { tree, requests } = pane('', true, false, '', { 12: 'openai-codex', 13: 'gpt-test' });
+  assert.ok(nodes(tree).find(n => n.type === 'option' && n.props.value === 'gpt-test'));
+  await nodes(tree).find(n => n.type === 'button' && n.children.includes('Suggest answer')).props.onClick();
+  const body = requests.find(r => r.path === '/assist').body;
+  assert.equal(body.answer_provider, 'openai-codex');
+  assert.equal(body.answer_model, 'gpt-test');
 });
 
 test('all projects option sends an explicit scope without a selected project', async () => {

@@ -1,6 +1,6 @@
 # Meeting Copilot
 
-A Windows-first, source-grounded meeting assistant by **Adam Nugroho**.
+A source-grounded meeting assistant for Hermes Desktop by **Adam Nugroho**.
 
 Get short, speakable answer suggestions during Teams or Zoom calls, grounded in your own project files and prior sessions before optional web research. Built as a desktop integration for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
@@ -9,22 +9,22 @@ Get short, speakable answer suggestions during Teams or Zoom calls, grounded in 
 ## Design
 
 - Explicit start, pause, and consent controls. Capture never starts at import or installation.
-- Read your explicitly selected active Meetily transcript; retain the Windows audio pipeline you already trust. Native Windows capture is an experimental fallback.
+- Independent macOS microphone/system-audio transcription with selectable local Whisper models; optionally attach to an explicitly selected Meetily recording. Native Windows capture remains experimental.
 - Local transcription; this project writes no additional raw audio recordings. Meetily retains its own recording behavior.
 - Select one project, **All projects + sessions**, or sessions only, with visible evidence. All-project scope covers up to 100 eligible project folders, not your whole computer.
 - **Automatic web fallback is on by default.** When local evidence is insufficient, the configured model can draft a filtered generic public query. Turn it off for sensitive calls; filtering is best effort, not a privacy guarantee. A query you enter explicitly overrides automatic planning.
-- Read-only answer generation through your configured model. No agent tools or external-system mutations.
+- Read-only answer generation through Meta Muse Spark (Meta Model API) when `MODEL_API_KEY` is set in the gateway environment, otherwise your configured model or an explicitly selected authenticated provider/model, independently of the transcription model. No global chat-model changes, agent tools or external-system mutations.
 - In-memory transcript buffer and a capture heartbeat that stops listening when the pane disconnects.
 
 **Privacy boundary:** local transcription does not mean fully local answers. The question, bounded transcript, and selected source snippets are sent to your configured answer model, including the fallback planner when enabled. Use a locally hosted model if those must remain on-device. Search providers receive either the filtered model-drafted query or the query you explicitly enter. All-project scope can mix unrelated project context; review evidence before sharing. See [SECURITY.md](SECURITY.md).
 
 ## Status
 
-The project is being built and validated on Windows. See the [verification notes](docs/verification.md) for what has actually been exercised. Do not infer production readiness from passing unit tests.
+Deterministic checks, synthetic-file macOS transcription and explicit answer-model routing have been exercised. Live independent microphone/system capture still needs user-approved permission and device testing. See the [verification notes](docs/verification.md); do not infer production readiness from passing unit tests.
 
 ## Install and use
 
-Prerequisites: a configured Hermes Desktop/Agent 0.22+ installation, Python 3.11+, and Meetily 0.4.1. The Meetily adapter is unofficial and depends on its live JSON format; future versions may require adapter changes.
+Prerequisites: a configured Hermes Desktop/Agent 0.22+ installation and Python 3.11+. Meetily 0.4.1 is optional for the JSON attachment mode; the adapter is unofficial and future versions may require changes.
 
 Run these commands using the **Python environment belonging to your Hermes installation**:
 
@@ -49,6 +49,21 @@ Installation copies only this plugin into the active `HERMES_HOME`, backing up a
 **Detach** stops the copilot reading, not Meetily recording. **Clear meeting** clears the copilot's buffer/result but does not delete Meetily's files or undo requests already sent to a provider.
 
 Current file retrieval supports Markdown/plain text/reStructuredText, not PDF, DOCX or XLSX. See [KNOWLEDGE.md](KNOWLEDGE.md), [MEETILY.md](MEETILY.md), and the experimental [native audio guide](AUDIO.md).
+
+### Independent macOS transcription and model selection
+
+No Meetily application, recordings, models or helper binaries are required for this mode.
+
+1. Install this plugin as above, then run `python prepare_macos.py` on macOS with `uv` and Apple Command Line Tools installed. This prepares an isolated Python 3.12 environment, faster-whisper CPU runtime, and an original signed Swift helper; it does **not** start capture or ask for recording permissions.
+2. Restart an already-running gateway from a separate terminal when its other work is idle: `hermes gateway restart`. Reloading desktop plugins alone does not refresh an already-mounted Python backend.
+3. Open the pane with the bottom-right **Meeting Copilot** button or **Cmd+K → Open Meeting Copilot**. The status-bar button also hides it; hiding unmounts the pane and pauses/detaches capture.
+4. Choose **Independent macOS transcription**, then **Microphone**, **System audio**, or **Microphone + system audio**. System audio captures system playback, not a specific selected app. Select **tiny.en**, **base.en**, or **small.en**. This initial release supports English only; higher-accuracy models use more memory/CPU. First explicit use can download weights from the public faster-whisper model source into the normal Hugging Face cache.
+5. Confirm participant consent and click **Start listening**. Approve macOS Microphone and/or Screen & System Audio Recording permissions when requested. Permission attribution and real audio routing need validation on your machine. **Pause listening** terminates the worker/helper; no additional audio recording is saved.
+6. Under **Answer model**, keep the default (Meta Muse Spark via the Meta Model API when `MODEL_API_KEY` is set in the gateway environment) or select an authenticated provider and exact model, including Meta Model API entries. This applies only to the copilot's answer and optional fallback planner, not Hermes chat or transcription. Explicit selection failures do not silently switch models. The public search provider remains the configured Hermes search provider. Each answer reports its `model_route` beside the elapsed time.
+
+Local transcription is separate from answer privacy: bounded transcript/source context may still leave the device for the selected answer provider. Disable automatic web fallback for sensitive calls. No raw audio is sent to that provider.
+
+For a no-device transcription check, generate a non-sensitive WAV and run the installed `audio-runtime/bin/python audio_worker.py --file path/to/synthetic.wav --model tiny.en` from the installed `dashboard/core` directory. Do not use private recordings as public test evidence. The [REA reconstruction report](docs/meetily-reconstruction.md) documents architectural evidence, not runtime parity with Meetily. This implementation does not copy or invoke Meetily binaries/assets.
 
 ## Development
 

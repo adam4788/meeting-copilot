@@ -1,5 +1,22 @@
 # Verification
 
+## Independent macOS implementation checks
+
+The original Swift helper compiled and was ad-hoc signed with embedded microphone usage metadata. Its installed `--check-only` returned `capture_started=false`, microphone metadata present, sources `microphone/system/both`, and a 16 kHz PCM contract. This is not a permission grant or hardware-capture test.
+
+A generated English speech WAV was decoded by the **installed isolated Python 3.12 faster-whisper CPU int8 worker using tiny.en**. It returned: “The meeting co-pilot transcribed speech locally, our launch review is scheduled for Friday.” The input was synthetic, not a real meeting. This verifies independent file decoding/model loading/transcription without Meetily; it does not establish recognition accuracy across voices or languages.
+
+A real explicit `openai-codex` / `gpt-6.1-sol` route returned the requested public marker “Independent model routing works.” in 7.58 seconds including route setup. The provider catalog returned three authenticated provider entries; this does not establish that every listed model is accepted by its account. Model selection and fallback planning share a request-local completion function; the global chat configuration is not modified.
+
+A direct Meta Model API route (`meta_models.py`, Muse Spark `muse-spark-1.3/1.2/1.1` via `https://api.meta.ai/v1/chat/completions`, stdlib HTTP, key from `MODEL_API_KEY` only) is covered by `test_meta_models.py`: allowlist validation, bearer auth, sanitized failures, catalog advertisement only when the key is present, default-to-Meta answer routing with `model_route` labeling, and visible fallback to the configured model when Meta is unreachable. No live Meta API call has been exercised yet; that requires a funded key and billing verification.
+
+`hermes plugins validate` (catalog admission gate) passes on a pin-mirror tree: manifest, requires_hermes `>=0.22.0`, capability probe, no core overrides, desktop stays inside the SDK surface, security scan safe. Two local-only notes: validating the raw working tree flags vendored `.so` files inside the gitignored `.venv-audio/` (absent from any pin), and the pre-existing `agent.*` / `hermes_cli.*` / `tools.*` imports are reported as private-core-import warnings for the reviewer. The new Meta route itself uses only the Python standard library.
+
+The backend adds consent-gated macOS start/pause, allowlisted audio sources/models, generation-scoped callbacks, and paused-state normalization. Tests cover stopped callback rejection, safe device enumeration without replacing active capture, independent model routing, concurrency and explicit-model failure without fallback. See the current test output for evolving counts.
+
+**Not yet verified:** live independent microphone audio, ScreenCaptureKit system audio, combined capture, permission attribution/denial behavior on this installed host, long-call resource use, and visual acceptance of the new selectors. These require an explicit user-started recording rehearsal. Meetily-based live transcript ingestion is separate evidence, not proof of the independent capture path.
+
+
 This records exercised checks, not promised features. The project is an early developer preview.
 
 ## Deterministic checks

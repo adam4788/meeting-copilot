@@ -149,8 +149,44 @@ class KnowledgeEngine:
                      source=str(row.get('url', '')), text=_clean(str(row.get('description', '')))[:1500],
                      updated_at=None) for row in data.get('data', {}).get('web', [])[:3]]
 
-    def answer(self, question, transcript='', project=None, web_query=None, all_projects=False, web_fallback=False):
+    def answer(self, question, transcript='', project=None, web_query=None, all_projects=False, web_fallback=False,
+               answer_provider=None, answer_model=None):
         started = time.monotonic()
+        # Keep routing request-local: shared engines and injected one-argument mocks
+        # retain their default behavior, even during concurrent selected requests.
+        complete = self._complete
+        model_route = 'hermes-configured'
+        meta_warnings = []
+        if answer_provider is not None or answer_model is not None:
+            try:
+                from .model_selection import selected_completion
+            except ImportError:  # top-level use (tests, scripts)
+                from model_selection import selected_completion
+            complete = selected_completion(answer_provider, answer_model)
+            model_route = 'meta/muse-spark-1.3' if answer_provider == 'meta' and not answer_model else f'{answer_provider}/{answer_model}'
+        else:
+            # Hackathon default: Meta Muse Spark answers when a key is configured.
+            # Falls back to the Hermes configured model with a visible warning.
+            try:
+                from .meta_models import DEFAULT_META_MODEL, api_key_present, meta_completion
+            except ImportError:  # top-level use (tests, scripts)
+                from meta_models import DEFAULT_META_MODEL, api_key_present, meta_completion
+            if api_key_present():
+                hermes_complete = complete
+                try:
+                    meta_default = meta_completion()
+                except ValueError:
+                    meta_default = None
+                if meta_default is not None:
+                    _meta = meta_default
+                    _hermes = hermes_complete
+                    def complete(messages):
+                        try:
+                            return _meta(messages)
+                        except Exception:
+                            meta_warnings.append('Meta Model API unavailable; used the configured model.')
+                            return _hermes(messages)
+                    model_route = f'meta/{DEFAULT_META_MODEL}'
         # Blank-button assistance must retrieve the actual conversation topic, not just the UI's generic instruction.
         retrieval_query = f'{question} {transcript[-2000:]}' if transcript else question
         sources = self.search(retrieval_query, project=project, limit=6, all_projects=all_projects)
@@ -162,7 +198,7 @@ class KnowledgeEngine:
         if web_query is not None and web_query.strip():
             mode, query = 'explicit', web_query
         elif web_fallback:
-            plan = plan_web(_clean(question), _clean(transcript), sources, [p['name'] for p in self.projects()], self._complete)
+            plan = plan_web(_clean(question), _clean(transcript), sources, [p['name'] for p in self.projects()], complete)
             if plan['needed']:
                 mode, query = 'automatic', plan['query']
             elif plan['reason'] == 'planner_unavailable':
@@ -182,16 +218,17 @@ class KnowledgeEngine:
         payload = {'question': _clean(question)[:2000], 'transcript': _clean(transcript)[-6000:],
                    'evidence': [{'citation': i, 'title': s['title'], 'text': s['text'][:2050]} for i, s in enumerate(sources, 1)]}
         try:
-            text = self._complete([{'role': 'system', 'content': system}, {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)}])
+            text = complete([{'role': 'system', 'content': system}, {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)}])
             citations = [int(n) for n in re.findall(r'\[(\d+)\]', text)]
             if sources and (not citations or any(n < 1 or n > len(sources) for n in citations)):
                 warnings.append('Answer citations are missing or invalid; verify against the listed evidence.')
         except Exception as exc:
             text = 'A model answer is unavailable. Review the retrieved sources; no actions were performed.'
             warnings.append(f'Model request failed ({type(exc).__name__}).')
+        warnings.extend(meta_warnings)
         if not sources:
             warnings.append('No matching local/session evidence found; transcript alone is not independent verification.')
-        return {'answer': text, 'sources': sources, 'elapsed_seconds': round(time.monotonic() - started, 3), 'warnings': warnings, 'web_search': web}
+        return {'answer': text, 'sources': sources, 'elapsed_seconds': round(time.monotonic() - started, 3), 'warnings': warnings, 'web_search': web, 'model_route': model_route}
 
     @staticmethod
     def _rank(docs, terms, limit):

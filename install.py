@@ -7,7 +7,9 @@ import os
 from pathlib import Path
 import shutil
 
-FILES = ('server.py', 'knowledge.py', 'web_policy.py', 'audio.py', 'meetily.py')
+FILES = ('server.py', 'knowledge.py', 'web_policy.py', 'audio.py', 'meetily.py',
+         'macos_audio.py', 'audio_worker.py', 'model_selection.py', 'meta_models.py',
+         'native/macos_capture.swift', 'requirements-macos-audio.txt')
 
 
 def install(source, home):
@@ -22,11 +24,13 @@ def install(source, home):
     backup = home / 'backups' / ('meeting-copilot-live-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
     for path in (target, desktop):
         if path.exists():
-            shutil.copytree(path, backup / path.parent.name / path.name)
+            shutil.copytree(path, backup / path.parent.name / path.name,
+                            ignore=shutil.ignore_patterns('audio-runtime', '__pycache__'))
     core = target / 'dashboard' / 'core'
     core.mkdir(parents=True, exist_ok=True)
     desktop.mkdir(parents=True, exist_ok=True)
     for name in FILES:
+        (core / name).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source / name, core / name)
     (core / '__init__.py').write_text('', encoding='utf-8')
     (target / '__init__.py').write_text('def register(ctx):\n    pass\n', encoding='utf-8')
