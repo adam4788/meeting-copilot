@@ -244,5 +244,30 @@ class AskCliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertNotIn('[1]', buf.getvalue())
 
+    def test_provider_failure_exits_nonzero_without_leaking(self):
+        import ask
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+        def boom(messages):
+            raise RuntimeError('down:sekret-token')
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(ask, 'build_completion', return_value=boom):
+            with redirect_stdout(out), redirect_stderr(err):
+                code = ask.main(['--question', 'Q?', '--docs', self.docs,
+                                 '--provider', 'meta'])
+        self.assertEqual(code, 2)
+        self.assertNotIn('sekret-token', out.getvalue() + err.getvalue())
+
+    def test_meta_without_key_is_clean_error(self):
+        import ask
+        with unittest.mock.patch.dict('os.environ', {}, clear=False):
+            import os as _os
+            _os.environ.pop('MODEL_API_KEY', None)
+            with self.assertRaises(SystemExit) as ctx:
+                ask.main(['--question', 'Q?', '--docs', self.docs, '--provider', 'meta'])
+        self.assertNotEqual(ctx.exception.code, 0)
+        self.assertIn('MODEL_API_KEY', str(ctx.exception.code))
+
+
 if __name__ == '__main__':
     unittest.main()

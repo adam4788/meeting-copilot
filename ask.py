@@ -159,6 +159,10 @@ def main(argv=None):
                 if 'may be sent to' not in w and 'prior-session' not in w]
         result['warnings'] = (['Offline demo: no data leaves this machine; web research '
                                'and session history are disabled.'] + kept)
+    else:
+        # ask.py never wires session history, so the engine's prior-session
+        # caveat is stale here even for a live provider.
+        result['warnings'] = [w for w in result['warnings'] if 'prior-session' not in w]
     total = time.monotonic() - started
     if args.json:
         print(json.dumps({**result, 'total_seconds': total}, indent=2, default=str))
@@ -177,6 +181,13 @@ def main(argv=None):
         print('Warnings:')
         for warning in result['warnings']:
             print(f'  - {warning}')
+    if result.get('provider_error'):
+        # The provider call failed; the printed answer is an explicit
+        # fallback. Signal scripting callers without hiding the payload.
+        print(f"\n(request failed: {result['provider_error']}; see warnings above)", file=sys.stderr)
+        if not args.json:
+            print(f"\n({result['elapsed_seconds']:.2f}s engine, {total:.2f}s total; no answer produced)")
+        return 2
     if args.provider == 'fake':
         print(f"\n({result['elapsed_seconds']:.2f}s engine, {total:.2f}s total; offline web/history disabled)")
     else:
