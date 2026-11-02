@@ -13,8 +13,8 @@ without network access unless you opt into a provider:
 
 ```sh
 python demo_standalone.py            # offline fixture demo, exits nonzero on failure
-python ask.py --question "What did the supplier quote?" --docs ./sample-docs --provider fake
-MODEL_API_KEY=... python ask.py --question "..." --docs ./sample-docs --provider meta
+python ask.py --question "What is the unit price?" --docs ./sample-docs --provider fake
+MODEL_API_KEY=<a-real-key> python ask.py --question "..." --docs ./sample-docs --provider meta
 ```
 
 `ask.py` answers from a docs folder (`<docs>/<project>/*.md|txt|rst`) plus an

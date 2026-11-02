@@ -10,6 +10,8 @@ Usage:
   python ask.py --question "..." --docs ./sample-docs \
       [--transcript meeting.json] [--project NAME] [--provider fake|meta] \
       [--model meta-...] [--json]
+  The default provider is fake (fully offline). Use --provider meta with a
+  real MODEL_API_KEY for live answers.
 """
 
 import argparse
@@ -102,8 +104,8 @@ def main(argv=None):
     parser.add_argument('--project', default=None, help='Project subfolder under --docs '
                         '(default: the only subfolder, if exactly one).')
     parser.add_argument('--all', action='store_true', help='Search all projects under --docs.')
-    parser.add_argument('--provider', default='meta', choices=('meta', 'fake'),
-                        help='Completion backend (default meta; fake is offline).')
+    parser.add_argument('--provider', default='fake', choices=('meta', 'fake'),
+                        help='Completion backend (default fake: fully offline).')
     parser.add_argument('--model', default=None, help='Meta model override.')
     parser.add_argument('--web-query', default=None,
                         help='NOT YET SUPPORTED standalone: exits with guidance.')

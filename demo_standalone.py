@@ -149,7 +149,10 @@ def main():
     print()
     if FAILURES:
         print(f'{len(FAILURES)} failing scenario(s): {FAILURES}')
+        print(f'Fixtures kept for inspection: {tmp}')
         return 1
+    import shutil as _shutil
+    _shutil.rmtree(tmp, ignore_errors=True)
     print('standalone fixture demo: all scenarios passed (offline, no Hermes).')
     return 0
 

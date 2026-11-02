@@ -162,6 +162,25 @@ class CoreAcceptanceTests(NoHermesTestCase):
             result = core.answer('Price?', transcript='t', project='acme')
         self.assertIn('[1]', result['answer'])
 
+    def test_injected_streaming_completion_streams(self):
+        def complete(messages):
+            return 'Full [1].'
+        def chunks(messages):
+            yield 'Part '
+            yield 'one [1].'
+        complete.stream_chunks = chunks
+        core = self._core(completion=complete)
+        self.assertTrue(core.engine.supports_streaming())
+        header, deltas = core.engine.answer_stream('What is the price?', transcript='t', project='acme')
+        self.assertEqual(list(deltas), ['Part ', 'one [1].'])
+        self.assertEqual(header['model_route'], 'injected')
+
+    def test_injected_plain_completion_reports_completed_only(self):
+        core = self._core(completion=lambda messages: 'Cited [1].')
+        self.assertFalse(core.engine.supports_streaming())
+        with self.assertRaises(NotImplementedError):
+            core.engine.answer_stream('What is the price?', transcript='t', project='acme')
+
 class AskCliTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix='ask-cli-')
@@ -209,7 +228,6 @@ class AskCliTests(unittest.TestCase):
                              '--provider', 'fake'])
         self.assertEqual(code, 0)
         self.assertNotIn('[1]', buf.getvalue())
-
 
 if __name__ == '__main__':
     unittest.main()

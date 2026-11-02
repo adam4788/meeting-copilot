@@ -24,6 +24,11 @@ def _completion_supports_streaming(complete):
     return callable(getattr(complete, 'stream_chunks', None))
 
 
+def _resolve_override(override):
+    """Unwrap a provider object to the callable the engine actually invokes."""
+    return getattr(override, 'complete', override)
+
+
 class _Aborted(Exception):
     """Raised when a request-scoped should_abort gate fires before an
     outbound provider call. Callers treat this as cancellation, never as
@@ -247,6 +252,8 @@ class KnowledgeEngine:
                         complete = meta_completion()
                     except ValueError:
                         return False
+                elif self._completion_override is not None:
+                    complete = _resolve_override(self._completion_override)
                 else:
                     complete = self._complete
             return _completion_supports_streaming(complete)
@@ -455,7 +462,9 @@ class KnowledgeEngine:
         sources = self.search(retrieval_query, project=project, limit=6, all_projects=all_projects)
         if aborted():
             raise _Aborted('cancelled before provider submission')
-        complete = self._complete
+        complete = (_resolve_override(self._completion_override)
+                    if self._completion_override is not None
+                    else self._complete)
         injected = self._completion_override is not None
         model_route = 'injected' if injected else 'hermes-configured'
         stream_fn = None
