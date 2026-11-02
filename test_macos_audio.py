@@ -289,9 +289,14 @@ class WorkerTests(unittest.TestCase):
             info = Path(temp) / 'Info.plist'
             info.write_bytes(plistlib.dumps({'CFBundleIdentifier': 'ai.nous.meeting-copilot.audio',
                                             'NSMicrophoneUsageDescription': 'Transcribe microphone audio only when you start meeting capture.'}))
-            subprocess.run(['/usr/bin/swiftc', '-parse-as-library', str(root / 'native/macos_capture.swift'),
+            # AVAudioSinkNode requires the macOS 26 SDK (workflow pins macos-26):
+            # never swallow the compiler output, or the next toolchain skew
+            # fails with only an exit status again.
+            proc = subprocess.run(['/usr/bin/swiftc', '-parse-as-library', str(root / 'native/macos_capture.swift'),
                             '-Xlinker', '-sectcreate', '-Xlinker', '__TEXT', '-Xlinker', '__info_plist', '-Xlinker', str(info),
-                            '-o', str(binary)], check=True, capture_output=True, timeout=120)
+                            '-o', str(binary)], check=False, capture_output=True, timeout=120, text=True)
+            self.assertEqual(proc.returncode, 0,
+                             f'swiftc failed (exit {proc.returncode}):\n--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}')
             result = subprocess.run([str(binary), '--check-only'], check=True, capture_output=True, timeout=5)
             self.assertIn(b'"capture_started":false', result.stdout)
             self.assertTrue(json.loads(result.stdout)['microphone_usage_description'])

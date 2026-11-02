@@ -30,7 +30,22 @@ class SnapshotBoundaryTests(unittest.TestCase):
             for i in range(count)]}
         staged = folder / 'next.json'
         staged.write_text(json.dumps(payload))
-        staged.replace(folder / 'transcripts.json')
+        # The bridge polls transcripts.json continuously; on Windows the
+        # atomic replace can briefly collide with an open reader (WinError
+        # 5/32) even though readers use share-tolerant handles. Retry only
+        # transient sharing violations with a hard deadline, like the
+        # test_meetily.py writer helper does.
+        import os as _os
+        import time as _time
+        deadline = _time.monotonic() + 2
+        while True:
+            try:
+                staged.replace(folder / 'transcripts.json')
+                break
+            except PermissionError as exc:
+                if _os.name != 'nt' or getattr(exc, 'winerror', None) not in (5, 32) or _time.monotonic() >= deadline:
+                    raise
+                _time.sleep(.005)
 
     def wait_for(self, predicate):
         end = time.monotonic() + 3
