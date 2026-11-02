@@ -247,13 +247,13 @@ class KnowledgeEngine:
                     from .meta_models import api_key_present, meta_completion
                 except ImportError:
                     from meta_models import api_key_present, meta_completion
-                if api_key_present():
+                if self._completion_override is not None:
+                    complete = _resolve_override(self._completion_override)
+                elif api_key_present():
                     try:
                         complete = meta_completion()
                     except ValueError:
                         return False
-                elif self._completion_override is not None:
-                    complete = _resolve_override(self._completion_override)
                 else:
                     complete = self._complete
             return _completion_supports_streaming(complete)

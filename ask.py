@@ -169,12 +169,19 @@ def main(argv=None):
     for i, source in enumerate(result['sources'], 1):
         title = source.get('title') or source.get('source') or 'source'
         print(f'  [{i}] {title} ({source.get("source", "")})')
+        snippet = (source.get('text') or '').strip().replace('\n', ' ')
+        if snippet:
+            print(f'      {snippet[:200]}')
     if result['warnings']:
         print()
         print('Warnings:')
         for warning in result['warnings']:
             print(f'  - {warning}')
-    print(f"\n({result['elapsed_seconds']:.2f}s engine, {total:.2f}s total; offline web/history disabled)")
+    if args.provider == 'fake':
+        print(f"\n({result['elapsed_seconds']:.2f}s engine, {total:.2f}s total; offline web/history disabled)")
+    else:
+        print(f"\n({result['elapsed_seconds']:.2f}s engine, {total:.2f}s total; web research and session history "
+              f"disabled — question plus selected snippets went to {args.provider}.)")
     return 0
 
 

@@ -175,6 +175,21 @@ class CoreAcceptanceTests(NoHermesTestCase):
         self.assertEqual(list(deltas), ['Part ', 'one [1].'])
         self.assertEqual(header['model_route'], 'injected')
 
+    def test_streaming_probe_follows_override_despite_env_key(self):
+        import os as _os
+        def plain(messages):
+            return 'Cited [1].'
+        def streamer(messages):
+            return 'Full [1].'
+        def chunks(messages):
+            yield 'Part [1].'
+        streamer.stream_chunks = chunks
+        with unittest.mock.patch.dict(_os.environ, {'MODEL_API_KEY': '0123456789abcdef'}):
+            plain_core = self._core(completion=plain)
+            stream_core = self._core(completion=streamer)
+            self.assertFalse(plain_core.engine.supports_streaming())
+            self.assertTrue(stream_core.engine.supports_streaming())
+
     def test_injected_plain_completion_reports_completed_only(self):
         core = self._core(completion=lambda messages: 'Cited [1].')
         self.assertFalse(core.engine.supports_streaming())
