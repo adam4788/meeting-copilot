@@ -25,7 +25,10 @@ jobs:
       - run: node --check desktop/plugin.js
       - run: node --test test_desktop.mjs
   macos-build:
-    runs-on: macos-latest
+    # macos_capture.swift uses AVAudioSinkNode (macOS 26 SDK). macos-latest
+    # resolved to an older image whose toolchain rejects it, so pin the
+    # image whose Xcode ships the required SDK.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

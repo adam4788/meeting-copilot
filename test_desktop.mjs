@@ -249,11 +249,19 @@ test('pane uses only approved theme vars and no resurrected scope controls', () 
   assert.match(source, /\/overlay\/scope/);
 });
 
+function reactImports(src) {
+  // Checkouts may use CRLF: `/\}.*$/` cannot cross a trailing `\r`
+  // (`.` excludes it and `$` will not match mid-string), so normalize
+  // line endings before parsing or `useRef } from 'react';` counts as a name.
+  const text = src.replace(/\r\n?/g, '\n');
+  const importLine = text.split('\n').find(l => l.startsWith('import {') && l.includes('react'));
+  assert.ok(importLine, 'expected a react import line');
+  return new Set(importLine.replace(/^import \{/, '').replace(/\}.*$/, '').split(',').map(s => s.trim()));
+}
+
 test('pane imports every React hook it calls (no undeclared globals)', () => {
   const src = readFileSync(new URL('./desktop/plugin.js', import.meta.url), 'utf8');
-  const importLine = src.split('\n').find(l => l.startsWith('import {') && l.includes('react'));
-  assert.ok(importLine, 'expected a react import line');
-  const imported = new Set(importLine.replace(/^import \{/, '').replace(/\}.*$/, '').split(',').map(s => s.trim()));
+  const imported = reactImports(src);
   const called = new Set([...src.matchAll(/(?<![A-Za-z0-9_.])use[A-Z]\w*(?=\()/g)].map(m => m[0]));
   const provided = new Set(['useState', 'useRef', 'useEffect', 'useQueryClient', 'useQuery', 'useValue']);
   for (const hook of called) {
@@ -263,6 +271,14 @@ test('pane imports every React hook it calls (no undeclared globals)', () => {
     }
   }
   assert.ok(imported.has('useRef'), 'useRef must be imported from react');
+});
+
+test('react import parser tolerates CRLF checkouts', () => {
+  const src = readFileSync(new URL('./desktop/plugin.js', import.meta.url), 'utf8');
+  const crlf = src.replace(/\n/g, '\r\n');
+  const imported = reactImports(crlf);
+  assert.ok(imported.has('useRef'), 'CRLF must not fuse the import tail into a name');
+  assert.ok(![...imported].some(s => s.includes('react')), 'no `} from \'react\'` fragments as names');
 });
 
 test('rejected scope sync keeps the stale warning actionable', async () => {
