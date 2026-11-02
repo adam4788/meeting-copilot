@@ -7,6 +7,7 @@ only from the MODEL_API_KEY environment variable of the gateway process --
 never from request bodies -- and nothing here reads or writes Hermes global
 configuration or credentials.
 """
+import codecs
 import json
 import os
 import urllib.request
@@ -45,7 +46,13 @@ def meta_completion(model=None):
             headers={'Authorization': 'Bearer ' + key.strip(), 'Content-Type': 'application/json'})
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
-                payload = json.loads(response.read().decode('utf-8', errors='replace'))
+                raw = response.read(262144 + 1)
+        except Exception as exc:
+            raise RuntimeError(f'Meta Model API request failed ({type(exc).__name__})') from None
+        if len(raw) > 262144:
+            raise RuntimeError('Meta Model API response exceeded size bound') from None
+        try:
+            payload = json.loads(raw.decode('utf-8', errors='replace'))
         except Exception as exc:
             raise RuntimeError(f'Meta Model API request failed ({type(exc).__name__})') from None
         try:
@@ -75,19 +82,39 @@ def meta_completion(model=None):
         except Exception as exc:
             raise RuntimeError(f'Meta Model API request failed ({type(exc).__name__})') from None
         deltas = []
+        total_chars = 0
         leftover = ''
+        decoder = codecs.getincrementaldecoder('utf-8')()
+        # Prefer read1: HTTPResponse.read returns only when the full amount
+        # arrives (or EOF), which blocks first-token latency on real SSE.
+        # read1 returns after at most one underlying syscall and stays
+        # chunked-encoding aware (HTTPResponse._read1_chunked). Fall back to
+        # read for file-like test doubles without read1.
+        read1 = getattr(response, 'read1', None)
+        read_piece = read1 if callable(read1) else response.read
         try:
             while True:
-                piece = response.read(4096)
+                piece = read_piece(4096)
+                if not isinstance(piece, (bytes, bytearray)):
+                    raise RuntimeError('Meta Model API returned no text answer') from None
                 if not piece:
-                    chunk, leftover = leftover, ''
+                    try:
+                        chunk = leftover + decoder.decode(b'', True)
+                    except UnicodeError:
+                        raise RuntimeError('Meta Model API returned no text answer') from None
+                    leftover = ''
                 else:
-                    chunk = leftover + piece.decode('utf-8', errors='replace')
+                    try:
+                        chunk = leftover + decoder.decode(piece, False)
+                    except UnicodeError:
+                        raise RuntimeError('Meta Model API returned no text answer') from None
                     leftover = ''
                     if not chunk.endswith('\n'):
                         split = chunk.rfind('\n')
                         if split == -1:
                             leftover = chunk
+                            if len(leftover) > 65536:
+                                raise RuntimeError('Meta Model API returned no text answer') from None
                             continue
                         leftover, chunk = chunk[split + 1:], chunk[:split + 1]
                 done = False
@@ -106,6 +133,10 @@ def meta_completion(model=None):
                         raise RuntimeError('Meta Model API returned no text answer') from None
                     if not isinstance(payload, dict):
                         continue
+                    if 'error' in payload:
+                        # Provider failure frame: sanitized RuntimeError, never
+                        # silent completed-only, without echoing payload text.
+                        raise RuntimeError('Meta Model API request failed (provider-error)') from None
                     choices = payload.get('choices')
                     if not isinstance(choices, list):
                         continue
@@ -117,11 +148,29 @@ def meta_completion(model=None):
                         if isinstance(content, str) and content:
                             deltas.append(content)
                             yield content
+                            total_chars += len(content)
+                            if total_chars > 262144:
+                                # Bounded accumulation: the server keeps the
+                                # partial answer with an interruption note
+                                # instead of growing without limit.
+                                raise NotImplementedError('streaming_truncated:size-bound')
+                        reason = choice.get('finish_reason')
+                        if reason == 'length':
+                            # Cut off by the output limit: partial text only,
+                            # never a complete answer — even with [DONE].
+                            raise NotImplementedError('streaming_truncated:length-limit')
+                        if reason == 'stop':
+                            done = True
                 if done or not piece:
                     break
             if not deltas:
                 # No incremental frames arrived: honest completed-only signal.
                 raise NotImplementedError('streaming_unsupported:completed-only-response')
+            if not done:
+                # Deltas without a terminal marker are a truncated stream, not
+                # a successful answer: the server keeps the partial text with
+                # an interruption note and offers retry.
+                raise NotImplementedError('streaming_truncated:eof-without-done')
         finally:
             try:
                 response.close()

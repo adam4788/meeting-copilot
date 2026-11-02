@@ -97,8 +97,16 @@ class MetaModelTests(unittest.TestCase):
         with patch.dict(sys.modules, {'hermes_cli.models': models}):
             with patch.dict(os.environ, {}, clear=False):
                 os.environ.pop('MODEL_API_KEY', None)
+                try:
+                    selection.clear_catalog_cache()
+                except Exception:
+                    pass
                 without = selection.available_models()
             with patch.dict(os.environ, {'MODEL_API_KEY': 'test-key-12345'}):
+                try:
+                    selection.clear_catalog_cache()
+                except Exception:
+                    pass
                 with_key = selection.available_models()
         self.assertEqual(without, hermes)
         meta = [p for p in with_key['providers'] if p['id'] == 'meta']
@@ -192,3 +200,299 @@ class MetaStreamingTests(unittest.TestCase):
             with patch('urllib.request.urlopen', return_value=FakeCompleted()):
                 with self.assertRaisesRegex(NotImplementedError, 'streaming_unsupported'):
                     list(module.meta_completion().stream_chunks([{'role': 'user', 'content': 'hi'}]))
+
+    def test_split_utf8_reassembles_across_reads(self):
+        module = meta_module()
+        raw = ('data: {"choices":[{"delta":{"content":"✓"}}]}\n\ndata: [DONE]\n\n').encode('utf-8')
+
+        class FakeStream:
+            def __init__(self, pieces):
+                self._pieces = list(pieces)
+            def read(self, size=-1):
+                return self._pieces.pop(0) if self._pieces else b''
+            def close(self):
+                pass
+
+        # Every byte split position across the multi-byte sequence reassembles
+        # to the intact character via the incremental decoder.
+        for split in range(1, len(raw)):
+            with self.subTest(split=split):
+                with patch.dict(os.environ, {'MODEL_API_KEY': 'test-key-12345'}):
+                    with patch('urllib.request.urlopen', return_value=FakeStream([raw[:split], raw[split:]])):
+                        chunks = list(module.meta_completion().stream_chunks([{'role': 'user', 'content': 'hi'}]))
+                self.assertEqual(chunks, ['✓'])
+
+    def test_provider_error_frame_is_sanitized_failure(self):
+        module = meta_module()
+
+        class FakeStream:
+            def __init__(self, pieces):
+                self._pieces = list(pieces)
+            def read(self, size=-1):
+                return self._pieces.pop(0) if self._pieces else b''
+            def close(self):
+                pass
+
+        # Error-only stream: sanitized RuntimeError, never completed-only,
+        # never echoing the provider message.
+        with patch.dict(os.environ, {'MODEL_API_KEY': 'test-key-12345'}):
+            with patch('urllib.request.urlopen', return_value=FakeStream(
+                    [b'data: {"error":{"message":"quota super-secret-key"}}\n\ndata: [DONE]\n\n'])):
+                with self.assertRaisesRegex(RuntimeError, 'provider-error'):
+                    list(module.meta_completion().stream_chunks([{'role': 'user', 'content': 'hi'}]))
+        # Error after a partial delta: still a failure, still sanitized.
+        with patch.dict(os.environ, {'MODEL_API_KEY': 'test-key-12345'}):
+            with patch('urllib.request.urlopen', return_value=FakeStream(
+                    [b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n',
+                     b'data: {"error":{"message":"quota super-secret-key"}}\n\ndata: [DONE]\n\n'])):
+                try:
+                    list(module.meta_completion().stream_chunks([{'role': 'user', 'content': 'hi'}]))
+                except RuntimeError as exc:
+                    self.assertIn('provider-error', str(exc))
+                    self.assertNotIn('quota', str(exc))
+                    self.assertNotIn('secret', str(exc))
+                else:
+                    self.fail('provider error after partial delta must raise')
+
+    def test_invalid_byte_is_sanitized_and_response_closed(self):
+        module = meta_module()
+        secret = 'super-secret-key-12345'
+
+        class FakeStream:
+            def __init__(self, pieces):
+                self._pieces = list(pieces)
+                self.closed = False
+            def read(self, size=-1):
+                return self._pieces.pop(0) if self._pieces else b''
+            def close(self):
+                self.closed = True
+
+        stream = FakeStream([b'data: {"choices":[{"delta":{"content":"\xff' + secret.encode() + b'"}}]}\n\n'])
+        with patch.dict(os.environ, {'MODEL_API_KEY': 'test-key-12345'}):
+            with patch('urllib.request.urlopen', return_value=stream):
+                try:
+                    list(module.meta_completion().stream_chunks([{'role': 'user', 'content': 'hi'}]))
+                except RuntimeError as exc:
+                    self.assertIn('no text answer', str(exc))
+                    self.assertNotIn(secret, str(exc))
+                    self.assertNotIn('\xff', str(exc))
+                else:
+                    self.fail('invalid byte must raise')
+        self.assertTrue(stream.closed)
+
+    def test_truncated_utf8_on_eof_is_sanitized_and_response_closed(self):
+        module = meta_module()
+
+        class FakeStream:
+            def __init__(self, pieces):
+                self._pieces = list(pieces)
+                self.closed = False
+            def read(self, size=-1):
+                return self._pieces.pop(0) if self._pieces else b''
+            def close(self):
+                self.closed = True
+
+        # Truncated 3-byte sequence for U+2713 at EOF: incremental finalize
+        # raises UnicodeDecodeError, which must surface sanitized.
+        bad = b'data: {"choices":[{"delta":{"content":"a\xe2\x82'
+        stream = FakeStream([bad])
+        with patch.dict(os.environ, {'MODEL_API_KEY': 'test-key-12345'}):
+            with patch('urllib.request.urlopen', return_value=stream):
+                try:
+                    list(module.meta_completion().stream_chunks([{'role': 'user', 'content': 'hi'}]))
+                except RuntimeError as exc:
+                    self.assertIn('no text answer', str(exc))
+                    self.assertNotIn('\xe2', str(exc))
+                else:
+                    self.fail('truncated UTF-8 at EOF must raise')
+        self.assertTrue(stream.closed)
+
+    def test_read1_delivers_first_delta_before_second_frame(self):
+        import queue
+        import threading
+        module = meta_module()
+        first = b'data: {"choices":[{"delta":{"content":"one"}}]}\n\n'
+        second = b'data: {"choices":[{"delta":{"content":"two"}}]}\n\ndata: [DONE]\n\n'
+        release_second = threading.Event()
+
+        class FakeRawHTTPResponse:
+            """Mimics real urllib HTTPResponse: read1 returns promptly while
+            plain read(4096) would block for the full amount."""
+            def __init__(self):
+                self.closed = False
+                self.calls = []
+                self._n = 0
+            def read1(self, size=-1):
+                self.calls.append('read1')
+                self._n += 1
+                if self._n == 1:
+                    return first
+                release_second.wait(timeout=10)
+                return second
+            def read(self, size=-1):
+                self.calls.append('read')
+                raise AssertionError('must use read1, not blocking read')
+            def close(self):
+                self.closed = True
+
+        stream = FakeRawHTTPResponse()
+        out = queue.Queue()
+        errors = queue.Queue()
+
+        def consume():
+            try:
+                for delta in module.meta_completion('muse-spark-1.2').stream_chunks(
+                        [{'role': 'user', 'content': 'hi'}]):
+                    out.put(delta)
+            except Exception as exc:  # pragma: no cover - surfaced on join
+                errors.put(exc)
+
+        with patch.dict(os.environ, {'MODEL_API_KEY': 'test-key-12345'}):
+            with patch('urllib.request.urlopen', return_value=stream):
+                worker = threading.Thread(target=consume, daemon=True)
+                worker.start()
+                try:
+                    # First delta must arrive while the second frame is still
+                    # blocked (provider not complete).
+                    got = out.get(timeout=10)
+                    self.assertEqual(got, 'one')
+                finally:
+                    release_second.set()
+                worker.join(timeout=10)
+                self.assertFalse(worker.is_alive())
+                rest = []
+                while not out.empty():
+                    rest.append(out.get_nowait())
+                self.assertEqual(rest, ['two'])
+                self.assertTrue(all(c == 'read1' for c in stream.calls))
+                self.assertTrue(stream.closed)
+                self.assertTrue(errors.empty())
+
+    def test_stream_cancel_closes_response(self):
+        module = meta_module()
+
+        class FakeStream:
+            def __init__(self, pieces):
+                self._pieces = list(pieces)
+                self.closed = False
+            def read(self, size=-1):
+                return self._pieces.pop(0) if self._pieces else b''
+            def close(self):
+                self.closed = True
+
+        frames = [b'data: {"choices":[{"delta":{"content":"one"}}]}\n\n',
+                  b'data: {"choices":[{"delta":{"content":"two"}}]}\n\ndata: [DONE]\n\n']
+        stream = FakeStream(frames)
+        with patch.dict(os.environ, {'MODEL_API_KEY': 'test-key-12345'}):
+            with patch('urllib.request.urlopen', return_value=stream):
+                gen = module.meta_completion().stream_chunks([{'role': 'user', 'content': 'hi'}])
+                self.assertEqual(next(gen), 'one')
+                gen.close()
+        self.assertTrue(stream.closed)
+
+
+class StreamBoundTests(unittest.TestCase):
+    def test_oversized_stream_truncates_with_explicit_signal(self):
+        module = meta_module()
+        big = 'x' * 70000
+        frames = [f'data: {{"choices":[{{"delta":{{"content":"{big}"}}}}]}}\n\n'.encode()] * 5 + [b'data: [DONE]\n\n']
+
+        class FakeStream:
+            def __init__(self, pieces):
+                self._pieces = list(pieces)
+            def read(self, size=-1):
+                return self._pieces.pop(0) if self._pieces else b''
+            def read1(self, size=-1):
+                return self.read(size)
+            def close(self):
+                pass
+
+        import json as _json
+        with patch.dict(os.environ, {'MODEL_API_KEY': 'test-key-12345'}):
+            with patch('urllib.request.urlopen', return_value=FakeStream(frames)):
+                gen = module.meta_completion('muse-spark-1.2').stream_chunks([{'role': 'user', 'content': 'hi'}])
+                seen = []
+                with self.assertRaisesRegex(NotImplementedError, 'truncated'):
+                    for chunk in gen:
+                        seen.append(chunk)
+        self.assertTrue(seen)
+        self.assertLess(sum(map(len, seen)), 400000)
+
+
+class CompletedBoundTests(unittest.TestCase):
+    def test_oversized_completed_response_is_rejected(self):
+        module = meta_module()
+
+        class FakeBig:
+            def read(self, size=-1):
+                return b'x' * (262144 + 1) if size is None or size < 0 or size > 262144 else b'x' * size
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        with patch.dict(os.environ, {'MODEL_API_KEY': 'test-key-12345'}):
+            with patch('urllib.request.urlopen', return_value=FakeBig()):
+                with self.assertRaisesRegex(RuntimeError, 'size bound'):
+                    module.meta_completion('muse-spark-1.2')([{'role': 'user', 'content': 'hi'}])
+
+
+class TruncatedStreamTests(unittest.TestCase):
+    def test_eof_without_done_is_truncation_not_success(self):
+        module = meta_module()
+
+        class FakeStream:
+            def __init__(self, pieces):
+                self._pieces = list(pieces)
+            def read(self, size=-1):
+                return self._pieces.pop(0) if self._pieces else b''
+            def read1(self, size=-1):
+                return self.read(size)
+            def close(self):
+                pass
+
+        frames = [b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n']
+        with patch.dict(os.environ, {'MODEL_API_KEY': 'test-key-12345'}):
+            with patch('urllib.request.urlopen', return_value=FakeStream(frames)):
+                gen = module.meta_completion('muse-spark-1.2').stream_chunks([{'role': 'user', 'content': 'hi'}])
+                seen = []
+                with self.assertRaisesRegex(NotImplementedError, 'truncated'):
+                    for chunk in gen:
+                        seen.append(chunk)
+        self.assertEqual(seen, ['partial'])
+
+
+class MetaFinishReasonTests(unittest.TestCase):
+    def _stream(self, frames):
+        module = meta_module()
+        class FakeStream:
+            def __init__(self, pieces):
+                self._pieces = list(pieces)
+            def read(self, size=-1):
+                return self._pieces.pop(0) if self._pieces else b''
+            def close(self):
+                pass
+        with patch.dict(os.environ, {'MODEL_API_KEY': 'test-key-12345'}):
+            with patch('urllib.request.urlopen', return_value=FakeStream(frames)):
+                gen = module.meta_completion('muse-spark-1.2').stream_chunks([{'role': 'user', 'content': 'hi'}])
+                seen = []
+                try:
+                    for chunk in gen:
+                        seen.append(chunk)
+                except NotImplementedError as exc:
+                    return seen, str(exc)
+                return seen, None
+
+    def test_length_limit_is_truncation_even_with_done(self):
+        seen, err = self._stream([
+            b'data: {"choices":[{"delta":{"content":"partial"},"finish_reason":"length"}]}\n\n',
+            b'data: [DONE]\n\n'])
+        self.assertEqual(seen, ['partial'])
+        self.assertIn('length-limit', err or '')
+
+    def test_stop_without_done_completes_cleanly(self):
+        seen, err = self._stream([
+            b'data: {"choices":[{"delta":{"content":"Two "}}]}\n\n',
+            b'data: {"choices":[{"delta":{"content":"reviewers."},"finish_reason":"stop"}]}\n\n'])
+        self.assertEqual(seen, ['Two ', 'reviewers.'])
+        self.assertIsNone(err)

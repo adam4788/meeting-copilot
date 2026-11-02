@@ -9,7 +9,7 @@
 - A configured answer provider receives the question, bounded recent transcript,
   and retrieved source snippets. This may be a hosted provider. Local transcription
   is **not** a promise that answer generation stays local.
-- Public search receives either the query the user explicitly enters or, when **automatic web fallback** is on (default), a short generic query drafted by your configured model when local evidence looks insufficient. Drafted queries are filtered for URLs, emails, IPs, paths, secret-like text and project names, and fail closed on any error. This filtering is best effort, not DLP: **turn the fallback off for sensitive calls.**
+- Public search receives either the query the user explicitly enters or, when **automatic web fallback** is opted in (off by default), a short generic query drafted by your configured model when local evidence looks insufficient. Drafted queries are filtered for URLs, emails, IPs, paths, secret-like text and project names, and fail closed on any error. This filtering is best effort, not DLP: **keep the fallback off for sensitive calls.**
 - **All projects + sessions** scope reads up to 100 eligible project folders under the project root (never the whole computer); evidence from unrelated projects may reach the configured model.
 - Project/session access is read-only. No model tools, automatic speech, chat
   messages, or business-system writes are granted.
@@ -24,7 +24,11 @@ configured model. Source snippets may contain inaccurate or adversarial text.
 Session history records statements, not independently verified execution.
 
 Clear meeting removes the application's displayed buffer/result; it cannot undo
-an answer request already sent to a provider. Pause stops new capture but does
+an answer request already sent to a provider. Clear is a process-local
+forget-everything boundary, not durable deletion: it suppresses cleared
+content on every later scan and releases retained transcript text, but the
+Meetily source files are untouched, so re-attaching after a backend restart
+can surface source transcript content again. Pause stops new capture but does
 not erase the transcript. Closing the pane triggers pause, with a heartbeat
 expiry fallback. Audio device changes may require restarting capture.
 

@@ -7,16 +7,32 @@ from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 
+def _is_engine_abort(exc):
+    """True when the engine raised its cooperative-cancellation signal."""
+    try:
+        from knowledge import _Aborted
+    except ImportError:
+        _Aborted = None
+    if _Aborted is not None and isinstance(exc, _Aborted):
+        return True
+    # The deployed dashboard loads the engine under a namespaced package, so
+    # a packaged _Aborted is a different class object: match by signal name.
+    # _Aborted is engine-private (never raised by providers or transports).
+    return type(exc).__name__ == '_Aborted'
+
+
 class AssistRequest(BaseModel):
     question: str = Field(default='', max_length=4000)
     request_id: str | None = Field(default=None, max_length=100)
     row_id: str | None = Field(default=None, max_length=200)
     project: str | None = Field(default=None, max_length=1000)
     all_projects: bool = False
-    web_fallback: bool = True
+    web_fallback: bool = False
     web_query: str | None = Field(default=None, max_length=300)
     answer_provider: str | None = Field(default=None, max_length=100)
     answer_model: str | None = Field(default=None, max_length=200)
+    # Exact-replay retry: a stored transcript snapshot instead of current segments.
+    transcript: str | None = Field(default=None, max_length=16000)
 
 
 class AssistCancelRequest(BaseModel):
@@ -33,6 +49,7 @@ class CaptureRequest(BaseModel):
     recording_id: str | None = Field(default=None, max_length=500)
     transcription_model: Literal['tiny.en', 'base.en', 'small.en'] = 'base.en'
     audio_source: Literal['microphone', 'system', 'both'] = 'microphone'
+    new_meeting: bool = False
 
 
 class MeetingState:
@@ -47,21 +64,31 @@ class MeetingState:
         self.audio = None
         self.capture_info = {}
         self.last_seen = time.monotonic()
+        self.pane_seen = self.last_seen
         self.engine_factory = engine_factory
         self.engine = None
         self.busy = False
         self.result = None
         self.requests = {}
         self.request_seq = 0
+        self.live_workers = 0
         self.generation = 0
         self.capture_generation = 0
+        self._status_generation = 0
+        self.retiring_generations = {}
         self.lock = threading.RLock()
         self.lifecycle_lock = threading.RLock()
         self.overlay_lock = threading.RLock()
+        self.overlay_lease_seq = 0
         self.capture_error = None
         self.segments = deque(maxlen=120)
         self.listening = False
         self.error = None
+        self.error_request = None
+        # A failed Meetily forget-boundary must not look like a clean Clear:
+        # the adapter keeps serving its old snapshot until the boundary is
+        # installed, so the failure stays visible until a later Clear lands it.
+        self.meetily_clear_error = None
         self.overlay = None
         self.overlay_scope_value = {}
 
@@ -71,6 +98,8 @@ class MeetingState:
             with self.lock:
                 item = {'speaker': str(segment.get('speaker', 'remote'))[:30], 'text': text,
                         'timestamp': segment.get('timestamp', time.time())}
+                if segment.get('partial_tail') is True:
+                    item['partial_tail'] = True
                 segment_id = segment.get('id')
                 if segment_id is not None:
                     item['id'] = str(segment_id)[:600]
@@ -112,86 +141,294 @@ class MeetingState:
                 self.audio_options = options
             return self.audio
 
-    def start(self, consent, backend='meetily', recording_id=None, transcription_model='base.en', audio_source='microphone'):
+    def start(self, consent, backend='meetily', recording_id=None, transcription_model='base.en', audio_source='microphone',
+              new_meeting=False):
         # Serialize the actual backend operation, not merely the UI state transition.
         # Status/segment callbacks take only self.lock, so stop/join cannot deadlock them.
         with self.lifecycle_lock:
-            return self._start(consent, backend, recording_id, transcription_model, audio_source)
+            return self._start(consent, backend, recording_id, transcription_model, audio_source, new_meeting)
 
-    def _start(self, consent, backend='meetily', recording_id=None, transcription_model='base.en', audio_source='microphone'):
+    def _start(self, consent, backend='meetily', recording_id=None, transcription_model='base.en', audio_source='microphone',
+               new_meeting=False):
         from fastapi import HTTPException
         if not consent:
             raise HTTPException(400, 'Confirm participant consent and audio capture before starting.')
         if backend == 'meetily' and not recording_id:
             raise HTTPException(400, 'Start a recording in Meetily, then explicitly select it here.')
         with self.lock:
+            # Check under the same lock Clear uses to record the failure, and
+            # before any state mutation: a concurrent plain start must block
+            # until a paused Clear publishes its outcome instead of reading a
+            # stale clean flag, and a rejected start must not flip listening
+            # on or advance the generation (a retry would then early-return
+            # as "already listening" without ever attaching).
+            if backend == 'meetily' and not new_meeting and self.meetily_clear_error is not None:
+                raise HTTPException(409, self.meetily_clear_error)
             if self.listening:
                 return {'listening': True}
             if backend in ('native', 'macos'):
                 self.get_audio(backend, transcription_model, audio_source)
+            self.last_start_args = (backend, recording_id, transcription_model, audio_source)
             session_key = (backend, recording_id if backend == 'meetily' else (transcription_model, audio_source))
-            if self.session_key != session_key:
+            # A new meeting never inherits the prior one: same-settings start
+            # defaults to resume (keeps transcript, results, retry data), while
+            # an explicit new_meeting — or a different session — clears them.
+            if self.session_key != session_key or (new_meeting and not self.listening):
                 self.segments.clear()
                 self.result = None
                 self.capture_info = {}
+                # New meeting: no tail window from the previous session, and no
+                # failed-request retry data from it either. Same-session resume
+                # keeps its bounded retiring window.
+                self.retiring_generations.clear()
+                self.error_request = None
+                # New meeting/session: retire every old slot immediately so no
+                # old question, partial answer, or source stays readable via
+                # /assist/<id>. Workers hold their own entry references and
+                # still observe cancelled + generation to exit promptly.
+                for e in self.requests.values():
+                    e['cancelled'] = True
+                self.requests.clear()
                 self.generation += 1
                 self.session_key = session_key
             self.backend = backend
             self.listening = True
             self.error = None
-            self.last_seen = time.monotonic()
+            # New capture, new counters: restarting with identical options
+            # must not display the previous capture's loss as current.
+            # Meeting-level history stays in segments and recent answers.
+            if isinstance(self.capture_info, dict):
+                for _loss_key in ('warning', 'dropped_chunks', 'native_dropped_chunks', 'worker_dropped_chunks',
+                                  'sub_second_dropped_chunks', 'reader_incomplete', 'partial_tail'):
+                    self.capture_info.pop(_loss_key, None)
             self.capture_generation += 1
+            # The newest capture owns the terminal state from birth: a late
+            # terminal from an older capture can never present itself as
+            # current, even before this capture emits its own terminal.
+            self._status_generation = self.capture_generation
             capture_generation = self.capture_generation
+            status_session_key = self.session_key
+        # Lease refresh outside self.lock: _touch_pane_seen takes overlay_lock,
+        # and overlay_lock -> self.lock ordering elsewhere forbids the reverse.
+        self._touch_pane_seen()
         def segment_callback(segment):
             with self.lock:
                 if self.listening and self.capture_generation == capture_generation:
                     self.add_segment(segment)
+                elif (capture_generation in self.retiring_generations
+                        and time.monotonic() < self.retiring_generations[capture_generation]):
+                    # Bounded tail of a retiring capture (pause flush): keep
+                    # trailing speech instead of dropping the last seconds.
+                    self.add_segment(segment)
         def status_callback(info):
             with self.lock:
-                if self.listening and self.capture_generation == capture_generation:
+                # Backends disagree on the terminal key: native/macOS audio
+                # emits 'state', Meetily emits 'status'. A status-shaped
+                # terminal error must be recognized, not mistaken for a
+                # clean pause.
+                state = (info.get('state') or info.get('status')) if isinstance(info, dict) else None
+                same_session = self.capture_generation == capture_generation
+                same_meeting = status_session_key == self.session_key
+                if state in ('stopped', 'error') and (same_session or (not self.listening and same_meeting)):
+                    # Terminal loss metadata must survive teardown: pause
+                    # bumps the generation before the adapter delivers its
+                    # final latched summary. A stale terminal never touches
+                    # an actively listening newer session — or a newer
+                    # meeting after a session switch. It also never rewinds
+                    # a newer generation's terminal state: each capture keeps
+                    # its own final loss evidence; only the newest stopped
+                    # or errored capture may overwrite it.
+                    if capture_generation >= self._status_generation:
+                        self.audio_status(info)
+                        self._status_generation = capture_generation
+                elif self.listening and self.capture_generation == capture_generation:
                     self.audio_status(info)
         try:
             if backend == 'meetily':
-                self.get_bridge().attach(recording_id, on_segment=segment_callback, on_status=status_callback)
+                bridge = self.get_bridge()
+                if new_meeting:
+                    forget = getattr(bridge, 'note_cleared', None)
+                    if callable(forget):
+                        forget(recording_id)
+                    with self.lock:
+                        self.meetily_clear_error = None
+                bridge.attach(recording_id, on_segment=segment_callback, on_status=status_callback)
             else:
+                # A native/macOS start installs no Meetily boundary, so it
+                # must not clear a failed one: the flag stands until a
+                # Meetily Clear or new meeting actually installs it.
                 self.audio.start(on_segment=segment_callback, on_status=status_callback)
         except Exception as exc:
             self.pause()
             raise HTTPException(503, f'Audio could not start: {type(exc).__name__}: {str(exc)[:300]}') from exc
-        threading.Thread(target=self.watchdog, name='meeting-capture-lease', daemon=True).start()
+        threading.Thread(target=self.watchdog, args=(capture_generation,), name='meeting-capture-lease', daemon=True).start()
         return {'listening': self.listening}
 
     def audio_status(self, info):
         with self.lock:
-            self.capture_info = info if isinstance(info, dict) else {'message': str(info)}
+            incoming = info if isinstance(info, dict) else {'message': str(info)}
+            if isinstance(incoming, dict) and 'state' not in incoming and isinstance(incoming.get('status'), str):
+                incoming = dict(incoming, state=incoming['status'])
+            previous = self.capture_info if isinstance(self.capture_info, dict) else {}
+            # Audio-loss evidence latches: a later plain status must not clear
+            # an earlier drop warning until pause, clear, or a new capture.
+            # Drop counts are monotonic within a capture: a lower later report
+            # (e.g. a worker-only update after a combined one) never rewinds.
+            for key in ('warning', 'dropped_chunks', 'native_dropped_chunks', 'worker_dropped_chunks',
+                        'sub_second_dropped_chunks', 'reader_incomplete', 'partial_tail'):
+                if incoming.get(key) is None and previous.get(key) is not None:
+                    incoming = dict(incoming)
+                    incoming[key] = previous[key]
+            for key in ('dropped_chunks', 'native_dropped_chunks', 'worker_dropped_chunks',
+                        'sub_second_dropped_chunks'):
+                if (isinstance(incoming.get(key), int)
+                        and isinstance(previous.get(key), int)
+                        and incoming[key] < previous[key]):
+                    incoming = dict(incoming)
+                    incoming[key] = previous[key]
+                    # A clamped count keeps its own warning: an incoming
+                    # lower-count warning would otherwise disagree with the
+                    # displayed total.
+                    if previous.get('warning'):
+                        incoming['warning'] = previous['warning']
+            self.capture_info = incoming
             lifecycle = info.get('state', info.get('status')) if isinstance(info, dict) else None
             if isinstance(info, dict) and (info.get('listening') is False or lifecycle in ('error', 'stopped', 'completed', 'idle')):
                 self.listening = False
             self.capture_error = str(info['error'])[:500] if isinstance(info, dict) and info.get('error') else None
 
-    def watchdog(self):
-        while self.listening:
+    def _touch_pane_seen(self):
+        """Refresh the pane lease under the lease lock.
+
+        Heartbeat renewal (touch) and lease-expiry decisions (watchdog,
+        overlay lease) must serialize on the same lock, or a renewal can
+        slip between an expiry check and its teardown.
+        """
+        with self.overlay_lock:
+            self.pane_seen = time.monotonic()
+            self.last_seen = self.pane_seen
+
+    def heartbeat(self):
+        """Pane-originated lease ping. Overlay helper polls use touch=False."""
+        with self.lock:
+            listening = self.listening
+        self._touch_pane_seen()
+        return {'listening': listening}
+
+    def watchdog(self, capture_generation=None):
+        if capture_generation is None:
+            capture_generation = self.capture_generation
+        while self.listening and capture_generation == self.capture_generation:
             time.sleep(2)
-            if time.monotonic() - self.last_seen > 30:
-                self.pause()
+            # Entire expiry teardown runs atomically under lifecycle_lock: a
+            # restart between the expiry check and backend stop must neither
+            # pause the new capture nor stop its backend / hide its overlay.
+            # pane_seen is read under overlay_lock — the same lock heartbeat
+            # renewal takes — so a renewal cannot slip between check and teardown.
+            with self.lifecycle_lock:
+                if capture_generation != self.capture_generation:
+                    break
+                with self.overlay_lock:
+                    expired = time.monotonic() - self.pane_seen > 30
+                    if expired:
+                        self.listening = False
+                        self.capture_generation += 1
+                        # Same bounded tail window as explicit pause: flushed
+                        # audio during teardown still belongs to this meeting.
+                        with self.lock:
+                            self.retiring_generations[capture_generation] = time.monotonic() + 5.0
+                        overlay = self.overlay
+                        self.overlay = None
+                    else:
+                        overlay = None
+                if not expired:
+                    continue
+                # Cancel answer work before stopping the backend (same order
+                # as explicit pause): a worker must not submit or publish
+                # while stop is in progress. Still cooperative for already
+                # blocked provider calls.
+                with self.lock:
+                    for entry in self.requests.values():
+                        if entry.get('status') in ('queued', 'streaming', 'running'):
+                            entry['cancelled'] = True
+                            entry['status'] = 'cancelled'
+                audio = self.audio if self.backend in ('native', 'macos') else self.bridge
+                if audio:
+                    try:
+                        audio.stop()
+                    except Exception:
+                        pass
+                with self.lock:
+                    self.busy = False
+                if overlay is not None:
+                    try:
+                        overlay.hide_overlay()
+                    except Exception:
+                        pass
                 break
 
-    def pause(self):
+    def restart_after_clear(self, last_args, clear_generation, clear_session):
+        # See the /clear route: restart the same session on a new generation
+        # only if nothing newer took over while Clear waited for the lifecycle
+        # lock. A newer start (different session or generation) or an explicit
+        # pause wins: Clear never stops a newer capture or resumes a paused one.
+        with self.lifecycle_lock:
+            if (self.listening and last_args
+                    and self.capture_generation == clear_generation + 1
+                    and self.session_key == clear_session):
+                self.pause(retain_tail=False)
+                self.retiring_generations.clear()
+                backend, recording_id, tm, src = last_args
+                self.start(True, backend, recording_id, tm, src)
+
+    def pause(self, *, retain_tail=True):
         with self.lifecycle_lock:
             with self.lock:
                 self.listening = False
+                # The retiring generation gets a bounded tail window: the
+                # adapter's graceful shutdown flushes trailing speech after
+                # pause, and those segments belong to this meeting. Five
+                # seconds covers the adapter's default teardown budget.
+                # Clear passes retain_tail=False: a forget-everything boundary
+                # must not accept stop-time audio into the cleared transcript.
+                if retain_tail:
+                    self.retiring_generations[self.capture_generation] = time.monotonic() + 5.0
+                # Prune expired windows so the map stays tiny.
+                now = time.monotonic()
+                for gen in [g for g, deadline in self.retiring_generations.items() if deadline < now]:
+                    del self.retiring_generations[gen]
                 self.capture_generation += 1
-                audio = self.audio if self.backend in ('native', 'macos') else self.bridge
-            if audio:
-                audio.stop()
-            with self.lock:
+                # Cancel answer work before stopping capture: provider workers
+                # observe cancellation during teardown instead of publishing
+                # while stop is in progress. Pause is still only cooperative
+                # for already-blocked provider calls.
                 for entry in self.requests.values():
                     if entry.get('status') in ('queued', 'streaming', 'running'):
                         entry['cancelled'] = True
                         entry['status'] = 'cancelled'
+                audio = self.audio if self.backend in ('native', 'macos') else self.bridge
+            if audio:
+                audio.stop()
+            with self.lock:
                 self.busy = False
-                self.capture_error = None
-                self.capture_info = {'state': 'stopped', 'backend': self.backend, 'message': 'Paused / detached', 'error': None}
+                # A genuine capture failure survives pause — including one the
+                # teardown terminal just delivered: the pane must still show
+                # what failed instead of an orderly-looking paused state.
+                # A clean pause keeps error state clear; resume clears it via
+                # the next running status.
+                error_before = self.capture_error
+                # Latch audio-loss evidence across pause: stopping must not
+                # silently clear a transcript-incomplete warning — including
+                # the per-unit counters, so the pane keeps reporting worker
+                # chunks, native frames, and sub-second tails separately.
+                previous = self.capture_info if isinstance(self.capture_info, dict) else {}
+                latched = {'state': 'stopped', 'backend': self.backend, 'message': 'Paused / detached',
+                           'error': previous.get('error') if error_before else None}
+                for key in ('warning', 'dropped_chunks', 'native_dropped_chunks', 'worker_dropped_chunks',
+                            'sub_second_dropped_chunks', 'reader_incomplete', 'partial_tail'):
+                    if previous.get(key) is not None:
+                        latched[key] = previous[key]
+                self.capture_info = latched
             return {'listening': False}
 
     def get_engine(self):
@@ -205,18 +442,22 @@ class MeetingState:
                     self.engine = module.KnowledgeEngine()
             return self.engine
 
-    def assist(self, question, project=None, web_query=None, all_projects=False, web_fallback=True, answer_provider=None, answer_model=None, request_id=None, row_id=None):
+    def assist(self, question, project=None, web_query=None, all_projects=False, web_fallback=False, answer_provider=None, answer_model=None, request_id=None, row_id=None, transcript=None):
         from fastapi import HTTPException
         import secrets
         if all_projects and project:
             raise HTTPException(400, 'Choose all projects or one project, not both.')
         with self.lock:
-            live = [entry for entry in self.requests.values() if entry.get('status') in ('queued', 'streaming', 'running')]
+            # Cancelled-but-not-yet-exited workers are not owners: a session
+            # switch or clear must not block new requests behind them.
+            live = [entry for entry in self.requests.values()
+                    if entry.get('status') in ('queued', 'streaming', 'running') and not entry.get('cancelled')]
             if live:
                 # Explicit row requests never hijack another row: 409 carries the
                 # owner so the caller keeps attribution instead of polling /status.
                 raise HTTPException(409, f"Request {live[0]['request_id']} is already being prepared.")
-            transcript = '\n'.join(f"{s['speaker']}: {s['text']}" for s in list(self.segments)[-40:])[-16000:]
+            transcript = ('\n'.join(f"{s['speaker']}: {s['text']}" for s in list(self.segments)[-40:])[-16000:]
+                          if transcript is None else str(transcript)[-16000:])
             if not question.strip():
                 if not transcript:
                     raise HTTPException(400, 'Enter a question or start listening first.')
@@ -226,35 +467,98 @@ class MeetingState:
             if request_id in self.requests:
                 raise HTTPException(409, f'Request {request_id} is already being prepared.')
             if len(self.requests) >= 8:
-                # Bound the slot table; drop only terminal entries, never live ones.
-                terminal = [key for key, entry in self.requests.items() if entry.get('status') in ('done', 'error', 'cancelled')]
-                for key in terminal[:len(self.requests) - 7]:
+                # Bound the slot table; drop terminal entries and cancelled
+                # orphans first, never genuinely live ones.
+                droppable = [key for key, entry in self.requests.items()
+                             if entry.get('status') in ('done', 'error', 'cancelled') or entry.get('cancelled')]
+                for key in droppable[:len(self.requests) - 7]:
                     del self.requests[key]
                 if len(self.requests) >= 8:
                     raise HTTPException(409, 'Too many pending answer requests.')
+            # Reserve worker capacity only after every rejecting check above:
+            # a 400/409 must never consume a slot that only a thread exit
+            # would release. Thread-start failure below still rolls back.
+            if self.live_workers >= 8:
+                raise HTTPException(503, 'Too many answer workers in flight; wait for one to finish and retry.')
+            self.live_workers += 1
             entry = {'request_id': request_id, 'row_id': row_id, 'question': question[:4000],
                      'status': 'queued', 'answer': '', 'sources': [], 'warnings': [],
                      'web_search': {'used': False}, 'model_route': '', 'streaming': False,
-                     'completed_only': True, 'error': None, 'cancelled': False, 'generation': self.generation}
+                     'completed_only': True, 'error': None, 'cancelled': False, 'generation': self.generation,
+                     # Full original request: retry replays exactly these
+                     # parameters (including the resolved question and the
+                     # transcript snapshot) instead of current pane state.
+                     'request': {'question': question[:4000], 'transcript': transcript,
+                                 'project': project, 'web_query': web_query, 'all_projects': all_projects,
+                                 'web_fallback': web_fallback, 'answer_provider': answer_provider,
+                                 'answer_model': answer_model, 'row_id': row_id}}
             self.requests[request_id] = entry
             self.busy, self.error, self.result = True, None, None
+            self.error_request = None
             generation = self.generation
 
         def work(entry_ref):
+            streamed_any = False
+            def aborted():
+                with self.lock:
+                    return bool(entry_ref.get('cancelled') or generation != self.generation)
+            def mark_cancelled():
+                with self.lock:
+                    entry_ref['status'] = 'cancelled'
             try:
+                if aborted():
+                    mark_cancelled()
+                    return
                 options = {}
                 if answer_provider is not None or answer_model is not None:
                     options = {'answer_provider': answer_provider, 'answer_model': answer_model}
                 engine = self.get_engine()
-                stream_header, chunks = None, None
+                # Prefer a retrieval-free streaming probe so completed-only routes
+                # never pay for double retrieval + ranking on fallback.
+                # Legacy/fake engines without the probe keep the old behavior:
+                # attempt the stream, fall back on NotImplementedError.
+                use_stream = False
                 try:
-                    stream_header, chunks = engine.answer_stream(
-                        question, transcript=transcript, project=project, web_query=web_query,
-                        all_projects=all_projects, web_fallback=web_fallback, **options)
-                except (NotImplementedError, AttributeError):
-                    stream_header, chunks = None, None
-                if chunks is None:
-                    result = engine.answer(question, transcript=transcript, project=project, web_query=web_query, all_projects=all_projects, web_fallback=web_fallback, **options)
+                    probe_fn = getattr(engine, 'supports_streaming', None)
+                    probe = probe_fn(**options) if callable(probe_fn) else True
+                except Exception:
+                    probe = True
+                stream_header, chunks = None, None
+                if probe:
+                    if aborted():
+                        mark_cancelled()
+                        return
+                    try:
+                        stream_header, chunks = engine.answer_stream(
+                            question, transcript=transcript, project=project, web_query=web_query,
+                            all_projects=all_projects, web_fallback=web_fallback,
+                            should_abort=aborted, **options)
+                        use_stream = chunks is not None
+                    except (NotImplementedError, AttributeError) as exc:
+                        # Sync stream-setup failures happen after retrieval:
+                        # reuse the prepared sources instead of repeating work.
+                        stream_header, chunks = getattr(exc, 'prepared', None), None
+                        use_stream = False
+                if not use_stream:
+                    if aborted():
+                        mark_cancelled()
+                        return
+                    # Completed-only work is genuinely running, not queued:
+                    # the pane label follows the live slot, not a stale default.
+                    with self.lock:
+                        if entry_ref.get('status') == 'queued':
+                            entry_ref['status'] = 'running'
+                    # A returned stream header is post-web (fully prepared);
+                    # an exception-carried payload declares its own stage.
+                    # Either way the fallback must not repeat completed work.
+                    if isinstance(stream_header, dict) and 'stage' not in stream_header:
+                        stream_header = dict(stream_header, stage='full')
+                    # The default Meta route already failed this request's
+                    # stream: fall back straight to the configured model
+                    # instead of retrying the failed endpoint.
+                    skip_meta = (isinstance(stream_header, dict)
+                                 and str(stream_header.get('model_route') or '').startswith('meta/'))
+                    result = engine.answer(question, transcript=transcript, project=project, web_query=web_query, all_projects=all_projects, web_fallback=web_fallback, should_abort=aborted, prepared=stream_header, skip_meta_default=skip_meta, **options)
                     with self.lock:
                         if entry_ref.get('cancelled'):
                             entry_ref['status'] = 'cancelled'
@@ -265,9 +569,23 @@ class MeetingState:
                                               'model_route': result.get('model_route', ''),
                                               'streaming': bool(result.get('streaming', False)),
                                               'completed_only': bool(result.get('completed_only', True))})
-                            self.result = result
+                            result['request'] = entry_ref.get('request')
+                            if result.get('provider_error'):
+                                # A completed-mode provider failure is an
+                                # explicit error with retry — never a normal
+                                # answer that hides the failure.
+                                entry_ref['status'] = 'error'
+                                entry_ref['error'] = str(result['provider_error'])[:500]
+                                self.error = str(result['provider_error'])[:500]
+                                self.error_request = entry_ref.get('request')
+                                self.result = None
+                            else:
+                                self.result = result
                     return
                 with self.lock:
+                    if entry_ref.get('cancelled') or generation != self.generation:
+                        entry_ref['status'] = 'cancelled'
+                        return
                     entry_ref['status'] = 'streaming'
                     entry_ref['streaming'] = True
                     entry_ref['completed_only'] = False
@@ -276,41 +594,161 @@ class MeetingState:
                     entry_ref['sources'] = header.get('sources', [])
                     entry_ref['warnings'] = header.get('warnings', [])
                     entry_ref['web_search'] = header.get('web_search', {'used': False})
-                for delta in chunks:
-                    with self.lock:
-                        if entry_ref.get('cancelled') or generation != self.generation:
-                            entry_ref['status'] = 'cancelled'
+                try:
+                    for delta in (chunks or []):
+                        with self.lock:
+                            if entry_ref.get('cancelled') or generation != self.generation:
+                                entry_ref['status'] = 'cancelled'
+                                try:
+                                    close = getattr(chunks, 'close', None)
+                                    if callable(close):
+                                        close()
+                                except Exception:
+                                    pass
+                                return
+                            if isinstance(delta, str) and delta:
+                                streamed_any = True
+                                entry_ref['answer'] = (entry_ref['answer'] + delta)[:12000]
+                except (NotImplementedError, AttributeError):
+                    # Lazy provider stream failed mid-iteration: fall back to a
+                    # completed answer when nothing streamed yet, else keep partial.
+                    if not streamed_any:
+                        if aborted():
+                            mark_cancelled()
                             return
-                        if isinstance(delta, str) and delta:
-                            entry_ref['answer'] = (entry_ref['answer'] + delta)[:12000]
+                        # The slot truthfully becomes a running completed-mode
+                        # job before the fallback call: the pane must read
+                        # 'Preparing', not a stale 'Streaming'.
+                        with self.lock:
+                            entry_ref['status'] = 'running'
+                            entry_ref['streaming'] = False
+                        header_prepared = stream_header
+                        if isinstance(header_prepared, dict) and 'stage' not in header_prepared:
+                            header_prepared = dict(header_prepared, stage='full')
+                        header_skip_meta = (isinstance(header_prepared, dict)
+                                            and str(header_prepared.get('model_route') or '').startswith('meta/'))
+                        result = engine.answer(question, transcript=transcript, project=project, web_query=web_query, all_projects=all_projects, web_fallback=web_fallback, should_abort=aborted, prepared=header_prepared, skip_meta_default=header_skip_meta, **options)
+                        with self.lock:
+                            if entry_ref.get('cancelled'):
+                                entry_ref['status'] = 'cancelled'
+                            elif generation == self.generation:
+                                entry_ref.update({'status': 'done', 'answer': result.get('answer', ''),
+                                                  'sources': result.get('sources', []), 'warnings': result.get('warnings', []),
+                                                  'web_search': result.get('web_search', {'used': False}),
+                                                  'model_route': result.get('model_route', ''),
+                                                  'streaming': bool(result.get('streaming', False)),
+                                                  'completed_only': bool(result.get('completed_only', True))})
+                                result['request'] = entry_ref.get('request')
+                                if result.get('provider_error'):
+                                    entry_ref['status'] = 'error'
+                                    entry_ref['error'] = str(result['provider_error'])[:500]
+                                    self.error = str(result['provider_error'])[:500]
+                                    self.error_request = entry_ref.get('request')
+                                    self.result = None
+                                else:
+                                    self.result = result
+                        return
+                    with self.lock:
+                        warnings = list(entry_ref.get('warnings') or [])
+                        msg = 'Stream interrupted; showing a partial answer. Retry for the complete response.'
+                        if msg not in warnings:
+                            warnings.append(msg)
+                        entry_ref['warnings'] = warnings
                 with self.lock:
                     if generation == self.generation and not entry_ref.get('cancelled'):
+                        warnings = list(entry_ref.get('warnings') or [])
+                        sources = entry_ref.get('sources') or []
+                        import re as _re
+                        citations = [int(n) for n in _re.findall(r'\[(\d+)\]', entry_ref.get('answer') or '')]
+                        if sources and (not citations or any(n < 1 or n > len(sources) for n in citations)):
+                            msg = 'Answer citations are missing or invalid; verify against the listed evidence.'
+                            if msg not in warnings:
+                                warnings.append(msg)
+                        if len(entry_ref.get('answer') or '') >= 12000:
+                            trunc = 'Answer reached the 12,000-character overlay cap and was shortened; ask a follow-up for the rest.'
+                            if trunc not in warnings:
+                                warnings.append(trunc)
+                        entry_ref['warnings'] = warnings
                         entry_ref['status'] = 'done'
                         self.result = {'answer': entry_ref['answer'], 'sources': entry_ref['sources'],
-                                       'warnings': entry_ref['warnings'], 'web_search': entry_ref['web_search'],
+                                       'warnings': warnings, 'web_search': entry_ref['web_search'],
                                        'model_route': entry_ref['model_route'], 'streaming': True,
-                                       'completed_only': False}
+                                       'completed_only': False, 'request': entry_ref.get('request')}
                     elif entry_ref.get('cancelled'):
                         entry_ref['status'] = 'cancelled'
             except Exception as exc:
+                if _is_engine_abort(exc):
+                    # Cooperative cancellation inside the engine: no error,
+                    # no partial publication beyond what already streamed.
+                    mark_cancelled()
+                    return
                 with self.lock:
                     if entry_ref.get('cancelled'):
                         entry_ref['status'] = 'cancelled'
                     elif generation == self.generation:
-                        entry_ref.update({'status': 'error', 'error': f'{type(exc).__name__}: {str(exc)[:500]}'})
-                        self.error = f'{type(exc).__name__}: {str(exc)[:500]}'
+                        if streamed_any and (entry_ref.get('answer') or '').strip():
+                            # Ordinary stream failures after partial output keep
+                            # the visible partial text, marked — not presented
+                            # as a complete answer, and never as a bare error
+                            # that hides what already arrived.
+                            warnings = list(entry_ref.get('warnings') or [])
+                            msg = f'Stream interrupted ({type(exc).__name__}); showing a partial answer. Retry for the complete response.'
+                            if msg not in warnings:
+                                warnings.append(msg)
+                            entry_ref['warnings'] = warnings
+                            entry_ref['status'] = 'done'
+                            self.result = {'answer': entry_ref['answer'], 'sources': entry_ref.get('sources', []),
+                                           'warnings': warnings, 'web_search': entry_ref.get('web_search', {'used': False}),
+                                           'model_route': entry_ref.get('model_route', ''), 'streaming': True,
+                                           'completed_only': False, 'request': entry_ref.get('request')}
+                        else:
+                            entry_ref.update({'status': 'error', 'error': f'{type(exc).__name__}: {str(exc)[:500]}'})
+                            self.error = f'{type(exc).__name__}: {str(exc)[:500]}'
+                            # The failed request stays retryable with its exact
+                            # original parameters, not current pane state.
+                            self.error_request = entry_ref.get('request')
             finally:
                 with self.lock:
-                    if not any(e.get('status') in ('queued', 'streaming', 'running') for e in self.requests.values()):
-                        self.busy = False
+                    # Cancelled orphans do not own the busy flag: a blocked
+                    # old-generation worker must never wedge the pane busy
+                    # after a newer request has already completed.
+                    self._recompute_busy_locked()
+                    self.live_workers = max(0, self.live_workers - 1)
         # Provider credentials are request/profile scoped; propagate that scope into the worker.
         # Native click handlers run on overlay threads, so the bridge snapshot
         # also carries the originating context with it (see BackendTransport).
         import contextvars
         context = contextvars.copy_context()
-        entry = self.requests[request_id]
-        threading.Thread(target=lambda: context.run(work, entry), name=f'meeting-answer-{request_id}', daemon=True).start()
+        with self.lock:
+            current = self.requests.get(request_id)
+        if current is not entry:
+            # The slot was cleared — or the caller-supplied ID was reused by
+            # a newer request — before this worker started. Never run the old
+            # request against a stranger's slot: that would attribute the old
+            # answer to the wrong row and corrupt the replacement's
+            # lifecycle (including cancelling it on a generation change).
+            # The replacement's own worker owns its entry.
+            with self.lock:
+                self.live_workers = max(0, self.live_workers - 1)
+                self._recompute_busy_locked()
+            raise RuntimeError('Answer request was cleared before it could start.')
+        try:
+            threading.Thread(target=lambda: context.run(work, entry), name=f'meeting-answer-{request_id}', daemon=True).start()
+        except Exception:
+            with self.lock:
+                self.live_workers = max(0, self.live_workers - 1)
+                if entry.get('status') == 'queued':
+                    entry['status'] = 'error'
+                    entry['error'] = 'Answer worker could not start.'
+                self._recompute_busy_locked()
+            raise
         return {'accepted': True, 'request_id': request_id, 'streaming': None}
+
+    def _recompute_busy_locked(self):
+        """Busy follows genuinely live, uncancelled work — never orphans."""
+        if not any(e.get('status') in ('queued', 'streaming', 'running') and not e.get('cancelled')
+                   for e in self.requests.values()):
+            self.busy = False
 
     def assist_request(self, request_id):
         with self.lock:
@@ -338,12 +776,17 @@ class MeetingState:
         """Keep only pane-owned keys; drop anything the pane never sets."""
         scope = scope if isinstance(scope, dict) else {}
         cleaned = {}
+        seq = scope.get('seq')
+        if isinstance(seq, int):
+            cleaned['seq'] = seq
         project = scope.get('project')
         if isinstance(project, str) and project:
             cleaned['project'] = project[:1000]
         if scope.get('all_projects') is True:
             cleaned['all_projects'] = True
-        if scope.get('web_fallback') is False:
+        if scope.get('web_fallback') is True:
+            cleaned['web_fallback'] = True
+        elif scope.get('web_fallback') is False:
             cleaned['web_fallback'] = False
         web_query = scope.get('web_query')
         if isinstance(web_query, str) and web_query.strip():
@@ -355,26 +798,115 @@ class MeetingState:
             cleaned['answer_model'] = model[:200]
         return cleaned
 
+    def _overlay_lease(self, overlay, seq):
+        """Hide the overlay when its pane lease expires, listening or not.
+
+        The capture watchdog only runs while listening; a manually paused
+        pane that then disconnects would otherwise orphan the window.
+        """
+        while True:
+            time.sleep(5)
+            if self._overlay_hide_if_expired(overlay, seq):
+                return
+
+    def _overlay_hide_if_expired(self, overlay, seq):
+        """Hide only if the same overlay/lease is still current and expired.
+
+        Identity, sequence, and heartbeat are revalidated atomically under
+        overlay_lock so a renewed show or heartbeat cannot be torn down by a
+        stale expiry check.
+        """
+        with self.overlay_lock:
+            if self.overlay is not overlay or seq != self.overlay_lease_seq:
+                return True
+            if time.monotonic() - self.pane_seen <= 30:
+                return False
+            self.overlay = None
+            self.overlay_lease_seq += 1
+        try:
+            overlay.hide_overlay()
+        except Exception:
+            pass
+        return True
+
+    def _start_overlay_lease_locked(self):
+        self.overlay_lease_seq += 1
+        overlay, seq = self.overlay, self.overlay_lease_seq
+        if overlay is not None:
+            threading.Thread(target=self._overlay_lease, args=(overlay, seq),
+                             name='meeting-overlay-lease', daemon=True).start()
+
+    def _refresh_overlay_token_locked(self):
+        # Re-bind the transport to this explicit pane action. Must run under
+        # overlay_lock on the pane's request thread so the captured context
+        # (and token) belong to the authenticated action, not a worker.
+        import secrets
+        bridge = self.overlay
+        transport = getattr(bridge, 'transport', None)
+        refresh = getattr(transport, 'refresh_pane_token', None)
+        module_action = None
+        try:
+            import importlib
+            module = importlib.import_module(f'{__package__}.overlay_bridge' if __package__ else 'overlay_bridge')
+            module_action = getattr(module, '_PANE_ACTION', None)
+        except Exception:
+            module_action = None
+        if not callable(refresh):
+            return
+        try:
+            token = secrets.token_hex(16)
+            if module_action is not None:
+                module_action.set(token)
+            refresh(token)
+        except Exception:
+            pass
+
     def overlay_show(self, scope):
         """Explicit pane action: backend-managed bridge owns one helper process."""
         import importlib
+        import secrets
         with self.overlay_lock:
             cleaned = self._clean_overlay_scope(scope)
-            self.overlay_scope_value = cleaned
             if self.overlay is not None:
-                self.overlay.set_scope(cleaned)
                 try:
-                    self.overlay.update(self.status())
+                    alive = self.overlay.process is not None and self.overlay.process.poll() is None
                 except Exception:
-                    pass
-                return {'shown': True, 'reused': True, 'available': True}
+                    alive = False
+                if not alive:
+                    # Stopped or reaped bridge (e.g. watchdog expiry cleanup):
+                    # never report a dead helper as reused.
+                    try:
+                        self.overlay.stop()
+                    except Exception:
+                        pass
+                    self.overlay = None
+                else:
+                    result = self.overlay.set_scope(cleaned)
+                    if not (isinstance(result, dict) and result.get('ignored_stale')):
+                        self.overlay_scope_value = cleaned
+                        self._refresh_overlay_token_locked()
+                    try:
+                        self.overlay.update(self.status())
+                    except Exception:
+                        pass
+                    self._start_overlay_lease_locked()
+                    return {'shown': True, 'reused': True, 'available': True}
             try:
                 module = importlib.import_module(f'{__package__}.overlay_bridge' if __package__ else 'overlay_bridge')
             except ImportError:
                 from fastapi import HTTPException
                 raise HTTPException(503, 'Overlay helper is not installed in this backend.')
-            bridge = module.OverlayBridge(helper=self._overlay_helper_path(), transport=module.BackendTransport(self))
-            bridge.set_scope(cleaned)
+            try:
+                pane_token = secrets.token_hex(16)
+                module_pane_action = getattr(module, '_PANE_ACTION', None)
+                if module_pane_action is not None:
+                    module_pane_action.set(pane_token)
+            except Exception:
+                pane_token = None
+            bridge = module.OverlayBridge(helper=self._overlay_helper_path(), transport=module.BackendTransport(self, pane_token=pane_token))
+            set_result = bridge.set_scope(cleaned)
+            if not (isinstance(set_result, dict) and set_result.get('ignored_stale')):
+                self.overlay_scope_value = cleaned
             try:
                 bridge.update(self.status())
             except Exception:
@@ -390,6 +922,7 @@ class MeetingState:
             except Exception:
                 pass
             self.overlay = bridge
+            self._start_overlay_lease_locked()
             if isinstance(result, dict):
                 out = dict(result)
                 out.setdefault('available', True)
@@ -399,6 +932,7 @@ class MeetingState:
     def overlay_hide(self):
         with self.overlay_lock:
             bridge, self.overlay = self.overlay, None
+            self.overlay_lease_seq += 1
         if bridge is not None:
             try:
                 bridge.hide_overlay()
@@ -407,18 +941,24 @@ class MeetingState:
         return {'shown': False}
 
     def overlay_scope(self, scope):
+        # Atomic under overlay_lock: bridge acceptance and authoritative
+        # publication cannot interleave with a concurrent update.
         with self.overlay_lock:
             cleaned = self._clean_overlay_scope(scope)
-            self.overlay_scope_value = cleaned
             bridge = self.overlay
-        if bridge is not None:
-            bridge.set_scope(cleaned)
+            if bridge is None:
+                self.overlay_scope_value = cleaned
+                return {'shown': False, 'scope': cleaned}
+            result = bridge.set_scope(cleaned)
+            if isinstance(result, dict) and result.get('ignored_stale'):
+                return {'shown': True, 'scope': dict(self.overlay_scope_value), 'accepted': False}
+            self.overlay_scope_value = cleaned
+            self._refresh_overlay_token_locked()
             try:
                 bridge.update(self.status())
             except Exception:
                 pass
-            return {'shown': True, 'scope': cleaned}
-        return {'shown': False, 'scope': cleaned}
+            return {'shown': True, 'scope': cleaned, 'accepted': True}
 
     def _overlay_helper_path(self):
         import os as _os
@@ -434,24 +974,61 @@ class MeetingState:
                 return str(candidate)
         return None
 
-    def status(self):
+    def status(self, touch=True):
+        if touch:
+            self._touch_pane_seen()
         with self.lock:
-            self.last_seen = time.monotonic()
             live = [dict(e) for e in self.requests.values() if e.get('status') in ('queued', 'streaming', 'running')]
+            terminal = [dict(e) for e in self.requests.values() if e.get('status') in ('done', 'error')]
+            terminal = terminal[-5:]
+            for entry in terminal:
+                if isinstance(entry.get('answer'), str) and len(entry['answer']) > 4000:
+                    entry['answer'] = entry['answer'][:4000] + '… (shortened; ask again for the rest)'
+                    entry['answer_shortened'] = True
             overlay_status = None
-            if self.overlay is not None:
+            overlay = self.overlay
+            if overlay is not None:
                 try:
-                    overlay_status = self.overlay.helper_status()
+                    overlay_status = overlay.helper_status()
                 except Exception:
                     overlay_status = None
-            overlay = self.overlay
+                try:
+                    alive = overlay.process is not None and overlay.process.poll() is None
+                except Exception:
+                    alive = False
+                if not alive:
+                    overlay = None
+            # The last session descriptor lets the pane compare the full
+            # session key (backend + recording/model/source) before starting:
+            # any change begins a fresh meeting and clears retained content.
+            last_session = None
+            try:
+                key = self.session_key
+                if isinstance(key, tuple) and len(key) == 2:
+                    if key[0] == 'meetily':
+                        last_session = {'backend': 'meetily', 'recording_id': key[1]}
+                    else:
+                        pair = key[1] if isinstance(key[1], (tuple, list)) else (None, None)
+                        pair = list(pair) + [None, None]
+                        last_session = {'backend': key[0], 'transcription_model': pair[0],
+                                        'audio_source': pair[1]}
+            except Exception:
+                last_session = None
             overlay_available = self._overlay_capability_available(overlay, overlay_status)
+            import sys as _sys_cap
+            macos_ready = _sys_cap.platform == 'darwin' and self._macos_runtime_ready()
             return {'listening': self.listening, 'segments': list(self.segments), 'error': self.error or self.capture_error,
+                    'error_request': self.error_request,
                     'busy': self.busy, 'result': self.result, 'requests': {e['request_id']: dict(e) for e in live},
-                    'capture': self.capture_info, 'backend': self.backend, 'generation': self.generation,
-                    'capture_generation': self.capture_generation,
-                    'capabilities': {'all_projects': True, 'automatic_web_fallback': True, 'independent_models': True, 'macos_transcription': True,
-                                     'overlay': overlay_available, 'overlay_stream': True, 'overlay_cancel': True}}
+                    'recent': terminal, 'meetily_clear_error': self.meetily_clear_error,
+                    'capture': self.capture_info, 'backend': self.backend, 'last_session': last_session,
+                    'generation': self.generation,
+                    'capture_generation': self.capture_generation, 'pane_seen': self.pane_seen,
+                    'overlay_shown': overlay is not None,
+                    'capabilities': {'all_projects': True, 'automatic_web_fallback': True, 'independent_models': True,
+                                     'macos_transcription': bool(macos_ready),
+                                     'overlay': overlay_available, 'overlay_stream': True, 'overlay_cancel': True,
+                                     'macos_detail': self._macos_capability_detail(macos_ready)}}
 
     def _overlay_capability_available(self, overlay, overlay_status):
         # With no bridge yet, capability reflects whether a helper could
@@ -472,6 +1049,31 @@ class MeetingState:
             return bool(overlay_status.get('available', True))
         return True
 
+    def _macos_runtime_ready(self):
+        """True only when the macOS worker env and helper look present. No probing."""
+        import os as _os
+        from pathlib import Path as _Path
+        try:
+            root = _Path(__file__).resolve().parent
+            helper = root / 'macos_capture'
+            worker = root / 'audio_worker.py'
+            runtime = root / 'audio-runtime/bin/python'
+            venv = root / '.venv-audio/bin/python'
+            override = _os.environ.get('MEETING_COPILOT_AUDIO_PYTHON', '').strip()
+            python_ok = (_Path(override).is_file() if override else
+                         (runtime.is_file() or venv.is_file()))
+            return bool(helper.is_file() and worker.is_file() and python_ok)
+        except Exception:
+            return False
+
+    def _macos_capability_detail(self, ready):
+        import sys as _sys
+        if _sys.platform != 'darwin':
+            return 'macOS transcription requires macOS.'
+        if ready:
+            return ''
+        return 'On macOS: run prepare_macos.py, allow Microphone / Screen Recording, then restart capture.'
+
 
 def _unavailable(message):
     from fastapi import HTTPException
@@ -483,11 +1085,16 @@ def make_router(state):
 
     @router.get('/status')
     def status():
-        return state.status()
+        return state.status(touch=True)
+
+    @router.post('/heartbeat')
+    def heartbeat():
+        return state.heartbeat()
 
     @router.post('/start')
     def start(body: CaptureRequest):
-        return state.start(body.consent, body.backend, body.recording_id, body.transcription_model, body.audio_source)
+        return state.start(body.consent, body.backend, body.recording_id, body.transcription_model, body.audio_source,
+                           new_meeting=body.new_meeting)
 
     @router.get('/recordings')
     def recordings():
@@ -513,7 +1120,7 @@ def make_router(state):
     @router.post('/assist')
     def assist(body: AssistRequest):
         return state.assist(body.question, body.project, body.web_query, body.all_projects, body.web_fallback, body.answer_provider, body.answer_model,
-                            request_id=body.request_id, row_id=body.row_id)
+                            request_id=body.request_id, row_id=body.row_id, transcript=body.transcript)
 
     @router.get('/assist/{request_id}')
     def assist_request(request_id: str):
@@ -545,17 +1152,101 @@ def make_router(state):
 
     @router.post('/clear')
     def clear():
-        with state.lock:
+        # Serialize with backend start/stop, which hold lifecycle_lock
+        # across their whole operation: a start racing Clear either
+        # publishes its bridge first (then Clear forgets via it) or waits
+        # until Clear is done (then it observes the published outcome).
+        # Without this, Clear could read state.bridge while a start has set
+        # listening but not yet created the bridge, skip the forget boundary,
+        # and restart capture onto unforgotten adapter state.
+        with state.lifecycle_lock, state.lock:
             state.segments.clear()
             state.result = None
             state.error = None
+            # Failed-request retry data holds the original question and
+            # transcript: it must not survive explicit clear or a session
+            # switch, or a later error could retry stale meeting content.
+            state.error_request = None
             for entry in state.requests.values():
                 if entry.get('status') in ('queued', 'streaming', 'running'):
                     entry['cancelled'] = True
                     entry['status'] = 'cancelled'
+            # Retention: completed/cancelled/error slots hold Q&A + snippets and
+            # remain readable via /assist/<id>. Purge them on explicit clear.
+            for key in [k for k, e in state.requests.items()
+                        if e.get('status') in ('done', 'error', 'cancelled')]:
+                del state.requests[key]
+            # A retiring tail window must not resurrect pre-clear speech:
+            # late callbacks from the old capture stay rejected after Clear.
+            # Retire the generation atomically with clearing: callbacks that
+            # land between this lock release and pause() carry the old
+            # generation and are rejected instead of appending.
+            state.retiring_generations.clear()
+            # Tell the Meetily bridge about the forget-everything boundary so
+            # its next re-attach suppresses the whole existing snapshot.
+            bridge = state.bridge
+            if bridge is not None:
+                forget = getattr(bridge, 'note_cleared', None)
+                if callable(forget):
+                    try:
+                        forget()
+                    except Exception as exc:
+                        state.meetily_clear_error = (
+                            'Could not install the Meetily forget boundary: %s. '
+                            'Clear otherwise completed; try Clear again or start a new meeting.' % exc)
+                    else:
+                        state.meetily_clear_error = None
+            was_listening = state.listening
+            # Snapshot the generation and session the restart must still match:
+            # a newer start (different settings, new generation) racing Clear
+            # must never be stopped and replaced by this stale restart.
+            clear_generation = state.capture_generation
+            clear_session = state.session_key
+            if was_listening:
+                state.capture_generation += 1
+            last_args = getattr(state, 'last_start_args', None)
+            try:
+                engine = state.engine
+                invalidator = getattr(engine, 'invalidate_cache', None)
+                if callable(invalidator):
+                    invalidator()
+                elif isinstance(getattr(engine, '_cache', None), dict):
+                    engine._cache.clear()
+            except Exception:
+                pass
             state.busy = False
             state.generation += 1
-        return state.status()
+        if was_listening and last_args and state.meetily_clear_error is None:
+            # Clear is a forget-everything boundary: stop the running capture
+            # and start a new generation on the same session so in-flight
+            # pre-clear audio can never resurrect cleared content, while live
+            # capture continues without the pane leaving the listening state.
+            # A failed forget-boundary install skips the restart: resuming
+            # capture on top of unforgotten adapter state would resurrect the
+            # cleared meeting, so stay paused with the error visible until
+            # Clear (or a new meeting, which fails closed with a 503) lands it.
+            # No tail window: stop-time audio belongs to the cleared meeting.
+            # The generation was already retired under the state lock above,
+            # so callbacks landing between clearing and pause stay rejected.
+            # The whole restart is one lifecycle transaction: a concurrent
+            # pause (or pane close) cannot slip between pause and start and
+            # be overridden by the restart. Listening is re-checked inside:
+            # a pause that won the race before this section means the user no
+            # longer wants capture, so the restart is skipped.
+            state.restart_after_clear(last_args, clear_generation, clear_session)
+        elif was_listening and state.meetily_clear_error is not None:
+            # The boundary install failed: stop capture and stay paused
+            # instead of restarting on top of unforgotten adapter state.
+            # No tail window — same as Clear's restart path. Like the
+            # restart, this stale failure path must not stop a newer capture
+            # that another thread started after Clear released the state
+            # lock: pause only the generation and session Clear retired.
+            with state.lifecycle_lock:
+                if (state.listening
+                        and state.capture_generation == clear_generation + 1
+                        and state.session_key == clear_session):
+                    state.pause(retain_tail=False)
+        return state.status(touch=True)
 
     return router
 

@@ -82,7 +82,11 @@ class GatewayTests(unittest.TestCase):
             release.set()
             capture._thread.join(2)
         self.assertEqual(capture.status()['state'], 'stopped')
-        self.assertEqual(segments, [])
+        # Teardown delivers exactly one terminal stopped summary (with the
+        # last known loss evidence); the slow spawn's late callbacks stay suppressed.
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0].get('state'), 'stopped')
+        self.assertNotIn('text', segments[0])
         self.assertIsNotNone(processes[0].poll())
         self.assertFalse(capture.status()['running'])
 
@@ -180,9 +184,14 @@ class WorkerTests(unittest.TestCase):
         raw = struct.pack('<4f', 0.0, 0.25, -0.5, 1.0)
         frame = {'type': 'pcm', 'source': 'microphone', 'rate': 16000,
                  'timestamp': 10.0, 'samples': 4, 'pcm': base64.b64encode(raw).decode()}
-        speaker, samples, stamp = decode_frame(json.dumps(frame).encode() + b'\n')
+        speaker, samples, stamp, native_drops = decode_frame(json.dumps(frame).encode() + b'\n')
         self.assertEqual((speaker, stamp), ('you', 10.0))
         self.assertEqual(samples.tolist(), [0, .25, -.5, 1])
+        self.assertEqual(native_drops, 0)
+        reported = dict(frame, dropped_chunks=3)
+        self.assertEqual(decode_frame(json.dumps(reported).encode() + b'\n')[3], 3)
+        native = dict(frame, native_dropped_chunks=7)
+        self.assertEqual(decode_frame(json.dumps(native).encode() + b'\n')[3], 7)
         for key, value in [('rate', 48000), ('source', 'url'), ('samples', 999999),
                            ('timestamp', float('nan')), ('pcm', '!')]:
             broken = dict(frame, **{key: value})
@@ -292,3 +301,424 @@ class WorkerTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class StatusLossAccumulationTests(unittest.TestCase):
+    def test_status_event_drops_accumulate_monotonically(self):
+        import json
+        import subprocess
+        import sys
+        import tempfile
+        from unittest.mock import patch
+        from audio_worker import run_capture
+        lines = (json.dumps({'type': 'status', 'state': 'running', 'dropped_chunks': 2}) + '\n'
+                 + json.dumps({'type': 'status', 'state': 'running', 'dropped_chunks': 3}) + '\n')
+        script = 'import sys; sys.stdout.write(' + repr(lines) + '); sys.stdout.flush()'
+        real_popen = subprocess.Popen
+        outputs = []
+        class Model:
+            pass
+        with tempfile.TemporaryDirectory() as helper_dir:
+            helper_script = Path(helper_dir) / 'statuses.py'
+            helper_script.write_text(script)
+            with patch('audio_worker.emit', outputs.append), patch('audio_worker.subprocess.Popen', lambda c, **kw: real_popen([sys.executable, str(helper_script)], **kw)):
+                run_capture(Model(), 'microphone', 'en', helper=Path('/fixture'))
+        running = [e for e in outputs if e.get('type') == 'status' and e.get('state') == 'running']
+        self.assertEqual([e['dropped_chunks'] for e in running], [2, 5])
+        self.assertIn('warning', running[-1])
+
+
+class StopFinalSummaryTests(unittest.TestCase):
+    def test_stop_delivers_terminal_state_with_last_known_loss(self):
+        from macos_audio import MacOSAudioCapture
+        capture = MacOSAudioCapture.__new__(MacOSAudioCapture)
+        import threading
+        capture._lock = threading.RLock()
+        capture._cancel = threading.Event()
+        capture._stopping = threading.Event()
+        capture._state = 'running'
+        capture._thread = None
+        capture._process = None
+        capture._error = None
+        capture._callback_error = None
+        capture._source = 'microphone'
+        capture._model_size = 'tiny.en'
+        capture.source = 'microphone'
+        capture.model_size = 'tiny.en'
+        capture._on_status = lambda value: None
+        capture._last_loss = {'dropped_chunks': 4, 'warning': 'drops happened'}
+        seen = []
+        capture._callback = lambda callback, value: seen.append(value)
+        capture.stop()
+        self.assertTrue(seen)
+        self.assertEqual(seen[-1]['state'], 'stopped')
+        self.assertEqual(seen[-1]['dropped_chunks'], 4)
+
+
+class ErrorFrameLossTests(unittest.TestCase):
+    def test_error_frame_drops_survive_in_final_summary(self):
+        import json
+        import subprocess
+        import sys
+        import tempfile
+        from unittest.mock import patch
+        from audio_worker import run_capture
+        lines = (json.dumps({'type': 'error', 'code': 'device', 'dropped_chunks': 3}) + '\n')
+        script = 'import sys; sys.stdout.write(' + repr(lines) + '); sys.stdout.flush()'
+        real_popen = subprocess.Popen
+        outputs = []
+        class Model:
+            pass
+        with tempfile.TemporaryDirectory() as helper_dir:
+            helper_script = Path(helper_dir) / 'err.py'
+            helper_script.write_text(script)
+            with patch('audio_worker.emit', outputs.append), patch('audio_worker.subprocess.Popen', lambda c, **kw: real_popen([sys.executable, str(helper_script)], **kw)):
+                run_capture(Model(), 'microphone', 'en', helper=Path('/fixture'))
+        stopped = [e for e in outputs if e.get('state') == 'stopped']
+        self.assertTrue(stopped)
+        self.assertEqual(stopped[0]['dropped_chunks'], 3)
+
+
+class PcmLossSingleCountTests(unittest.TestCase):
+    def test_pcm_frame_drops_counted_exactly_once(self):
+        import base64
+        import json
+        import subprocess
+        import sys
+        import tempfile
+        from unittest.mock import patch
+        from audio_worker import run_capture
+        pcm = {'type': 'pcm', 'source': 'microphone', 'rate': 16000,
+               'samples': 16000, 'timestamp': 1.0,
+               'pcm': base64.b64encode(bytes(64000)).decode(), 'native_dropped_chunks': 3}
+        lines = (json.dumps({'type': 'status', 'state': 'running', 'dropped_chunks': 2}) + '\n'
+                 + json.dumps(pcm) + '\n')
+        script = 'import sys; sys.stdout.write(' + repr(lines) + '); sys.stdout.flush()'
+        real_popen = subprocess.Popen
+        outputs = []
+        class Model:
+            def transcribe(self, samples, **kw):
+                from types import SimpleNamespace as NS
+                return iter([NS(text='')]), None
+        with tempfile.TemporaryDirectory() as helper_dir:
+            helper_script = Path(helper_dir) / 'mix.py'
+            helper_script.write_text(script)
+            with patch('audio_worker.emit', outputs.append), patch('audio_worker.subprocess.Popen', lambda c, **kw: real_popen([sys.executable, str(helper_script)], **kw)):
+                run_capture(Model(), 'microphone', 'en', helper=Path('/fixture'))
+        running = [e for e in outputs if e.get('type') == 'status' and e.get('state') == 'running']
+        self.assertEqual([e['dropped_chunks'] for e in running], [2, 5])
+
+
+class GracefulShutdownTests(unittest.TestCase):
+    def test_sigterm_handler_flushes_instead_of_dying(self):
+        import json
+        import signal
+        import subprocess
+        import sys
+        import tempfile
+        from unittest.mock import patch
+        from audio_worker import run_capture
+        lines = json.dumps({'type': 'status', 'state': 'running'}) + '\n'
+        script = 'import sys; sys.stdout.write(' + repr(lines) + '); sys.stdout.flush()'
+        real_popen = subprocess.Popen
+        prev = signal.getsignal(signal.SIGTERM)
+        try:
+            with tempfile.TemporaryDirectory() as helper_dir:
+                helper_script = Path(helper_dir) / 'one.py'
+                helper_script.write_text(script)
+                with patch('audio_worker.emit'), patch('audio_worker.subprocess.Popen', lambda c, **kw: real_popen([sys.executable, str(helper_script)], **kw)):
+                    run_capture(object(), 'microphone', 'en', helper=Path('/fixture'))
+            installed = signal.getsignal(signal.SIGTERM)
+            self.assertTrue(callable(installed) and installed not in (signal.SIG_DFL, signal.SIG_IGN, None))
+        finally:
+            signal.signal(signal.SIGTERM, prev)
+
+
+class InProgressTranscriptionTests(unittest.TestCase):
+    def test_finished_transcription_emits_despite_stop(self):
+        import base64
+        import json
+        import subprocess
+        import sys
+        import tempfile
+        import threading
+        import time
+        from unittest.mock import patch
+        from audio_worker import run_capture
+        pcm = {'type': 'pcm', 'source': 'microphone', 'rate': 16000,
+               'samples': 16000, 'timestamp': 1.0,
+               'pcm': base64.b64encode(bytes(64000)).decode()}
+        script = 'import sys; sys.stdout.write(' + repr((json.dumps(pcm) + '\n') * 4) + '); sys.stdout.flush()'
+        real_popen = subprocess.Popen
+        outputs = []
+        entered, release = threading.Event(), threading.Event()
+        class Model:
+            def transcribe(self, samples, **kw):
+                entered.set()
+                self.count = len(samples)
+                release.wait(5)
+                from types import SimpleNamespace as NS
+                return iter([NS(text='Trailing speech')]), None
+        model = Model()
+        with tempfile.TemporaryDirectory() as helper_dir:
+            helper_script = Path(helper_dir) / 'one.py'
+            helper_script.write_text(script)
+            with patch('audio_worker.emit', outputs.append), patch('audio_worker.subprocess.Popen', lambda c, **kw: real_popen([sys.executable, str(helper_script)], **kw)):
+                done = threading.Event()
+                worker_stop = {'event': None}
+                import audio_worker
+                real_run = audio_worker.run_capture
+                def run_with_stop(*a, **k):
+                    import threading as _t
+                    k['stop'] = worker_stop['event'] = _t.Event()
+                    try:
+                        real_run(*a, **k)
+                    finally:
+                        done.set()
+                thread = threading.Thread(target=run_with_stop, args=(model, 'microphone'),
+                                          kwargs={'helper': Path('/fixture'), 'language': 'en'})
+                thread.start()
+                self.assertTrue(entered.wait(5))
+                worker_stop['event'].set()
+                release.set()
+                thread.join(10)
+        segments = [e for e in outputs if e.get('text')]
+        self.assertTrue(any('Trailing speech' in (e.get('text') or '') for e in segments))
+
+
+class ForcedShutdownTests(unittest.TestCase):
+    def test_unresponsive_worker_is_marked_forced(self):
+        import threading
+        from macos_audio import MacOSAudioCapture
+        capture = MacOSAudioCapture.__new__(MacOSAudioCapture)
+        capture._lock = threading.RLock()
+        capture._cancel = threading.Event()
+        capture._stopping = threading.Event()
+        capture._state = 'running'
+        capture._thread = None
+        capture._process = None
+        capture._error = None
+        capture._callback_error = None
+        capture.source = 'microphone'
+        capture.model_size = 'tiny.en'
+        capture._on_status = lambda value: None
+        capture._last_loss = {}
+        class Stubborn:
+            def terminate(self):
+                pass
+            def poll(self):
+                return None
+            def wait(self, timeout=None):
+                import time as _t
+                _t.sleep(min(timeout or 0, 0.05))
+                raise TimeoutError('still alive')
+        capture._process = Stubborn()
+        seen = []
+        capture._callback = lambda callback, value: seen.append(value)
+        import macos_audio as _mod
+        real_terminate = _mod.terminate_group
+        _mod.terminate_group = lambda *a, **k: None
+        try:
+            capture.stop(timeout=0.2)
+        finally:
+            _mod.terminate_group = real_terminate
+        self.assertTrue(seen)
+        self.assertEqual(seen[-1]['state'], 'stopped')
+        self.assertIn('Forced shutdown', seen[-1].get('warning', ''))
+
+
+class SubSecondOnlyLossTests(unittest.TestCase):
+    def test_sub_second_tail_alone_produces_loss_summary(self):
+        import base64
+        import json
+        import subprocess
+        import sys
+        import tempfile
+        from unittest.mock import patch
+        from audio_worker import run_capture
+        # 8000 samples < 16000: never forms a chunk, only a sub-second tail.
+        pcm = {'type': 'pcm', 'source': 'microphone', 'rate': 16000,
+               'samples': 8000, 'timestamp': 1.0,
+               'pcm': base64.b64encode(bytes(32000)).decode()}
+        lines = json.dumps(pcm) + '\n'
+        script = 'import sys; sys.stdout.write(' + repr(lines) + '); sys.stdout.flush()'
+        real_popen = subprocess.Popen
+        outputs = []
+        class Model:
+            def transcribe(self, samples, **kw):
+                from types import SimpleNamespace as NS
+                return iter([NS(text='')]), None
+        with tempfile.TemporaryDirectory() as helper_dir:
+            helper_script = Path(helper_dir) / 'tail.py'
+            helper_script.write_text(script)
+            with patch('audio_worker.emit', outputs.append), patch('audio_worker.subprocess.Popen', lambda c, **kw: real_popen([sys.executable, str(helper_script)], **kw)):
+                run_capture(Model(), 'microphone', 'en', helper=Path('/fixture'))
+        stopped = [e for e in outputs if e.get('state') == 'stopped']
+        self.assertTrue(stopped, 'a discarded sub-second tail must surface a summary')
+        self.assertEqual(stopped[0].get('sub_second_dropped_chunks'), 1)
+
+
+class LossContractTests(unittest.TestCase):
+    def test_status_events_carry_separate_loss_units(self):
+        import json
+        import subprocess
+        import sys
+        import tempfile
+        from unittest.mock import patch
+        from audio_worker import run_capture
+        lines = json.dumps({'type': 'status', 'state': 'running', 'native_dropped_chunks': 2}) + '\n'
+        script = 'import sys; sys.stdout.write(' + repr(lines) + '); sys.stdout.flush()'
+        real_popen = subprocess.Popen
+        outputs = []
+        class Model:
+            pass
+        with tempfile.TemporaryDirectory() as helper_dir:
+            helper_script = Path(helper_dir) / 's.py'
+            helper_script.write_text(script)
+            with patch('audio_worker.emit', outputs.append), patch('audio_worker.subprocess.Popen', lambda c, **kw: real_popen([sys.executable, str(helper_script)], **kw)):
+                run_capture(Model(), 'microphone', 'en', helper=Path('/fixture'))
+        running = [e for e in outputs if e.get('type') == 'status' and e.get('state') == 'running']
+        self.assertTrue(running)
+        last = running[-1]
+        self.assertEqual(last['native_dropped_chunks'], 2)
+        self.assertIn('worker_dropped_chunks', last)
+
+
+class TailOrderingTests(unittest.TestCase):
+    def test_tail_transcribed_after_queued_chunks(self):
+        import base64
+        import json
+        import subprocess
+        import sys
+        import tempfile
+        from unittest.mock import patch
+        from audio_worker import run_capture
+        # 4 full frames (64000 samples: one live chunk) then a 16000
+        # trailing chunk with a newer stamp, flushed as the ordered tail.
+        frames = []
+        for i in range(5):
+            frames.append({'type': 'pcm', 'source': 'microphone', 'rate': 16000,
+                           'samples': 16000, 'timestamp': 1.0 + i,
+                           'pcm': base64.b64encode(bytes(64000)).decode()})
+        lines = ''.join(json.dumps(f) + '\n' for f in frames)
+        script = 'import sys; sys.stdout.write(' + repr(lines) + '); sys.stdout.flush()'
+        real_popen = subprocess.Popen
+        outputs = []
+        from types import SimpleNamespace as NS
+        def fake_transcribe(model, samples, speaker, stamp, language):
+            return {'type': 'segment', 'speaker': speaker,
+                    'text': f't@{stamp}', 'timestamp': stamp}
+        with tempfile.TemporaryDirectory() as helper_dir:
+            helper_script = Path(helper_dir) / 'o.py'
+            helper_script.write_text(script)
+            with patch('audio_worker.emit', outputs.append), patch('audio_worker.subprocess.Popen', lambda c, **kw: real_popen([sys.executable, str(helper_script)], **kw)), patch('audio_worker.transcribe', fake_transcribe):
+                run_capture(NS(), 'microphone', 'en', helper=Path('/fixture'))
+        segments = [e for e in outputs if e.get('type') == 'segment']
+        self.assertEqual(len(segments), 2)
+        # The queued full chunk (older stamp) comes before the reader tail.
+        self.assertLess(float(segments[0]['text'][2:]), float(segments[1]['text'][2:]))
+        self.assertTrue(segments[1].get('partial_tail'))
+
+
+class TeardownErrorVisibilityTests(unittest.TestCase):
+    def _capture(self):
+        import threading
+        from macos_audio import MacOSAudioCapture
+        capture = MacOSAudioCapture.__new__(MacOSAudioCapture)
+        capture._lock = threading.RLock()
+        capture._cancel = threading.Event()
+        capture._stopping = threading.Event()
+        capture._state = 'running'
+        capture._error = None
+        capture._callback_error = None
+        capture._source = 'microphone'
+        capture._model_size = 'tiny.en'
+        capture.source = 'microphone'
+        capture.model_size = 'tiny.en'
+        capture._thread = None
+        capture._process = None
+        capture._on_status = lambda value: None
+        return capture
+
+    def test_expected_worker_eof_stays_suppressed_during_stop(self):
+        capture = self._capture()
+        seen = []
+        capture._callback = lambda callback, value: seen.append(value)
+        capture._stopping.set()
+        capture._notify('error', 'worker')
+        self.assertEqual(seen, [])
+
+    def test_real_failure_during_stop_is_still_delivered(self):
+        capture = self._capture()
+        seen = []
+        capture._callback = lambda callback, value: seen.append(value)
+        capture._stopping.set()
+        capture._notify('error', 'protocol')
+        self.assertTrue(seen)
+        self.assertEqual(seen[-1]['state'], 'error')
+
+
+class CrossSourceOrderingTests(unittest.TestCase):
+    def test_older_tail_emits_before_newer_queued_chunk(self):
+        import base64
+        import json
+        import subprocess
+        import sys
+        import tempfile
+        import threading
+        from unittest.mock import patch
+        from audio_worker import run_capture
+        # Remote full chunk (newer stamp) arrives first and queues; the
+        # local tail (older stamp) forms at EOF. Emission must be chronological.
+        frames = []
+        for i in range(4):
+            frames.append({'type': 'pcm', 'source': 'system', 'rate': 16000,
+                           'samples': 16000, 'timestamp': 5.0,
+                           'pcm': base64.b64encode(bytes(64000)).decode()})
+        frames.append({'type': 'pcm', 'source': 'microphone', 'rate': 16000,
+                       'samples': 16000, 'timestamp': 3.0,
+                       'pcm': base64.b64encode(bytes(64000)).decode()})
+        lines = ''.join(json.dumps(f) + '\n' for f in frames)
+        script = 'import sys; sys.stdout.write(' + repr(lines) + '); sys.stdout.flush()'
+        real_popen = subprocess.Popen
+        outputs = []
+        def fake_transcribe(model, samples, speaker, stamp, language):
+            return {'type': 'segment', 'speaker': speaker,
+                    'text': f'{speaker}@{stamp}', 'timestamp': stamp}
+        from types import SimpleNamespace as NS
+        stop = threading.Event()
+        stop.set()  # force the ordered-flush path, not the live loop
+        with tempfile.TemporaryDirectory() as helper_dir:
+            helper_script = Path(helper_dir) / 'x.py'
+            helper_script.write_text(script)
+            with patch('audio_worker.emit', outputs.append), patch('audio_worker.subprocess.Popen', lambda c, **kw: real_popen([sys.executable, str(helper_script)], **kw)), patch('audio_worker.transcribe', fake_transcribe):
+                run_capture(NS(), 'both', 'en', stop=stop, helper=Path('/fixture'))
+        segments = [e for e in outputs if e.get('type') == 'segment']
+        self.assertEqual(len(segments), 2)
+        self.assertEqual([s['text'] for s in segments], ['you@3.0', 'remote@5.0'])
+
+
+class ShutdownErrorPreservationTests(unittest.TestCase):
+    def test_recorded_helper_error_reported_even_when_stop_set(self):
+        import json
+        import subprocess
+        import sys
+        import tempfile
+        import threading
+        from unittest.mock import patch
+        from audio_worker import run_capture
+        lines = json.dumps({'type': 'error', 'code': 'capture'}) + '\n'
+        script = 'import sys; sys.stdout.write(' + repr(lines) + '); sys.stdout.flush()'
+        real_popen = subprocess.Popen
+        outputs = []
+        from types import SimpleNamespace as NS
+        stop = threading.Event()
+        stop.set()  # teardown already owns the state
+        with tempfile.TemporaryDirectory() as helper_dir:
+            helper_script = Path(helper_dir) / 'e.py'
+            helper_script.write_text(script)
+            with patch('audio_worker.emit', outputs.append), patch('audio_worker.subprocess.Popen', lambda c, **kw: real_popen([sys.executable, str(helper_script)], **kw)):
+                run_capture(NS(), 'microphone', 'en', stop=stop, helper=Path('/fixture'))
+        errors = [e for e in outputs if e.get('type') == 'error']
+        self.assertTrue(errors, 'a real helper failure must surface even during teardown')
+        self.assertEqual(errors[0].get('code'), 'capture')

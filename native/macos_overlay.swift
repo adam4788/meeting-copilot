@@ -16,26 +16,32 @@ struct QuestionRow: Decodable, Identifiable {
     let busy: Bool?
     let streaming: Bool?
     let completedOnly: Bool?
-    init(id: String, question: String, answer: String? = nil, busy: Bool? = nil, streaming: Bool? = nil, completedOnly: Bool? = nil) {
-        self.id = id; self.question = question; self.answer = answer; self.busy = busy; self.streaming = streaming; self.completedOnly = completedOnly
+    let warnings: [String]?
+    let sources: [String]?
+    init(id: String, question: String, answer: String? = nil, busy: Bool? = nil, streaming: Bool? = nil, completedOnly: Bool? = nil, warnings: [String]? = nil, sources: [String]? = nil) {
+        self.id = id; self.question = question; self.answer = answer; self.busy = busy; self.streaming = streaming; self.completedOnly = completedOnly; self.warnings = warnings; self.sources = sources
     }
-    enum CodingKeys: String, CodingKey { case id, question, answer, busy, streaming, completedOnly = "completed_only" }
+    enum CodingKeys: String, CodingKey { case id, question, answer, busy, streaming, completedOnly = "completed_only", warnings, sources }
 }
 struct Snapshot: Decodable {
     var transcript: [TranscriptLine] = []
     var questions: [QuestionRow] = []
     var message: String? = nil
     var shareWarning: String? = nil
-    init(transcript: [TranscriptLine] = [], questions: [QuestionRow] = [], message: String? = nil, shareWarning: String? = nil) {
-        self.transcript = transcript; self.questions = questions; self.message = message; self.shareWarning = shareWarning
+    var listening: Bool? = nil
+    var truncated: Bool? = nil
+    init(transcript: [TranscriptLine] = [], questions: [QuestionRow] = [], message: String? = nil, shareWarning: String? = nil, listening: Bool? = nil, truncated: Bool? = nil) {
+        self.transcript = transcript; self.questions = questions; self.message = message; self.shareWarning = shareWarning; self.listening = listening; self.truncated = truncated
     }
-    enum CodingKeys: String, CodingKey { case transcript, questions, message, shareWarning = "share_warning" }
+    enum CodingKeys: String, CodingKey { case transcript, questions, message, shareWarning = "share_warning", listening, truncated }
     init(from decoder: Decoder) throws {
         let box = try decoder.container(keyedBy: CodingKeys.self)
         transcript = (try? box.decode([TranscriptLine].self, forKey: .transcript)) ?? []
         questions = (try? box.decode([QuestionRow].self, forKey: .questions)) ?? []
         message = try? box.decode(String.self, forKey: .message)
         shareWarning = try? box.decode(String.self, forKey: .shareWarning)
+        listening = try? box.decode(Bool.self, forKey: .listening)
+        truncated = try? box.decode(Bool.self, forKey: .truncated)
     }
 }
 
@@ -45,14 +51,19 @@ struct OverlayState {
     private(set) var questions: [QuestionRow] = []
     private(set) var message: String? = nil
     private(set) var shareWarning: String? = nil
+    private(set) var listening: Bool = true
+    private(set) var truncated: Bool = false
     mutating func update(_ snapshot: Snapshot) {
         transcript = Array(snapshot.transcript.suffix(6))
         questions = Array(snapshot.questions.suffix(20))
         message = snapshot.message
         shareWarning = snapshot.shareWarning
+        if let listening = snapshot.listening { self.listening = listening }
+        if let truncated = snapshot.truncated { self.truncated = truncated }
     }
     func clickable(_ id: String) -> Bool {
-        questions.contains { $0.id == id && $0.busy != true }
+        guard listening else { return false }
+        return questions.contains { $0.id == id && $0.busy != true }
     }
 }
 
@@ -79,35 +90,61 @@ struct OverlayView: View {
             HStack {
                 Text("Meeting Copilot").font(.headline)
                 Spacer()
-                Text(model.interactive ? "Interactive · 10s" : "Click-through · ⌃⌥⌘O")
+                Text(model.interactive ? "Interactive · ~10s · press shortcut again to return early" : "Click-through · press ⌃⌥⌘O to interact")
                     .font(.caption).foregroundColor(.secondary)
+                    .accessibilityLabel(model.interactive ? "Interactive mode, returns to click-through in about 10 seconds, or press the shortcut again to return early" : "Click-through mode, press Control Option Command O to interact")
             }
-            if let message = model.state.message { Text(message).font(.caption) }
+            .accessibilityElement(children: .combine)
+            if let message = model.state.message { Text(message).font(.caption).accessibilityLabel("Status: \(message)") }
+            if let warning = model.state.shareWarning { Text(warning).font(.caption).foregroundColor(.secondary).accessibilityLabel("Privacy notice: \(warning)") }
+            if model.state.truncated { Text("Long answers shortened; open the pane for full text.").font(.caption).foregroundColor(.secondary) }
             ForEach(model.state.transcript) { line in
                 Text("\(line.speaker): \(line.text)").font(.caption).lineLimit(2)
             }
-            if let warning = model.state.message ?? model.state.shareWarning { Text(warning).font(.caption).foregroundColor(.secondary) }
             Divider()
+            if model.state.questions.isEmpty {
+                Text(model.state.listening ? "Listening — questions you ask will appear here. Tap one to get its answer." : "Paused — resume capture in the Meeting Copilot pane to detect questions.")
+                    .font(.caption).foregroundColor(.secondary)
+                    .accessibilityLabel(model.state.listening ? "Listening, no questions detected yet" : "Paused, resume capture in the pane")
+            }
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 6) {
                     ForEach(model.state.questions) { row in
-                        Button(action: { model.click(row.id) }) {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(row.question).font(.subheadline).bold()
-                                if row.busy == true {
-                                    Text(row.streaming == true ? "Streaming answer…" : "Preparing answer…").font(.caption)
-                                }
-                                if let answer = row.answer {
-                                    Text(answer).font(.caption).textSelection(.enabled)
-                                    Button(action: {
-                                        NSPasteboard.general.clearContents()
-                                        NSPasteboard.general.setString(answer, forType: .string)
-                                    }) {
-                                        Text("Copy answer").font(.caption)
-                                    }.buttonStyle(.link)
-                                }
-                            }.frame(maxWidth: .infinity, alignment: .leading).padding(6)
-                        }.buttonStyle(.plain).disabled(!model.interactive || row.busy == true)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Button(action: { model.click(row.id) }) {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(row.question).font(.subheadline).bold()
+                                    if row.busy == true {
+                                        Text(row.streaming == true ? "Streaming answer…" : "Preparing answer…").font(.caption)
+                                    }
+                                    if let answer = row.answer {
+                                        Text(answer).font(.caption).textSelection(.enabled)
+                                    }
+                                    if let warnings = row.warnings {
+                                        ForEach(warnings, id: \.self) { warning in
+                                            Text("⚠ \(warning)").font(.caption).foregroundColor(.orange)
+                                                .accessibilityLabel("Warning: \(warning)")
+                                        }
+                                    }
+                                    if let sources = row.sources, !sources.isEmpty {
+                                        Text("Sources: \(sources.joined(separator: " · "))").font(.caption).foregroundColor(.secondary)
+                                            .accessibilityLabel("Sources: \(sources.joined(separator: ", "))")
+                                    }
+                                }.frame(maxWidth: .infinity, alignment: .leading).padding(6)
+                            }.buttonStyle(.plain).disabled(!model.interactive || !model.state.listening || row.busy == true)
+                            .accessibilityLabel("Ask: \(row.question)")
+                            .accessibilityHint(model.state.listening ? "Gets an answer for this question" : "Resume capture in the pane to enable")
+                            if row.answer != nil {
+                                Button(action: {
+                                    NSPasteboard.general.clearContents()
+                                    NSPasteboard.general.setString(row.answer ?? "", forType: .string)
+                                }) {
+                                    Text("Copy answer").font(.caption)
+                                }.buttonStyle(.link)
+                                .disabled(!model.interactive)
+                                .accessibilityLabel("Copy answer for \(row.question)")
+                            }
+                        }
                     }
                 }
             }
@@ -179,12 +216,15 @@ final class Controller: NSObject {
             return noErr
         }
         guard InstallEventHandler(GetApplicationEventTarget(), handler, 1, &event, pointer, &eventHandler) == noErr else {
+            if let line = try? JSONSerialization.data(withJSONObject: ["type": "error", "code": "hotkey"]) , let text = String(data: line, encoding: .utf8) { print(text); fflush(stdout) }
             model.state = OverlayState(); return
         }
-        let keyID = EventHotKeyID(signature: OSType(0x4d43504f), id: 1)
+        let keyID = EventHotKeyID(signature: OSType(0x4D43504F), id: 1)
         if RegisterEventHotKey(UInt32(kVK_ANSI_O), UInt32(controlKey | optionKey | cmdKey), keyID,
                                GetApplicationEventTarget(), 0, &hotKey) != noErr {
             // Fail closed: the overlay remains click-through if the shortcut is unavailable.
+            // stderr is discarded by the bridge, so also report on stdout for the pane.
+            if let line = try? JSONSerialization.data(withJSONObject: ["type": "error", "code": "hotkey"]) , let text = String(data: line, encoding: .utf8) { print(text); fflush(stdout) }
             fputs("Overlay hotkey unavailable; remaining click-through.\n", stderr)
         }
     }

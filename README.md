@@ -12,7 +12,7 @@ Get short, speakable answer suggestions during Teams or Zoom calls, grounded in 
 - Independent macOS microphone/system-audio transcription with selectable local Whisper models; optionally attach to an explicitly selected Meetily recording. Native Windows capture remains experimental.
 - Local transcription; this project writes no additional raw audio recordings. Meetily retains its own recording behavior.
 - Select one project, **All projects + sessions**, or sessions only, with visible evidence. All-project scope covers up to 100 eligible project folders, not your whole computer.
-- **Automatic web fallback is on by default.** When local evidence is insufficient, the configured model can draft a filtered generic public query. Turn it off for sensitive calls; filtering is best effort, not a privacy guarantee. A query you enter explicitly overrides automatic planning.
+- **Automatic web fallback is off by default.** When local evidence is insufficient and you opt in, the configured model can draft a filtered generic public query. Filtering is best effort, not a privacy guarantee. A query you enter explicitly always overrides automatic planning.
 - Read-only answer generation through Meta Muse Spark (Meta Model API) when `MODEL_API_KEY` is set in the gateway environment, otherwise your configured model or an explicitly selected authenticated provider/model, independently of the transcription model. No global chat-model changes, agent tools or external-system mutations.
 - In-memory transcript buffer and a capture heartbeat that stops listening when the pane disconnects.
 
@@ -22,7 +22,7 @@ Get short, speakable answer suggestions during Teams or Zoom calls, grounded in 
 
 Deterministic checks, synthetic-file macOS transcription and explicit answer-model routing have been exercised. Live independent microphone/system capture still needs user-approved permission and device testing. See the [verification notes](docs/verification.md); do not infer production readiness from passing unit tests.
 
-A macOS overlay exists (`native/macos_overlay.swift` and `overlay_bridge.py`), launched only by the pane's Show overlay action after you start listening. It streams real incremental answers into the tapped question row using your current pane settings (project/sessions, web fallback, answer provider/model); nothing is captured or sent until you tap. `sharingType = .none` is best-effort only: Apple documents it as legacy, so assume the overlay may appear in a screen share. No visual or Zoom/Meet screen-share test has been performed.
+A macOS overlay exists (`native/macos_overlay.swift` and `overlay_bridge.py`), launched only by the pane's Show overlay action after you start listening. It streams real incremental answers into the tapped question row using your current pane settings (project/sessions, web fallback, answer provider/model), auto-syncing scope changes while shown; nothing is captured or sent until you tap. `sharingType = .none` is best-effort only: Apple documents it as legacy, so assume the overlay may appear in a screen share. No visual or Zoom/Meet screen-share test has been performed. The overlay returns to click-through after ~10s; press the shortcut (default Ctrl+Option+Cmd+O) to interact again.
 
 ## Install and use
 
@@ -46,7 +46,7 @@ Installation copies only this plugin into the active `HERMES_HOME`, backing up a
 3. Choose **Search scope**: one project, **All projects + sessions**, or **Past sessions only**.
 4. Confirm permission and click **Attach to Meetily**.
 5. Click **Suggest answer** for the latest question, or type a specific question.
-6. **Automatic web fallback** is checked by default; uncheck it to prevent automatically planned searches. To override it, expand **Search online with a specific query** and enter a public query explicitly.
+6. **Automatic web fallback** is unchecked by default; check it to allow automatically planned searches for this meeting. To override it, expand **Search online with a specific query** and enter a public query explicitly.
 
 **Detach** stops the copilot reading, not Meetily recording. **Clear meeting** clears the copilot's buffer/result but does not delete Meetily's files or undo requests already sent to a provider.
 
@@ -54,7 +54,7 @@ Current file retrieval supports Markdown/plain text/reStructuredText, not PDF, D
 
 ### Independent macOS transcription and model selection
 
-No Meetily application, recordings, models or helper binaries are required for this mode.
+No Meetily application, recordings, or models are required for this mode. A macOS audio worker plus a small signed Swift capture helper are built during preparation (see step 1); they only run after you click Start listening.
 
 1. Install this plugin as above, then run `python prepare_macos.py` on macOS with `uv` and Apple Command Line Tools installed. This prepares an isolated Python 3.12 environment, faster-whisper CPU runtime, and an original signed Swift helper; it does **not** start capture or ask for recording permissions.
 2. Restart an already-running gateway from a separate terminal when its other work is idle: `hermes gateway restart`. Reloading desktop plugins alone does not refresh an already-mounted Python backend.
@@ -63,7 +63,7 @@ No Meetily application, recordings, models or helper binaries are required for t
 5. Confirm participant consent and click **Start listening**. Approve macOS Microphone and/or Screen & System Audio Recording permissions when requested. Permission attribution and real audio routing need validation on your machine. **Pause listening** terminates the worker/helper; no additional audio recording is saved.
 6. Under **Answer model**, keep the default (Meta Muse Spark via the Meta Model API when `MODEL_API_KEY` is set in the gateway environment) or select an authenticated provider and exact model, including Meta Model API entries. This applies only to the copilot's answer and optional fallback planner, not Hermes chat or transcription. Explicit selection failures do not silently switch models. The public search provider remains the configured Hermes search provider. Each answer reports its `model_route` beside the elapsed time.
 
-Local transcription is separate from answer privacy: bounded transcript/source context may still leave the device for the selected answer provider. Disable automatic web fallback for sensitive calls. No raw audio is sent to that provider.
+Local transcription is separate from answer privacy: bounded transcript/source context may still leave the device for the selected answer provider. Disable automatic web fallback for sensitive calls. No raw audio is sent to that provider. Cancel, pause, and Clear meeting mark requests so no further answers are published, but they cannot recall context already transmitted to a model or search provider, nor interrupt an in-flight provider call already in progress.
 
 For a no-device transcription check, generate a non-sensitive WAV and run the installed `audio-runtime/bin/python audio_worker.py --file path/to/synthetic.wav --model tiny.en` from the installed `dashboard/core` directory. Do not use private recordings as public test evidence. The [REA reconstruction report](docs/meetily-reconstruction.md) documents architectural evidence, not runtime parity with Meetily. This implementation does not copy or invoke Meetily binaries/assets.
 

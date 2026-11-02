@@ -104,6 +104,7 @@ class MacOSAudioCapture:
         self._process = None
         self._thread = None
         self._cancel = threading.Event()
+        self._stopping = threading.Event()
 
     def devices(self):
         """Static capabilities only. Does not probe TCC or instantiate AV/SC APIs."""
@@ -124,13 +125,23 @@ class MacOSAudioCapture:
     def _notify(self, state, code=None):
         if self._cancel.is_set():
             return
+        # During the graceful stop window the worker's expected EOF must not
+        # surface as a capture error: teardown already owns the final state.
+        # A real failure reported mid-teardown is still news, never hidden.
+        if self._stopping.is_set():
+            if state != 'error' or code in ('worker', None):
+                return
         with self._lock:
             self._state, self._error = state, error_message(code) if code else None
         self._callback(self._on_status, self.status())
 
     def _callback(self, callback, value):
         if self._cancel.is_set():
-            return
+            # Terminal capture states are always delivered: final loss
+            # counts and errors must reach the pane even during teardown.
+            state = value.get('state') if isinstance(value, dict) else None
+            if state not in ('stopped', 'error'):
+                return
         try:
             callback(value)
         except Exception:
@@ -147,9 +158,11 @@ class MacOSAudioCapture:
             if self._thread and self._thread.is_alive():
                 raise RuntimeError('Audio capture is already active or stopping')
             self._cancel = threading.Event()
+            self._stopping = threading.Event()
             self._on_segment = on_segment
             self._on_status = on_status or (lambda value: None)
             self._state, self._error, self._callback_error = 'starting', None, None
+            self._last_loss = {}
             self._process = None
             self._thread = threading.Thread(target=self._run, daemon=True, name='macos-audio-worker')
             self._thread.start()
@@ -182,16 +195,32 @@ class MacOSAudioCapture:
                 if kind == 'error':
                     self._notify('error', event.get('code'))
                     break
-                if kind == 'status' and event.get('state') in ('loading', 'starting', 'running'):
-                    self._notify(event['state'])
+                if kind == 'status' and event.get('state') in ('loading', 'starting', 'running', 'stopped'):
+                    extra = {k: event.get(k) for k in ('warning', 'dropped_chunks', 'native_dropped_chunks',
+                                                       'worker_dropped_chunks', 'sub_second_dropped_chunks',
+                                                       'reader_incomplete', 'partial_tail')
+                             if event.get(k) is not None}
+                    self._notify(event['state'], None)
+                    if extra:
+                        with self._lock:
+                            self._last_loss = dict(extra)
+                        try:
+                            merged = self.status()
+                            merged.update(extra)
+                            self._callback(self._on_status, merged)
+                        except Exception:
+                            pass
                 elif kind == 'segment':
                     text, stamp = event.get('text'), event.get('timestamp')
                     if (not isinstance(text, str) or len(text) > 16000 or
                             event.get('speaker') not in ('you', 'remote') or
                             not isinstance(stamp, (float, int)) or not math.isfinite(stamp)):
                         raise ValueError('protocol')
-                    self._callback(self._on_segment, {'speaker': event['speaker'],
-                                                     'text': text, 'timestamp': float(stamp)})
+                    segment = {'speaker': event['speaker'],
+                               'text': text, 'timestamp': float(stamp)}
+                    if event.get('partial_tail') is True:
+                        segment['partial_tail'] = True
+                    self._callback(self._on_segment, segment)
         except RuntimeError:
             self._notify('error', 'runtime')
         except (ValueError, UnicodeError, AttributeError):
@@ -207,12 +236,36 @@ class MacOSAudioCapture:
                     self._state = 'stopped'
 
     def stop(self, timeout=3.0):
-        """Cancel callbacks immediately and terminate worker plus native descendants.
+        """Bounded graceful shutdown: SIGTERM first so the worker flushes its
+        tail and delivers a final summary, then force-terminate leftovers.
 
         Already executing user callbacks cannot be forcibly interrupted.
         """
         timeout = max(0.0, min(float(timeout), 10.0))
         deadline = time.monotonic() + timeout
+        self._stopping.set()
+        force_needed = False
+        with self._lock:
+            process, thread = self._process, self._thread
+        if process:
+            # Graceful window: the worker stops its helper, flushes trailing
+            # audio, and exits on its own. Callbacks stay live so the final
+            # summary and tail segments reach the pane.
+            try:
+                process.terminate()
+            except Exception:
+                pass
+            # Honor the caller's stop budget (reserving 0.5s for forced
+            # teardown): slow inference or queued chunks can need more than
+            # a fixed one-second window to flush the trailing audio.
+            graceful = max(0.0, min(deadline - time.monotonic() - 0.5, timeout - 0.5))
+            try:
+                process.wait(timeout=graceful or 0.0)
+            except Exception:
+                pass
+            # Whether force termination was actually needed — not reader
+            # liveness, which can misreport a killed worker as clean.
+            force_needed = process.poll() is None
         self._cancel.set()
         with self._lock:
             process, thread = self._process, self._thread
@@ -223,3 +276,21 @@ class MacOSAudioCapture:
         with self._lock:
             if self._state != 'error':
                 self._state = 'stopping' if thread and thread.is_alive() else 'stopped'
+            final_loss = dict(getattr(self, '_last_loss', None) or {})
+            forced = force_needed or bool(thread and thread.is_alive())
+        # Deliver the terminal state with the last known loss evidence: the
+        # worker may have been terminated before its own summary arrived.
+        # The process group is dead at this point, so 'stopping' is settled
+        # to 'stopped' for delivery. A forced shutdown is marked explicitly:
+        # trailing audio may never have been reported.
+        if forced:
+            prior = final_loss.get('warning') or ''
+            final_loss['warning'] = (prior + ' Forced shutdown before the worker exited; trailing audio may be incomplete.').strip()
+        try:
+            final = self.status()
+            if final.get('state') == 'stopping':
+                final['state'] = 'stopped'
+            final.update(final_loss)
+            self._callback(self._on_status, final)
+        except Exception:
+            pass

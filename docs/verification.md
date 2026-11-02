@@ -14,10 +14,20 @@ A direct Meta Model API route (`meta_models.py`, Muse Spark `muse-spark-1.3/1.2/
 
 The backend adds consent-gated macOS start/pause, allowlisted audio sources/models, generation-scoped callbacks, and paused-state normalization. Tests cover stopped callback rejection, safe device enumeration without replacing active capture, independent model routing, concurrency and explicit-model failure without fallback. See the current test output for evolving counts.
 
-**Not yet verified:** live independent microphone audio, ScreenCaptureKit system audio, combined capture, permission attribution/denial behavior on this installed host, long-call resource use, and visual acceptance of the new selectors. These require an explicit user-started recording rehearsal. Meetily-based live transcript ingestion is separate evidence, not proof of the independent capture path.
+**Limited hardware observation:** earlier local microphone probes produced PCM frames and a final stopped status after SIGTERM on the installed helper. This is shutdown-path evidence, not a verified meeting, routing matrix, or permission-denial/recovery test. Synthetic file transcription is separate evidence.
+
+**Not yet verified:** ScreenCaptureKit system/combined routing, permission attribution and denial/recovery across devices, multi-speaker recognition, long-call resource use, and live visual acceptance. Any further device rehearsal requires explicit user consent; no new recording is started by the checks below.
 
 
 This records exercised checks, not promised features. The project is an early developer preview.
+
+## Current local acceptance checkpoint
+
+- The combined gate ran **410 Python tests (3 skipped), 54 Node contract tests, JavaScript syntax, and `git diff --check`**, with exit status 0. Counts describe this checkpoint, not a permanent test total. Installed artifacts were rebuilt (`install.py` + `prepare_macos.py`) and verified (`macos_capture --check-only`, `macos_overlay --self-test`, tiny.en file transcription, clean live-mic SIGTERM drain) after the latest fixes.
+- New real-bridge/HTTP regressions cover Clear on a 5,001-segment Meetily snapshot, post-clear speech before resume, switching recordings after Clear, New meeting on the same recording, and interruption during initial delivery. These use synthetic local snapshots—not private recordings or hardware.
+- A read-only probe of the actual gateway returned **401 without credentials, 200 with a fresh profile-bound native HTTP ticket, and 401 when reusing that consumed ticket**. Capture was paused with no transcript or requests. This verifies that host's observed authentication path, not cross-principal isolation or a provider-to-overlay flow.
+- The mounted gateway response lacked the current source's `last_session` field. Therefore backend reload is **not established**: copying files or reconnecting Desktop must not be reported as activation of these fixes. A supported gateway restart and behavior-specific authenticated readback remain required.
+- No renderer CDP endpoint answered at the documented local port. The user's app was not relaunched to enable debugging. Visual acceptance and actual screen-share behavior remain unverified.
 
 ## Deterministic checks
 

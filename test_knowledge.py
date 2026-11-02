@@ -303,3 +303,339 @@ class AnswerStreamTests(KnowledgeTests):
                 result = fresh.answer('What does Orchid require?', project='alpha')
         self.assertFalse(result['streaming'])
         self.assertTrue(result['completed_only'])
+
+
+class StreamingProbeTests(unittest.TestCase):
+    def test_supports_streaming_probe_needs_no_retrieval(self):
+        from unittest.mock import Mock
+        calls = []
+        engine = KnowledgeEngine.__new__(KnowledgeEngine)
+        streaming = Mock(return_value='x [1].')
+        streaming.stream_chunks = Mock(return_value=iter(['x']))
+        import model_selection as selection
+        orig = selection.selected_completion
+        selection.selected_completion = lambda p, m: streaming
+        try:
+            engine2 = KnowledgeEngine.__new__(KnowledgeEngine)
+            self.assertTrue(engine2.supports_streaming(answer_provider='p', answer_model='m'))
+        finally:
+            selection.selected_completion = orig
+        plain = Mock(return_value='x [1].')
+        del plain.stream_chunks
+        selection.selected_completion = lambda p, m: plain
+        try:
+            engine3 = KnowledgeEngine.__new__(KnowledgeEngine)
+            self.assertFalse(engine3.supports_streaming(answer_provider='p', answer_model='m'))
+        finally:
+            selection.selected_completion = orig
+
+
+class IncrementalRetrievalTests(KnowledgeTests):
+    def test_expired_ttl_without_disk_changes_skips_rereads(self):
+        from pathlib import Path
+        from unittest.mock import patch
+        import time as _time
+        (self.project / 'notes.md').write_text('Orchid approval.', encoding='utf-8')
+        first = self.engine.search('Orchid', project='alpha')
+        self.assertTrue(first)
+        # Expire the TTL relative to the monotonic clock (robust to clock origin).
+        for key, (stamp, fingerprint, docs) in list(self.engine._cache.items()):
+            self.engine._cache[key] = (_time.monotonic() - 16, fingerprint, docs)
+        with patch.object(Path, 'read_text', side_effect=AssertionError('must not re-read')):
+            second = self.engine.search('Orchid', project='alpha')
+        self.assertEqual(second, first)
+
+    def test_changed_file_invalidates_fingerprint(self):
+        import time as _time
+        (self.project / 'notes.md').write_text('Orchid approval.', encoding='utf-8')
+        self.assertTrue(self.engine.search('Orchid', project='alpha'))
+        for key, (stamp, fingerprint, docs) in list(self.engine._cache.items()):
+            self.engine._cache[key] = (_time.monotonic() - 16, fingerprint, docs)
+        (self.project / 'notes.md').write_text('Orchid approved yesterday.', encoding='utf-8')
+        hits = self.engine.search('Orchid approved', project='alpha')
+        self.assertTrue(any('approved yesterday' in h['text'] for h in hits))
+
+    def test_preselect_bounds_single_combined_rank(self):
+        docs = [{'text': f'doc {i} orchid'} for i in range(50)]
+        short = KnowledgeEngine._preselect(docs, ['orchid'], 6)
+        self.assertEqual(len(short), 6)
+        self.assertEqual(short[0]['text'], 'doc 0 orchid')
+        self.assertEqual(KnowledgeEngine._preselect(docs, ['missing'], 6), [])
+
+
+class LargeCorpusBoundTests(KnowledgeTests):
+    def test_unchanged_large_project_skips_rereads_after_expiry(self):
+        import time as _time
+        from pathlib import Path
+        from unittest.mock import patch
+        # Big files fill the 600-chunk doc cap from the first ~38 files while
+        # hundreds more candidate files follow: the fingerprint must still
+        # match exactly, or every post-TTL search pays full re-reads.
+        for i in range(40):
+            (self.project / f'doc{i:02}.md').write_text('Orchid review notes. ' * 1600, encoding='utf-8')
+        for i in range(300):
+            (self.project / f'note{i:03}.md').write_text(f'Orchid appendix note {i}.', encoding='utf-8')
+        first = self.engine.search('Orchid review', project='alpha', limit=6)
+        self.assertTrue(first)
+        self.assertTrue(dict(self.engine._cache))
+        for key, (stamp, fingerprint, docs) in list(self.engine._cache.items()):
+            self.engine._cache[key] = (_time.monotonic() - 16, fingerprint, docs)
+        with patch.object(Path, 'read_text', side_effect=AssertionError('must not re-read')):
+            second = self.engine.search('Orchid review', project='alpha', limit=6)
+        self.assertEqual(second, first)
+
+
+class DefaultMetaStreamFallbackTests(KnowledgeTests):
+    def test_default_meta_stream_failure_before_output_falls_back(self):
+        import os
+        from unittest.mock import Mock, patch
+        (self.project / 'notes.md').write_text('Orchid approval.', encoding='utf-8')
+        def failing_stream(messages):
+            raise RuntimeError('meta stream down')
+        meta_complete = Mock(side_effect=AssertionError('must not complete'))
+        meta_complete.stream_chunks = failing_stream
+        with patch.dict(os.environ, {'MODEL_API_KEY': 'test-key-12345'}):
+            with patch('meta_models.meta_completion', return_value=meta_complete):
+                with self.assertRaises(NotImplementedError) as ctx:
+                    self.engine.answer_stream('What does Orchid require?', project='alpha', web_fallback=False)
+        self.assertIn('streaming_unsupported', str(ctx.exception))
+
+    def test_explicit_provider_stream_failure_stays_an_error(self):
+        import model_selection
+        real = model_selection.selected_completion
+        def failing_stream(messages):
+            raise RuntimeError('provider down')
+        complete = Mock(return_value='x')
+        complete.stream_chunks = failing_stream
+        with patch.object(model_selection, 'selected_completion', return_value=complete):
+            with self.assertRaises(RuntimeError):
+                self.engine.answer_stream('What does Orchid require?', project='alpha',
+                                          web_fallback=False, answer_provider='p', answer_model='m')
+
+
+class ProviderBoundaryAbortTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.projects = self.root / 'Projects'
+        self.projects.mkdir()
+        (self.projects / 'alpha').mkdir()
+        self.home = self.root / 'hermes'
+        self.home.mkdir()
+
+    def test_cancel_during_meta_failure_never_calls_fallback(self):
+        from knowledge import _Aborted
+        engine = KnowledgeEngine(self.projects, self.home)
+        flag = [False]
+        def failing_meta(messages):
+            flag[0] = True
+            raise RuntimeError('meta down')
+        hermes_spy = Mock(return_value='hello [1].')
+        with patch('meta_models.api_key_present', return_value=True), \
+             patch('meta_models.meta_completion', return_value=failing_meta), \
+             patch.object(engine, '_complete', hermes_spy):
+            with self.assertRaises(_Aborted):
+                engine.answer('q?', transcript='hello there', should_abort=lambda: flag[0])
+        hermes_spy.assert_not_called()
+
+    def test_cancel_between_stream_setup_and_consumption_never_submits(self):
+        from knowledge import _Aborted
+        engine = KnowledgeEngine(self.projects, self.home)
+        submitted = []
+        def lazy(messages):
+            def gen():
+                submitted.append(1)
+                yield 'a'
+            return gen()
+        provider = Mock()
+        provider.stream_chunks = Mock(side_effect=lazy)
+        flag = [False]
+        with patch.object(engine, '_complete', provider):
+            header, gen = engine.answer_stream('q?', transcript='hello there',
+                                               should_abort=lambda: flag[0])
+            flag[0] = True
+            with self.assertRaises(_Aborted):
+                list(gen)
+        self.assertEqual(submitted, [])
+
+
+class PreparedFallbackTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.projects = self.root / 'Projects'
+        self.projects.mkdir()
+        (self.projects / 'alpha').mkdir()
+        self.home = self.root / 'hermes'
+        self.home.mkdir()
+
+    def test_completed_fallback_reuses_prepared_retrieval(self):
+        engine = KnowledgeEngine(self.projects, self.home)
+        provider = Mock()
+        provider.stream_chunks = Mock(return_value=iter(['x']))
+        with patch.object(engine, '_complete', provider):
+            header, chunks = engine.answer_stream('q?', 'hello there')
+            list(chunks)
+        self.assertIn('sources', header)
+        search_spy = Mock(side_effect=engine.search)
+        web_spy = Mock(side_effect=engine._web)
+        with patch.object(engine, 'search', search_spy), \
+             patch.object(engine, '_web', web_spy), \
+             patch.object(engine, '_complete', Mock(return_value='done [1].')):
+            result = engine.answer('q?', transcript='hello there', prepared=header)
+        search_spy.assert_not_called()
+        web_spy.assert_not_called()
+        self.assertEqual(result['sources'], header['sources'])
+
+
+class PreparedReuseTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.projects = self.root / 'Projects'
+        self.projects.mkdir()
+        (self.projects / 'alpha').mkdir()
+        self.home = self.root / 'hermes'
+        self.home.mkdir()
+
+    def test_prepared_web_search_provenance_survives_fallback(self):
+        from knowledge import KnowledgeEngine
+        engine = KnowledgeEngine(self.projects, self.home)
+        with patch.object(engine, '_complete', Mock(return_value='done [1].')):
+            result = engine.answer('q?', transcript='hello',
+                                   prepared={'sources': [], 'warnings': [],
+                                             'web_search': {'used': True, 'mode': 'explicit', 'query': 'q'}})
+        self.assertEqual(result['web_search']['used'], True)
+
+    def test_sync_stream_setup_failure_carries_prepared_retrieval(self):
+        from knowledge import KnowledgeEngine
+        engine = KnowledgeEngine(self.projects, self.home)
+        search_spy = Mock(side_effect=engine.search)
+        with patch.object(engine, 'search', search_spy), \
+             patch.object(engine, '_complete', object()):
+            with self.assertRaises(NotImplementedError) as ctx:
+                engine.answer_stream('q?', 'hello there')
+        prepared = getattr(ctx.exception, 'prepared', None)
+        self.assertIsNotNone(prepared)
+        first_count = search_spy.call_count
+        self.assertGreaterEqual(first_count, 1)
+        with patch.object(engine, 'search', search_spy), \
+             patch.object(engine, '_complete', Mock(return_value='done [1].')):
+            result = engine.answer('q?', transcript='hello there', prepared=prepared)
+        self.assertEqual(search_spy.call_count, first_count)
+        self.assertIn('done', result['answer'])
+
+
+class PreparedStageTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.projects = self.root / 'Projects'
+        self.projects.mkdir()
+        (self.projects / 'alpha').mkdir()
+        self.home = self.root / 'hermes'
+        self.home.mkdir()
+
+    def test_retrieval_stage_still_runs_requested_web_phase(self):
+        engine = KnowledgeEngine(self.projects, self.home)
+        web_spy = Mock(return_value=[])
+        with patch.object(engine, '_web', web_spy), \
+             patch.object(engine, '_complete', Mock(return_value='done [1].')):
+            result = engine.answer('q?', transcript='hello', web_query='docs',
+                                   prepared={'sources': [], 'warnings': [],
+                                             'web': {'used': False}, 'stage': 'retrieval'})
+        web_spy.assert_called_once()
+        self.assertTrue(result['web_search']['used'])
+
+    def test_full_stage_never_repeats_completed_web_phase(self):
+        engine = KnowledgeEngine(self.projects, self.home)
+        web_spy = Mock(return_value=[])
+        with patch.object(engine, '_web', web_spy), \
+             patch.object(engine, '_complete', Mock(return_value='done [1].')):
+            result = engine.answer('q?', transcript='hello', web_query='docs',
+                                   prepared={'sources': [], 'warnings': [],
+                                             'web': {'used': False}, 'stage': 'full'})
+        web_spy.assert_not_called()
+
+
+class MetaSkipAndStreamingFlagTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.projects = self.root / 'Projects'
+        self.projects.mkdir()
+        (self.projects / 'alpha').mkdir()
+        self.home = self.root / 'hermes'
+        self.home.mkdir()
+
+    def test_skip_meta_default_never_touches_failed_endpoint(self):
+        engine = KnowledgeEngine(self.projects, self.home)
+        hermes_spy = Mock(return_value='done [1].')
+        with patch('meta_models.api_key_present', return_value=True), \
+             patch('meta_models.meta_completion') as meta_factory, \
+             patch.object(engine, '_complete', hermes_spy):
+            result = engine.answer('q?', transcript='hello', skip_meta_default=True,
+                                   prepared={'sources': [], 'warnings': [],
+                                             'web': {'used': False}, 'stage': 'full'})
+        meta_factory.assert_not_called()
+        hermes_spy.assert_called_once()
+        self.assertIn('done', result['answer'])
+
+    def test_fallback_answer_reports_completed_not_streaming(self):
+        engine = KnowledgeEngine(self.projects, self.home)
+        with patch.object(engine, '_complete', Mock(return_value='done [1].')):
+            result = engine.answer('q?', transcript='hello',
+                                   prepared={'sources': [], 'warnings': [],
+                                             'web': {'used': False}, 'stage': 'full'})
+        self.assertFalse(result['streaming'])
+        self.assertTrue(result['completed_only'])
+
+
+class SyncSetupPreparedRouteTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.projects = self.root / 'Projects'
+        self.projects.mkdir()
+        (self.projects / 'alpha').mkdir()
+        self.home = self.root / 'hermes'
+        self.home.mkdir()
+
+    def test_sync_setup_failure_carries_model_route(self):
+        from knowledge import KnowledgeEngine
+        engine = KnowledgeEngine(self.projects, self.home)
+        with patch.object(engine, '_complete', object()):
+            with self.assertRaises(NotImplementedError) as ctx:
+                engine.answer_stream('q?', 'hello there')
+        prepared = getattr(ctx.exception, 'prepared', None)
+        self.assertIsNotNone(prepared)
+        self.assertIn('model_route', prepared)
+
+
+class WebPlannedReuseTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.projects = self.root / 'Projects'
+        self.projects.mkdir()
+        (self.projects / 'alpha').mkdir()
+        self.home = self.root / 'hermes'
+        self.home.mkdir()
+
+    def test_planned_but_unused_web_is_not_replanned(self):
+        from knowledge import KnowledgeEngine
+        engine = KnowledgeEngine(self.projects, self.home)
+        with patch.object(engine, '_complete', Mock(return_value='done [1].')), \
+             patch('knowledge.plan_web') as plan_spy:
+            engine.answer('q?', transcript='hello',
+                          prepared={'sources': [], 'warnings': [],
+                                    'web_search': {'used': False},
+                                    'web_planned': True})
+        plan_spy.assert_not_called()

@@ -52,7 +52,9 @@ def decode_frame(line):
     samples = np.frombuffer(raw, dtype='<f4')
     if not np.isfinite(samples).all():
         raise ValueError('PCM values')
-    return ('you' if item['source'] == 'microphone' else 'remote'), samples, float(stamp)
+    native_drops = item.get('native_dropped_chunks', item.get('dropped_chunks'))
+    native_drops = int(native_drops) if isinstance(native_drops, int) and native_drops > 0 else 0
+    return ('you' if item['source'] == 'microphone' else 'remote'), samples, float(stamp), native_drops
 
 
 def load_model(name, factory=None):
@@ -74,42 +76,117 @@ def run_capture(model, source, language, helper=None, stop=None):
     """Bounded reader queue. Helper inherits worker process group for gateway cleanup."""
     import numpy as np
     stop = stop or threading.Event()
+    helper_proc = {}
+    def _graceful_stop(signum, frame):
+        # SIGTERM (adapter teardown) means flush-and-exit, not die-mid-chunk:
+        # stop the helper so the reader sees EOF, then drain, flush the tail,
+        # and exit cleanly with a final summary.
+        stop.set()
+        try:
+            proc = helper_proc.get('proc')
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
+    try:
+        signal.signal(signal.SIGTERM, _graceful_stop)
+    except Exception:
+        pass
     helper = helper or Path(__file__).resolve().with_name('macos_capture')
     process = subprocess.Popen([str(helper), '--start', '--source', source],
                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL)
+    helper_proc['proc'] = process
     pending = queue.Queue(maxsize=4)
     done = threading.Event()
     failure = []
+    dropped = {'count': 0}
+    native_lost = {'count': 0}
+    tail_items = []
+    sub_second_lost = {'count': 0}
+    # faster-whisper inference is not guaranteed thread-safe: the reader's
+    # tail flush and the main drain must never transcribe concurrently.
+    infer_lock = threading.Lock()
 
     def enqueue(item):
         if pending.full():
             try:
                 pending.get_nowait()
+                dropped['count'] += 1
             except queue.Empty:
                 pass
         pending.put_nowait(item)
+        # Report the very first drop immediately, then every fourth: audio
+        # loss must be visible, not just hinted after sustained overload.
+        # Always the combined total: a worker-only count would rewind the
+        # pane's latched combined total on arrival.
+        if dropped['count'] == 1 or (dropped['count'] and dropped['count'] % 4 == 0):
+            try:
+                total = native_lost['count'] + dropped['count']
+                emit({'type': 'status', 'state': 'running', 'dropped_chunks': total,
+                      'native_dropped_chunks': native_lost['count'],
+                      'worker_dropped_chunks': dropped['count'],
+                      'warning': f"Transcription falling behind; worker dropped {dropped['count']} chunk(s), "
+                                 f"native dropped {native_lost['count']} frame(s). Some words may be missing."})
+            except Exception:
+                pass
 
     def read():
         buffers = {'you': [], 'remote': []}
         counts = {'you': 0, 'remote': 0}
         stamps = {}
+        # DEPRECATED mixed-unit field: 'dropped_chunks' sums worker chunks and
+        # native frames for backward compatibility only. Consumers must
+        # prefer native_dropped_chunks / worker_dropped_chunks /
+        # sub_second_dropped_chunks, which are reported separately and never
+        # summed in user-facing text.
         try:
-            while not stop.is_set():
+            # Drain to EOF unconditionally: stopping teardown must not strand
+            # helper-pipe audio. EOF (helper exit) ends the loop; the thread
+            # is a daemon and joins are bounded, so a live helper cannot hang
+            # shutdown.
+            while True:
                 line = process.stdout.readline(MAX_FRAME + 1)
                 if not line:
                     break
                 if len(line) > MAX_FRAME or not line.endswith(b'\n'):
                     raise ValueError('frame bounds')
                 header = json.loads(line)
+                # Loss accounting comes first: status and error frames carry
+                # pending native drops that must not be lost with the frame.
+                # PCM frames account their own drops via decode_frame below,
+                # so they are excluded here to avoid double counting.
+                reported = header.get('native_dropped_chunks', header.get('dropped_chunks'))
+                if header.get('type') in ('status', 'error') and isinstance(reported, int) and reported > 0:
+                    native_lost['count'] += reported
                 if header.get('type') == 'error':
                     failure.append(header.get('code', 'capture'))
                     break
                 if header.get('type') == 'status':
                     if header.get('state') == 'running':
-                        emit({'type': 'status', 'state': 'running'})
+                        running = {'type': 'status', 'state': 'running',
+                                   'dropped_chunks': native_lost['count'] + dropped['count'],
+                                   'native_dropped_chunks': native_lost['count'],
+                                   'worker_dropped_chunks': dropped['count']}
+                        if native_lost['count'] or dropped['count']:
+                            running['warning'] = (
+                                f"Transcription falling behind; worker dropped {dropped['count']} chunk(s), "
+                                f"native dropped {native_lost['count']} frame(s). Some words may be missing.")
+                        elif header.get('warning'):
+                            running['warning'] = header.get('warning')
+                        emit(running)
                     continue
-                speaker, samples, stamp = decode_frame(line)
+                speaker, samples, stamp, native_drops = decode_frame(line)
+                if native_drops:
+                    native_lost['count'] += native_drops
+                    try:
+                        emit({'type': 'status', 'state': 'running',
+                              'dropped_chunks': native_lost['count'] + dropped['count'],
+                              'native_dropped_chunks': native_lost['count'],
+                              'worker_dropped_chunks': dropped['count'],
+                              'warning': f"Capture dropped {native_lost['count']} native frame(s) under backpressure; some audio may be missing."})
+                    except Exception:
+                        pass
                 if (source == 'microphone' and speaker != 'you') or (source == 'system' and speaker != 'remote'):
                     raise ValueError('unexpected source')
                 if not counts[speaker]:
@@ -122,6 +199,28 @@ def run_capture(model, source, language, helper=None, stop=None):
         except Exception:
             failure.append('protocol')
         finally:
+            # Hand sub-chunk buffers to the ordered tail list instead of
+            # transcribing them here: the main flush transcribes queued
+            # audio oldest-first, then these tails in timestamp order, so a
+            # trailing fragment can never overtake earlier chunks.
+            # Anything that cannot be queued is counted as lost audio, never
+            # silently cleared. The main flush counts sub-second leftovers.
+            for speaker in ('you', 'remote'):
+                try:
+                    if counts.get(speaker, 0) > 0 and buffers.get(speaker):
+                        chunk = np.concatenate(buffers[speaker])
+                        try:
+                            tail_items.append((stamps.get(speaker, 0.0), speaker, chunk))
+                        except Exception:
+                            if len(chunk) >= 16000:
+                                dropped['count'] += 1
+                            else:
+                                sub_second_lost['count'] += 1
+                except Exception:
+                    dropped['count'] += 1
+                    continue
+                finally:
+                    buffers[speaker], counts[speaker] = [], 0
             done.set()
 
     reader = threading.Thread(target=read, daemon=True, name='native-audio-reader')
@@ -134,10 +233,84 @@ def run_capture(model, source, language, helper=None, stop=None):
                 if done.is_set():
                     break
                 continue
-            result = transcribe(model, samples, speaker, stamp, language)
-            if result['text'] and not stop.is_set():
-                emit(result)
-        if not stop.is_set():
+            with infer_lock:
+                result = transcribe(model, samples, speaker, stamp, language)
+            # A finished transcription is valid speech: emit it even during
+            # teardown (delivery is best-effort) instead of silently dropping
+            # a chunk that was already removed from the queue.
+            if result['text']:
+                try:
+                    emit(result)
+                except Exception:
+                    break
+        # Graceful stop: wait briefly for the reader to finish consuming the
+        # helper pipe, then flush trailing full chunks instead of discarding.
+        # Best effort even when stop is set: this is the point of the flush.
+        reader.join(timeout=1.0)
+        reader_incomplete = reader.is_alive()
+        try:
+            leftover = []
+            while True:
+                try:
+                    leftover.append(pending.get_nowait())
+                except queue.Empty:
+                    break
+            # Reader tails join the leftovers; everything emits in
+            # timestamp order so a tail from one speaker can never
+            # overtake — or be overtaken by — an older chunk from the other.
+            try:
+                leftover.extend((speaker, samples, stamp)
+                                for stamp, speaker, samples in sorted(tail_items, key=lambda t: t[0]))
+            except Exception:
+                pass
+            # Cross-source chronological order: a tail from one speaker can
+            # predate a queued chunk from the other, so emit by timestamp.
+            try:
+                leftover.sort(key=lambda item: item[2])
+            except Exception:
+                pass
+            for speaker, samples, stamp in leftover:
+                try:
+                    if getattr(samples, 'size', len(samples)) >= 16000:
+                        with infer_lock:
+                            flushed = transcribe(model, samples, speaker, stamp, language)
+                        if flushed['text']:
+                            flushed['partial_tail'] = True
+                            try:
+                                emit(flushed)
+                            except Exception:
+                                dropped['count'] += 1
+                    elif getattr(samples, 'size', len(samples)) > 0:
+                        # Honest accounting: sub-second trailing audio that
+                        # cannot form a chunk is lost, not silently kept.
+                        # Tracked separately from full worker chunks.
+                        sub_second_lost['count'] += 1
+                except Exception:
+                    # A failed flush transcription is lost audio too.
+                    dropped['count'] += 1
+                    continue
+            total_lost = dropped['count'] + native_lost['count']
+            if total_lost or sub_second_lost['count'] or reader_incomplete:
+                try:
+                    warning = (f"Stopped with worker {dropped['count']} dropped chunk(s), "
+                               f"native {native_lost['count']} dropped frame(s), "
+                               f"{sub_second_lost['count']} sub-second tail(s); some words may be missing.")
+                    if reader_incomplete:
+                        warning += ' Reader had not finished; tail accounting may be incomplete.'
+                    emit({'type': 'status', 'state': 'stopped', 'dropped_chunks': total_lost,
+                          'native_dropped_chunks': native_lost['count'],
+                          'worker_dropped_chunks': dropped['count'],
+                          'sub_second_dropped_chunks': sub_second_lost['count'],
+                          'reader_incomplete': bool(reader_incomplete),
+                          'warning': warning})
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if not stop.is_set() or failure:
+            # A recorded helper failure is always reported — even when
+            # teardown already set stop. Silence here would hide a real
+            # capture failure behind an orderly-looking shutdown.
             code = failure[0] if failure else 'capture'
             emit({'type': 'error', 'code': code, 'message': error_message(code)})
     finally:
