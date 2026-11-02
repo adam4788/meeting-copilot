@@ -6,6 +6,26 @@ Get short, speakable answer suggestions during Teams or Zoom calls, grounded in 
 
 > **Early development.** Not a finished replacement for Meetily or Cluely. Hardware compatibility, transcription quality, and answer latency must be checked on your machine. No meeting bots, automatic speaking, or message sending.
 
+## Standalone use (no Hermes required)
+
+The answer core runs without Hermes installed, without a Hermes home, and
+without network access unless you opt into a provider:
+
+```sh
+python demo_standalone.py            # offline fixture demo, exits nonzero on failure
+python ask.py --question "What did the supplier quote?" --docs ./sample-docs --provider fake
+MODEL_API_KEY=... python ask.py --question "..." --docs ./sample-docs --provider meta
+```
+
+`ask.py` answers from a docs folder (`<docs>/<project>/*.md|txt|rst`) plus an
+optional transcript (`--transcript meeting.json`), prints numbered sources,
+warnings, and timing, or `--json` for machine output. Providers: `fake`
+(deterministic offline) and `meta` (Meta Model API via `MODEL_API_KEY`).
+Web research and session history are unavailable standalone — the CLI says
+so instead of failing obscurely. Library use: `answer_core.AnswerCore`
+with injected `completion`/`search`/`history` providers; `hermes_adapters`
+holds the host-backed factories the plugin uses by default.
+
 ## Design
 
 - Explicit start, pause, and consent controls. Capture never starts at import or installation.

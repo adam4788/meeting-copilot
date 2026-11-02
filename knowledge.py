@@ -37,18 +37,37 @@ def _clean(text):
     return text
 
 
+# Sentinel: use the host session store unless a history override is given.
+_USE_HOST = object()
+
+
 class KnowledgeEngine:
-    def __init__(self, project_root=None, hermes_home=None):
+    def __init__(self, project_root=None, hermes_home=None, _completion=None,
+                 _search=None, _history=_USE_HOST, _standalone=False):
         # Keep the existing Documents layout when present; also support the common
         # macOS/Linux ~/Projects layout without requiring gateway environment edits.
-        default_root = Path.home() / 'Documents' / 'Projects'
-        if not default_root.is_dir() and (Path.home() / 'Projects').is_dir():
-            default_root = Path.home() / 'Projects'
-        self.project_root = Path(project_root or os.environ.get('MEETING_COPILOT_PROJECT_ROOT') or default_root).resolve()
-        default_home = Path(os.environ.get('LOCALAPPDATA', Path.home() / 'AppData' / 'Local')) / 'hermes' if os.name == 'nt' else Path.home() / '.hermes'
-        self.hermes_home = Path(hermes_home or os.environ.get('HERMES_HOME', default_home)).resolve()
-        if 'profiles' in {part.lower() for part in self.hermes_home.parts} or any(os.environ.get(key, '').lower() not in ('', 'default') for key in ('HERMES_PROFILE_NAME', 'HERMES_PROFILE')):
-            raise ValueError('Only the default Hermes profile is supported')
+        # An explicit project_root (or env override) must not touch the home
+        # directory at all: probe defaults only when nothing was given.
+        explicit_root = project_root or os.environ.get('MEETING_COPILOT_PROJECT_ROOT')
+        if explicit_root:
+            default_root = Path(explicit_root)
+        else:
+            default_root = Path.home() / 'Documents' / 'Projects'
+            if not default_root.is_dir() and (Path.home() / 'Projects').is_dir():
+                default_root = Path.home() / 'Projects'
+        self.project_root = Path(default_root).resolve()
+        # Injected capabilities (answer_core): no host home, no profile
+        # validation, no host environment dependence of any kind.
+        self._completion_override = _completion
+        self._search_override = _search
+        self._history_override = _history
+        if _standalone or _completion is not None or _search is not None or _history is not _USE_HOST:
+            self.hermes_home = Path(hermes_home).resolve() if hermes_home else None
+        else:
+            default_home = Path(os.environ.get('LOCALAPPDATA', Path.home() / 'AppData' / 'Local')) / 'hermes' if os.name == 'nt' else Path.home() / '.hermes'
+            self.hermes_home = Path(hermes_home or os.environ.get('HERMES_HOME', default_home)).resolve()
+            if 'profiles' in {part.lower() for part in self.hermes_home.parts} or any(os.environ.get(key, '').lower() not in ('', 'default') for key in ('HERMES_PROFILE_NAME', 'HERMES_PROFILE')):
+                raise ValueError('Only the default Hermes profile is supported')
         self._cache = {}
         self._lock = threading.RLock()
 
@@ -143,6 +162,9 @@ class KnowledgeEngine:
         return docs
 
     def _sessions(self, terms):
+        if self._history_override is not _USE_HOST:
+            search = getattr(self._history_override, 'search', self._history_override)
+            return list(search(terms))
         path = self.hermes_home / 'state.db'
         if not path.is_file():
             return []
@@ -193,6 +215,9 @@ class KnowledgeEngine:
         return docs
 
     def _complete(self, messages):
+        if self._completion_override is not None:
+            complete = getattr(self._completion_override, 'complete', self._completion_override)
+            return complete(messages)
         # Lazy import: pure retrieval and injected tests need only the stdlib.
         from agent.auxiliary_client import call_llm
         response = call_llm(task='meeting_copilot', messages=messages, tools=None,
@@ -229,13 +254,18 @@ class KnowledgeEngine:
             return False
 
     def _web(self, query):
-        from tools.web_tools import web_search_tool
-        data = json.loads(web_search_tool(query, limit=3))
-        if not data.get('success', True):
-            raise RuntimeError('Configured web search unavailable')
+        if self._search_override is not None:
+            search = getattr(self._search_override, 'search', self._search_override)
+            rows = search(query)
+        else:
+            from tools.web_tools import web_search_tool
+            data = json.loads(web_search_tool(query, limit=3))
+            if not data.get('success', True):
+                raise RuntimeError('Configured web search unavailable')
+            rows = data.get('data', {}).get('web', [])
         return [dict(id=f"web:{row.get('url', '')}", title=_clean(str(row.get('title', 'Web result')))[:160],
                      source=str(row.get('url', '')), text=_clean(str(row.get('description', '')))[:1500],
-                     updated_at=None) for row in data.get('data', {}).get('web', [])[:3]]
+                     updated_at=None) for row in rows[:3]]
 
     def answer(self, question, transcript='', project=None, web_query=None, all_projects=False, web_fallback=False,
                answer_provider=None, answer_model=None, should_abort=None, prepared=None, skip_meta_default=False):
@@ -244,7 +274,11 @@ class KnowledgeEngine:
         # Keep routing request-local: shared engines and injected one-argument mocks
         # retain their default behavior, even during concurrent selected requests.
         complete = self._complete
-        model_route = 'hermes-configured'
+        # An explicitly injected completion is an explicit provider choice:
+        # the env-keyed Meta default must not hijack it (standalone data
+        # could otherwise leave the machine despite the injection contract).
+        injected = self._completion_override is not None
+        model_route = 'injected' if injected else 'hermes-configured'
         meta_warnings = []
         _fallback_marks = []
         _route_is_meta_default = False
@@ -266,7 +300,7 @@ class KnowledgeEngine:
                 from .meta_models import DEFAULT_META_MODEL, api_key_present, meta_completion
             except ImportError:  # top-level use (tests, scripts)
                 from meta_models import DEFAULT_META_MODEL, api_key_present, meta_completion
-            if api_key_present() and not skip_meta_default:
+            if not injected and api_key_present() and not skip_meta_default:
                 hermes_complete = complete
                 try:
                     meta_default = meta_completion()
@@ -422,7 +456,8 @@ class KnowledgeEngine:
         if aborted():
             raise _Aborted('cancelled before provider submission')
         complete = self._complete
-        model_route = 'hermes-configured'
+        injected = self._completion_override is not None
+        model_route = 'injected' if injected else 'hermes-configured'
         stream_fn = None
         if answer_provider is not None or answer_model is not None:
             try:
@@ -436,7 +471,7 @@ class KnowledgeEngine:
                 from .meta_models import DEFAULT_META_MODEL, api_key_present, meta_completion
             except ImportError:  # top-level use (tests, scripts)
                 from meta_models import DEFAULT_META_MODEL, api_key_present, meta_completion
-            if api_key_present():
+            if not injected and api_key_present():
                 try:
                     complete = meta_completion()
                 except ValueError:
