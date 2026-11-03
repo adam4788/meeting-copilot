@@ -82,19 +82,22 @@ def run_benchmark(projects=12, docs_per_project=5, runs=20, limit=6):
         detail_hits = 0
         parity_hits = 0
         search_latencies = []
+        def _in_sources(found, needle):
+            # Sources are native paths; normalize separators so the check
+            # behaves the same on Windows and POSIX.
+            return any(needle in str(source.get('source', '')).replace('\\', '/')
+                       for source in found)
         for query in queries:
             started = time.perf_counter()
             found = core.search(query['query'], limit=limit, all_projects=True)
             search_latencies.append((time.perf_counter() - started) * 1000)
-            if any(f"/{query['project']}/{query['expected']}" in source.get('source', '')
-                   for source in found):
+            if _in_sources(found, f"/{query['project']}/{query['expected']}"):
                 hits += 1
             topic_found = core.search(query['topic_query'], limit=limit, all_projects=True)
-            if any(f"/{query['topic']}-" in source.get('source', '') for source in topic_found):
+            if _in_sources(topic_found, f"/{query['topic']}-"):
                 topic_hits += 1
             detail_found = core.search(query['detail_query'], limit=limit, all_projects=True)
-            if any(f"/{query['project']}/{query['expected']}" in source.get('source', '')
-                   for source in detail_found):
+            if _in_sources(detail_found, f"/{query['project']}/{query['expected']}"):
                 detail_hits += 1
             single = core.search(query['detail_query'], project=query['project'], limit=1)
             combined = core.search(query['detail_query'], all_projects=True, limit=1)
