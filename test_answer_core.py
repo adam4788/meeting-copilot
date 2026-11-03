@@ -378,6 +378,37 @@ class CoreAcceptanceTests(NoHermesTestCase):
         self.assertEqual(knowledge._clean_url('https://example.com/?q=dogs%26cats'),
                          'https://example.com/?q=dogs%26cats')
 
+    def test_round14_credential_and_benign_shapes(self):
+        import knowledge
+        blob = ' '.join([
+            knowledge._clean('Cookie: PHPSESSID=abc123; theme=dark'),
+            knowledge._clean_url('https://example.com/?jsessionid=abcXYZ123'),
+            knowledge._clean('password%253DabcXYZ123'),
+            knowledge._clean('%257B%2522session_id%2522%253A%2522abcXYZ123%2522%257D'),
+            knowledge._clean('token: abcXYZ123'),
+            knowledge._clean('token%3Dabc%26public%3Dhello'),
+            knowledge._clean('token=abcXYZ123&public=hello'),
+        ])
+        self.assertNotIn('abcXYZ123', blob)
+        self.assertNotIn('abc123', blob.replace('REDACTED', ''))
+        self.assertIn('public%3Dhello', blob)
+        self.assertIn('public=hello', blob)
+        self.assertEqual(knowledge._clean('Session: 2027Q1'), 'Session: 2027Q1')
+        self.assertEqual(knowledge._clean('Session: product-roadmap'),
+                         'Session: product-roadmap')
+        self.assertEqual(knowledge._clean_url('https://example.com/?session=2027Q1'),
+                         'https://example.com/?session=2027Q1')
+
+    def test_fake_separated_doc_terms_lose_to_adjacent_transcript(self):
+        import ask
+        complete = ask.fake_completion_factory()
+        sep_doc = 'alpha ' + ('filler ' * 80) + ' beta ' + ('filler ' * 80) + ' gamma'
+        payload = {'question': 'alpha beta gamma',
+                   'transcript': 'alpha beta are current',
+                   'evidence': [{'citation': 1, 'title': 'doc', 'text': sep_doc}]}
+        out = complete([{'role': 'user', 'content': json.dumps(payload)}])
+        self.assertIn('transcript itself says', out)
+
     def test_round13_credential_and_benign_shapes(self):
         import knowledge
         blob = ' '.join([

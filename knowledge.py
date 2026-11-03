@@ -92,11 +92,11 @@ def _clean(text, _depth=0):
     # Percent-encoded credential assignments (single/double-encoded JSON):
     # redact just the value in place so benign encoded text nearby (e.g.
     # %22launch plan%22) stays byte-for-byte intact.
-    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])?token|password|passwd|secret|api[ _-]?key|authorization|session(?:_id|id)?|credential)%3[ad][^\s&;]+',
+    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])?token|password|passwd|secret|api[ _-]?key|authorization|session(?:_id|id)?|credential)(?:%253[ad]|%3[ad])(?:[^\s&;%]|%(?!26|3[bB]))+',
                   r'\1=[REDACTED]', text)
     _q = r'(?:%2522|%22)'
     _c = r'(?:%253[ad]|%3[ad])'
-    text = re.sub(r'(?i)(' + _q + r'[\w%-]*?(?:token|secret|password|api[\w%-]*?key|authorization)'
+    text = re.sub(r'(?i)(' + _q + r'[\w%-]*?(?:token|secret|password|api[\w%-]*?key|authorization|session_id|sessionid|credential)'
                   + _q + r'?\s*' + _c + r'\s*' + _q + r'?)(?:[^%]|%(?!22))*?(%22|%2522(?=%257D|%7D|%2C|,|&|$)|&|$)',
                   r'\1REDACTED\2', text)
     # Bearer credentials first: the generic key=value rule below would
@@ -143,24 +143,38 @@ def _clean(text, _depth=0):
                   _quoted_value, text)
     text = re.sub(r"(?i)('?(?:" + _names + r")'?\s*[:=]\s*')([^']*)(')",
                   _quoted_value, text)
-    text = re.sub(r'(?i)\b(token\s*[:=]\s*"?)([^\s,;"]+)',
-                  lambda m: m.group(1) + ('[REDACTED]' if ('=' in m.group(1) and len(m.group(2)) >= 3)
-                                          or (any(ch in m.group(2) for ch in '._~+/=-') and len(m.group(2)) >= 8)
-                                          or len(m.group(2)) >= 24 else m.group(2)), text)
+    def _token_assignment(match):
+        value = match.group(2)
+        head, sep, tail = re.split(r'(?i)(%26|%3B)', value, maxsplit=1)[0], '', ''
+        parts = re.split(r'(?i)(%26|%3B)', value, maxsplit=1)
+        if len(parts) == 3:
+            head, sep, tail = parts
+        else:
+            head = value
+        mixed = (any(ch.isupper() for ch in head) and any(ch.islower() for ch in head)
+                 and any(ch.isdigit() for ch in head))
+        if (('=' in match.group(1) and len(head) >= 3) or mixed
+                or (any(ch in head for ch in '._~+/=-') and len(head) >= 8)
+                or len(head) >= 24):
+            return match.group(1) + '[REDACTED]' + sep + tail
+        return match.group(0)
+    text = re.sub(r'(?i)\b(token\s*[:=]\s*"?)([^\s,;&"]+)', _token_assignment, text)
     def _cookie_line(match):
-        return re.sub(r'(?i)(\b(?:session(?:_id|id)?|jsessionid|auth(?:_token|token)?|token|csrftoken|xsrftoken|sid)\s*=\s*)[^\s;]+', r'\1[REDACTED]', match.group(0))
+        return re.sub(r'(?i)(\b(?:session(?:_id|id)?|jsessionid|phpsessid|auth(?:_token|token)?|token|csrftoken|xsrftoken|sid)\s*=\s*)[^\s;]+', r'\1[REDACTED]', match.group(0))
     text = re.sub(r'(?im)^.*\b(?:set-cookie|cookie)\s*:.*$', _cookie_line, text)
     def _session_assignment(match):
         value = match.group(2)
         if re.fullmatch(r'\d{4}-\d{2}-\d{2}([T ].*)?', value) or (value.isdigit() and len(value) <= 8):
             return match.group(0)
+        if ':' in match.group(1) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,19}', value):
+            return match.group(0)
         if _credential_like(value) or (value.isdigit() and len(value) >= 9):
             return match.group(1) + '[REDACTED]'
         return match.group(0)
-    text = re.sub(r'(?i)\b(session(?:_id|id)?\s*[:=]\s*"?)([^\s,;"]+)', _session_assignment, text)
-    text = re.sub(r'(?i)\b(credential\s*[:=]\s*"?)([^\s,;"]+)',
+    text = re.sub(r'(?i)\b(session(?:_id|id)?\s*[:=]\s*"?)((?:[^\s,;&"%]|%(?!26|3[bB]))+)', _session_assignment, text)
+    text = re.sub(r'(?i)\b(credential\s*[:=]\s*"?)((?:[^\s,;&"%]|%(?!26|3[bB]))+)',
                   lambda m: m.group(1) + ('[REDACTED]' if ('=' in m.group(1) and len(m.group(2)) >= 3) or _credential_like(m.group(2)) else m.group(2)), text)
-    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])token|csrftoken|xsrftoken|api[ _-]?key|password|passwd|secret|client[ _-]?secret|authorization|session_id|sessionid|sid)"?\s*[=:]\s*"?[^\s,;"]+', r'\1=[REDACTED]', text)
+    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])token|csrftoken|xsrftoken|api[ _-]?key|password|passwd|secret|client[ _-]?secret|authorization|session_id|sessionid|phpsessid|jsessionid|sid)"?\s*[=:]\s*"?(?:[^\s,;&"%]|%(?!26|3[bB]))+', r'\1=[REDACTED]', text)
     # ALL-CAPS env-style assignments: MCP_API_KEY=..., SERVICE_AUTH_TOKEN=...
     text = re.sub(r'\b([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|AUTH)[A-Z0-9_]*\s*=\s*)[^\s,;]+',
                   r'\1[REDACTED]', text)
@@ -195,7 +209,7 @@ def _clean_url(url, _depth=0):
                              'authorization', 'signature', 'sig',
                              'sessionid', 'credential', 'credentials') for part in parts)
                 or _key(name) in ('key', 'apikey', 'accesstoken', 'refreshtoken',
-                                  'clientsecret', 'sessionid')
+                                  'clientsecret', 'sessionid', 'jsessionid', 'phpsessid')
                 or ('api' in parts and 'key' in parts))
     def _redact_part(part):
         # One &-separated part. Encoded delimiters (%26/%3B/%3D) are only
@@ -203,6 +217,8 @@ def _clean_url(url, _depth=0):
         # ordinary values like q=dogs%26cats stay byte-for-byte intact.
         key, eq, _value = part.partition('=')
         if eq and _key(key) == 'session':
+            if re.fullmatch(r'\d{4}[A-Za-z]\d?', _value):
+                return part, False
             if _credential_like(_value) or len(_value) >= 16:
                 return f'{key}=REDACTED', True
             return part, False
@@ -994,7 +1010,7 @@ class KnowledgeEngine:
                 self._index_cache[fingerprint] = (index, total_chars)
                 # Bounded by entries and total indexed characters: a few
                 # huge corpora cannot crowd out memory without limit.
-                while (len(self._index_cache) > 32
+                while (len(self._index_cache) > 64
                        or sum(chars for _i, chars in self._index_cache.values()) > 50000000):
                     oldest = next(iter(self._index_cache))
                     self._index_cache.pop(oldest)[0].close()

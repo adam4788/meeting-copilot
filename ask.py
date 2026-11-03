@@ -116,12 +116,17 @@ def fake_completion_factory():
             if isinstance(payload.get('transcript'), str):
                 transcript = payload['transcript']
         terms = _content_terms(question)
+        # Score what will actually be quoted: the best 220-char passage of
+        # each transcript line / document, not whole bodies with widely
+        # separated term mentions.
         best_line, best_hits = '', set()
         for line in str(transcript).splitlines():
-            hits = _term_hits(terms, line)
+            passage = _passage(line, terms)
+            hits = _term_hits(terms, passage)
             if len(hits) > len(best_hits):
-                best_line, best_hits = line.strip(), hits
-        doc_hits, body_hits = set(), set()
+                best_line, best_hits = passage, hits
+        doc_hits, body_hits, passage_hits = set(), set(), set()
+        snippet = ''
         if evidence:
             # Consider every retrieved document, not only the first: a
             # title-heavy top hit must not suppress a relevant later one
@@ -130,15 +135,17 @@ def fake_completion_factory():
             for idx, item in enumerate(evidence):
                 item_body = _term_hits(terms, item.get('text', ''))
                 item_all = _term_hits(terms, f"{item.get('title', '')} {item.get('text', '')}")
-                if len(item_body) > len(body_hits):
+                item_passage = _passage(item.get('text', ''), terms)
+                item_passage_hits = _term_hits(terms, item_passage)
+                if (len(item_passage_hits), len(item_body)) > (len(passage_hits), len(body_hits)):
                     top, body_hits, doc_hits = item, item_body, item_all
+                    passage_hits, snippet = item_passage_hits, item_passage
                     citation = item.get('citation', idx + 1)
-            snippet = _passage(top.get('text', ''), terms) if top else ''
             # A one-term question ('Price?') can only ever score one hit;
             # multi-term questions need two so a shared generic word in an
             # unrelated document is not presented as the answer.
             required = 1 if len(terms) <= 1 else 2
-            if snippet and len(body_hits) >= required and len(body_hits) >= len(best_hits):
+            if snippet and len(passage_hits) >= required and len(passage_hits) >= len(best_hits):
                 title = ' '.join(str(top.get('title', '')).split())[:80]
                 redacted = ' (searched snippet redacted)' if 'REDACTED' in snippet else ''
                 from_line = f' From {title}:' if title else ''
@@ -146,7 +153,7 @@ def fake_completion_factory():
                         f'called){redacted}.{from_line} "{snippet}" [{citation}]. Configure '
                         f'MODEL_API_KEY with --provider meta for a synthesized answer.')
         transcript_required = 1 if len(terms) <= 1 else 2
-        if best_line and len(best_hits) >= transcript_required and len(best_hits) > len(body_hits):
+        if best_line and len(best_hits) >= transcript_required and len(best_hits) > len(passage_hits):
             quote = _passage(best_line, terms)
             lead = ('the retrieved documents do not directly answer this; '
                     if evidence else 'no documents matched; ')
