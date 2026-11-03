@@ -123,7 +123,11 @@ class _CliParser(argparse.ArgumentParser):
 
     def error(self, message):
         argv = getattr(self, '_argv', [])
-        if '--json' in argv:
+        json_requested = any(
+            token == '--json' or token.startswith('--json=')
+            or (token.startswith('--') and len(token) > 2 and '--json'.startswith(token))
+            for token in argv)
+        if json_requested:
             print(json.dumps({'error': message}, indent=2))
             raise SystemExit(2)
         super().error(message)
@@ -147,7 +151,7 @@ def main(argv=None):
                         help='Evidence-only search over docs; no model call is made.')
     parser.add_argument('--list-projects', action='store_true',
                         help='List project folders under --docs and exit.')
-    parser.add_argument('--limit', type=int, default=6, help='Evidence limit for --search (1-20).')
+    parser.add_argument('--limit', type=int, default=None, help='Evidence limit for --search (1-20, default 6).')
     parser.add_argument('--json', action='store_true', help='Emit machine-readable JSON.')
     parser.add_argument('--version', action='version', version='meeting-copilot standalone 0.2.0')
     args = parser.parse_args(argv)
@@ -180,12 +184,14 @@ def main(argv=None):
              '  Ask:          python ask.py --docs ./sample-docs --question "What is the unit price?"\n'
              '  Search docs:  python ask.py --docs ./sample-docs --search "unit price"\n'
              '  List projects: python ask.py --docs ./sample-docs --list-projects')
-    if args.limit < 1 or args.limit > 20:
-        fail('--limit must be between 1 and 20.')
     if args.project and args.all:
         fail('Choose --project NAME or --all, not both.')
-    if args.search is None and not args.list_projects and args.limit != 6:
+    if args.limit is not None and args.search is None:
         print('Warning: --limit applies only to --search and is ignored here.', file=sys.stderr)
+    if args.list_projects and args.all:
+        print('Warning: --all is ignored with --list-projects.', file=sys.stderr)
+    if (args.list_projects or args.search is not None) and args.question is not None and not args.question.strip():
+        print('Warning: --question is ignored in this mode.', file=sys.stderr)
     if args.model and args.provider == 'fake':
         print('Warning: --model is ignored with --provider fake.', file=sys.stderr)
     if (args.list_projects or args.search is not None) and args.provider != 'fake':
@@ -228,8 +234,11 @@ def main(argv=None):
             raise AssertionError('search mode must not call a model')
         core = AnswerCore(project_root=docs, completion=_never_called,
                           search=DisabledSearch(), history=NoHistory())
+        search_limit = args.limit if args.limit is not None else 6
+        if search_limit < 1 or search_limit > 20:
+            fail('--limit must be between 1 and 20.')
         try:
-            found = core.search(args.search, project=project, limit=args.limit,
+            found = core.search(args.search, project=project, limit=search_limit,
                                 all_projects=args.all)
         except ValueError as exc:
             fail(f'Invalid request: {exc}')

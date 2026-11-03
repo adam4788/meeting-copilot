@@ -388,6 +388,22 @@ class IncrementalRetrievalTests(KnowledgeTests):
         short = KnowledgeEngine._preselect(docs, ['alpha'], 6)
         self.assertIn('alpha ' * 30, [d['text'] for d in short])
 
+    def test_preselect_does_not_invent_ligature_tokens(self):
+        # FTS5 unicode61 does not compatibility-decompose the ﬂ ligature,
+        # so preselection must not treat "ﬂower" as the token "flower".
+        docs = [{'text': 'ﬂower ﬂower'}, {'text': 'flower'}]
+        short = KnowledgeEngine._preselect(docs, ['flower'], 1)
+        self.assertEqual([d['text'] for d in short], ['flower'])
+
+    def test_all_project_ranking_matches_single_project(self):
+        for i in range(6):
+            (self.project / f'short{i}.md').write_text(f'alpha short note {i}', encoding='utf-8')
+        (self.project / 'long.md').write_text(
+            'alpha alpha ' + ('filler prose about schedules and budgets ' * 40), encoding='utf-8')
+        single = self.engine.search('alpha', project='alpha', limit=1)
+        combined = self.engine.search('alpha', all_projects=True, limit=1)
+        self.assertEqual([h['text'] for h in combined], [h['text'] for h in single])
+
 
 class LargeCorpusBoundTests(KnowledgeTests):
     def test_unchanged_large_project_skips_rereads_after_expiry(self):

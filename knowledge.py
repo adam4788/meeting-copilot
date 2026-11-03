@@ -28,7 +28,7 @@ def _completion_supports_streaming(complete):
 def _fts_tokens(text):
     """Tokenize the way SQLite FTS5 (unicode61) does for preselection:
     accents fold away and underscores separate tokens."""
-    normalized = unicodedata.normalize('NFKD', str(text).lower())
+    normalized = unicodedata.normalize('NFD', str(text).lower())
     stripped = ''.join(ch for ch in normalized if not unicodedata.combining(ch))
     return re.findall(r'[^\W_]+', stripped)
 
@@ -44,15 +44,53 @@ class _Aborted(Exception):
     a model failure."""
 
 
+def _credential_like(value):
+    return (len(value) >= 12
+            or (len(value) >= 6 and any(ch.isdigit() for ch in value)
+                and any(ch.isalpha() for ch in value)))
+
+
 def _clean(text):
     # Bearer credentials first: the generic key=value rule below would
     # otherwise redact only the word "Bearer" and leave the token itself.
-    text = re.sub(r'(?i)\b(authorization\s*[:=]\s*bearer\s+)[^\s,;]+', r'\1[REDACTED]', text)
-    text = re.sub(r'(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}', 'Bearer [REDACTED]', text)
+    # Ordinary prose ("Bearer investment strategy") is not credential-shaped
+    # and stays intact.
+    def _bearer(match):
+        prefix, token = match.group(1), match.group(2)
+        return prefix + '[REDACTED]' if _credential_like(token) else match.group(0)
+    text = re.sub(r'(?i)\b(authorization\s*[:=]\s*bearer\s+)([^\s,;]+)', _bearer, text)
+    text = re.sub(r'(?i)\b(bearer\s+)([A-Za-z0-9._~+/=-]+)', _bearer, text)
     text = re.sub(r'(?i)\b(api[_-]?key|password|secret|access[_-]?token|refresh[_-]?token|authorization)\s*[=:]\s*[^\s,;]+', r'\1=[REDACTED]', text)
     text = re.sub(r'\b(?:sk-|ghp_|github_pat_)[A-Za-z0-9_-]{12,}', '[REDACTED]', text)
     text = re.sub(r'-----BEGIN [^-]*PRIVATE KEY-----.*?(?:-----END [^-]*PRIVATE KEY-----|$)', '[REDACTED PRIVATE KEY]', text, flags=re.S)
     return text
+
+
+def _clean_url(url):
+    """Redact credential-bearing URL parts (userinfo, sensitive query keys)."""
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+    raw = str(url or '')
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return _clean(raw)
+    sensitive = {'key', 'apikey', 'api_key', 'token', 'access_token', 'auth',
+                 'authorization', 'signature', 'sig', 'password', 'secret'}
+    def _key(name):
+        return re.sub(r'[^a-z0-9]', '', str(name).lower())
+    query = [(k, 'REDACTED' if _key(k) in sensitive else v)
+             for k, v in parse_qsl(parts.query, keep_blank_values=True)]
+    netloc = parts.netloc
+    if '@' in netloc:
+        userinfo, _, host = netloc.rpartition('@')
+        if ':' in userinfo:
+            userinfo = userinfo.split(':', 1)[0] + ':[REDACTED]'
+        netloc = f'{userinfo}@{host}'
+    fragment = parts.fragment
+    if '=' in fragment:
+        fragment = _clean(fragment)
+    return urlunsplit((parts.scheme, netloc, parts.path,
+                       urlencode(query), fragment))
 
 
 # Sentinel: use the host session store unless a history override is given.
@@ -195,15 +233,25 @@ class KnowledgeEngine:
                 # identifier/source fields get the same redaction as text.
                 def _scrub(value, limit=None):
                     cleaned_value = _clean(str(value))
-                    cleaned_value = re.sub(r'(?i)\btoken\s*[:=]\s*[^\s,;]+',
-                                           'token=[REDACTED]', cleaned_value)
+                    def _token(match):
+                        return (match.group(1) + '[REDACTED]'
+                                if _credential_like(match.group(2)) else match.group(0))
+                    cleaned_value = re.sub(r'(?i)\b(token\s*[:=]\s*)([^\s,;]+)',
+                                           _token, cleaned_value)
                     return cleaned_value[:limit] if limit else cleaned_value
+                raw_updated = record.get('updated_at')
+                if isinstance(raw_updated, str):
+                    updated = _scrub(raw_updated)
+                elif isinstance(raw_updated, (int, float)) or raw_updated is None:
+                    updated = raw_updated
+                else:
+                    updated = None
                 cleaned.append({
                     'id': _scrub(record.get('id', '')),
                     'title': _scrub(record.get('title', ''), 160),
                     'source': _scrub(record.get('source', '')),
                     'text': _scrub(record.get('text', ''), 2000),
-                    'updated_at': record.get('updated_at'),
+                    'updated_at': updated,
                 })
             return cleaned
         path = self.hermes_home / 'state.db'
@@ -309,8 +357,8 @@ class KnowledgeEngine:
             if not data.get('success', True):
                 raise RuntimeError('Configured web search unavailable')
             rows = data.get('data', {}).get('web', [])
-        return [dict(id=f"web:{row.get('url', '')}", title=_clean(str(row.get('title', 'Web result')))[:160],
-                     source=str(row.get('url', '')), text=_clean(str(row.get('description', '')))[:1500],
+        return [dict(id=f"web:{_clean_url(row.get('url', ''))}", title=_clean(str(row.get('title', 'Web result')))[:160],
+                     source=_clean_url(row.get('url', '')), text=_clean(str(row.get('description', '')))[:1500],
                      updated_at=None) for row in rows[:3]]
 
     def answer(self, question, transcript='', project=None, web_query=None, all_projects=False, web_fallback=False,
@@ -622,7 +670,9 @@ class KnowledgeEngine:
             except Exception as exc:
                 if default_meta_route and not yielded:
                     raise NotImplementedError('streaming_unsupported:default-meta-route-failed') from exc
-                raise
+                # Provider exception text can embed credentials/endpoints:
+                # surface the failure type only, like the completed path.
+                raise RuntimeError(f'Model request failed ({type(exc).__name__}).') from None
         return header, guarded()
 
     @staticmethod
@@ -682,7 +732,8 @@ class KnowledgeEngine:
                         continue
                     # Cheap per-project shortlist; the single bounded FTS rank
                     # below orders the union instead of one index per project.
-                    docs.extend(self._preselect(self._files(folder), terms, limit))
+                    docs.extend(self._preselect(self._files(folder), terms,
+                                                min(100, max(limit * 10, 30))))
             elif project:
                 selected = self.project_root / project
                 folder = selected.resolve()

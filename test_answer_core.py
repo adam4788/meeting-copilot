@@ -263,11 +263,50 @@ class CoreAcceptanceTests(NoHermesTestCase):
             core.answer_stream('Price?', answer_provider='meta')
         with self.assertRaisesRegex(ValueError, 'not supported by AnswerCore'):
             core.answer_stream('Price?', answer_model='anything')
+        with self.assertRaisesRegex(ValueError, 'not supported by AnswerCore'):
+            core.answer_stream('Price?', 't', 'acme', None, False, False, 'meta')
 
     def test_ordinary_token_wording_is_not_redacted(self):
         import knowledge
         self.assertEqual(knowledge._clean('Token: meeting agenda'), 'Token: meeting agenda')
+        self.assertEqual(knowledge._clean('Bearer investment strategy discussion'),
+                         'Bearer investment strategy discussion')
         self.assertIn('[REDACTED]', knowledge._clean('Authorization: Bearer sentinel987'))
+
+    def test_injected_history_updated_at_is_scrubbed(self):
+        class History:
+            def search(self, terms):
+                return [{'id': 'h1', 'title': 'note', 'source': 'history:test',
+                         'text': 'quasar note', 'updated_at': 'Bearer abcdefghijklmnop'}]
+        core = self._core(history=History())
+        result = core.answer('quasar price?', transcript='t', project='acme')
+        self.assertNotIn('abcdefghijklmnop', json.dumps(result, default=str))
+
+    def test_web_result_urls_are_sanitized(self):
+        def search(query):
+            return [{'url': 'https://user:passw0rd@example.com/x?api_key=sekret99&ok=1',
+                     'title': 'Result', 'description': 'quasar result'}]
+        core = self._core(search=search)
+        result = core.answer('quasar price?', transcript='t', project='acme',
+                             web_query='quasar public')
+        blob = json.dumps(result, default=str)
+        self.assertNotIn('sekret99', blob)
+        self.assertNotIn('passw0rd', blob)
+        self.assertIn('ok=1', blob)
+
+    def test_lazy_stream_errors_are_sanitized(self):
+        def complete(messages):
+            return 'Full [1].'
+        def chunks(messages):
+            yield 'Part '
+            raise RuntimeError('boom password=sentinel987')
+        setattr(complete, 'stream_chunks', chunks)
+        core = self._core(completion=complete)
+        _, deltas = core.engine.answer_stream('Price?', transcript='t', project='acme')
+        with self.assertRaises(RuntimeError) as ctx:
+            list(deltas)
+        self.assertNotIn('sentinel987', str(ctx.exception))
+        self.assertIn('Model request failed', str(ctx.exception))
 
 
 class AskCliTests(unittest.TestCase):
@@ -495,6 +534,19 @@ class AskCliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn('--limit applies only to --search', err)
 
+    def test_abbreviated_json_flag_still_gets_json_parser_errors(self):
+        import ask
+        import io
+        import json as _json
+        from contextlib import redirect_stdout, redirect_stderr
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            with self.assertRaises(SystemExit) as ctx:
+                ask.main(['--docs', self.docs, '--question', 'hi',
+                          '--j', '--limit', 'oops'])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn('invalid int value', _json.loads(out.getvalue())['error'])
+
     def test_list_conflict_has_no_ignored_warning(self):
         import ask
         import io
@@ -515,6 +567,8 @@ class RetrievalEvalTests(unittest.TestCase):
         report = eval_retrieval.run_benchmark(projects=3, docs_per_project=2, runs=2)
         self.assertEqual(report['recall_at_k']['exact_reference'], 1.0)
         self.assertEqual(report['recall_at_k']['natural_topic'], 1.0)
+        self.assertEqual(report['recall_at_k']['marker_free_detail'], 1.0)
+        self.assertEqual(report['ranking_parity']['all_vs_single_top1'], 1.0)
         self.assertEqual(report['search_latency_ms']['count'], 3)
         self.assertIn('p95', report['answer_latency_ms_fake_provider'])
 

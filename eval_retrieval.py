@@ -22,6 +22,9 @@ try:
 except ImportError:
     from answer_core import AnswerCore, DisabledSearch, NoHistory
 
+COLORS = ('red', 'blue', 'green', 'amber', 'violet', 'silver',
+          'copper', 'coral', 'ivory', 'jade', 'onyx', 'pearl')
+
 TOPICS = (
     ('pricing', 'unit price annual minimum quote'),
     ('renewal', 'contract renewal september finance approval'),
@@ -48,13 +51,15 @@ def build_corpus(root, projects=12, docs_per_project=5):
         for d in range(docs_per_project):
             topic, words = TOPICS[(p + d) % len(TOPICS)]
             marker = f'zqx{p}w{d}v'
+            detail = f'{topic} checkpoint {COLORS[p % len(COLORS)]}' if d == 0 else ''
             (project / f'{topic}-{d}.md').write_text(
                 f'# {topic} note {d}\n\n{words}. Reference marker {marker}. '
-                f'Project {p} document {d} discusses {topic} in ordinary prose.\n',
+                f'Project {p} document {d} discusses {topic} in ordinary prose. {detail}\n',
                 encoding='utf-8')
             if d == 0:
                 queries.append({'query': f'{words} {marker}',
                                 'topic_query': words,
+                                'detail_query': detail,
                                 'topic': topic,
                                 'project': project.name,
                                 'expected': f'{topic}-{d}.md'})
@@ -70,6 +75,8 @@ def run_benchmark(projects=12, docs_per_project=5, runs=20, limit=6):
                           search=DisabledSearch(), history=NoHistory())
         hits = 0
         topic_hits = 0
+        detail_hits = 0
+        parity_hits = 0
         search_latencies = []
         for query in queries:
             started = time.perf_counter()
@@ -81,6 +88,14 @@ def run_benchmark(projects=12, docs_per_project=5, runs=20, limit=6):
             topic_found = core.search(query['topic_query'], limit=limit, all_projects=True)
             if any(f"/{query['topic']}-" in source.get('source', '') for source in topic_found):
                 topic_hits += 1
+            detail_found = core.search(query['detail_query'], limit=limit, all_projects=True)
+            if any(f"/{query['project']}/{query['expected']}" in source.get('source', '')
+                   for source in detail_found):
+                detail_hits += 1
+            single = core.search(query['detail_query'], project=query['project'], limit=1)
+            combined = core.search(query['detail_query'], all_projects=True, limit=1)
+            if single and combined and single[0].get('source') == combined[0].get('source'):
+                parity_hits += 1
         answer_latencies = []
         for _ in range(max(1, runs)):
             started = time.perf_counter()
@@ -89,13 +104,19 @@ def run_benchmark(projects=12, docs_per_project=5, runs=20, limit=6):
             answer_latencies.append((time.perf_counter() - started) * 1000)
         recall = hits / len(queries) if queries else 0.0
         topic_recall = topic_hits / len(queries) if queries else 0.0
+        detail_recall = detail_hits / len(queries) if queries else 0.0
+        parity = parity_hits / len(queries) if queries else 0.0
         return {
             'corpus': {'projects': projects, 'docs_per_project': docs_per_project,
                        'documents': projects * docs_per_project, 'queries': len(queries)},
             'recall_at_k': {'k': limit, 'exact_reference': round(recall, 4),
                             'exact_hits': hits,
                             'natural_topic': round(topic_recall, 4),
-                            'topic_hits': topic_hits},
+                            'topic_hits': topic_hits,
+                            'marker_free_detail': round(detail_recall, 4),
+                            'detail_hits': detail_hits},
+            'ranking_parity': {'all_vs_single_top1': round(parity, 4),
+                               'parity_hits': parity_hits},
             'search_latency_ms': _summary(search_latencies),
             'answer_latency_ms_fake_provider': _summary(answer_latencies),
             'note': 'Synthetic corpus + fake completion; not a production accuracy or latency claim.',
@@ -130,6 +151,9 @@ def main(argv=None):
         print(f"Corpus: {corpus['documents']} docs in {corpus['projects']} projects, {corpus['queries']} queries")
         print(f"Recall@{recall['k']} exact-reference: {recall['exact_reference']:.2%} ({recall['exact_hits']}/{corpus['queries']})")
         print(f"Recall@{recall['k']} natural-topic: {recall['natural_topic']:.2%} ({recall['topic_hits']}/{corpus['queries']})")
+        print(f"Recall@{recall['k']} marker-free detail: {recall['marker_free_detail']:.2%} ({recall['detail_hits']}/{corpus['queries']})")
+        parity = report['ranking_parity']
+        print(f"All-vs-single top-1 parity: {parity['all_vs_single_top1']:.2%} ({parity['parity_hits']}/{corpus['queries']})")
         for key in ('search_latency_ms', 'answer_latency_ms_fake_provider'):
             item = report[key]
             print(f"{key}: mean {item['mean']} ms, p50 {item['p50']} ms, p95 {item['p95']} ms, max {item['max']} ms")

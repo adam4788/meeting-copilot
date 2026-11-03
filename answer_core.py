@@ -97,9 +97,16 @@ class AnswerCore:
     def answer_stream(self, *args, **kwargs):
         # The injected completion IS the provider in standalone mode:
         # silently swapping it for a host-selected provider would break
-        # the injection boundary (and could reach the network).
+        # the injection boundary (and could reach the network). Reject
+        # overrides however they are passed — positional or keyword.
+        import inspect
+        try:
+            bound = inspect.signature(self.engine.answer_stream).bind_partial(*args, **kwargs)
+            supplied = bound.arguments
+        except (TypeError, ValueError):
+            supplied = kwargs
         for key in ('answer_provider', 'answer_model'):
-            if kwargs.get(key) is not None:
+            if supplied.get(key) is not None:
                 raise ValueError(f'{key} is not supported by AnswerCore; '
                                  'inject the completion provider instead')
         return self.engine.answer_stream(*args, **kwargs)
