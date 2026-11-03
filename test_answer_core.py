@@ -10,8 +10,8 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
-from unittest import mock
 
 BLOCKED = ('agent', 'agent.auxiliary_client', 'tools', 'tools.web_tools')
 
@@ -23,7 +23,7 @@ class NoHermesTestCase(unittest.TestCase):
                     'MEETING_COPILOT_PROJECT_ROOT', 'MODEL_API_KEY'):
             os.environ.pop(key, None)
         os.environ['HERMES_HOME'] = str(Path(self._scratch()) / 'nope-hermes-home')
-        self._import_patcher = mock.patch.dict(sys.modules, {name: None for name in BLOCKED})
+        self._import_patcher = unittest.mock.patch.dict(sys.modules, {name: None for name in BLOCKED})
         self._import_patcher.start()
         self.addCleanup(self._import_patcher.stop)
         self.addCleanup(self._restore_env)
@@ -217,6 +217,43 @@ class CoreAcceptanceTests(NoHermesTestCase):
         result = core.answer('Price?', transcript='t', project='acme')
         self.assertIn('[1]', result['answer'])
 
+    def test_omitted_project_root_never_falls_back_to_home(self):
+        import knowledge
+        def no_home():
+            raise AssertionError('home must not be touched')
+        with unittest.mock.patch.object(knowledge.Path, 'home', no_home):
+            from answer_core import AnswerCore
+            with self.assertRaisesRegex(ValueError, 'project_root is required'):
+                AnswerCore(completion=lambda messages: 'Cited [1].')
+
+    def test_demo_import_does_not_mutate_environment(self):
+        import subprocess
+        import sys as _sys
+        env = dict(os.environ)
+        env['MODEL_API_KEY'] = 'sentinel-value'
+        result = subprocess.run(
+            [_sys.executable, '-c',
+             'import os, demo_standalone; print(os.environ.get("MODEL_API_KEY"))'],
+            cwd=str(Path(__file__).resolve().parent), env=env,
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.stdout.strip(), 'sentinel-value')
+
+    def test_injected_history_is_redacted_like_host_history(self):
+        captured = []
+        def complete(messages):
+            captured.extend(messages)
+            return 'Cited [1].'
+        class SecretHistory:
+            def search(self, terms):
+                return [{'id': 'h1', 'title': 'note password=hunter2',
+                         'source': 'history:test',
+                         'text': 'quasar password=hunter2 token: hunter2',
+                         'updated_at': None}]
+        core = self._core(completion=complete, history=SecretHistory())
+        result = core.answer('quasar price?', transcript='t', project='acme')
+        self.assertNotIn('hunter2', json.dumps(captured))
+        self.assertNotIn('hunter2', json.dumps(result, default=str))
+
 
 class AskCliTests(unittest.TestCase):
     def setUp(self):
@@ -380,6 +417,49 @@ class AskCliTests(unittest.TestCase):
         self.assertIn('Choose one mode', str(err.code))
         err = self._run('--docs', self.docs, '--list-projects', '--project', 'acme', '--all')
         self.assertIn('not both', str(err.code))
+
+    def test_json_preflight_errors_are_json(self):
+        import ask
+        import io
+        import json as _json
+        from contextlib import redirect_stdout, redirect_stderr
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.dict('os.environ', {}, clear=False):
+            import os as _os
+            _os.environ.pop('MODEL_API_KEY', None)
+            with redirect_stdout(out), redirect_stderr(err):
+                with self.assertRaises(SystemExit) as ctx:
+                    ask.main(['--question', 'hi', '--docs', self.docs,
+                              '--provider', 'meta', '--json'])
+        self.assertNotEqual(ctx.exception.code, 0)
+        self.assertIn('MODEL_API_KEY', _json.loads(out.getvalue())['error'])
+
+    def test_search_warns_transcript_is_ignored(self):
+        code, _, err = self._capture(['--docs', self.docs, '--search', 'Acme renews',
+                                      '--transcript', '/nonexistent'])
+        self.assertEqual(code, 0)
+        self.assertIn('--transcript is ignored', err)
+
+    def test_empty_search_terms_rejected(self):
+        err = self._run('--docs', self.docs, '--search', '')
+        self.assertIn('cannot be empty', str(err.code))
+
+    def test_list_projects_warns_project_is_ignored(self):
+        code, _, err = self._capture(['--docs', self.docs, '--list-projects',
+                                      '--project', 'nonsense'])
+        self.assertEqual(code, 0)
+        self.assertIn('--project is ignored', err)
+
+    def test_fake_mode_restores_caller_environment(self):
+        import ask
+        import io
+        from contextlib import redirect_stdout
+        with unittest.mock.patch.dict('os.environ', {'MODEL_API_KEY': 'sentinel-value'}):
+            with redirect_stdout(io.StringIO()):
+                code = ask.main(['--question', 'Q?', '--docs', self.docs,
+                                 '--provider', 'fake'])
+            self.assertEqual(code, 0)
+            self.assertEqual(os.environ.get('MODEL_API_KEY'), 'sentinel-value')
 
 
 class RetrievalEvalTests(unittest.TestCase):

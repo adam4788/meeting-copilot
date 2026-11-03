@@ -66,6 +66,11 @@ class AnswerCore:
     """Host-independent grounded answering over project files + transcript."""
 
     def __init__(self, project_root=None, completion=None, search=None, history=None):
+        if project_root is None:
+            # Standalone means no host defaults: never fall back to the
+            # user's home Projects folder or Hermes environment.
+            raise ValueError('project_root is required for the standalone core; '
+                             'pass the docs/project root explicitly')
         if project_root is not None:
             from pathlib import Path as _Path
             root = _Path(project_root)

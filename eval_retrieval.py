@@ -75,7 +75,8 @@ def run_benchmark(projects=12, docs_per_project=5, runs=20, limit=6):
             started = time.perf_counter()
             found = core.search(query['query'], limit=limit, all_projects=True)
             search_latencies.append((time.perf_counter() - started) * 1000)
-            if any(query['expected'] in source.get('source', '') for source in found):
+            if any(f"/{query['project']}/{query['expected']}" in source.get('source', '')
+                   for source in found):
                 hits += 1
             topic_found = core.search(query['topic_query'], limit=limit, all_projects=True)
             if any(f"/{query['topic']}-" in source.get('source', '') for source in topic_found):

@@ -140,31 +140,48 @@ def main(argv=None):
     parser.add_argument('--version', action='version', version='meeting-copilot standalone 0.2.0')
     args = parser.parse_args(argv)
 
+    def fail(message, code=1):
+        # JSON callers get machine-readable errors on stdout, never a
+        # plain-text SystemExit they cannot parse.
+        if args.json:
+            print(json.dumps({'error': message}, indent=2))
+            raise SystemExit(code)
+        raise SystemExit(message)
+
     if args.docs is None:
-        raise SystemExit('Missing --docs DIR. Quickstart: '
-                         'python ask.py --docs ./sample-docs --list-projects')
+        fail('Missing --docs DIR. Quickstart: '
+             'python ask.py --docs ./sample-docs --list-projects')
     docs = Path(args.docs)
     if not docs.is_dir():
-        raise SystemExit(f'Docs directory not found: {docs}')
+        fail(f'Docs directory not found: {docs}')
     if args.web_query is not None:
-        raise SystemExit(
-            'Web research has no standalone provider yet (host search only). '
-            'Run without --web-query for file-grounded answers.')
+        fail('Web research has no standalone provider yet (host search only). '
+             'Run without --web-query for file-grounded answers.')
     if args.search is not None and args.question:
-        raise SystemExit('Choose --search TERMS or --question, not both.')
+        fail('Choose --search TERMS or --question, not both.')
     if args.list_projects and (args.search is not None or (args.question or '').strip()):
-        raise SystemExit('Choose one mode: --list-projects, --search, or --question.')
+        fail('Choose one mode: --list-projects, --search, or --question.')
+    if args.search is not None and not args.search.strip():
+        fail('Search terms cannot be empty.')
     if not args.list_projects and args.search is None and not (args.question or '').strip():
-        raise SystemExit('What do you want to do?\n'
-                         '  Ask:          python ask.py --docs ./sample-docs --question "What is the unit price?"\n'
-                         '  Search docs:  python ask.py --docs ./sample-docs --search "unit price"\n'
-                         '  List projects: python ask.py --docs ./sample-docs --list-projects')
+        fail('What do you want to do?\n'
+             '  Ask:          python ask.py --docs ./sample-docs --question "What is the unit price?"\n'
+             '  Search docs:  python ask.py --docs ./sample-docs --search "unit price"\n'
+             '  List projects: python ask.py --docs ./sample-docs --list-projects')
     if args.limit < 1 or args.limit > 20:
-        raise SystemExit('--limit must be between 1 and 20.')
+        fail('--limit must be between 1 and 20.')
     if args.model and args.provider == 'fake':
         print('Warning: --model is ignored with --provider fake.', file=sys.stderr)
+    if (args.list_projects or args.search is not None) and args.provider != 'fake':
+        print('Warning: --provider/--model are ignored in this mode; no model is called.', file=sys.stderr)
+    if args.search is not None and args.transcript is not None:
+        print('Warning: --transcript is ignored with --search; evidence comes from docs only.', file=sys.stderr)
+    if args.list_projects and args.project is not None:
+        print('Warning: --project is ignored with --list-projects.', file=sys.stderr)
+    if args.list_projects and args.transcript is not None:
+        print('Warning: --transcript is ignored with --list-projects.', file=sys.stderr)
     if args.project and args.all:
-        raise SystemExit('Choose --project NAME or --all, not both.')
+        fail('Choose --project NAME or --all, not both.')
 
     subs = sorted(sub.name for sub in docs.iterdir()
                     if sub.is_dir() and not sub.name.startswith('.') and not sub.is_symlink())
@@ -186,11 +203,11 @@ def main(argv=None):
         if len(subs) == 1:
             project = subs[0]
         else:
-            raise SystemExit('Pick one project with --project NAME (or --all): '
-                             + (', '.join(subs) if subs else '(no project folders under --docs)'))
+            fail('Pick one project with --project NAME (or --all): '
+                 + (', '.join(subs) if subs else '(no project folders under --docs)'))
     if project is not None and project not in subs:
-        raise SystemExit(f'No project {project!r} under {docs}.'
-                         + (f' Available: {", ".join(subs)}.' if subs else ' No project folders found.'))
+        fail(f'No project {project!r} under {docs}.'
+             + (f' Available: {", ".join(subs)}.' if subs else ' No project folders found.'))
 
     if args.search is not None:
         # Evidence-only mode never calls a model: a completion that raises
@@ -203,7 +220,7 @@ def main(argv=None):
             found = core.search(args.search, project=project, limit=args.limit,
                                 all_projects=args.all)
         except ValueError as exc:
-            raise SystemExit(f'Invalid request: {exc}')
+            fail(f'Invalid request: {exc}')
         if args.json:
             print(json.dumps({'query': args.search, 'count': len(found), 'sources': found},
                              indent=2, default=str))
@@ -214,21 +231,32 @@ def main(argv=None):
     try:
         transcript = load_transcript(args.transcript) if args.transcript else None
     except (OSError, ValueError) as exc:
-        raise SystemExit(f'Cannot read transcript: {exc}')
+        fail(f'Cannot read transcript: {exc}')
     if transcript is None:
         transcript = ''
+    saved_model_key = None
+    model_key_present = False
     if args.provider == 'fake':
         # Fake means fully offline: the engine would otherwise try the Meta
-        # default route whenever a key happens to be configured.
-        os.environ.pop('MODEL_API_KEY', None)
+        # default route whenever a key happens to be configured. Scrub it
+        # only for the answer call and restore the caller's environment.
+        model_key_present = 'MODEL_API_KEY' in os.environ
+        saved_model_key = os.environ.pop('MODEL_API_KEY', None)
     started = time.monotonic()
     try:
         core = AnswerCore(project_root=docs, completion=build_completion(args.provider, args.model),
                           search=DisabledSearch(), history=NoHistory())
         result = core.answer(args.question, transcript=transcript, project=project,
                              all_projects=args.all)
+    except SystemExit as exc:
+        fail(str(exc.code))
     except (ValueError, OSError) as exc:
-        raise SystemExit(f'Invalid request: {exc}')
+        fail(f'Invalid request: {exc}')
+    finally:
+        if model_key_present and saved_model_key is not None:
+            os.environ['MODEL_API_KEY'] = saved_model_key
+        elif saved_model_key is not None:
+            os.environ.pop('MODEL_API_KEY', None)
     if args.provider == 'fake':
         # The static engine warnings assume a real provider and host
         # history; with a fake completion and no history they mislead.

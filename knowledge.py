@@ -36,7 +36,7 @@ class _Aborted(Exception):
 
 
 def _clean(text):
-    text = re.sub(r'(?i)\b(api[_-]?key|password|secret|access[_-]?token|refresh[_-]?token|authorization)\s*[=:]\s*[^\s,;]+', r'\1=[REDACTED]', text)
+    text = re.sub(r'(?i)\b(api[_-]?key|password|secret|token|access[_-]?token|refresh[_-]?token|authorization)\s*[=:]\s*[^\s,;]+', r'\1=[REDACTED]', text)
     text = re.sub(r'\b(?:sk-|ghp_|github_pat_)[A-Za-z0-9_-]{12,}', '[REDACTED]', text)
     text = re.sub(r'-----BEGIN [^-]*PRIVATE KEY-----.*?(?:-----END [^-]*PRIVATE KEY-----|$)', '[REDACTED PRIVATE KEY]', text, flags=re.S)
     return text
@@ -170,7 +170,20 @@ class KnowledgeEngine:
         if self._history_override is not _USE_HOST:
             search = getattr(self._history_override, 'search', self._history_override)
             records = search(terms)
-            return list(records or [])
+            # Injected history gets the same treatment as the host session
+            # store: redact credential-looking values and bound fields
+            # before any of it can reach a completion provider or caller.
+            cleaned = []
+            for record in records or []:
+                if not isinstance(record, dict):
+                    continue
+                item = dict(record)
+                if 'title' in item:
+                    item['title'] = _clean(str(item.get('title', '')))[:160]
+                if 'text' in item:
+                    item['text'] = _clean(str(item.get('text', '')))[:2000]
+                cleaned.append(item)
+            return cleaned
         path = self.hermes_home / 'state.db'
         if not path.is_file():
             return []
@@ -592,16 +605,22 @@ class KnowledgeEngine:
 
     @staticmethod
     def _preselect(docs, terms, limit):
-        """Cheap pure-Python shortlist so only one FTS index is built per search."""
+        """Cheap pure-Python shortlist so only one FTS index is built per search.
+
+        Match whole tokens, mirroring the FTS query: substring matching
+        would let e.g. "renewal" crowd out a document containing the actual
+        token "new" before ranking ever sees it.
+        """
         if not docs:
             return []
+        wanted = set(terms)
         scored = []
         for position, doc in enumerate(docs):
             try:
-                text = str(doc.get('text', '')).lower()
+                tokens = set(re.findall(r'\w+', str(doc.get('text', '')).lower()))
             except Exception:
                 continue
-            hits = sum(1 for term in terms if term in text)
+            hits = len(wanted & tokens)
             if hits:
                 scored.append((-hits, position, doc))
         scored.sort(key=lambda item: (item[0], item[1]))

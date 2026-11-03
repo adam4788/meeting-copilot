@@ -362,6 +362,17 @@ class IncrementalRetrievalTests(KnowledgeTests):
         self.assertEqual(short[0]['text'], 'doc 0 orchid')
         self.assertEqual(KnowledgeEngine._preselect(docs, ['missing'], 6), [])
 
+    def test_preselect_matches_tokens_not_substrings(self):
+        # "renewal" contains the substring "new" but not the token: it must
+        # not crowd the document that actually contains "new" out of the
+        # shortlist before FTS ranking runs.
+        docs = [{'text': f'renewal paperwork {i}'} for i in range(6)]
+        docs.append({'text': 'brand new rollout'})
+        short = KnowledgeEngine._preselect(docs, ['new'], 6)
+        self.assertEqual([d['text'] for d in short], ['brand new rollout'])
+        hits = self.engine._rank(short, ['new'], 6)
+        self.assertEqual([h['text'] for h in hits], ['brand new rollout'])
+
 
 class LargeCorpusBoundTests(KnowledgeTests):
     def test_unchanged_large_project_skips_rereads_after_expiry(self):

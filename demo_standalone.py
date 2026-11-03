@@ -22,8 +22,6 @@ import tempfile
 import traceback
 from pathlib import Path
 
-os.environ.pop('MODEL_API_KEY', None)
-
 try:
     from answer_core import AnswerCore, DisabledSearch, NoHistory
 except ImportError:
@@ -73,7 +71,7 @@ def web_guard():
     return search
 
 
-def main():
+def _run():
     tmp = Path(tempfile.mkdtemp(prefix='standalone-demo-'))
     docs = tmp / 'docs'
     docs.mkdir(parents=True, exist_ok=True)
@@ -155,6 +153,20 @@ def main():
     _shutil.rmtree(tmp, ignore_errors=True)
     print('standalone fixture demo: all scenarios passed (offline, no Hermes).')
     return 0
+
+
+def main():
+    # Scrub any real key only while scenarios run, then restore the
+    # caller's environment exactly as found.
+    present = 'MODEL_API_KEY' in os.environ
+    saved = os.environ.pop('MODEL_API_KEY', None)
+    try:
+        return _run()
+    finally:
+        if present and saved is not None:
+            os.environ['MODEL_API_KEY'] = saved
+        else:
+            os.environ.pop('MODEL_API_KEY', None)
 
 
 if __name__ == '__main__':
