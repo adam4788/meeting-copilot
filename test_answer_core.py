@@ -1275,6 +1275,20 @@ class AskCliTests(unittest.TestCase):
         self.assertFalse(payload['ok'])
         self.assertEqual(payload['projects'], [])
 
+    def test_doctor_explains_missing_project_folders_in_json_and_text(self):
+        empty = Path(self.docs) / 'elsewhere'
+        empty.mkdir()
+        (empty / 'notes.md').write_text('Meeting notes', encoding='utf-8')
+        code, out, _ = self._capture(['--docs', str(empty), '--doctor', '--json'])
+        self.assertEqual(code, 2)
+        payload = json.loads(out)
+        self.assertFalse(payload['ok'])
+        self.assertIn('no project folders', ' '.join(payload['problems']).lower())
+        self.assertIn('subfolder', ' '.join(payload['problems']).lower())
+        code, out, _ = self._capture(['--docs', str(empty), '--doctor'])
+        self.assertEqual(code, 2)
+        self.assertIn('subfolder', out.lower())
+
     def test_doctor_rejects_mixed_modes(self):
         err = self._run('--docs', self.docs, '--doctor', '--search', 'x')
         self.assertIn('Choose one mode', str(err.code))

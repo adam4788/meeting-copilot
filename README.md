@@ -31,6 +31,10 @@ python ask.py --docs ./my-docs --search "renewal"
 python ask.py --docs ./my-docs --question "When is the Acme renewal?"
 ```
 
+`--doctor --json` reports setup failures in its `problems` array, including
+missing project folders and how to arrange the documents; it exits `2` when
+not ready.
+
 `ask.py` has three job-shaped modes: `--list-projects` shows what can be
 searched, `--search` returns evidence only (no model call), and `--question`
 answers with numbered citations. It reads a docs folder

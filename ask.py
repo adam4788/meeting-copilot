@@ -512,6 +512,9 @@ def main(argv=None):
                           search=DisabledSearch(), history=NoHistory())
         problems = []
         project_reports = []
+        if not subs:
+            problems.append('No project folders found. Put documents in a project subfolder '
+                            '(<docs>/<project>/*.md|txt|rst), or pass its parent as --docs.')
         for name in subs:
             try:
                 chunks = core.engine._files((docs / name).resolve())
