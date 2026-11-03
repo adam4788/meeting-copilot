@@ -140,15 +140,24 @@ def fake_completion_factory():
                               'do', 'does', 'did', 'can', 'could', 'should',
                               'would', 'will')
                     and bool(terms) and _content_terms(body) <= terms)
+        def _is_question_text(value):
+            body = _speaker_body(value).rstrip()
+            return body.endswith('?') and bool(_term_hits(terms, body))
         def _strip_echo_prefix(line):
-            # 'Alice: what is alpha beta? approved' -> 'approved': the
-            # question segment never scores, even on the same line.
-            if '?' not in line:
-                return '' if _is_echo(line) else line
-            head, _, tail = line.partition('?')
-            if _content_terms(_speaker_body(head)) <= terms and tail.strip():
-                return tail.strip()
-            return '' if _is_echo(line) else line
+            # 'Alice: what is alpha beta? approved' -> 'approved': question
+            # segments never score, even repeated on the same line.
+            result = line
+            for _ in range(4):
+                if '?' not in result:
+                    return '' if _is_echo(result) else result
+                head, _, tail = result.partition('?')
+                if _content_terms(_speaker_body(head)) <= terms or _is_question_text(head + '?'):
+                    result = tail.strip()
+                    if not result:
+                        return ''
+                    continue
+                return '' if _is_echo(result) else result
+            return result
         best_line, best_hits = '', set()
         lines = str(transcript).splitlines()
         for i in range(len(lines)):
@@ -172,7 +181,8 @@ def fake_completion_factory():
                 item_body = _term_hits(terms, item.get('text', ''))
                 item_all = _term_hits(terms, f"{item.get('title', '')} {item.get('text', '')}")
                 item_passage = _passage(item.get('text', ''), terms)
-                item_passage_hits = (set() if _is_echo(item_passage)
+                item_passage_hits = (set() if (_is_echo(item_passage)
+                                               or _is_question_text(item_passage))
                                      else _term_hits(terms, item_passage))
                 if (len(item_passage_hits), len(item_body)) > (len(passage_hits), len(body_hits)):
                     top, body_hits, doc_hits = item, item_body, item_all

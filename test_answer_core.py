@@ -378,6 +378,45 @@ class CoreAcceptanceTests(NoHermesTestCase):
         self.assertEqual(knowledge._clean_url('https://example.com/?q=dogs%26cats'),
                          'https://example.com/?q=dogs%26cats')
 
+    def test_round18_credential_and_benign_shapes(self):
+        import knowledge
+        blob = ' '.join([
+            knowledge._clean('{"jwt":"SENTINEL123xyz"}'),
+            knowledge._clean('{%22jwt%22%3A%22SENTINEL123xyz%22}'),
+            knowledge._clean('{"jwt":"SENTINEL alpha beta"}'),
+            knowledge._clean('{%22private_key%22%3A%22SENTINEL123xyz%22}'),
+        ])
+        self.assertNotIn('SENTINEL', blob)
+        self.assertEqual(knowledge._clean('session_id=42'), 'session_id=42')
+        self.assertEqual(knowledge._clean('session_id=abc'), 'session_id=[REDACTED]')
+        self.assertEqual(knowledge._clean('JWT: authentication'), 'JWT: authentication')
+        self.assertEqual(knowledge._clean('Session: Q3-planning'), 'Session: Q3-planning')
+        self.assertEqual(knowledge._clean('Token: 2024/03/01'), 'Token: 2024/03/01')
+
+    def test_history_bare_secret_exception_is_generic(self):
+        class BareHist:
+            def search(self, terms):
+                raise RuntimeError('SENTINELBARESECRET')
+        core = self._core(history=BareHist())
+        with self.assertRaises(RuntimeError) as ctx:
+            core.search('price', project='acme')
+        self.assertNotIn('SENTINELBARESECRET', str(ctx.exception))
+        self.assertIn('History provider failed', str(ctx.exception))
+
+    def test_fake_repeated_and_extended_questions_are_not_answers(self):
+        import ask
+        complete = ask.fake_completion_factory()
+        def run(payload):
+            return complete([{'role': 'user', 'content': json.dumps(payload)}])
+        out = run({'question': 'What is alpha beta?', 'transcript': '',
+                   'evidence': [{'citation': 1, 'title': 'd',
+                                 'text': 'What is alpha beta and when will it launch?'}]})
+        self.assertIn('does not directly answer', out)
+        out = run({'question': 'What is alpha beta?',
+                   'transcript': 'Alice: What is alpha beta? What is alpha beta?',
+                   'evidence': []})
+        self.assertNotIn('What is alpha beta?', out)
+
     def test_round17_credential_and_benign_shapes(self):
         import knowledge
         blob = ' '.join([
