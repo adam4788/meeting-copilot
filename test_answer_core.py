@@ -342,6 +342,39 @@ class CoreAcceptanceTests(NoHermesTestCase):
         self.assertEqual(knowledge._clean('Bearer identification documents'),
                          'Bearer identification documents')
 
+    def test_url_encoded_and_fragment_keys_are_redacted(self):
+        import knowledge
+        self.assertNotIn('secret123', knowledge._clean_url(
+            'https://example.com/x?access%5Ftoken=secret123'))
+        self.assertNotIn('secret123', knowledge._clean_url(
+            'https://example.com/x#access_token=secret123'))
+        self.assertNotIn('secret123', knowledge._clean_url(
+            'https://example.com/x#refresh_token=secret123'))
+
+    def test_authorization_bearer_alphabetic_token_redacted(self):
+        class History:
+            def search(self, terms):
+                return [{'id': 'h1', 'title': 'note', 'source': 'history:test',
+                         'text': 'quasar Authorization: Bearer abcdefghijklmnop',
+                         'updated_at': None}]
+        core = self._core(history=History())
+        result = core.answer('quasar price?', transcript='t', project='acme')
+        self.assertNotIn('abcdefghijklmnop', json.dumps(result, default=str))
+
+    def test_lazy_not_implemented_errors_are_sanitized(self):
+        def complete(messages):
+            return 'Full [1].'
+        def chunks(messages):
+            yield 'Part '
+            raise NotImplementedError('secret=example-secret-123')
+        setattr(complete, 'stream_chunks', chunks)
+        core = self._core(completion=complete)
+        _, deltas = core.engine.answer_stream('Price?', transcript='t', project='acme')
+        with self.assertRaises(NotImplementedError) as ctx:
+            list(deltas)
+        self.assertNotIn('example-secret-123', str(ctx.exception))
+        self.assertIn('streaming_unsupported', str(ctx.exception))
+
 
 class AskCliTests(unittest.TestCase):
     def setUp(self):
@@ -567,6 +600,18 @@ class AskCliTests(unittest.TestCase):
                                       '--limit', '1'])
         self.assertEqual(code, 0)
         self.assertIn('--limit applies only to --search', err)
+
+    def test_list_nonblank_question_is_rejected(self):
+        err = self._run('--docs', self.docs, '--list-projects', '--question', 'ignored')
+        self.assertIn('Choose one mode', str(err.code))
+
+    def test_docs_pointed_at_project_folder_explains_layout(self):
+        flat = Path(self.tmp) / 'flat'
+        flat.mkdir()
+        (flat / 'notes.md').write_text('price notes', encoding='utf-8')
+        err = self._run('--docs', str(flat), '--all', '--search', 'price')
+        self.assertIn('No project folders', str(err.code))
+        self.assertIn('move them into a subfolder', str(err.code))
 
     def test_search_blank_question_warns_not_rejects(self):
         code, _, err = self._capture(['--docs', self.docs, '--search', 'Acme renews',

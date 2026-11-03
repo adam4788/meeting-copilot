@@ -395,6 +395,18 @@ class IncrementalRetrievalTests(KnowledgeTests):
         short = KnowledgeEngine._preselect(docs, ['flower'], 1)
         self.assertEqual([d['text'] for d in short], ['flower'])
 
+    def test_phrase_query_survives_all_project_candidates(self):
+        # FTS treats "alpha_beta" as the phrase alpha<->beta: decoys with
+        # words between the terms must not crowd out the only phrase match.
+        for i in range(30):
+            (self.project / f'decoy{i}.md').write_text(f'alpha middle beta note {i}', encoding='utf-8')
+        (self.project / 'target.md').write_text(
+            'alpha beta ' + ('surrounding prose about schedules and budgets ' * 20), encoding='utf-8')
+        single = self.engine.search('alpha_beta', project='alpha', limit=6)
+        combined = self.engine.search('alpha_beta', all_projects=True, limit=6)
+        self.assertTrue(any('alpha beta' in h['text'] for h in single))
+        self.assertEqual([h['text'] for h in combined], [h['text'] for h in single])
+
     def test_all_project_ranking_matches_single_project(self):
         for i in range(6):
             (self.project / f'short{i}.md').write_text(f'alpha short note {i}', encoding='utf-8')

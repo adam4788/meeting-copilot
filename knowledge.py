@@ -91,7 +91,8 @@ def _clean(text):
     def _bearer(match):
         prefix, token = match.group(1), match.group(2)
         return prefix + '[REDACTED]' if _credential_like(token) else match.group(0)
-    text = re.sub(r'(?i)\b(authorization\s*[:=]\s*bearer\s+)([^\s,;]+)', _bearer, text)
+    text = re.sub(r'(?i)\b(authorization\s*[:=]\s*bearer\s+)([^\s,;]+)',
+                  lambda m: m.group(1) + '[REDACTED]', text)
     text = re.sub(r'(?i)\b(bearer\s+)([A-Za-z0-9._~+/=-]+)', _bearer, text)
     text = re.sub(r'(?i)\b(api[_-]?key|password|secret|access[_-]?token|refresh[_-]?token|authorization)\s*[=:]\s*[^\s,;]+', r'\1=[REDACTED]', text)
     text = re.sub(r'\b(?:sk-|ghp_|github_pat_)[A-Za-z0-9_-]{12,}', '[REDACTED]', text)
@@ -109,7 +110,8 @@ def _clean_url(url):
     sensitive = {'key', 'apikey', 'token', 'accesstoken', 'auth',
                  'authorization', 'signature', 'sig', 'password', 'secret'}
     def _key(name):
-        return re.sub(r'[^a-z0-9]', '', str(name).lower())
+        from urllib.parse import unquote_plus
+        return re.sub(r'[^a-z0-9]', '', unquote_plus(str(name)).lower())
     changed = False
     # Userinfo password: scheme://user:pass@host
     match = re.match(r'^([a-zA-Z][a-zA-Z0-9+.-]*://)([^/?#@]*):([^/?#@]*)@', raw)
@@ -128,12 +130,20 @@ def _clean_url(url):
             else:
                 parts.append(part)
         raw = base + '?' + '&'.join(parts) + (hashmark + fragment if hashmark else '')
-    if not changed:
-        return raw
     if '#' in raw:
         head, _, fragment = raw.partition('#')
         if '=' in fragment:
-            raw = head + '#' + _clean(fragment)
+            cleaned_fragment = _clean(fragment)
+            # Fragment parameters use the same sensitive keys as queries.
+            frag_parts = []
+            for part in fragment.split('&'):
+                k, eq, _v = part.partition('=')
+                if eq and _key(k) in sensitive:
+                    frag_parts.append(f'{k}=REDACTED')
+                    changed = True
+                else:
+                    frag_parts.append(part)
+            raw = head + '#' + ('&'.join(frag_parts) if changed else cleaned_fragment)
     return raw
 
 
@@ -161,6 +171,8 @@ class KnowledgeEngine:
         self._completion_override = _completion
         self._search_override = _search
         self._history_override = _history
+        self._standalone_mode = bool(_standalone or _completion is not None
+                                     or _search is not None or _history is not _USE_HOST)
         if _standalone or _completion is not None or _search is not None or _history is not _USE_HOST:
             self.hermes_home = Path(hermes_home).resolve() if hermes_home else None
         else:
@@ -683,9 +695,14 @@ class KnowledgeEngine:
         except _Aborted:
             raise
         except NotImplementedError as exc:
-            # A provider-raised NotImplementedError can embed secrets in its
-            # message: convert it to a sanitized internal fallback signal
-            # (same type and prepared payload, no provider text).
+            if not self._standalone_mode:
+                # Host path (historical): carry prepared work on the
+                # provider's own exception for the caller's fallback.
+                setattr(exc, 'prepared', {'sources': sources, 'warnings': warnings,
+                                          'web': web, 'web_search': web, 'web_planned': web_planned,
+                                          'stage': 'full', 'model_route': model_route})
+                raise
+            # Standalone: provider text can embed secrets — sanitized signal.
             err = NotImplementedError('streaming_unsupported:provider-not-implemented')
             setattr(err, 'prepared', {'sources': sources, 'warnings': warnings,
                                       'web': web, 'web_search': web, 'web_planned': web_planned,
@@ -718,20 +735,23 @@ class KnowledgeEngine:
             except _Aborted:
                 raise
             except NotImplementedError:
-                # Same sanitization as stream setup: provider text never
-                # reaches the caller, only the unsupported-stream signal.
+                if not self._standalone_mode:
+                    raise
                 raise NotImplementedError('streaming_unsupported:provider-not-implemented') from None
             except Exception as exc:
                 if default_meta_route and not yielded:
                     raise NotImplementedError('streaming_unsupported:default-meta-route-failed') from exc
-                # Provider exception text can embed credentials/endpoints:
-                # surface the failure type only, like the completed path.
+                if not self._standalone_mode:
+                    raise
+                # Standalone: provider exception text can embed
+                # credentials/endpoints — surface the failure type only.
                 raise RuntimeError(f'Model request failed ({type(exc).__name__}).') from None
         return header, guarded()
 
     @staticmethod
     def _preselect(docs, terms, limit, token_cache=None):
-        """BM25-mirroring shortlist so only one FTS index is built per search.
+        """BM25-mirroring shortlist (legacy helper; search now ranks
+        per-project FTS candidates directly — see search()).
 
         Scores candidates with the same ingredients SQLite BM25 uses
         (term frequency saturated by document length, inverse document
@@ -753,7 +773,8 @@ class KnowledgeEngine:
             tokens = None
             if token_cache is not None:
                 try:
-                    cache_key = (id(doc), len(str(doc.get('text', ''))))
+                    raw_text = str(doc.get('text', ''))
+                    cache_key = (id(doc), len(raw_text), hash(raw_text))
                     tokens = token_cache.get(cache_key)
                 except Exception:
                     tokens = None
@@ -762,9 +783,7 @@ class KnowledgeEngine:
                     tokens = _fts_tokens(doc.get('text', ''))
                 except Exception:
                     continue
-                if token_cache is not None and cache_key is not None:
-                    if len(token_cache) > 4096:
-                        token_cache.clear()
+                if token_cache is not None and cache_key is not None and len(token_cache) <= 4096:
                     token_cache[cache_key] = tokens
             counts = {}
             for token in tokens:
@@ -817,11 +836,13 @@ class KnowledgeEngine:
                     folder = selected.resolve()
                     if folder.parent != self.project_root or selected.is_symlink():
                         continue
-                    # Cheap per-project shortlist; the single bounded FTS rank
-                    # below orders the union instead of one index per project.
-                    docs.extend(self._preselect(self._files(folder), terms,
-                                                min(100, max(limit * 10, 30)),
-                                                token_cache=self._token_cache))
+                    # Candidates come from the project's own FTS ranking
+                    # (same tokenizer and BM25 the final rank uses), then
+                    # one combined rank orders the union. A Python-scored
+                    # shortlist kept discarding BM25's winner on phrase,
+                    # accent, and length-normalization edge cases.
+                    docs.extend(self._rank(self._files(folder), terms,
+                                           min(100, max(limit * 10, 30))))
             elif project:
                 selected = self.project_root / project
                 folder = selected.resolve()

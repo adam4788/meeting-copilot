@@ -180,7 +180,7 @@ def main(argv=None):
              'Run without --web-query for file-grounded answers.')
     if args.search is not None and (args.question or '').strip():
         fail('Choose --search TERMS or --question, not both.')
-    if args.list_projects and args.search is not None:
+    if args.list_projects and (args.search is not None or (args.question or '').strip()):
         fail('Choose one mode: --list-projects, --search, or --question.')
     if args.search is not None and not args.search.strip():
         fail('Search terms cannot be empty.')
@@ -210,6 +210,17 @@ def main(argv=None):
 
     subs = sorted(sub.name for sub in docs.iterdir()
                     if sub.is_dir() and not sub.name.startswith('.') and not sub.is_symlink())
+    if not subs and not args.list_projects:
+        # A docs directory full of files but no project subfolders is the
+        # most common layout mistake: say exactly what to change instead
+        # of silently returning no sources.
+        root_files = [entry.name for entry in docs.iterdir()
+                      if entry.is_file() and entry.suffix.lower() in ('.md', '.txt', '.rst')]
+        detail = (f' Found document files at its root ({", ".join(root_files[:3])}); '
+                  'move them into a subfolder per project.' if root_files else '')
+        fail(f'No project folders under {docs}.{detail} '
+             'Expected layout: <docs>/<project>/*.md|txt|rst — '
+             'or pass the parent directory as --docs.')
     if args.list_projects:
         if args.json:
             print(json.dumps({'projects': [{'name': name} for name in subs]}, indent=2))
