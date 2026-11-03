@@ -5,6 +5,7 @@ import re
 import time
 import sqlite3
 import json
+import math
 import threading
 import unicodedata
 from contextlib import closing
@@ -27,15 +28,44 @@ def _completion_supports_streaming(complete):
 
 def _fts_tokens(text):
     """Tokenize the way SQLite FTS5 (unicode61) does for preselection:
-    accents fold away and underscores separate tokens."""
-    normalized = unicodedata.normalize('NFD', str(text).lower())
-    stripped = ''.join(ch for ch in normalized if not unicodedata.combining(ch))
-    return re.findall(r'[^\W_]+', stripped)
+    Latin accents fold away, underscores separate tokens, ligatures and
+    non-Latin combining marks are preserved (unicode61 only strips
+    diacritics from Latin characters)."""
+    decomposed = unicodedata.normalize('NFD', str(text).lower())
+    kept = []
+    for ch in decomposed:
+        if unicodedata.combining(ch):
+            base = next((c for c in reversed(kept) if not unicodedata.combining(c)), '')
+            if base and unicodedata.name(base, '').startswith('LATIN'):
+                continue
+        kept.append(ch)
+    tokens, current = [], []
+    for ch in kept:
+        category = unicodedata.category(ch)
+        if ch != '_' and (category[0] in ('L', 'N') or category in ('Mn', 'Mc')):
+            current.append(ch)
+        elif current:
+            tokens.append(''.join(current))
+            current = []
+    if current:
+        tokens.append(''.join(current))
+    return tokens
 
 
 def _resolve_override(override):
-    """Unwrap a provider object to the callable the engine actually invokes."""
-    return getattr(override, 'complete', override)
+    """Unwrap a provider object to the callable the engine actually invokes.
+
+    A provider object may expose complete() and stream_chunks() as separate
+    methods: keep both reachable on the resolved callable.
+    """
+    complete = getattr(override, 'complete', override)
+    stream = getattr(override, 'stream_chunks', None)
+    if callable(stream) and not callable(getattr(complete, 'stream_chunks', None)):
+        def _with_stream(messages, _complete=complete):
+            return _complete(messages)
+        _with_stream.stream_chunks = stream  # type: ignore[attr-defined]
+        return _with_stream
+    return complete
 
 
 class _Aborted(Exception):
@@ -45,9 +75,12 @@ class _Aborted(Exception):
 
 
 def _credential_like(value):
-    return (len(value) >= 12
-            or (len(value) >= 6 and any(ch.isdigit() for ch in value)
-                and any(ch.isalpha() for ch in value)))
+    # Credential-shaped: digit+letter mix, symbol-bearing, or very long.
+    # A long purely alphabetic word ("identification") is ordinary prose.
+    return ((len(value) >= 6 and any(ch.isdigit() for ch in value)
+             and any(ch.isalpha() for ch in value))
+            or (len(value) >= 8 and any(ch in '._~+/=-' for ch in value))
+            or len(value) >= 32)
 
 
 def _clean(text):
@@ -67,30 +100,41 @@ def _clean(text):
 
 
 def _clean_url(url):
-    """Redact credential-bearing URL parts (userinfo, sensitive query keys)."""
-    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+    """Redact credential-bearing URL parts (userinfo, sensitive query keys).
+
+    Ordinary URLs return byte-for-byte unchanged: only URLs that actually
+    carry credentials are rewritten, and only their sensitive parts.
+    """
     raw = str(url or '')
-    try:
-        parts = urlsplit(raw)
-    except ValueError:
-        return _clean(raw)
-    sensitive = {'key', 'apikey', 'api_key', 'token', 'access_token', 'auth',
+    sensitive = {'key', 'apikey', 'token', 'accesstoken', 'auth',
                  'authorization', 'signature', 'sig', 'password', 'secret'}
     def _key(name):
         return re.sub(r'[^a-z0-9]', '', str(name).lower())
-    query = [(k, 'REDACTED' if _key(k) in sensitive else v)
-             for k, v in parse_qsl(parts.query, keep_blank_values=True)]
-    netloc = parts.netloc
-    if '@' in netloc:
-        userinfo, _, host = netloc.rpartition('@')
-        if ':' in userinfo:
-            userinfo = userinfo.split(':', 1)[0] + ':[REDACTED]'
-        netloc = f'{userinfo}@{host}'
-    fragment = parts.fragment
-    if '=' in fragment:
-        fragment = _clean(fragment)
-    return urlunsplit((parts.scheme, netloc, parts.path,
-                       urlencode(query), fragment))
+    changed = False
+    # Userinfo password: scheme://user:pass@host
+    match = re.match(r'^([a-zA-Z][a-zA-Z0-9+.-]*://)([^/?#@]*):([^/?#@]*)@', raw)
+    if match:
+        raw = match.group(1) + match.group(2) + ':[REDACTED]@' + raw[match.end():]
+        changed = True
+    if '?' in raw:
+        base, _, rest = raw.partition('?')
+        query, hashmark, fragment = rest.partition('#')
+        parts = []
+        for part in query.split('&'):
+            key, eq, _value = part.partition('=')
+            if eq and _key(key) in sensitive:
+                parts.append(f'{key}=REDACTED')
+                changed = True
+            else:
+                parts.append(part)
+        raw = base + '?' + '&'.join(parts) + (hashmark + fragment if hashmark else '')
+    if not changed:
+        return raw
+    if '#' in raw:
+        head, _, fragment = raw.partition('#')
+        if '=' in fragment:
+            raw = head + '#' + _clean(fragment)
+    return raw
 
 
 # Sentinel: use the host session store unless a history override is given.
@@ -125,6 +169,7 @@ class KnowledgeEngine:
             if 'profiles' in {part.lower() for part in self.hermes_home.parts} or any(os.environ.get(key, '').lower() not in ('', 'default') for key in ('HERMES_PROFILE_NAME', 'HERMES_PROFILE')):
                 raise ValueError('Only the default Hermes profile is supported')
         self._cache = {}
+        self._token_cache = {}
         self._lock = threading.RLock()
 
     def invalidate_cache(self):
@@ -132,6 +177,7 @@ class KnowledgeEngine:
         in-flight search cannot repopulate retained state after a clear."""
         with self._lock:
             self._cache.clear()
+            self._token_cache.clear()
 
     def projects(self):
         if not self.project_root.is_dir():
@@ -241,7 +287,11 @@ class KnowledgeEngine:
                     return cleaned_value[:limit] if limit else cleaned_value
                 raw_updated = record.get('updated_at')
                 if isinstance(raw_updated, str):
-                    updated = _scrub(raw_updated)
+                    # A timestamp field has no business carrying Bearer
+                    # prose: scrub any Bearer value here regardless of the
+                    # general prose-preserving heuristic.
+                    updated = re.sub(r'(?i)\bbearer\s+[^\s,;]+', 'Bearer [REDACTED]',
+                                     _scrub(raw_updated))
                 elif isinstance(raw_updated, (int, float)) or raw_updated is None:
                     updated = raw_updated
                 else:
@@ -633,12 +683,14 @@ class KnowledgeEngine:
         except _Aborted:
             raise
         except NotImplementedError as exc:
-            # Retrieval, planning, and web work are already done: carry them
-            # on the fallback signal so the caller does not repeat them.
-            setattr(exc, 'prepared', {'sources': sources, 'warnings': warnings,
+            # A provider-raised NotImplementedError can embed secrets in its
+            # message: convert it to a sanitized internal fallback signal
+            # (same type and prepared payload, no provider text).
+            err = NotImplementedError('streaming_unsupported:provider-not-implemented')
+            setattr(err, 'prepared', {'sources': sources, 'warnings': warnings,
                                       'web': web, 'web_search': web, 'web_planned': web_planned,
                                       'stage': 'full', 'model_route': model_route})
-            raise
+            raise err from None
         except Exception as exc:
             if default_meta_route:
                 # Default Meta stream failed before producing output: let the
@@ -666,7 +718,9 @@ class KnowledgeEngine:
             except _Aborted:
                 raise
             except NotImplementedError:
-                raise
+                # Same sanitization as stream setup: provider text never
+                # reaches the caller, only the unsupported-stream signal.
+                raise NotImplementedError('streaming_unsupported:provider-not-implemented') from None
             except Exception as exc:
                 if default_meta_route and not yielded:
                     raise NotImplementedError('streaming_unsupported:default-meta-route-failed') from exc
@@ -676,34 +730,67 @@ class KnowledgeEngine:
         return header, guarded()
 
     @staticmethod
-    def _preselect(docs, terms, limit):
-        """Cheap pure-Python shortlist so only one FTS index is built per search.
+    def _preselect(docs, terms, limit, token_cache=None):
+        """BM25-mirroring shortlist so only one FTS index is built per search.
 
-        Match whole tokens, mirroring the FTS query: substring matching
-        would let e.g. "renewal" crowd out a document containing the actual
-        token "new" before ranking ever sees it.
+        Scores candidates with the same ingredients SQLite BM25 uses
+        (term frequency saturated by document length, inverse document
+        frequency) instead of substring or raw-frequency heuristics that
+        can discard the document BM25 itself would rank first.
         """
         if not docs:
             return []
         wanted = set()
         for term in terms:
             wanted.update(_fts_tokens(term))
-        scored = []
+        if not wanted:
+            return []
+        tokenized = []
+        total_length = 0
+        doc_freq = {term: 0 for term in wanted}
         for position, doc in enumerate(docs):
-            try:
-                counts = {}
-                for token in _fts_tokens(doc.get('text', '')):
-                    if token in wanted:
-                        counts[token] = counts.get(token, 0) + 1
-            except Exception:
+            cache_key = None
+            tokens = None
+            if token_cache is not None:
+                try:
+                    cache_key = (id(doc), len(str(doc.get('text', ''))))
+                    tokens = token_cache.get(cache_key)
+                except Exception:
+                    tokens = None
+            if tokens is None:
+                try:
+                    tokens = _fts_tokens(doc.get('text', ''))
+                except Exception:
+                    continue
+                if token_cache is not None and cache_key is not None:
+                    if len(token_cache) > 4096:
+                        token_cache.clear()
+                    token_cache[cache_key] = tokens
+            counts = {}
+            for token in tokens:
+                if token in wanted:
+                    counts[token] = counts.get(token, 0) + 1
+            for term in counts:
+                doc_freq[term] += 1
+            total_length += len(tokens)
+            tokenized.append((position, doc, counts, len(tokens)))
+        if not tokenized:
+            return []
+        average_length = (total_length / len(tokenized)) or 1.0
+        count_docs = len(tokenized)
+        scored = []
+        for position, doc, counts, length in tokenized:
+            if not counts:
                 continue
-            if counts:
-                # Distinct coverage first (mirrors multi-term relevance),
-                # then term frequency so a strongly matching later document
-                # is not cut purely by file order before BM25 can rank it.
-                scored.append((-len(counts), -sum(counts.values()), position, doc))
-        scored.sort(key=lambda item: (item[0], item[1], item[2]))
-        return [doc for _, _, _, doc in scored[:limit]]
+            score = 0.0
+            for term, frequency in counts.items():
+                freq = doc_freq[term]
+                idf = max(0.01, math.log(1.0 + (count_docs - freq + 0.5) / (freq + 0.5)))
+                denom = frequency + 1.2 * (0.25 + 0.75 * (length / average_length))
+                score += idf * (frequency * 2.2) / denom
+            scored.append((-score, position, doc))
+        scored.sort(key=lambda item: (item[0], item[1]))
+        return [doc for _, _, doc in scored[:limit]]
 
     @staticmethod
     def _rank(docs, terms, limit):
@@ -733,7 +820,8 @@ class KnowledgeEngine:
                     # Cheap per-project shortlist; the single bounded FTS rank
                     # below orders the union instead of one index per project.
                     docs.extend(self._preselect(self._files(folder), terms,
-                                                min(100, max(limit * 10, 30))))
+                                                min(100, max(limit * 10, 30)),
+                                                token_cache=self._token_cache))
             elif project:
                 selected = self.project_root / project
                 folder = selected.resolve()

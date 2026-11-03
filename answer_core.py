@@ -41,7 +41,9 @@ def _as_completion(value):
     complete = getattr(value, 'complete', value)
     if not callable(complete):
         raise ValueError('Completion provider must be callable or expose .complete(messages)')
-    return complete
+    # Return the provider itself, not the unwrapped method: the engine's
+    # resolver needs the object to find a separate stream_chunks method.
+    return value
 
 
 def _as_search(value):

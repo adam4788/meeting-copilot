@@ -123,10 +123,15 @@ class _CliParser(argparse.ArgumentParser):
 
     def error(self, message):
         argv = getattr(self, '_argv', [])
-        json_requested = any(
-            token == '--json' or token.startswith('--json=')
-            or (token.startswith('--') and len(token) > 2 and '--json'.startswith(token))
-            for token in argv)
+        json_requested = False
+        for token in argv:
+            if token == '--':
+                break  # end of options: later tokens are positional values
+            if (token == '--json' or token.startswith('--json=')
+                    or (token.startswith('--') and len(token) > 2
+                        and '--json'.startswith(token))):
+                json_requested = True
+                break
         if json_requested:
             print(json.dumps({'error': message}, indent=2))
             raise SystemExit(2)
@@ -173,9 +178,9 @@ def main(argv=None):
     if args.web_query is not None:
         fail('Web research has no standalone provider yet (host search only). '
              'Run without --web-query for file-grounded answers.')
-    if args.search is not None and args.question:
+    if args.search is not None and (args.question or '').strip():
         fail('Choose --search TERMS or --question, not both.')
-    if args.list_projects and (args.search is not None or (args.question or '').strip()):
+    if args.list_projects and args.search is not None:
         fail('Choose one mode: --list-projects, --search, or --question.')
     if args.search is not None and not args.search.strip():
         fail('Search terms cannot be empty.')
@@ -184,7 +189,7 @@ def main(argv=None):
              '  Ask:          python ask.py --docs ./sample-docs --question "What is the unit price?"\n'
              '  Search docs:  python ask.py --docs ./sample-docs --search "unit price"\n'
              '  List projects: python ask.py --docs ./sample-docs --list-projects')
-    if args.project and args.all:
+    if args.project and args.all and not args.list_projects:
         fail('Choose --project NAME or --all, not both.')
     if args.limit is not None and args.search is None:
         print('Warning: --limit applies only to --search and is ignored here.', file=sys.stderr)
@@ -212,7 +217,8 @@ def main(argv=None):
             print('Projects:')
             for name in subs:
                 print(f'  - {name}')
-            print(f'\nAsk one: python ask.py --docs {docs} --project {subs[0]} --question "..."')
+            import shlex as _shlex
+            print(f'\nAsk one: python ask.py --docs {_shlex.quote(str(docs))} --project {_shlex.quote(subs[0])} --question "..."')
         else:
             print(f'No project folders under {docs}. Create one folder per project containing .md/.txt/.rst files.')
         return 0

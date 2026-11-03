@@ -158,7 +158,10 @@ def main(argv=None):
             item = report[key]
             print(f"{key}: mean {item['mean']} ms, p50 {item['p50']} ms, p95 {item['p95']} ms, max {item['max']} ms")
         print(report['note'])
-    return 0 if report['recall_at_k']['exact_reference'] >= args.min_recall else 1
+    gated = min(report['recall_at_k']['exact_reference'],
+                  report['recall_at_k']['marker_free_detail'],
+                  report['ranking_parity']['all_vs_single_top1'])
+    return 0 if gated >= args.min_recall else 1
 
 
 if __name__ == '__main__':

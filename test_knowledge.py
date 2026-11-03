@@ -404,6 +404,20 @@ class IncrementalRetrievalTests(KnowledgeTests):
         combined = self.engine.search('alpha', all_projects=True, limit=1)
         self.assertEqual([h['text'] for h in combined], [h['text'] for h in single])
 
+    def test_preselect_bm25_prefers_short_strong_match(self):
+        docs = [{'text': f'alpha short note {i}'} for i in range(6)]
+        docs.append({'text': 'alpha alpha ' + ('filler prose about schedules and budgets ' * 40)})
+        short = KnowledgeEngine._preselect(docs, ['alpha'], 1)
+        self.assertTrue(short[0]['text'].startswith('alpha short note'))
+
+    def test_preselect_preserves_greek_accent_distinction(self):
+        # FTS5 only folds Latin diacritics: unaccented Greek must not
+        # crowd out the exact accented token.
+        docs = [{'text': 'αθηνα αθηνα αθηνα'} for _ in range(6)]
+        docs.append({'text': 'αθήνα'})
+        short = KnowledgeEngine._preselect(docs, ['αθήνα'], 6)
+        self.assertEqual([d['text'] for d in short], ['αθήνα'])
+
 
 class LargeCorpusBoundTests(KnowledgeTests):
     def test_unchanged_large_project_skips_rereads_after_expiry(self):

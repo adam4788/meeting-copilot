@@ -308,6 +308,40 @@ class CoreAcceptanceTests(NoHermesTestCase):
         self.assertNotIn('sentinel987', str(ctx.exception))
         self.assertIn('Model request failed', str(ctx.exception))
 
+    def test_provider_not_implemented_errors_are_sanitized(self):
+        def setup_boom(messages):
+            raise NotImplementedError('secret=example-secret-123')
+        core = self._core(completion=setup_boom)
+        core.engine._completion_override = setup_boom
+        def stream_setup(messages):
+            raise NotImplementedError('secret=example-secret-123')
+        setattr(setup_boom, 'stream_chunks', stream_setup)
+        with self.assertRaises(NotImplementedError) as ctx:
+            core.engine.answer_stream('Price?', transcript='t', project='acme')
+        self.assertNotIn('example-secret-123', str(ctx.exception))
+        self.assertIn('streaming_unsupported', str(ctx.exception))
+
+    def test_provider_object_keeps_stream_chunks(self):
+        class Provider:
+            def complete(self, messages):
+                return 'Full [1].'
+            def stream_chunks(self, messages):
+                yield 'Streamed [1].'
+        core = self._core(completion=Provider())
+        self.assertTrue(core.engine.supports_streaming())
+        _, deltas = core.engine.answer_stream('Price?', transcript='t', project='acme')
+        self.assertEqual(list(deltas), ['Streamed [1].'])
+
+    def test_url_cleaning_preserves_ordinary_urls(self):
+        import knowledge
+        ordinary = 'https://example.com/x?q=hello%20world&flag'
+        self.assertEqual(knowledge._clean_url(ordinary), ordinary)
+        cleaned = knowledge._clean_url('https://example.com/x?access_token=sekret99&ok=1')
+        self.assertNotIn('sekret99', cleaned)
+        self.assertIn('ok=1', cleaned)
+        self.assertEqual(knowledge._clean('Bearer identification documents'),
+                         'Bearer identification documents')
+
 
 class AskCliTests(unittest.TestCase):
     def setUp(self):
@@ -469,7 +503,7 @@ class AskCliTests(unittest.TestCase):
     def test_ambiguous_modes_are_rejected(self):
         err = self._run('--docs', self.docs, '--list-projects', '--search', 'Acme')
         self.assertIn('Choose one mode', str(err.code))
-        err = self._run('--docs', self.docs, '--list-projects', '--project', 'acme', '--all')
+        err = self._run('--docs', self.docs, '--question', 'Q?', '--project', 'acme', '--all')
         self.assertIn('not both', str(err.code))
 
     def test_json_preflight_errors_are_json(self):
@@ -534,6 +568,19 @@ class AskCliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn('--limit applies only to --search', err)
 
+    def test_search_blank_question_warns_not_rejects(self):
+        code, _, err = self._capture(['--docs', self.docs, '--search', 'Acme renews',
+                                      '--question', ' '])
+        self.assertEqual(code, 0)
+        self.assertIn('--question is ignored', err)
+
+    def test_list_project_all_warns_and_lists(self):
+        code, out, err = self._capture(['--docs', self.docs, '--list-projects',
+                                        '--project', 'acme', '--all'])
+        self.assertEqual(code, 0)
+        self.assertIn('acme', out)
+        self.assertIn('--all is ignored', err)
+
     def test_abbreviated_json_flag_still_gets_json_parser_errors(self):
         import ask
         import io
@@ -547,18 +594,18 @@ class AskCliTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 2)
         self.assertIn('invalid int value', _json.loads(out.getvalue())['error'])
 
-    def test_list_conflict_has_no_ignored_warning(self):
+    def test_list_project_all_warns_and_returns_json(self):
         import ask
         import io
         import json as _json
         from contextlib import redirect_stdout, redirect_stderr
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
-            with self.assertRaises(SystemExit):
-                ask.main(['--docs', self.docs, '--list-projects', '--project',
-                          'acme', '--all', '--json'])
-        self.assertNotIn('ignored', err.getvalue())
-        self.assertIn('not both', _json.loads(out.getvalue())['error'])
+            code = ask.main(['--docs', self.docs, '--list-projects', '--project',
+                             'acme', '--all', '--json'])
+        self.assertEqual(code, 0)
+        self.assertIn('ignored', err.getvalue())
+        self.assertEqual(_json.loads(out.getvalue())['projects'][0]['name'], 'acme')
 
 
 class RetrievalEvalTests(unittest.TestCase):
