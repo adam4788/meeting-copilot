@@ -378,6 +378,30 @@ class CoreAcceptanceTests(NoHermesTestCase):
         self.assertEqual(knowledge._clean_url('https://example.com/?q=dogs%26cats'),
                          'https://example.com/?q=dogs%26cats')
 
+    def test_round11_credential_and_benign_shapes(self):
+        import knowledge
+        blob = ' '.join([
+            knowledge._clean('Cookie: session=abc'),
+            knowledge._clean('%257B%2522password%2522%253A%2522sentinelABC123%2522%257D'),
+            knowledge._clean('%22auth_token%22%3A%22abc12345%22'),
+            knowledge._clean('Find %22launch plan%22 and %22token%22%3A%22abc123%22'),
+        ])
+        for sentinel in ('sentinelABC123', 'abc12345', 'abc123'):
+            self.assertNotIn(sentinel, blob)
+        self.assertIn('%22launch plan%22', blob)
+        self.assertEqual(knowledge._clean('session: "2024-01-01"'), 'session: "2024-01-01"')
+        self.assertEqual(knowledge._clean('Token: "economics" is a topic'),
+                         'Token: "economics" is a topic')
+
+    def test_history_provider_exception_is_sanitized(self):
+        class BadHist:
+            def search(self, terms):
+                raise RuntimeError('password=sentinelEXCEPTION123')
+        core = self._core(history=BadHist())
+        with self.assertRaises(RuntimeError) as ctx:
+            core.search('price', project='acme')
+        self.assertNotIn('sentinelEXCEPTION123', str(ctx.exception))
+
     def test_round10_credential_and_benign_shapes(self):
         import knowledge
         blob = ' '.join([
@@ -417,15 +441,15 @@ class CoreAcceptanceTests(NoHermesTestCase):
         self.assertEqual(knowledge._clean('Token: meeting agenda'), 'Token: meeting agenda')
 
     def test_rank_index_cache_invalidates_on_content_change(self):
-        import knowledge
+        engine = self._core().engine
         docs = [dict(id=f'd{i}', title=f'doc{i}', source=f's{i}',
                      text=('alpha beta gamma ' * 20) + f' unique{i}',
                      updated_at=None) for i in range(50)]
-        first = knowledge.KnowledgeEngine._rank(docs, ['alpha', 'unique7'], 3)
-        again = knowledge.KnowledgeEngine._rank(docs, ['alpha', 'unique7'], 3)
+        first = engine._rank(docs, ['alpha', 'unique7'], 3)
+        again = engine._rank(docs, ['alpha', 'unique7'], 3)
         self.assertEqual([d['source'] for d in first], [d['source'] for d in again])
         docs[7] = dict(docs[7], text='zeta omega replaced content ' * 10)
-        changed = knowledge.KnowledgeEngine._rank(docs, ['zeta'], 3)
+        changed = engine._rank(docs, ['zeta'], 3)
         self.assertTrue(changed and changed[0]['source'] == 's7')
 
     def test_semicolon_params_and_ordinary_sort_key(self):
@@ -742,6 +766,39 @@ class AskCliTests(unittest.TestCase):
         blob = ' '.join(payload.get('warnings', []))
         self.assertIn('are not searched', blob)
         self.assertIn('--transcript is ignored', blob)
+
+    def test_fake_passage_prefers_term_cluster(self):
+        filler = ' '.join(['filler'] * 60)
+        (Path(self.docs) / 'acme' / 'notes.md').write_text(
+            f'unit mentioned once. {filler} The unit price is $84 each.\n',
+            encoding='utf-8')
+        code, out, _ = self._capture(['--question', 'What is the unit price?',
+                                      '--docs', self.docs, '--provider', 'fake'])
+        self.assertEqual(code, 0)
+        self.assertIn('$84', out.split('\n\nSources')[0])
+
+    def test_fake_rejects_title_only_match(self):
+        (Path(self.docs) / 'acme' / 'unit price notes.md').write_text(
+            'The unit handbook covers shipping windows and warehouses.\n',
+            encoding='utf-8')
+        (Path(self.docs) / 'acme' / 'notes.md').unlink()
+        code, out, _ = self._capture(['--question', 'What is the unit price?',
+                                      '--docs', self.docs, '--provider', 'fake'])
+        self.assertEqual(code, 0)
+        self.assertIn('does not directly answer', out.split('\n\nSources')[0])
+
+    def test_fake_quotes_matching_part_of_long_transcript_line(self):
+        transcript = Path(self.docs) / 'input.txt'
+        filler = ' '.join(['filler'] * 60)
+        transcript.write_text(f'Alice: {filler} the quasar deadline is Friday.\n',
+                              encoding='utf-8')
+        (Path(self.docs) / 'acme' / 'notes.md').write_text(
+            'Unrelated pricing notes.\n', encoding='utf-8')
+        code, out, _ = self._capture(['--question', 'When is the quasar deadline?',
+                                      '--docs', self.docs, '--provider', 'fake',
+                                      '--transcript', str(transcript)])
+        self.assertEqual(code, 0)
+        self.assertIn('quasar deadline is Friday', out)
 
     def test_fake_rejects_weak_transcript_match(self):
         transcript = Path(self.docs) / 'input.txt'

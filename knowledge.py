@@ -89,10 +89,14 @@ def _clean(text, _depth=0):
     # Percent-encoded JSON blobs (e.g. %22auth_token%22%3A...) hide their
     # key names from the assignment rules below; decode them first when a
     # credential marker is present.
-    if '%22' in text.lower() and re.search(
-            r'(?i)%22[\w-]*?(?:token|secret|password|api[\w-]*?key|authorization)(?:%22)?\s*%3[ad]', text):
-        from urllib.parse import unquote
-        text = unquote(text)
+    # Percent-encoded credential assignments (single/double-encoded JSON):
+    # redact just the value in place so benign encoded text nearby (e.g.
+    # %22launch plan%22) stays byte-for-byte intact.
+    _q = r'(?:%2522|%22)'
+    _c = r'(?:%253[ad]|%3[ad])'
+    text = re.sub(r'(?i)(' + _q + r'[\w%-]*?(?:token|secret|password|api[\w%-]*?key|authorization)'
+                  + _q + r'?\s*' + _c + r'\s*' + _q + r'?)[^%]*?(' + _q + r'|&|$)',
+                  r'\1REDACTED\2', text)
     # Bearer credentials first: the generic key=value rule below would
     # otherwise redact only the word "Bearer" and leave the token itself.
     # Ordinary prose ("Bearer investment strategy") is not credential-shaped
@@ -118,17 +122,29 @@ def _clean(text, _depth=0):
     _names = (r'(?:[a-z][a-z0-9_-]*[_-])?token|csrftoken|xsrftoken|api[ _-]?key|'
               r'password|passwd|secret|client[ _-]?secret|authorization|credential|'
               r'session(?:id)?|sid')
-    text = re.sub(r'(?i)("?(?:' + _names + r')"?\s*[:=]\s*")(?:\\.|[^"\\])*(")',
-                  r'\1[REDACTED]\2', text)
-    text = re.sub(r"(?i)('?(?:" + _names + r")'?\s*[:=]\s*')[^']*(')",
-                  r'\1[REDACTED]\2', text)
+    def _quoted_value(match):
+        prefix, value, close = match.group(1), match.group(2), match.group(3)
+        stripped = prefix.lstrip()
+        if not stripped.startswith(('"', "'")):
+            # Unquoted prose keys: quoted dates and ordinary Token: topics
+            # are content, not credentials.
+            if 'session' in prefix.lower() and re.fullmatch(r'\d{4}-\d{2}-\d{2}([T ].*)?', value):
+                return match.group(0)
+            if re.search(r'(?i)\btoken\b', prefix) and not re.search(r'[_-]token', prefix) \
+                    and '=' not in prefix and not _credential_like(value):
+                return match.group(0)
+        return prefix + '[REDACTED]' + close
+    text = re.sub(r'(?i)("?(?:' + _names + r')"?\s*[:=]\s*")((?:\\.|[^"\\])*)(")',
+                  _quoted_value, text)
+    text = re.sub(r"(?i)('?(?:" + _names + r")'?\s*[:=]\s*')([^']*)(')",
+                  _quoted_value, text)
     text = re.sub(r'(?i)\b(token\s*[:=]\s*"?)([^\s,;"]+)',
                   lambda m: m.group(1) + ('[REDACTED]' if ('=' in m.group(1) and len(m.group(2)) >= 3) or _credential_like(m.group(2)) else m.group(2)), text)
     def _session_assignment(match):
         value = match.group(2)
         if re.fullmatch(r'\d{4}-\d{2}-\d{2}([T ].*)?', value) or (value.isdigit() and len(value) <= 8):
             return match.group(0)
-        if _credential_like(value) or ('=' in match.group(1) and len(value) >= 6):
+        if _credential_like(value) or ('=' in match.group(1) and len(value) >= 3):
             return match.group(1) + '[REDACTED]'
         return match.group(0)
     text = re.sub(r'(?i)\b(session\s*[:=]\s*"?)([^\s,;"]+)', _session_assignment, text)
@@ -272,6 +288,8 @@ class KnowledgeEngine:
         self._cache = {}
         self._token_cache = {}
         self._lock = threading.RLock()
+        self._index_cache = OrderedDict()
+        self._index_cache_lock = threading.Lock()
 
     def invalidate_cache(self):
         """Clear retrieved project snippets under the retrieval lock so an
@@ -279,12 +297,12 @@ class KnowledgeEngine:
         with self._lock:
             self._cache.clear()
             self._token_cache.clear()
-        # Retrieved text also lives in the shared FTS index cache; a
+        # Retrieved text also lives in this engine's FTS index cache; a
         # clear must not leave it retained there.
-        with KnowledgeEngine._INDEX_CACHE_LOCK:
-            for index in KnowledgeEngine._INDEX_CACHE.values():
+        with self._index_cache_lock:
+            for index in self._index_cache.values():
                 index.close()
-            KnowledgeEngine._INDEX_CACHE.clear()
+            self._index_cache.clear()
 
     def projects(self):
         if not self.project_root.is_dir():
@@ -373,7 +391,12 @@ class KnowledgeEngine:
     def _sessions(self, terms):
         if self._history_override is not _USE_HOST:
             search = getattr(self._history_override, 'search', self._history_override)
-            records = search(terms)
+            try:
+                records = search(terms)
+            except Exception as exc:
+                # Provider errors must not carry raw credential text back
+                # to the caller.
+                raise RuntimeError(_clean(str(exc))) from None
             # Injected history gets the same treatment as the host session
             # store: redact credential-looking values and bound fields
             # before any of it can reach a completion provider or caller.
@@ -906,11 +929,7 @@ class KnowledgeEngine:
         scored.sort(key=lambda item: (item[0], item[1]))
         return [doc for _, _, doc in scored[:limit]]
 
-    _INDEX_CACHE = OrderedDict()
-    _INDEX_CACHE_LOCK = threading.Lock()
-
-    @staticmethod
-    def _rank(docs, terms, limit):
+    def _rank(self, docs, terms, limit):
         # Memory-only FTS indexes, cached by corpus fingerprint (source,
         # length, content hash): warm searches over an unchanged corpus
         # reuse the index instead of rebuilding it per query. Content
@@ -920,19 +939,19 @@ class KnowledgeEngine:
                              hashlib.sha256(d['text'].encode('utf-8', 'replace')).hexdigest())
                             for d in docs)
         query = ' OR '.join('"' + term + '"' for term in terms)
-        with KnowledgeEngine._INDEX_CACHE_LOCK:
-            index = KnowledgeEngine._INDEX_CACHE.get(fingerprint)
+        with self._index_cache_lock:
+            index = self._index_cache.get(fingerprint)
             if index is not None:
-                KnowledgeEngine._INDEX_CACHE.move_to_end(fingerprint)
+                self._index_cache.move_to_end(fingerprint)
             if index is None:
                 index = sqlite3.connect(':memory:', check_same_thread=False)
                 index.execute('CREATE VIRTUAL TABLE docs USING fts5(text)')
                 index.executemany('INSERT INTO docs(rowid,text) VALUES (?,?)',
                                   [(i + 1, d['text']) for i, d in enumerate(docs)])
-                KnowledgeEngine._INDEX_CACHE[fingerprint] = index
-                while len(KnowledgeEngine._INDEX_CACHE) > 12:
-                    oldest = next(iter(KnowledgeEngine._INDEX_CACHE))
-                    KnowledgeEngine._INDEX_CACHE.pop(oldest).close()
+                self._index_cache[fingerprint] = index
+                while len(self._index_cache) > 12:
+                    oldest = next(iter(self._index_cache))
+                    self._index_cache.pop(oldest).close()
             rows = index.execute('SELECT rowid FROM docs WHERE docs MATCH ? ORDER BY bm25(docs) LIMIT ?', (query, limit)).fetchall()
         return [docs[row[0] - 1].copy() for row in rows]
 

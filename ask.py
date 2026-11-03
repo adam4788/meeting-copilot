@@ -57,17 +57,30 @@ def _passage(text, terms):
     if not flat or not terms:
         return flat[:220]
     lowered = flat.lower()
-    starts = []
+    positions = {}
     for term in terms:
+        found = []
         idx = lowered.find(term)
-        if idx < 0:
+        while idx >= 0:
+            found.append(idx)
+            idx = lowered.find(term, idx + 1)
+        if not found:
             match = _re.search(r'[a-z0-9]*' + _re.escape(term[:4]) + r'[a-z0-9]*', lowered)
-            idx = match.start() if match else -1
-        if idx >= 0:
-            starts.append(idx)
-    if not starts:
+            if match:
+                found.append(match.start())
+        if found:
+            positions[term] = found
+    if not positions:
         return flat[:220]
-    start = max(0, min(starts) - 40)
+    # Choose the 220-char window containing the most distinct query terms,
+    # not merely the window around the earliest stray mention.
+    candidates = {0} | {max(0, pos - 40) for found in positions.values() for pos in found}
+    start, best_score = 0, -1
+    for cand in sorted(candidates):
+        score = sum(1 for found in positions.values()
+                    if any(cand <= pos < cand + 220 for pos in found))
+        if score > best_score:
+            start, best_score = cand, score
     snippet = flat[start:start + 220]
     if start > 0:
         snippet = '…' + snippet
@@ -111,11 +124,12 @@ def fake_completion_factory():
             top = evidence[0]
             snippet = _passage(top.get('text', ''), terms)
             doc_hits = _term_hits(terms, f"{top.get('title', '')} {top.get('text', '')}")
+            body_hits = _term_hits(terms, top.get('text', ''))
             # A one-term question ('Price?') can only ever score one hit;
             # multi-term questions need two so a shared generic word in an
             # unrelated document is not presented as the answer.
             required = 1 if len(terms) <= 1 else 2
-            if snippet and len(doc_hits) >= required and len(doc_hits) >= len(best_hits):
+            if snippet and len(body_hits) >= required and len(doc_hits) >= len(best_hits):
                 title = ' '.join(str(top.get('title', '')).split())[:80]
                 redacted = ' (searched snippet redacted)' if 'REDACTED' in snippet else ''
                 from_line = f' From {title}:' if title else ''
@@ -124,7 +138,7 @@ def fake_completion_factory():
                         f'MODEL_API_KEY with --provider meta for a synthesized answer.')
         transcript_required = 1 if len(terms) <= 1 else 2
         if best_line and len(best_hits) >= transcript_required and len(best_hits) > len(doc_hits):
-            quote = ' '.join(best_line.split())[:220]
+            quote = _passage(best_line, terms)
             lead = ('the retrieved documents do not directly answer this; '
                     if evidence else 'no documents matched; ')
             return ('Offline extractive answer (fake provider — no model was '
@@ -261,10 +275,13 @@ def main(argv=None):
         if token == '--':
             break
         pre.append(token)
-    json_requested = any(token == '--json' or token.startswith('--json=')
-                         or (token.startswith('--j') and '--json'.startswith(token))
+    json_requested = any(token == '--json'
+                         or (token.startswith('--j') and '=' not in token
+                             and '--json'.startswith(token))
                          for token in pre)
-    if json_requested and '--version' in pre:
+    version_requested = any(token.startswith('--v') and '--version'.startswith(token)
+                            for token in pre)
+    if json_requested and version_requested:
         print(json.dumps({'version': 'meeting-copilot standalone 0.2.0'}, indent=2))
         return 0
     if json_requested and any(token in ('-h', '--help') for token in pre):
