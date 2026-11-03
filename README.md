@@ -33,7 +33,10 @@ python ask.py --docs ./my-docs --question "When is the Acme renewal?"
 
 `--doctor --json` reports setup failures in its `problems` array, including
 missing project folders and how to arrange the documents; it exits `2` when
-not ready.
+not ready. For `--provider meta`, this offline check only tests whether
+`MODEL_API_KEY` is set: it does not validate the key, network, or model.
+JSON's `provider.ready` reflects that local check, while
+`provider.connection_verified` is `false`.
 
 `ask.py` has three job-shaped modes: `--list-projects` shows what can be
 searched, `--search` returns evidence only (no model call), and `--question`

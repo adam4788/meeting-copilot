@@ -1266,6 +1266,20 @@ class AskCliTests(unittest.TestCase):
         self.assertTrue(payload['ok'])
         self.assertEqual(payload['projects'][0]['chunks'], 1)
 
+    def test_doctor_meta_key_is_not_mistaken_for_verified_connectivity(self):
+        with unittest.mock.patch.dict('os.environ', {'MODEL_API_KEY': 'private-sentinel'}):
+            code, out, _ = self._capture(['--docs', self.docs, '--doctor', '--provider', 'meta', '--json'])
+            self.assertEqual(code, 0)
+            payload = json.loads(out)
+            self.assertTrue(payload['provider']['ready'])
+            self.assertFalse(payload['provider']['connection_verified'])
+            self.assertIn('not verified', ' '.join(payload['warnings']).lower())
+            self.assertNotIn('private-sentinel', out)
+            code, out, _ = self._capture(['--docs', self.docs, '--doctor', '--provider', 'meta'])
+            self.assertEqual(code, 0)
+            self.assertIn('not verified', out.lower())
+            self.assertNotIn('private-sentinel', out)
+
     def test_doctor_empty_docs_is_actionable_failure(self):
         empty = Path(self.docs) / 'elsewhere'
         empty.mkdir()

@@ -539,6 +539,10 @@ def main(argv=None):
         provider_report = {'provider': args.provider,
                            'ready': not (args.provider == 'meta'
                                          and not os.environ.get('MODEL_API_KEY'))}
+        if args.provider == 'meta':
+            provider_report['connection_verified'] = False
+            warn('Meta provider credentials, network access, and model availability are not verified; '
+                 'doctor only checks whether MODEL_API_KEY is set.')
         ok = bool(project_reports) and all(r['chunks'] for r in project_reports) and not problems
         payload = {'docs': str(docs), 'projects': project_reports,
                    'provider': provider_report, 'problems': problems, 'ok': ok}
@@ -554,12 +558,17 @@ def main(argv=None):
                 print(f"  - {report['name']}: {report['files']} file(s), {report['chunks']} searchable chunk(s)")
             if not project_reports:
                 print('  - no project folders found (expected <docs>/<project>/*.md|txt|rst)')
-            print(f"Provider: {args.provider} ({'ready' if provider_report['ready'] else 'MODEL_API_KEY not set'})")
+            provider_status = ('MODEL_API_KEY set; connection not verified' if provider_report['ready']
+                               else 'MODEL_API_KEY not set; connection not verified') if args.provider == 'meta' else 'ready (offline)'
+            print(f'Provider: {args.provider} ({provider_status})')
             if transcript_report is not None:
                 print(f"Transcript: {'ok, ' + str(transcript_report['characters']) + ' characters' if transcript_report['ok'] else 'failed: ' + transcript_report['error']}")
             for problem in problems:
                 print(f'Problem: {problem}')
-            print('Ready.' if ok else 'Not ready: fix the problems above, then run --list-projects.')
+            if ok and args.provider == 'meta':
+                print('Ready for a connection attempt; Meta connection not verified.')
+            else:
+                print('Ready.' if ok else 'Not ready: fix the problems above, then run --list-projects.')
         return 0 if ok else 2
     if args.list_projects:
         if args.json:
