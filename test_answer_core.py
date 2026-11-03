@@ -378,6 +378,30 @@ class CoreAcceptanceTests(NoHermesTestCase):
         self.assertEqual(knowledge._clean_url('https://example.com/?q=dogs%26cats'),
                          'https://example.com/?q=dogs%26cats')
 
+    def test_round10_credential_and_benign_shapes(self):
+        import knowledge
+        blob = ' '.join([
+            knowledge._clean('session=12345678901234567890'),
+            knowledge._clean('token=abc'),
+            knowledge._clean_url('https://host/x#access_token%253DsecretSENTINEL42'),
+            knowledge._clean_url('https://host/x?next=https%3A%2F%2Finner%2F%3Faccess_token%3DsecretSENTINEL42'),
+        ])
+        self.assertNotIn('12345678901234567890', blob)
+        self.assertNotIn('secretSENTINEL42', blob)
+        self.assertEqual(knowledge._clean('https://example.com/?q=%22tokenization%22'),
+                         'https://example.com/?q=%22tokenization%22')
+        self.assertEqual(knowledge._clean('session: 2026'), 'session: 2026')
+
+    def test_history_provider_never_sees_credential_terms(self):
+        seen = []
+        class Hist:
+            def search(self, terms):
+                seen.extend(terms)
+                return []
+        core = self._core(completion=lambda messages: 'x [1].', history=Hist())
+        core.search('what is the token=secretSENTINEL42 price', project='acme')
+        self.assertNotIn('secretsentinel42', seen)
+
     def test_round9_credential_and_benign_shapes(self):
         import knowledge
         blob = ' '.join([
@@ -718,6 +742,33 @@ class AskCliTests(unittest.TestCase):
         blob = ' '.join(payload.get('warnings', []))
         self.assertIn('are not searched', blob)
         self.assertIn('--transcript is ignored', blob)
+
+    def test_fake_rejects_weak_transcript_match(self):
+        transcript = Path(self.docs) / 'input.txt'
+        transcript.write_text('Alice: quasar launch is delayed.\n', encoding='utf-8')
+        code, out, _ = self._capture(['--question', 'When is the quasar deadline?',
+                                      '--docs', self.docs, '--provider', 'fake',
+                                      '--transcript', str(transcript)])
+        self.assertEqual(code, 0)
+        self.assertNotIn('transcript itself says', out)
+
+    def test_fake_quotes_passage_around_matching_terms(self):
+        intro = ' '.join(['filler'] * 80)
+        (Path(self.docs) / 'acme' / 'notes.md').write_text(
+            f'{intro} The unit price is $84 each for the renewal.\n', encoding='utf-8')
+        code, out, _ = self._capture(['--question', 'What is the unit price?',
+                                      '--docs', self.docs, '--provider', 'fake'])
+        self.assertEqual(code, 0)
+        self.assertIn('$84', out.split('\n\nSources')[0])
+
+    def test_json_version_and_option_termination(self):
+        code, out, _ = self._capture(['--json', '--version'])
+        self.assertEqual(code, 0)
+        self.assertIn('0.2.0', json.loads(out)['version'])
+        # After --, --help is positional: no JSON help shortcut.
+        import ask
+        with self.assertRaises(SystemExit):
+            ask.main(['--json', '--', '--help'])
 
     def test_fake_uses_transcript_when_no_documents_match(self):
         (Path(self.docs) / 'acme' / 'notes.md').write_text(

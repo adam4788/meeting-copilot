@@ -51,6 +51,31 @@ def _term_hits(terms, value):
     return hits
 
 
+def _passage(text, terms):
+    import re as _re
+    flat = ' '.join(str(text).split())
+    if not flat or not terms:
+        return flat[:220]
+    lowered = flat.lower()
+    starts = []
+    for term in terms:
+        idx = lowered.find(term)
+        if idx < 0:
+            match = _re.search(r'[a-z0-9]*' + _re.escape(term[:4]) + r'[a-z0-9]*', lowered)
+            idx = match.start() if match else -1
+        if idx >= 0:
+            starts.append(idx)
+    if not starts:
+        return flat[:220]
+    start = max(0, min(starts) - 40)
+    snippet = flat[start:start + 220]
+    if start > 0:
+        snippet = '…' + snippet
+    if start + 220 < len(flat):
+        snippet += '…'
+    return snippet
+
+
 def fake_completion_factory():
     def complete(messages):
         # Extractive offline answer: quote the top retrieved snippet only
@@ -84,7 +109,7 @@ def fake_completion_factory():
         doc_hits = set()
         if evidence:
             top = evidence[0]
-            snippet = ' '.join(str(top.get('text', '')).split())[:220]
+            snippet = _passage(top.get('text', ''), terms)
             doc_hits = _term_hits(terms, f"{top.get('title', '')} {top.get('text', '')}")
             # A one-term question ('Price?') can only ever score one hit;
             # multi-term questions need two so a shared generic word in an
@@ -97,7 +122,8 @@ def fake_completion_factory():
                 return (f'Offline extractive answer (fake provider — no model was '
                         f'called){redacted}.{from_line} "{snippet}" [1]. Configure '
                         f'MODEL_API_KEY with --provider meta for a synthesized answer.')
-        if best_line and len(best_hits) >= 1 and len(best_hits) > len(doc_hits):
+        transcript_required = 1 if len(terms) <= 1 else 2
+        if best_line and len(best_hits) >= transcript_required and len(best_hits) > len(doc_hits):
             quote = ' '.join(best_line.split())[:220]
             lead = ('the retrieved documents do not directly answer this; '
                     if evidence else 'no documents matched; ')
@@ -228,21 +254,24 @@ def main(argv=None):
     parser.add_argument('--json', action='store_true',
                         help='Emit one machine-readable JSON object on stdout (supported by all modes).')
     parser.add_argument('--version', action='version', version='meeting-copilot standalone 0.2.0')
-    if any(token in ('-h', '--help') for token in parser._argv):
-        # --json --help gets machine-readable help, not plain text.
-        json_requested = False
-        for token in parser._argv:
-            if token == '--':
-                break
-            if (token == '--json' or token.startswith('--json=')
-                    or (token.startswith('--j') and '--json'.startswith(token))):
-                json_requested = True
-                break
-        if json_requested:
-            print(json.dumps({'description': parser.description,
-                              'usage': parser.format_usage().strip(),
-                              'help': parser.format_help()}, indent=2))
-            return 0
+    # Options after -- are positional, never flags: detect help/version
+    # only before it, and honor --json for both outputs.
+    pre = []
+    for token in parser._argv:
+        if token == '--':
+            break
+        pre.append(token)
+    json_requested = any(token == '--json' or token.startswith('--json=')
+                         or (token.startswith('--j') and '--json'.startswith(token))
+                         for token in pre)
+    if json_requested and '--version' in pre:
+        print(json.dumps({'version': 'meeting-copilot standalone 0.2.0'}, indent=2))
+        return 0
+    if json_requested and any(token in ('-h', '--help') for token in pre):
+        print(json.dumps({'description': parser.description,
+                          'usage': parser.format_usage().strip(),
+                          'help': parser.format_help()}, indent=2))
+        return 0
     args = parser.parse_args(argv)
 
     def fail(message, code=1):

@@ -89,7 +89,8 @@ def _clean(text, _depth=0):
     # Percent-encoded JSON blobs (e.g. %22auth_token%22%3A...) hide their
     # key names from the assignment rules below; decode them first when a
     # credential marker is present.
-    if '%22' in text.lower() and re.search(r'(?i)(token|secret|password|api[_%a-z0-9]*key)', text):
+    if '%22' in text.lower() and re.search(
+            r'(?i)%22[\w-]*?(?:token|secret|password|api[\w-]*?key|authorization)(?:%22)?\s*%3[ad]', text):
         from urllib.parse import unquote
         text = unquote(text)
     # Bearer credentials first: the generic key=value rule below would
@@ -108,9 +109,9 @@ def _clean(text, _depth=0):
     text = re.sub(r'(?i)\b(bearer\s+)([A-Za-z0-9._~+/=-]+)', _bearer, text)
     def _session_value(match):
         token = match.group(2)
-        if re.fullmatch(r'\d{4}-\d{2}-\d{2}([T ].*)?', token) or token.isdigit():
+        if re.fullmatch(r'\d{4}-\d{2}-\d{2}([T ].*)?', token) or (token.isdigit() and len(token) <= 8):
             return match.group(0)
-        return match.group(1) + ('[REDACTED]' if _credential_like(token) else token)
+        return match.group(1) + ('[REDACTED]' if _credential_like(token) or (token.isdigit() and len(token) >= 9) else token)
     text = re.sub(r'(?i)\b(session\s+)([A-Za-z0-9._~+/=-]+)', _session_value, text)
     # Quoted values redact whole: password: "abc def" and {"token":"x"}
     # are credentials by context whatever their shape.
@@ -122,10 +123,10 @@ def _clean(text, _depth=0):
     text = re.sub(r"(?i)('?(?:" + _names + r")'?\s*[:=]\s*')[^']*(')",
                   r'\1[REDACTED]\2', text)
     text = re.sub(r'(?i)\b(token\s*[:=]\s*"?)([^\s,;"]+)',
-                  lambda m: m.group(1) + ('[REDACTED]' if ('=' in m.group(1) and len(m.group(2)) >= 4) or _credential_like(m.group(2)) else m.group(2)), text)
+                  lambda m: m.group(1) + ('[REDACTED]' if ('=' in m.group(1) and len(m.group(2)) >= 3) or _credential_like(m.group(2)) else m.group(2)), text)
     def _session_assignment(match):
         value = match.group(2)
-        if re.fullmatch(r'\d{4}-\d{2}-\d{2}([T ].*)?', value) or value.isdigit():
+        if re.fullmatch(r'\d{4}-\d{2}-\d{2}([T ].*)?', value) or (value.isdigit() and len(value) <= 8):
             return match.group(0)
         if _credential_like(value) or ('=' in match.group(1) and len(value) >= 6):
             return match.group(1) + '[REDACTED]'
@@ -188,6 +189,10 @@ def _clean_url(url, _depth=0):
             processed, flag = _redact_part(decoded)
             if flag:
                 return processed, True
+            if '://' in decoded:
+                cleaned = _clean_url(decoded)
+                if cleaned != decoded:
+                    return cleaned, True
         subs = re.split(r'(?i)%26|%3B', part)
         if len(subs) > 1:
             processed = [_redact_part(sub) for sub in subs]
@@ -213,7 +218,7 @@ def _clean_url(url, _depth=0):
         raw = base + '?' + ''.join(tokens) + (hashmark + fragment if hashmark else '')
     if '#' in raw:
         head, _, fragment = raw.partition('#')
-        if '=' not in fragment and '%3d' in fragment.lower():
+        if '=' not in fragment and '%' in fragment:
             processed, did = _redact_part(fragment)
             if did:
                 raw = head + '#' + processed
@@ -598,7 +603,7 @@ class KnowledgeEngine:
             nonlocal web
             mode, query = None, None
             if web_query is not None and web_query.strip():
-                mode, query = 'explicit', web_query
+                mode, query = 'explicit', _clean(web_query)
             elif web_fallback:
                 if aborted():
                     raise _Aborted('cancelled before provider submission')
@@ -751,7 +756,7 @@ class KnowledgeEngine:
         web_planned = False
         mode, query = None, None
         if web_query is not None and web_query.strip():
-            mode, query = 'explicit', web_query
+            mode, query = 'explicit', _clean(web_query)
         elif web_fallback:
             if aborted():
                 raise _Aborted('cancelled before provider submission')
@@ -925,7 +930,7 @@ class KnowledgeEngine:
                 index.executemany('INSERT INTO docs(rowid,text) VALUES (?,?)',
                                   [(i + 1, d['text']) for i, d in enumerate(docs)])
                 KnowledgeEngine._INDEX_CACHE[fingerprint] = index
-                while len(KnowledgeEngine._INDEX_CACHE) > 8:
+                while len(KnowledgeEngine._INDEX_CACHE) > 12:
                     oldest = next(iter(KnowledgeEngine._INDEX_CACHE))
                     KnowledgeEngine._INDEX_CACHE.pop(oldest).close()
             rows = index.execute('SELECT rowid FROM docs WHERE docs MATCH ? ORDER BY bm25(docs) LIMIT ?', (query, limit)).fetchall()
@@ -935,7 +940,7 @@ class KnowledgeEngine:
         if all_projects and project:
             raise ValueError('Choose all projects or one project, not both')
         limit = max(0, min(int(limit), 20))
-        terms = list(dict.fromkeys(term for term in re.findall(r'\w{2,}', question.lower()) if term not in _STOPWORDS))[:20]
+        terms = list(dict.fromkeys(term for term in re.findall(r'\w{2,}', _clean(question).lower()) if term not in _STOPWORDS))[:20]
         if not terms or not limit:
             return []
         with self._lock:
