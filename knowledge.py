@@ -92,10 +92,12 @@ def _clean(text, _depth=0):
     # Percent-encoded credential assignments (single/double-encoded JSON):
     # redact just the value in place so benign encoded text nearby (e.g.
     # %22launch plan%22) stays byte-for-byte intact.
+    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])?token|password|passwd|secret|api[ _-]?key|authorization|session(?:_id|id)?|credential)%3[ad][^\s&;]+',
+                  r'\1=[REDACTED]', text)
     _q = r'(?:%2522|%22)'
     _c = r'(?:%253[ad]|%3[ad])'
     text = re.sub(r'(?i)(' + _q + r'[\w%-]*?(?:token|secret|password|api[\w%-]*?key|authorization)'
-                  + _q + r'?\s*' + _c + r'\s*' + _q + r'?)(?:[^%]|%(?!2522|%22))*?(' + _q + r'|&|$)',
+                  + _q + r'?\s*' + _c + r'\s*' + _q + r'?)(?:[^%]|%(?!22))*?(%22|%2522(?=%257D|%7D|%2C|,|&|$)|&|$)',
                   r'\1REDACTED\2', text)
     # Bearer credentials first: the generic key=value rule below would
     # otherwise redact only the word "Bearer" and leave the token itself.
@@ -115,7 +117,10 @@ def _clean(text, _depth=0):
         token = match.group(2)
         if re.fullmatch(r'\d{4}-\d{2}-\d{2}([T ].*)?', token) or (token.isdigit() and len(token) <= 8):
             return match.group(0)
-        return match.group(1) + ('[REDACTED]' if _credential_like(token) or (token.isdigit() and len(token) >= 9) else token)
+        if (any(ch in token for ch in '._~+/=-') and len(token) >= 8) or len(token) >= 24 \
+                or (token.isdigit() and len(token) >= 9):
+            return match.group(1) + '[REDACTED]'
+        return match.group(0)
     text = re.sub(r'(?i)\b(session\s+)([A-Za-z0-9._~+/=-]+)', _session_value, text)
     # Quoted values redact whole: password: "abc def" and {"token":"x"}
     # are credentials by context whatever their shape.
@@ -139,9 +144,11 @@ def _clean(text, _depth=0):
     text = re.sub(r"(?i)('?(?:" + _names + r")'?\s*[:=]\s*')([^']*)(')",
                   _quoted_value, text)
     text = re.sub(r'(?i)\b(token\s*[:=]\s*"?)([^\s,;"]+)',
-                  lambda m: m.group(1) + ('[REDACTED]' if ('=' in m.group(1) and len(m.group(2)) >= 3) or _credential_like(m.group(2)) else m.group(2)), text)
+                  lambda m: m.group(1) + ('[REDACTED]' if ('=' in m.group(1) and len(m.group(2)) >= 3)
+                                          or (any(ch in m.group(2) for ch in '._~+/=-') and len(m.group(2)) >= 8)
+                                          or len(m.group(2)) >= 24 else m.group(2)), text)
     def _cookie_line(match):
-        return re.sub(r'(?i)(\bsession(?:_id|id)?\s*=\s*)[^\s;]+', r'\1[REDACTED]', match.group(0))
+        return re.sub(r'(?i)(\b(?:session(?:_id|id)?|jsessionid|auth(?:_token|token)?|token|csrftoken|xsrftoken|sid)\s*=\s*)[^\s;]+', r'\1[REDACTED]', match.group(0))
     text = re.sub(r'(?im)^.*\b(?:set-cookie|cookie)\s*:.*$', _cookie_line, text)
     def _session_assignment(match):
         value = match.group(2)
@@ -152,8 +159,8 @@ def _clean(text, _depth=0):
         return match.group(0)
     text = re.sub(r'(?i)\b(session(?:_id|id)?\s*[:=]\s*"?)([^\s,;"]+)', _session_assignment, text)
     text = re.sub(r'(?i)\b(credential\s*[:=]\s*"?)([^\s,;"]+)',
-                  lambda m: m.group(1) + ('[REDACTED]' if _credential_like(m.group(2)) else m.group(2)), text)
-    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])token|csrftoken|xsrftoken|api[ _-]?key|password|passwd|secret|client[ _-]?secret|authorization|sessionid|sid)"?\s*[=:]\s*"?[^\s,;"]+', r'\1=[REDACTED]', text)
+                  lambda m: m.group(1) + ('[REDACTED]' if ('=' in m.group(1) and len(m.group(2)) >= 3) or _credential_like(m.group(2)) else m.group(2)), text)
+    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])token|csrftoken|xsrftoken|api[ _-]?key|password|passwd|secret|client[ _-]?secret|authorization|session_id|sessionid|sid)"?\s*[=:]\s*"?[^\s,;"]+', r'\1=[REDACTED]', text)
     # ALL-CAPS env-style assignments: MCP_API_KEY=..., SERVICE_AUTH_TOKEN=...
     text = re.sub(r'\b([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|AUTH)[A-Z0-9_]*\s*=\s*)[^\s,;]+',
                   r'\1[REDACTED]', text)
@@ -185,7 +192,7 @@ def _clean_url(url, _depth=0):
         from urllib.parse import unquote_plus
         parts = [part for part in re.split(r'[^a-z0-9]+', unquote_plus(str(name)).lower()) if part]
         return (any(part in ('token', 'secret', 'password', 'auth',
-                             'authorization', 'signature', 'sig', 'session',
+                             'authorization', 'signature', 'sig',
                              'sessionid', 'credential', 'credentials') for part in parts)
                 or _key(name) in ('key', 'apikey', 'accesstoken', 'refreshtoken',
                                   'clientsecret', 'sessionid')
@@ -195,6 +202,10 @@ def _clean_url(url, _depth=0):
         # normalized when they actually hide a sensitive assignment, so
         # ordinary values like q=dogs%26cats stay byte-for-byte intact.
         key, eq, _value = part.partition('=')
+        if eq and _key(key) == 'session':
+            if _credential_like(_value) or len(_value) >= 16:
+                return f'{key}=REDACTED', True
+            return part, False
         if eq and _sensitive(key):
             return f'{key}=REDACTED', True
         if not eq:
@@ -211,9 +222,11 @@ def _clean_url(url, _depth=0):
             if flag:
                 return processed, True
             if '://' in decoded:
-                cleaned = _clean_url(decoded)
-                if cleaned != decoded:
-                    return cleaned, True
+                nested = re.search(r'https?://[^\s&;]+', decoded)
+                if nested:
+                    cleaned = _clean_url(nested.group(0))
+                    if cleaned != nested.group(0):
+                        return decoded[:nested.start()] + cleaned + decoded[nested.end():], True
         subs = re.split(r'(?i)%26|%3B', part)
         if len(subs) > 1:
             processed = [_redact_part(sub) for sub in subs]
@@ -409,7 +422,8 @@ class KnowledgeEngine:
         if self._history_override is not _USE_HOST:
             search = getattr(self._history_override, 'search', self._history_override)
             try:
-                records = list(search(terms) or [])
+                import itertools
+                records = list(itertools.islice(search(terms) or [], 100))
             except Exception as exc:
                 # Provider errors must not carry raw credential text back
                 # to the caller.
@@ -957,6 +971,16 @@ class KnowledgeEngine:
                             for d in docs)
         query = ' OR '.join('"' + term + '"' for term in terms)
         with self._index_cache_lock:
+            if sum(len(d['text']) for d in docs) > 50000000:
+                index = sqlite3.connect(':memory:', check_same_thread=False)
+                try:
+                    index.execute('CREATE VIRTUAL TABLE docs USING fts5(text)')
+                    index.executemany('INSERT INTO docs(rowid,text) VALUES (?,?)',
+                                      [(i + 1, d['text']) for i, d in enumerate(docs)])
+                    rows = index.execute('SELECT rowid FROM docs WHERE docs MATCH ? ORDER BY bm25(docs) LIMIT ?', (query, limit)).fetchall()
+                finally:
+                    index.close()
+                return [docs[row[0] - 1].copy() for row in rows]
             entry = self._index_cache.get(fingerprint)
             if entry is not None:
                 self._index_cache.move_to_end(fingerprint)
@@ -970,7 +994,7 @@ class KnowledgeEngine:
                 self._index_cache[fingerprint] = (index, total_chars)
                 # Bounded by entries and total indexed characters: a few
                 # huge corpora cannot crowd out memory without limit.
-                while (len(self._index_cache) > 16
+                while (len(self._index_cache) > 32
                        or sum(chars for _i, chars in self._index_cache.values()) > 50000000):
                     oldest = next(iter(self._index_cache))
                     self._index_cache.pop(oldest)[0].close()

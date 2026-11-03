@@ -378,6 +378,37 @@ class CoreAcceptanceTests(NoHermesTestCase):
         self.assertEqual(knowledge._clean_url('https://example.com/?q=dogs%26cats'),
                          'https://example.com/?q=dogs%26cats')
 
+    def test_round13_credential_and_benign_shapes(self):
+        import knowledge
+        blob = ' '.join([
+            knowledge._clean('session_id=abc'),
+            knowledge._clean('credential=abc'),
+            knowledge._clean('token%3Dxyz password%3Dabc'),
+            knowledge._clean('Cookie: JSESSIONID=abc; auth=xyz; theme=dark'),
+            knowledge._clean('%7B%22password%22%3A%22a%2522b%22%7D'),
+            knowledge._clean_url('https://example.com/?q=https%3A%2F%2Fu%3Ap%40example.com'),
+        ])
+        for sentinel in ('xyz', 'a%2522b', ':p@'):
+            self.assertNotIn(sentinel, blob)
+        self.assertEqual(knowledge._clean('Session 2027Q1 planning'),
+                         'Session 2027Q1 planning')
+        self.assertEqual(knowledge._clean('Token: roadmap2027'), 'Token: roadmap2027')
+        self.assertEqual(knowledge._clean_url('https://example.com/report?session=planning'),
+                         'https://example.com/report?session=planning')
+
+    def test_history_iteration_is_bounded(self):
+        consumed = []
+        def many(terms):
+            for i in range(10000):
+                consumed.append(i)
+                yield {'id': str(i), 'title': 't', 'source': 's', 'text': 'price'}
+        class ManyHist:
+            def search(self, terms):
+                return many(terms)
+        core = self._core(history=ManyHist())
+        core.search('price', project='acme')
+        self.assertLessEqual(len(consumed), 100)
+
     def test_round12_credential_and_benign_shapes(self):
         import knowledge
         blob = ' '.join([
@@ -791,6 +822,17 @@ class AskCliTests(unittest.TestCase):
         blob = ' '.join(payload.get('warnings', []))
         self.assertIn('are not searched', blob)
         self.assertIn('--transcript is ignored', blob)
+
+    def test_fake_outdated_doc_loses_to_current_transcript(self):
+        import ask
+        complete = ask.fake_completion_factory()
+        payload = {'question': 'alpha beta gamma',
+                   'transcript': 'alpha beta gamma are current',
+                   'evidence': [{'citation': 1, 'title': 'gamma',
+                                 'text': 'alpha beta are outdated'}]}
+        out = complete([{'role': 'user', 'content': json.dumps(payload)}])
+        self.assertIn('transcript itself says', out)
+        self.assertIn('current', out)
 
     def test_fake_transcript_not_suppressed_by_title_only_doc(self):
         (Path(self.docs) / 'acme' / 'notes.md').write_text(

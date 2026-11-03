@@ -138,7 +138,7 @@ def fake_completion_factory():
             # multi-term questions need two so a shared generic word in an
             # unrelated document is not presented as the answer.
             required = 1 if len(terms) <= 1 else 2
-            if snippet and len(body_hits) >= required and len(doc_hits) >= len(best_hits):
+            if snippet and len(body_hits) >= required and len(body_hits) >= len(best_hits):
                 title = ' '.join(str(top.get('title', '')).split())[:80]
                 redacted = ' (searched snippet redacted)' if 'REDACTED' in snippet else ''
                 from_line = f' From {title}:' if title else ''
