@@ -48,9 +48,12 @@ def fake_completion_factory():
         if evidence:
             snippet = ' '.join(str(evidence[0].get('text', '')).split())[:220]
             if snippet:
+                title = ' '.join(str(evidence[0].get('title', '')).split())[:80]
+                redacted = ' (searched snippet redacted)' if 'REDACTED' in snippet else ''
+                from_line = f' From {title}:' if title else ''
                 return (f'Offline extractive answer (fake provider — no model was '
-                        f'called): "{snippet}" [1]. Configure MODEL_API_KEY with '
-                        f'--provider meta for a synthesized answer.')
+                        f'called){redacted}.{from_line} "{snippet}" [1]. Configure '
+                        f'MODEL_API_KEY with --provider meta for a synthesized answer.')
         return ('Offline demo answer (fake provider). No local evidence '
                 'matched, so nothing is cited.')
     return complete
@@ -143,10 +146,14 @@ class _CliParser(argparse.ArgumentParser):
 
 
 def main(argv=None):
-    parser = _CliParser(description='Standalone grounded Q&A (no Hermes required).')
+    parser = _CliParser(description='Standalone grounded Q&A (no Hermes required).',
+                        epilog='Examples: ask.py --docs ./sample-docs --list-projects | '
+                               'ask.py --docs ./sample-docs --search "unit price" | '
+                               'ask.py --docs ./sample-docs --question "What is the unit price?"')
     parser._argv = list(argv) if argv is not None else sys.argv[1:]
     parser.add_argument('--question', default=None, help='Question to answer.')
-    parser.add_argument('--docs', default=None, help='Directory of project documents (.md/.txt/.rst).')
+    parser.add_argument('--docs', default=None,
+                        help='Docs root: one subfolder per project, with .md/.txt/.rst files inside each.')
     parser.add_argument('--transcript', default=None, help='Transcript file (Meetily JSON, segments JSON, or text); - reads stdin.')
     parser.add_argument('--project', default=None, help='Project subfolder under --docs '
                         '(default: the only subfolder, if exactly one).')
@@ -161,7 +168,8 @@ def main(argv=None):
     parser.add_argument('--list-projects', action='store_true',
                         help='List project folders under --docs and exit.')
     parser.add_argument('--limit', type=int, default=None, help='Evidence limit for --search (1-20, default 6).')
-    parser.add_argument('--json', action='store_true', help='Emit machine-readable JSON.')
+    parser.add_argument('--json', action='store_true',
+                        help='Emit one machine-readable JSON object on stdout (supported by all modes).')
     parser.add_argument('--version', action='version', version='meeting-copilot standalone 0.2.0')
     args = parser.parse_args(argv)
 
@@ -214,7 +222,7 @@ def main(argv=None):
 
     subs = sorted(sub.name for sub in docs.iterdir()
                     if sub.is_dir() and not sub.name.startswith('.') and not sub.is_symlink())
-    if subs and not args.list_projects:
+    if subs:
         root_files = [entry.name for entry in docs.iterdir()
                       if entry.is_file() and entry.suffix.lower() in ('.md', '.txt', '.rst')]
         if root_files:
@@ -316,8 +324,9 @@ def main(argv=None):
         # history; with a fake completion and no history they mislead.
         kept = [w for w in result['warnings']
                 if 'may be sent to' not in w and 'prior-session' not in w]
-        result['warnings'] = (['Offline demo: no data leaves this machine; web research '
-                               'and session history are disabled.'] + kept)
+        result['warnings'] = (['Offline extractive demo (fake provider — no model call): '
+                               'no data leaves this machine; web research and session '
+                               'history are disabled.'] + kept)
     else:
         # ask.py never wires session history, so the engine's prior-session
         # caveat is stale here even for a live provider.

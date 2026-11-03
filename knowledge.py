@@ -84,6 +84,13 @@ def _credential_like(value):
 
 
 def _clean(text):
+    text = str(text)
+    # Percent-encoded JSON blobs (e.g. %22auth_token%22%3A...) hide their
+    # key names from the assignment rules below; decode them first when a
+    # credential marker is present.
+    if '%22' in text.lower() and re.search(r'(?i)(token|secret|password|api[_%a-z0-9]*key)', text):
+        from urllib.parse import unquote
+        text = unquote(text)
     # Bearer credentials first: the generic key=value rule below would
     # otherwise redact only the word "Bearer" and leave the token itself.
     # Ordinary prose ("Bearer investment strategy") is not credential-shaped
@@ -95,8 +102,19 @@ def _clean(text):
                   lambda m: m.group(1) + '[REDACTED]', text)
     text = re.sub(r'(?i)\b(authorization\s*[:=]\s*(?:basic|token|digest)\s+)[^\s,;]+',
                   r'\1[REDACTED]', text)
+    text = re.sub(r'(?i)\b(authorization\s*[-–—:]?\s*(?:bearer|basic|token|digest)\s+)[^\s,;]+',
+                  r'\1[REDACTED]', text)
     text = re.sub(r'(?i)\b(bearer\s+)([A-Za-z0-9._~+/=-]+)', _bearer, text)
-    text = re.sub(r'(?i)\b(api[_-]?key|password|secret|access[_-]?token|refresh[_-]?token|authorization)\s*[=:]\s*[^\s,;]+', r'\1=[REDACTED]', text)
+    text = re.sub(r'(?i)\b(session\s+)([A-Za-z0-9._~+/=-]+)',
+                  lambda m: m.group(1) + ('[REDACTED]' if _credential_like(m.group(2)) else m.group(2)), text)
+    text = re.sub(r'(?i)\b(token\s*[:=]\s*"?)([^\s,;"]+)',
+                  lambda m: m.group(1) + ('[REDACTED]' if _credential_like(m.group(2)) else m.group(2)), text)
+    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])token|api[_-]?key|password|passwd|secret|client[_-]?secret|authorization|session(?:id)?|sid)"?\s*[=:]\s*"?[^\s,;"]+', r'\1=[REDACTED]', text)
+    # ALL-CAPS env-style assignments: MCP_API_KEY=..., SERVICE_AUTH_TOKEN=...
+    text = re.sub(r'\b([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|AUTH)[A-Z0-9_]*\s*=\s*)[^\s,;]+',
+                  r'\1[REDACTED]', text)
+    # Scheme-less userinfo (user:pass@host) carries a password without a URL.
+    text = re.sub(r'(?<![\w@.])[\w.+-]+:[^\s/@:]+@', '[REDACTED]@', text)
     text = re.sub(r'\b(?:sk-|ghp_|github_pat_)[A-Za-z0-9_-]{12,}', '[REDACTED]', text)
     text = re.sub(r'-----BEGIN [^-]*PRIVATE KEY-----.*?(?:-----END [^-]*PRIVATE KEY-----|$)', '[REDACTED PRIVATE KEY]', text, flags=re.S)
     # URLs embedded in free text (transcripts, documents) carry the same
@@ -112,6 +130,8 @@ def _clean_url(url):
     carry credentials are rewritten, and only their sensitive parts.
     """
     raw = str(url or '')
+    if any(ord(ch) < 32 for ch in raw) or '%00' in raw.lower():
+        return '[removed URL]'
     def _key(name):
         from urllib.parse import unquote_plus
         return re.sub(r'[^a-z0-9]', '', unquote_plus(str(name)).lower())
@@ -130,6 +150,8 @@ def _clean_url(url):
     if '?' in raw:
         base, _, rest = raw.partition('?')
         query, hashmark, fragment = rest.partition('#')
+        # Encoded pair delimiters (%26, %3B) otherwise hide later keys.
+        query = re.sub(r'(?i)%26|%3B', '&', query)
         parts = []
         for part in query.split('&'):
             key, eq, _value = part.partition('=')
@@ -142,7 +164,7 @@ def _clean_url(url):
     if '#' in raw:
         head, _, fragment = raw.partition('#')
         if '=' in fragment:
-            cleaned_fragment = _clean(fragment)
+            cleaned_fragment = _clean(re.sub(r'(?i)%26|%3B', '&', fragment))
             # Fragment parameters use the same sensitive keys as queries.
             frag_parts = []
             for part in cleaned_fragment.split('&'):
@@ -850,7 +872,7 @@ class KnowledgeEngine:
                     files = self._files(folder)
                     per_project.append(files)
                     total_docs += len(files)
-                if total_docs <= 10000:
+                if total_docs <= 5000:
                     # One index over the full eligible corpus: BM25
                     # statistics are global, so all-project ranking is
                     # exactly the ranker's own ordering (no shortlist can

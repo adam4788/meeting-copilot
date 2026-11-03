@@ -21,6 +21,15 @@ python ask.py --question "What is the unit price?" --docs ./sample-docs --transc
 MODEL_API_KEY=YOUR_REAL_KEY python ask.py --question "..." --docs ./sample-docs --provider meta
 ```
 
+Your own documents use one folder per project:
+
+```sh
+mkdir -p my-docs/acme
+printf 'Acme renewal is in September.\n' > my-docs/acme/renewal.md
+python ask.py --docs ./my-docs --search "renewal"
+python ask.py --docs ./my-docs --question "When is the Acme renewal?"
+```
+
 `ask.py` has three job-shaped modes: `--list-projects` shows what can be
 searched, `--search` returns evidence only (no model call), and `--question`
 answers with numbered citations. It reads a docs folder

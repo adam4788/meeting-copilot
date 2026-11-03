@@ -355,6 +355,24 @@ class CoreAcceptanceTests(NoHermesTestCase):
         self.assertNotIn('secret123', knowledge._clean_url(
             'https://example.com/x?refresh%5Ftoken=secret123'))
 
+    def test_round7_credential_shapes_are_scrubbed(self):
+        import knowledge
+        samples = [
+            knowledge._clean('{"auth_token":"abc12345"}'),
+            knowledge._clean('%22auth_token%22%3A%22abc12345%22'),
+            knowledge._clean('Cookie: sid=x; session=abc12345; theme=dark'),
+            knowledge._clean('MCP_API_KEY=abc12345'),
+            knowledge._clean('user:passw0rd@example.com'),
+            knowledge._clean('Auth: session 123e4567-e89b-12d3-a456-426614174000'),
+            knowledge._clean_url('https://example.com/x?auth=abc12345&ok=1'),
+            knowledge._clean_url('https://example.com/x?ok=1%26refresh_token=abc12345'),
+        ]
+        blob = ' '.join(samples)
+        self.assertNotIn('abc12345', blob)
+        self.assertNotIn('passw0rd', blob)
+        self.assertNotIn('123e4567', blob)
+        self.assertEqual(knowledge._clean_url('https://example.com/\x01x'), '[removed URL]')
+
     def test_transcript_urls_and_basic_auth_are_scrubbed(self):
         captured = []
         def complete(messages):
@@ -623,12 +641,16 @@ class AskCliTests(unittest.TestCase):
         code, _, err = self._capture(['--docs', self.docs, '--search', 'Acme renews'])
         self.assertEqual(code, 0)
         self.assertIn('are not searched', err)
+        code, _, err = self._capture(['--docs', self.docs, '--list-projects'])
+        self.assertEqual(code, 0)
+        self.assertIn('are not searched', err)
 
     def test_default_fake_quotes_retrieved_evidence(self):
         code, out, _ = self._capture(['--question', 'When does Acme renew?',
                                       '--docs', self.docs, '--provider', 'fake'])
         self.assertEqual(code, 0)
         self.assertIn('Acme renews in September.', out)
+        self.assertIn('From notes.md:', out)
         self.assertIn('no model was called', out)
 
     def test_list_nonblank_question_is_rejected(self):
