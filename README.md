@@ -13,18 +13,26 @@ without network access unless you opt into a provider:
 
 ```sh
 python demo_standalone.py            # offline fixture demo, exits nonzero on failure
+python eval_retrieval.py             # synthetic recall@k + latency percentiles (not production accuracy)
+python ask.py --docs ./sample-docs --list-projects
+python ask.py --docs ./sample-docs --search "unit price"
 python ask.py --question "What is the unit price?" --docs ./sample-docs --provider fake
+python ask.py --question "What is the unit price?" --docs ./sample-docs --transcript ./sample-docs/transcript.txt
 MODEL_API_KEY=YOUR_REAL_KEY python ask.py --question "..." --docs ./sample-docs --provider meta
 ```
 
-`ask.py` answers from a docs folder (`<docs>/<project>/*.md|txt|rst`) plus an
-optional transcript (`--transcript meeting.json`), prints numbered sources,
-warnings, and timing, or `--json` for machine output. Providers: `fake`
-(deterministic offline) and `meta` (Meta Model API via `MODEL_API_KEY`).
-Web research and session history are unavailable standalone — the CLI says
-so instead of failing obscurely. Library use: `answer_core.AnswerCore`
-with injected `completion`/`search`/`history` providers; `hermes_adapters`
-holds the host-backed factories the plugin uses by default.
+`ask.py` has three job-shaped modes: `--list-projects` shows what can be
+searched, `--search` returns evidence only (no model call), and `--question`
+answers with numbered citations. It reads a docs folder
+(`<docs>/<project>/*.md|txt|rst`) plus an optional transcript
+(`--transcript meeting.json`, or `-` for stdin), prints sources, warnings,
+and timing, or `--json` for machine output. Provider failures exit `2`.
+Providers: `fake` (deterministic offline, the default) and `meta`
+(Meta Model API via `MODEL_API_KEY`). Web research and session history are
+unavailable standalone — the CLI says so instead of failing obscurely.
+Library use: `answer_core.AnswerCore` with injected
+`completion`/`search`/`history` providers; `hermes_adapters` holds the
+host-backed factories the plugin uses by default.
 
 ## Design
 

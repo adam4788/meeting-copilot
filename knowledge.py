@@ -169,7 +169,8 @@ class KnowledgeEngine:
     def _sessions(self, terms):
         if self._history_override is not _USE_HOST:
             search = getattr(self._history_override, 'search', self._history_override)
-            return list(search(terms))
+            records = search(terms)
+            return list(records or [])
         path = self.hermes_home / 'state.db'
         if not path.is_file():
             return []
@@ -222,7 +223,10 @@ class KnowledgeEngine:
     def _complete(self, messages):
         if self._completion_override is not None:
             complete = getattr(self._completion_override, 'complete', self._completion_override)
-            return complete(messages)
+            text = complete(messages)
+            if not isinstance(text, str) or not text.strip():
+                raise RuntimeError('No text answer returned')
+            return text.strip()
         # Lazy import: pure retrieval and injected tests need only the stdlib.
         from agent.auxiliary_client import call_llm
         response = call_llm(task='meeting_copilot', messages=messages, tools=None,

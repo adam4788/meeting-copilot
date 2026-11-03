@@ -52,9 +52,8 @@ def fake_completion_factory():
     return complete
 
 
-def load_transcript(path):
-    """Accept a Meetily transcripts.json, a segments list, or plain text."""
-    text = Path(path).read_text(encoding='utf-8')
+def _transcript_from_text(text):
+    """Parse transcript text: Meetily JSON, a segments list, or plain text."""
     try:
         data = json.loads(text)
     except ValueError:
@@ -80,6 +79,16 @@ def load_transcript(path):
     return '\n'.join(lines)
 
 
+def load_transcript(path):
+    """Accept a Meetily transcripts.json, a segments list, or plain text.
+
+    ``-`` reads the transcript from stdin.
+    """
+    if str(path) == '-':
+        return _transcript_from_text(sys.stdin.read())
+    return _transcript_from_text(Path(path).read_text(encoding='utf-8-sig'))
+
+
 def build_completion(provider, model):
     if provider == 'fake':
         return fake_completion_factory()
@@ -96,22 +105,44 @@ def build_completion(provider, model):
     raise SystemExit(f'Unknown provider {provider!r}: use fake|meta')
 
 
+def _print_sources(sources):
+    if not sources:
+        print('Sources: none found — try broader terms, another --project, or --all.')
+        return
+    print('Sources:')
+    for i, source in enumerate(sources, 1):
+        title = source.get('title') or source.get('source') or 'source'
+        print(f'  [{i}] {title} ({source.get("source", "")})')
+        snippet = (source.get('text') or '').strip().replace('\n', ' ')
+        if snippet:
+            print(f'      {snippet[:200]}')
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Standalone grounded Q&A (no Hermes required).')
-    parser.add_argument('--question', required=True, help='Question to answer.')
-    parser.add_argument('--docs', required=True, help='Directory of project documents (.md/.txt/.rst).')
-    parser.add_argument('--transcript', default=None, help='Transcript file (Meetily JSON, segments JSON, or text).')
+    parser.add_argument('--question', default=None, help='Question to answer.')
+    parser.add_argument('--docs', default=None, help='Directory of project documents (.md/.txt/.rst).')
+    parser.add_argument('--transcript', default=None, help='Transcript file (Meetily JSON, segments JSON, or text); - reads stdin.')
     parser.add_argument('--project', default=None, help='Project subfolder under --docs '
                         '(default: the only subfolder, if exactly one).')
     parser.add_argument('--all', action='store_true', help='Search all projects under --docs.')
     parser.add_argument('--provider', default='fake', choices=('meta', 'fake'),
                         help='Completion backend (default fake: fully offline).')
-    parser.add_argument('--model', default=None, help='Meta model override.')
+    parser.add_argument('--model', default=None, help='Meta model override (meta provider only).')
     parser.add_argument('--web-query', default=None,
                         help='NOT YET SUPPORTED standalone: exits with guidance.')
+    parser.add_argument('--search', default=None, metavar='TERMS',
+                        help='Evidence-only search over docs; no model call is made.')
+    parser.add_argument('--list-projects', action='store_true',
+                        help='List project folders under --docs and exit.')
+    parser.add_argument('--limit', type=int, default=6, help='Evidence limit for --search (1-20).')
     parser.add_argument('--json', action='store_true', help='Emit machine-readable JSON.')
+    parser.add_argument('--version', action='version', version='meeting-copilot standalone 0.2.0')
     args = parser.parse_args(argv)
 
+    if args.docs is None:
+        raise SystemExit('Missing --docs DIR. Quickstart: '
+                         'python ask.py --docs ./sample-docs --list-projects')
     docs = Path(args.docs)
     if not docs.is_dir():
         raise SystemExit(f'Docs directory not found: {docs}')
@@ -119,18 +150,38 @@ def main(argv=None):
         raise SystemExit(
             'Web research has no standalone provider yet (host search only). '
             'Run without --web-query for file-grounded answers.')
+    if args.search is not None and args.question:
+        raise SystemExit('Choose --search TERMS or --question, not both.')
+    if args.list_projects and (args.search is not None or (args.question or '').strip()):
+        raise SystemExit('Choose one mode: --list-projects, --search, or --question.')
+    if not args.list_projects and args.search is None and not (args.question or '').strip():
+        raise SystemExit('What do you want to do?\n'
+                         '  Ask:          python ask.py --docs ./sample-docs --question "What is the unit price?"\n'
+                         '  Search docs:  python ask.py --docs ./sample-docs --search "unit price"\n'
+                         '  List projects: python ask.py --docs ./sample-docs --list-projects')
+    if args.limit < 1 or args.limit > 20:
+        raise SystemExit('--limit must be between 1 and 20.')
+    if args.model and args.provider == 'fake':
+        print('Warning: --model is ignored with --provider fake.', file=sys.stderr)
+    if args.project and args.all:
+        raise SystemExit('Choose --project NAME or --all, not both.')
 
-    try:
-        transcript = load_transcript(args.transcript) if args.transcript else None
-    except (OSError, ValueError) as exc:
-        raise SystemExit(f'Cannot read transcript: {exc}')
-    if transcript is None:
-        transcript = ''
+    subs = sorted(sub.name for sub in docs.iterdir()
+                    if sub.is_dir() and not sub.name.startswith('.') and not sub.is_symlink())
+    if args.list_projects:
+        if args.json:
+            print(json.dumps({'projects': [{'name': name} for name in subs]}, indent=2))
+        elif subs:
+            print('Projects:')
+            for name in subs:
+                print(f'  - {name}')
+            print(f'\nAsk one: python ask.py --docs {docs} --project {subs[0]} --question "..."')
+        else:
+            print(f'No project folders under {docs}. Create one folder per project containing .md/.txt/.rst files.')
+        return 0
     if args.project and args.all:
         raise SystemExit('Choose --project NAME or --all, not both.')
     project = args.project
-    subs = sorted(sub.name for sub in docs.iterdir()
-                    if sub.is_dir() and not sub.name.startswith('.') and not sub.is_symlink())
     if project is None and not args.all:
         if len(subs) == 1:
             project = subs[0]
@@ -140,6 +191,32 @@ def main(argv=None):
     if project is not None and project not in subs:
         raise SystemExit(f'No project {project!r} under {docs}.'
                          + (f' Available: {", ".join(subs)}.' if subs else ' No project folders found.'))
+
+    if args.search is not None:
+        # Evidence-only mode never calls a model: a completion that raises
+        # if invoked proves the point and keeps the mode fully offline.
+        def _never_called(messages):
+            raise AssertionError('search mode must not call a model')
+        core = AnswerCore(project_root=docs, completion=_never_called,
+                          search=DisabledSearch(), history=NoHistory())
+        try:
+            found = core.search(args.search, project=project, limit=args.limit,
+                                all_projects=args.all)
+        except ValueError as exc:
+            raise SystemExit(f'Invalid request: {exc}')
+        if args.json:
+            print(json.dumps({'query': args.search, 'count': len(found), 'sources': found},
+                             indent=2, default=str))
+        else:
+            _print_sources(found)
+        return 0
+
+    try:
+        transcript = load_transcript(args.transcript) if args.transcript else None
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f'Cannot read transcript: {exc}')
+    if transcript is None:
+        transcript = ''
     if args.provider == 'fake':
         # Fake means fully offline: the engine would otherwise try the Meta
         # default route whenever a key happens to be configured.
@@ -164,18 +241,15 @@ def main(argv=None):
         # caveat is stale here even for a live provider.
         result['warnings'] = [w for w in result['warnings'] if 'prior-session' not in w]
     total = time.monotonic() - started
+    failed = bool(result.get('provider_error'))
     if args.json:
         print(json.dumps({**result, 'total_seconds': total}, indent=2, default=str))
-        return 0
+        if failed:
+            print(f"\n(request failed: {result['provider_error']}; see warnings in JSON)", file=sys.stderr)
+        return 2 if failed else 0
     print(result['answer'])
     print()
-    print('Sources:')
-    for i, source in enumerate(result['sources'], 1):
-        title = source.get('title') or source.get('source') or 'source'
-        print(f'  [{i}] {title} ({source.get("source", "")})')
-        snippet = (source.get('text') or '').strip().replace('\n', ' ')
-        if snippet:
-            print(f'      {snippet[:200]}')
+    _print_sources(result['sources'])
     if result['warnings']:
         print()
         print('Warnings:')

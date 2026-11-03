@@ -196,6 +196,28 @@ class CoreAcceptanceTests(NoHermesTestCase):
         with self.assertRaises(NotImplementedError):
             core.engine.answer_stream('What is the price?', transcript='t', project='acme')
 
+    def test_explicit_missing_project_root_fails_clearly(self):
+        from answer_core import AnswerCore
+        with self.assertRaisesRegex(ValueError, 'Project root not found'):
+            AnswerCore(project_root=str(Path(self._scratch()) / 'missing'),
+                       completion=lambda messages: 'Cited [1].')
+
+    def test_empty_injected_completion_is_a_safe_provider_failure(self):
+        core = self._core(completion=lambda messages: '   ')
+        result = core.answer('Price?', transcript='t', project='acme')
+        self.assertTrue(result['provider_error'])
+        self.assertTrue(result['warnings'])
+        self.assertNotIn('Cited', result['answer'])
+
+    def test_history_provider_returning_none_is_no_history(self):
+        class NoneHistory:
+            def search(self, terms):
+                return None
+        core = self._core(history=NoneHistory())
+        result = core.answer('Price?', transcript='t', project='acme')
+        self.assertIn('[1]', result['answer'])
+
+
 class AskCliTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix='ask-cli-')
@@ -267,6 +289,107 @@ class AskCliTests(unittest.TestCase):
                 ask.main(['--question', 'Q?', '--docs', self.docs, '--provider', 'meta'])
         self.assertNotEqual(ctx.exception.code, 0)
         self.assertIn('MODEL_API_KEY', str(ctx.exception.code))
+
+    def _capture(self, argv):
+        import ask
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = ask.main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_list_projects_needs_no_question(self):
+        code, out, _ = self._capture(['--docs', self.docs, '--list-projects'])
+        self.assertEqual(code, 0)
+        self.assertIn('acme', out)
+        self.assertIn('Ask one:', out)
+
+    def test_search_mode_returns_evidence_without_model(self):
+        code, out, _ = self._capture(['--docs', self.docs, '--search', 'Acme renews'])
+        self.assertEqual(code, 0)
+        self.assertIn('notes.md', out)
+        self.assertIn('Acme renews in September.', out)
+
+    def test_search_json_shape(self):
+        import json as _json
+        code, out, _ = self._capture(['--docs', self.docs, '--search', 'Acme renews', '--json'])
+        self.assertEqual(code, 0)
+        payload = _json.loads(out)
+        self.assertEqual(payload['query'], 'Acme renews')
+        self.assertEqual(payload['count'], len(payload['sources']))
+        self.assertGreaterEqual(payload['count'], 1)
+
+    def test_no_action_shows_three_choices(self):
+        err = self._run('--docs', self.docs)
+        self.assertIn('Ask:', str(err.code))
+        self.assertIn('Search docs:', str(err.code))
+        self.assertIn('List projects:', str(err.code))
+
+    def test_missing_docs_points_to_quickstart(self):
+        err = self._run('--list-projects')
+        self.assertIn('Missing --docs', str(err.code))
+        self.assertIn('--list-projects', str(err.code))
+
+    def test_version_flag_works_without_docs_or_question(self):
+        import ask
+        import io
+        from contextlib import redirect_stdout
+        out = io.StringIO()
+        with redirect_stdout(out):
+            with self.assertRaises(SystemExit) as ctx:
+                ask.main(['--version'])
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertIn('meeting-copilot standalone', out.getvalue())
+
+    def test_transcript_dash_reads_stdin(self):
+        import ask
+        import io
+        payload = io.StringIO('[{"speaker": "you", "text": "Hello there"}]')
+        with unittest.mock.patch.object(ask.sys, 'stdin', payload):
+            self.assertEqual(ask.load_transcript('-'), 'you: Hello there')
+
+    def test_json_provider_failure_exits_nonzero(self):
+        import ask
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+        def boom(messages):
+            raise RuntimeError('down:sekret-token')
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(ask, 'build_completion', return_value=boom):
+            with redirect_stdout(out), redirect_stderr(err):
+                code = ask.main(['--question', 'Q?', '--docs', self.docs,
+                                 '--provider', 'meta', '--json'])
+        self.assertEqual(code, 2)
+        self.assertNotIn('sekret-token', out.getvalue() + err.getvalue())
+
+    def test_model_flag_warns_when_fake(self):
+        code, _, err = self._capture(['--question', 'Q?', '--docs', self.docs,
+                                      '--provider', 'fake', '--model', 'anything'])
+        self.assertEqual(code, 0)
+        self.assertIn('--model is ignored', err)
+
+    def test_human_output_explains_empty_sources(self):
+        code, out, _ = self._capture(['--question', 'zzzznomatch', '--docs', self.docs,
+                                      '--provider', 'fake'])
+        self.assertEqual(code, 0)
+        self.assertIn('Sources: none found', out)
+
+    def test_ambiguous_modes_are_rejected(self):
+        err = self._run('--docs', self.docs, '--list-projects', '--search', 'Acme')
+        self.assertIn('Choose one mode', str(err.code))
+        err = self._run('--docs', self.docs, '--list-projects', '--project', 'acme', '--all')
+        self.assertIn('not both', str(err.code))
+
+
+class RetrievalEvalTests(unittest.TestCase):
+    def test_synthetic_benchmark_reports_recall_and_latency(self):
+        import eval_retrieval
+        report = eval_retrieval.run_benchmark(projects=3, docs_per_project=2, runs=2)
+        self.assertEqual(report['recall_at_k']['exact_reference'], 1.0)
+        self.assertEqual(report['recall_at_k']['natural_topic'], 1.0)
+        self.assertEqual(report['search_latency_ms']['count'], 3)
+        self.assertIn('p95', report['answer_latency_ms_fake_provider'])
 
 
 if __name__ == '__main__':

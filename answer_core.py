@@ -66,6 +66,11 @@ class AnswerCore:
     """Host-independent grounded answering over project files + transcript."""
 
     def __init__(self, project_root=None, completion=None, search=None, history=None):
+        if project_root is not None:
+            from pathlib import Path as _Path
+            root = _Path(project_root)
+            if not root.is_dir():
+                raise ValueError(f'Project root not found: {root}')
         self.engine = KnowledgeEngine(
             project_root=project_root,
             hermes_home=None,
