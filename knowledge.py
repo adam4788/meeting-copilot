@@ -8,6 +8,7 @@ import json
 import math
 import threading
 import unicodedata
+from collections import OrderedDict
 from contextlib import closing
 
 try:
@@ -116,11 +117,21 @@ def _clean(text, _depth=0):
     _names = (r'(?:[a-z][a-z0-9_-]*[_-])?token|csrftoken|xsrftoken|api[ _-]?key|'
               r'password|passwd|secret|client[ _-]?secret|authorization|credential|'
               r'session(?:id)?|sid')
-    text = re.sub(r'(?i)("?(?:' + _names + r')"?\s*[:=]\s*")[^"]*(")',
+    text = re.sub(r'(?i)("?(?:' + _names + r')"?\s*[:=]\s*")(?:\\.|[^"\\])*(")',
+                  r'\1[REDACTED]\2', text)
+    text = re.sub(r"(?i)('?(?:" + _names + r")'?\s*[:=]\s*')[^']*(')",
                   r'\1[REDACTED]\2', text)
     text = re.sub(r'(?i)\b(token\s*[:=]\s*"?)([^\s,;"]+)',
-                  lambda m: m.group(1) + ('[REDACTED]' if _credential_like(m.group(2)) else m.group(2)), text)
-    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])token|csrftoken|xsrftoken|api[ _-]?key|password|passwd|secret|client[ _-]?secret|authorization|credential|session(?:id)?|sid)"?\s*[=:]\s*"?[^\s,;"]+', r'\1=[REDACTED]', text)
+                  lambda m: m.group(1) + ('[REDACTED]' if ('=' in m.group(1) and len(m.group(2)) >= 4) or _credential_like(m.group(2)) else m.group(2)), text)
+    def _session_assignment(match):
+        value = match.group(2)
+        if re.fullmatch(r'\d{4}-\d{2}-\d{2}([T ].*)?', value) or value.isdigit():
+            return match.group(0)
+        if _credential_like(value) or ('=' in match.group(1) and len(value) >= 6):
+            return match.group(1) + '[REDACTED]'
+        return match.group(0)
+    text = re.sub(r'(?i)\b(session\s*[:=]\s*"?)([^\s,;"]+)', _session_assignment, text)
+    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])token|csrftoken|xsrftoken|api[ _-]?key|password|passwd|secret|client[ _-]?secret|authorization|credential|sessionid|sid)"?\s*[=:]\s*"?[^\s,;"]+', r'\1=[REDACTED]', text)
     # ALL-CAPS env-style assignments: MCP_API_KEY=..., SERVICE_AUTH_TOKEN=...
     text = re.sub(r'\b([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|AUTH)[A-Z0-9_]*\s*=\s*)[^\s,;]+',
                   r'\1[REDACTED]', text)
@@ -169,6 +180,14 @@ def _clean_url(url, _depth=0):
             dkey, deq, _dv = unquote_plus(part).partition('=')
             if deq and _sensitive(dkey):
                 return f'{dkey}=REDACTED', True
+        # Double-encoded assignments (%2526/%253D): decode a layer, but
+        # only rewrite when a sensitive key actually surfaces.
+        from urllib.parse import unquote_plus
+        decoded = unquote_plus(part)
+        if decoded != part:
+            processed, flag = _redact_part(decoded)
+            if flag:
+                return processed, True
         subs = re.split(r'(?i)%26|%3B', part)
         if len(subs) > 1:
             processed = [_redact_part(sub) for sub in subs]
@@ -194,6 +213,11 @@ def _clean_url(url, _depth=0):
         raw = base + '?' + ''.join(tokens) + (hashmark + fragment if hashmark else '')
     if '#' in raw:
         head, _, fragment = raw.partition('#')
+        if '=' not in fragment and '%3d' in fragment.lower():
+            processed, did = _redact_part(fragment)
+            if did:
+                raw = head + '#' + processed
+                changed = True
         if '=' in fragment:
             cleaned_fragment = _clean(fragment, _depth=_depth)
             # Fragment parameters use the same sensitive keys as queries.
@@ -250,6 +274,12 @@ class KnowledgeEngine:
         with self._lock:
             self._cache.clear()
             self._token_cache.clear()
+        # Retrieved text also lives in the shared FTS index cache; a
+        # clear must not leave it retained there.
+        with KnowledgeEngine._INDEX_CACHE_LOCK:
+            for index in KnowledgeEngine._INDEX_CACHE.values():
+                index.close()
+            KnowledgeEngine._INDEX_CACHE.clear()
 
     def projects(self):
         if not self.project_root.is_dir():
@@ -871,7 +901,7 @@ class KnowledgeEngine:
         scored.sort(key=lambda item: (item[0], item[1]))
         return [doc for _, _, doc in scored[:limit]]
 
-    _INDEX_CACHE = {}
+    _INDEX_CACHE = OrderedDict()
     _INDEX_CACHE_LOCK = threading.Lock()
 
     @staticmethod
@@ -880,18 +910,22 @@ class KnowledgeEngine:
         # length, content hash): warm searches over an unchanged corpus
         # reuse the index instead of rebuilding it per query. Content
         # changes produce a new fingerprint, so stale text cannot rank.
+        import hashlib
         fingerprint = tuple((str(d.get('source', '')), len(d['text']),
-                             hash(d['text'])) for d in docs)
+                             hashlib.sha256(d['text'].encode('utf-8', 'replace')).hexdigest())
+                            for d in docs)
         query = ' OR '.join('"' + term + '"' for term in terms)
         with KnowledgeEngine._INDEX_CACHE_LOCK:
             index = KnowledgeEngine._INDEX_CACHE.get(fingerprint)
+            if index is not None:
+                KnowledgeEngine._INDEX_CACHE.move_to_end(fingerprint)
             if index is None:
                 index = sqlite3.connect(':memory:', check_same_thread=False)
                 index.execute('CREATE VIRTUAL TABLE docs USING fts5(text)')
                 index.executemany('INSERT INTO docs(rowid,text) VALUES (?,?)',
                                   [(i + 1, d['text']) for i, d in enumerate(docs)])
                 KnowledgeEngine._INDEX_CACHE[fingerprint] = index
-                while len(KnowledgeEngine._INDEX_CACHE) > 2:
+                while len(KnowledgeEngine._INDEX_CACHE) > 8:
                     oldest = next(iter(KnowledgeEngine._INDEX_CACHE))
                     KnowledgeEngine._INDEX_CACHE.pop(oldest).close()
             rows = index.execute('SELECT rowid FROM docs WHERE docs MATCH ? ORDER BY bm25(docs) LIMIT ?', (query, limit)).fetchall()

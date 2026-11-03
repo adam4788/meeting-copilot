@@ -76,29 +76,36 @@ def fake_completion_factory():
             if isinstance(payload.get('transcript'), str):
                 transcript = payload['transcript']
         terms = _content_terms(question)
+        best_line, best_hits = '', set()
+        for line in str(transcript).splitlines():
+            hits = _term_hits(terms, line)
+            if len(hits) > len(best_hits):
+                best_line, best_hits = line.strip(), hits
+        doc_hits = set()
         if evidence:
             top = evidence[0]
             snippet = ' '.join(str(top.get('text', '')).split())[:220]
             doc_hits = _term_hits(terms, f"{top.get('title', '')} {top.get('text', '')}")
-            best_line, best_hits = '', set()
-            for line in str(transcript).splitlines():
-                hits = _term_hits(terms, line)
-                if len(hits) > len(best_hits):
-                    best_line, best_hits = line.strip(), hits
-            if snippet and len(doc_hits) >= 2 and len(doc_hits) >= len(best_hits):
+            # A one-term question ('Price?') can only ever score one hit;
+            # multi-term questions need two so a shared generic word in an
+            # unrelated document is not presented as the answer.
+            required = 1 if len(terms) <= 1 else 2
+            if snippet and len(doc_hits) >= required and len(doc_hits) >= len(best_hits):
                 title = ' '.join(str(top.get('title', '')).split())[:80]
                 redacted = ' (searched snippet redacted)' if 'REDACTED' in snippet else ''
                 from_line = f' From {title}:' if title else ''
                 return (f'Offline extractive answer (fake provider — no model was '
                         f'called){redacted}.{from_line} "{snippet}" [1]. Configure '
                         f'MODEL_API_KEY with --provider meta for a synthesized answer.')
-            if best_line and len(best_hits) >= 1 and len(best_hits) > len(doc_hits):
-                quote = ' '.join(best_line.split())[:220]
-                return ('Offline extractive answer (fake provider — no model was '
-                        'called): the retrieved documents do not directly answer '
-                        f'this; the transcript itself says: "{quote}" (transcript, '
-                        'uncited). Configure MODEL_API_KEY with --provider meta '
-                        'for a synthesized answer.')
+        if best_line and len(best_hits) >= 1 and len(best_hits) > len(doc_hits):
+            quote = ' '.join(best_line.split())[:220]
+            lead = ('the retrieved documents do not directly answer this; '
+                    if evidence else 'no documents matched; ')
+            return ('Offline extractive answer (fake provider — no model was '
+                    f'called): {lead}the transcript itself says: "{quote}" '
+                    '(transcript, uncited). Configure MODEL_API_KEY with '
+                    '--provider meta for a synthesized answer.')
+        if evidence:
             return ('Offline extractive answer (fake provider — no model was '
                     'called): retrieved evidence does not directly answer this '
                     'question, so no snippet is presented as an answer. See the '
@@ -221,6 +228,21 @@ def main(argv=None):
     parser.add_argument('--json', action='store_true',
                         help='Emit one machine-readable JSON object on stdout (supported by all modes).')
     parser.add_argument('--version', action='version', version='meeting-copilot standalone 0.2.0')
+    if any(token in ('-h', '--help') for token in parser._argv):
+        # --json --help gets machine-readable help, not plain text.
+        json_requested = False
+        for token in parser._argv:
+            if token == '--':
+                break
+            if (token == '--json' or token.startswith('--json=')
+                    or (token.startswith('--j') and '--json'.startswith(token))):
+                json_requested = True
+                break
+        if json_requested:
+            print(json.dumps({'description': parser.description,
+                              'usage': parser.format_usage().strip(),
+                              'help': parser.format_help()}, indent=2))
+            return 0
     args = parser.parse_args(argv)
 
     def fail(message, code=1):

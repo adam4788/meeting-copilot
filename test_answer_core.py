@@ -378,6 +378,20 @@ class CoreAcceptanceTests(NoHermesTestCase):
         self.assertEqual(knowledge._clean_url('https://example.com/?q=dogs%26cats'),
                          'https://example.com/?q=dogs%26cats')
 
+    def test_round9_credential_and_benign_shapes(self):
+        import knowledge
+        blob = ' '.join([
+            knowledge._clean("password: 'alpha bravo'"),
+            knowledge._clean('{"token":"abc\\"def123"}'),
+            knowledge._clean('token=alphabetical'),
+            knowledge._clean_url('https://host/x#access_token%3Dalpha123456'),
+            knowledge._clean_url('https://host/x?x=ok%2526access_token%253Dalpha123456'),
+        ])
+        for sentinel in ('alpha bravo', 'def123', 'alphabetical', 'alpha123456'):
+            self.assertNotIn(sentinel, blob)
+        self.assertEqual(knowledge._clean('session: 2026-11-02'), 'session: 2026-11-02')
+        self.assertEqual(knowledge._clean('Token: meeting agenda'), 'Token: meeting agenda')
+
     def test_rank_index_cache_invalidates_on_content_change(self):
         import knowledge
         docs = [dict(id=f'd{i}', title=f'doc{i}', source=f's{i}',
@@ -704,6 +718,34 @@ class AskCliTests(unittest.TestCase):
         blob = ' '.join(payload.get('warnings', []))
         self.assertIn('are not searched', blob)
         self.assertIn('--transcript is ignored', blob)
+
+    def test_fake_uses_transcript_when_no_documents_match(self):
+        (Path(self.docs) / 'acme' / 'notes.md').write_text(
+            'Unrelated pricing and renewal notes.\n', encoding='utf-8')
+        transcript = Path(self.docs) / 'input.txt'
+        transcript.write_text('Alice: The quasar deadline is November 17.\n',
+                              encoding='utf-8')
+        code, out, _ = self._capture(['--question', 'When is the quasar deadline?',
+                                      '--docs', self.docs, '--provider', 'fake',
+                                      '--transcript', str(transcript)])
+        self.assertEqual(code, 0)
+        self.assertIn('transcript itself says', out)
+        self.assertIn('November 17', out)
+
+    def test_fake_answers_one_term_question(self):
+        (Path(self.docs) / 'acme' / 'notes.md').write_text(
+            'Quoted unit price is $84 each.\n', encoding='utf-8')
+        code, out, _ = self._capture(['--question', 'Price?',
+                                      '--docs', self.docs, '--provider', 'fake'])
+        self.assertEqual(code, 0)
+        answer = out.split('\n\nSources')[0]
+        self.assertIn('$84', answer)
+        self.assertNotIn('does not directly answer', answer)
+
+    def test_json_help_is_json(self):
+        code, out, _ = self._capture(['--json', '--help'])
+        self.assertEqual(code, 0)
+        self.assertIn('Standalone grounded', json.loads(out)['description'])
 
     def test_fake_prefers_transcript_over_unrelated_document(self):
         (Path(self.docs) / 'acme' / 'notes.md').write_text(
