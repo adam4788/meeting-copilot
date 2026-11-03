@@ -95,7 +95,7 @@ def _clean(text, _depth=0):
     _q = r'(?:%2522|%22)'
     _c = r'(?:%253[ad]|%3[ad])'
     text = re.sub(r'(?i)(' + _q + r'[\w%-]*?(?:token|secret|password|api[\w%-]*?key|authorization)'
-                  + _q + r'?\s*' + _c + r'\s*' + _q + r'?)[^%]*?(' + _q + r'|&|$)',
+                  + _q + r'?\s*' + _c + r'\s*' + _q + r'?)(?:[^%]|%(?!2522|%22))*?(' + _q + r'|&|$)',
                   r'\1REDACTED\2', text)
     # Bearer credentials first: the generic key=value rule below would
     # otherwise redact only the word "Bearer" and leave the token itself.
@@ -140,15 +140,20 @@ def _clean(text, _depth=0):
                   _quoted_value, text)
     text = re.sub(r'(?i)\b(token\s*[:=]\s*"?)([^\s,;"]+)',
                   lambda m: m.group(1) + ('[REDACTED]' if ('=' in m.group(1) and len(m.group(2)) >= 3) or _credential_like(m.group(2)) else m.group(2)), text)
+    def _cookie_line(match):
+        return re.sub(r'(?i)(\bsession(?:_id|id)?\s*=\s*)[^\s;]+', r'\1[REDACTED]', match.group(0))
+    text = re.sub(r'(?im)^.*\b(?:set-cookie|cookie)\s*:.*$', _cookie_line, text)
     def _session_assignment(match):
         value = match.group(2)
         if re.fullmatch(r'\d{4}-\d{2}-\d{2}([T ].*)?', value) or (value.isdigit() and len(value) <= 8):
             return match.group(0)
-        if _credential_like(value) or ('=' in match.group(1) and len(value) >= 3):
+        if _credential_like(value) or (value.isdigit() and len(value) >= 9):
             return match.group(1) + '[REDACTED]'
         return match.group(0)
-    text = re.sub(r'(?i)\b(session\s*[:=]\s*"?)([^\s,;"]+)', _session_assignment, text)
-    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])token|csrftoken|xsrftoken|api[ _-]?key|password|passwd|secret|client[ _-]?secret|authorization|credential|sessionid|sid)"?\s*[=:]\s*"?[^\s,;"]+', r'\1=[REDACTED]', text)
+    text = re.sub(r'(?i)\b(session(?:_id|id)?\s*[:=]\s*"?)([^\s,;"]+)', _session_assignment, text)
+    text = re.sub(r'(?i)\b(credential\s*[:=]\s*"?)([^\s,;"]+)',
+                  lambda m: m.group(1) + ('[REDACTED]' if _credential_like(m.group(2)) else m.group(2)), text)
+    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])token|csrftoken|xsrftoken|api[ _-]?key|password|passwd|secret|client[ _-]?secret|authorization|sessionid|sid)"?\s*[=:]\s*"?[^\s,;"]+', r'\1=[REDACTED]', text)
     # ALL-CAPS env-style assignments: MCP_API_KEY=..., SERVICE_AUTH_TOKEN=...
     text = re.sub(r'\b([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|AUTH)[A-Z0-9_]*\s*=\s*)[^\s,;]+',
                   r'\1[REDACTED]', text)
@@ -291,6 +296,21 @@ class KnowledgeEngine:
         self._index_cache = OrderedDict()
         self._index_cache_lock = threading.Lock()
 
+    def close(self):
+        with self._index_cache_lock:
+            for index, _chars in self._index_cache.values():
+                try:
+                    index.close()
+                except Exception:
+                    pass
+            self._index_cache.clear()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def invalidate_cache(self):
         """Clear retrieved project snippets under the retrieval lock so an
         in-flight search cannot repopulate retained state after a clear."""
@@ -299,10 +319,7 @@ class KnowledgeEngine:
             self._token_cache.clear()
         # Retrieved text also lives in this engine's FTS index cache; a
         # clear must not leave it retained there.
-        with self._index_cache_lock:
-            for index in self._index_cache.values():
-                index.close()
-            self._index_cache.clear()
+        self.close()
 
     def projects(self):
         if not self.project_root.is_dir():
@@ -392,7 +409,7 @@ class KnowledgeEngine:
         if self._history_override is not _USE_HOST:
             search = getattr(self._history_override, 'search', self._history_override)
             try:
-                records = search(terms)
+                records = list(search(terms) or [])
             except Exception as exc:
                 # Provider errors must not carry raw credential text back
                 # to the caller.
@@ -401,7 +418,7 @@ class KnowledgeEngine:
             # store: redact credential-looking values and bound fields
             # before any of it can reach a completion provider or caller.
             cleaned = []
-            for record in records or []:
+            for record in records[:100]:
                 if not isinstance(record, dict):
                     continue
                 # Whitelist the evidence contract: provider metadata and
@@ -940,18 +957,23 @@ class KnowledgeEngine:
                             for d in docs)
         query = ' OR '.join('"' + term + '"' for term in terms)
         with self._index_cache_lock:
-            index = self._index_cache.get(fingerprint)
-            if index is not None:
+            entry = self._index_cache.get(fingerprint)
+            if entry is not None:
                 self._index_cache.move_to_end(fingerprint)
-            if index is None:
+                index = entry[0]
+            else:
                 index = sqlite3.connect(':memory:', check_same_thread=False)
                 index.execute('CREATE VIRTUAL TABLE docs USING fts5(text)')
                 index.executemany('INSERT INTO docs(rowid,text) VALUES (?,?)',
                                   [(i + 1, d['text']) for i, d in enumerate(docs)])
-                self._index_cache[fingerprint] = index
-                while len(self._index_cache) > 12:
+                total_chars = sum(len(d['text']) for d in docs)
+                self._index_cache[fingerprint] = (index, total_chars)
+                # Bounded by entries and total indexed characters: a few
+                # huge corpora cannot crowd out memory without limit.
+                while (len(self._index_cache) > 16
+                       or sum(chars for _i, chars in self._index_cache.values()) > 50000000):
                     oldest = next(iter(self._index_cache))
-                    self._index_cache.pop(oldest).close()
+                    self._index_cache.pop(oldest)[0].close()
             rows = index.execute('SELECT rowid FROM docs WHERE docs MATCH ? ORDER BY bm25(docs) LIMIT ?', (query, limit)).fetchall()
         return [docs[row[0] - 1].copy() for row in rows]
 

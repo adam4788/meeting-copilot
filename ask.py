@@ -74,11 +74,13 @@ def _passage(text, terms):
         return flat[:220]
     # Choose the 220-char window containing the most distinct query terms,
     # not merely the window around the earliest stray mention.
-    candidates = {0} | {max(0, pos - 40) for found in positions.values() for pos in found}
+    candidates = ({0} | {max(0, pos - 40) for found in positions.values() for pos in found}
+                  | {pos for found in positions.values() for pos in found}
+                  | {max(0, pos - 219) for found in positions.values() for pos in found})
     start, best_score = 0, -1
     for cand in sorted(candidates):
-        score = sum(1 for found in positions.values()
-                    if any(cand <= pos < cand + 220 for pos in found))
+        score = sum(1 for term, found in positions.items()
+                    if any(cand <= pos and pos + len(term) <= cand + 220 for pos in found))
         if score > best_score:
             start, best_score = cand, score
     snippet = flat[start:start + 220]
@@ -119,12 +121,19 @@ def fake_completion_factory():
             hits = _term_hits(terms, line)
             if len(hits) > len(best_hits):
                 best_line, best_hits = line.strip(), hits
-        doc_hits = set()
+        doc_hits, body_hits = set(), set()
         if evidence:
-            top = evidence[0]
-            snippet = _passage(top.get('text', ''), terms)
-            doc_hits = _term_hits(terms, f"{top.get('title', '')} {top.get('text', '')}")
-            body_hits = _term_hits(terms, top.get('text', ''))
+            # Consider every retrieved document, not only the first: a
+            # title-heavy top hit must not suppress a relevant later one
+            # (or a relevant transcript).
+            top, citation = None, 1
+            for idx, item in enumerate(evidence):
+                item_body = _term_hits(terms, item.get('text', ''))
+                item_all = _term_hits(terms, f"{item.get('title', '')} {item.get('text', '')}")
+                if len(item_body) > len(body_hits):
+                    top, body_hits, doc_hits = item, item_body, item_all
+                    citation = item.get('citation', idx + 1)
+            snippet = _passage(top.get('text', ''), terms) if top else ''
             # A one-term question ('Price?') can only ever score one hit;
             # multi-term questions need two so a shared generic word in an
             # unrelated document is not presented as the answer.
@@ -134,10 +143,10 @@ def fake_completion_factory():
                 redacted = ' (searched snippet redacted)' if 'REDACTED' in snippet else ''
                 from_line = f' From {title}:' if title else ''
                 return (f'Offline extractive answer (fake provider — no model was '
-                        f'called){redacted}.{from_line} "{snippet}" [1]. Configure '
+                        f'called){redacted}.{from_line} "{snippet}" [{citation}]. Configure '
                         f'MODEL_API_KEY with --provider meta for a synthesized answer.')
         transcript_required = 1 if len(terms) <= 1 else 2
-        if best_line and len(best_hits) >= transcript_required and len(best_hits) > len(doc_hits):
+        if best_line and len(best_hits) >= transcript_required and len(best_hits) > len(body_hits):
             quote = _passage(best_line, terms)
             lead = ('the retrieved documents do not directly answer this; '
                     if evidence else 'no documents matched; ')

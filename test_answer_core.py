@@ -378,6 +378,31 @@ class CoreAcceptanceTests(NoHermesTestCase):
         self.assertEqual(knowledge._clean_url('https://example.com/?q=dogs%26cats'),
                          'https://example.com/?q=dogs%26cats')
 
+    def test_round12_credential_and_benign_shapes(self):
+        import knowledge
+        blob = ' '.join([
+            knowledge._clean('%22token%22%3A%22abc%2Fdef%22'),
+            knowledge._clean('Cookie: session=x; session_id=y; theme=dark'),
+        ])
+        self.assertNotIn('abc%2Fdef', blob)
+        self.assertEqual(blob.count('REDACTED'), 3, blob)
+        self.assertEqual(knowledge._clean('session=planning launch'),
+                         'session=planning launch')
+        self.assertEqual(knowledge._clean('Credential: hiring process'),
+                         'Credential: hiring process')
+
+    def test_lazy_history_exception_is_sanitized(self):
+        def bad_records(terms):
+            yield {'id': '1', 'title': 't', 'source': 's', 'text': 'x'}
+            raise RuntimeError('password=sentinelLAZY123')
+        class LazyHist:
+            def search(self, terms):
+                return bad_records(terms)
+        core = self._core(history=LazyHist())
+        with self.assertRaises(RuntimeError) as ctx:
+            core.search('price', project='acme')
+        self.assertNotIn('sentinelLAZY123', str(ctx.exception))
+
     def test_round11_credential_and_benign_shapes(self):
         import knowledge
         blob = ' '.join([
@@ -766,6 +791,29 @@ class AskCliTests(unittest.TestCase):
         blob = ' '.join(payload.get('warnings', []))
         self.assertIn('are not searched', blob)
         self.assertIn('--transcript is ignored', blob)
+
+    def test_fake_transcript_not_suppressed_by_title_only_doc(self):
+        (Path(self.docs) / 'acme' / 'notes.md').write_text(
+            'The unit handbook covers shipping windows.\n', encoding='utf-8')
+        transcript = Path(self.docs) / 'input.txt'
+        transcript.write_text('Bob: The unit price is $99.\n', encoding='utf-8')
+        code, out, _ = self._capture(['--question', 'What is the unit price?',
+                                      '--docs', self.docs, '--provider', 'fake',
+                                      '--transcript', str(transcript)])
+        self.assertEqual(code, 0)
+        self.assertIn('transcript itself says', out)
+        self.assertIn('$99', out)
+
+    def test_fake_considers_second_document(self):
+        (Path(self.docs) / 'acme' / 'notes.md').write_text(
+            'The unit handbook covers shipping windows.\n', encoding='utf-8')
+        (Path(self.docs) / 'acme' / 'pricing.txt').write_text(
+            'The unit price is $84 each.\n', encoding='utf-8')
+        code, out, _ = self._capture(['--question', 'What is the unit price?',
+                                      '--docs', self.docs, '--provider', 'fake'])
+        self.assertEqual(code, 0)
+        answer = out.split('\n\nSources')[0]
+        self.assertIn('$84', answer)
 
     def test_fake_passage_prefers_term_cluster(self):
         filler = ' '.join(['filler'] * 60)
