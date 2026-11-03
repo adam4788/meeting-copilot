@@ -350,6 +350,23 @@ class CoreAcceptanceTests(NoHermesTestCase):
             'https://example.com/x#access_token=secret123'))
         self.assertNotIn('secret123', knowledge._clean_url(
             'https://example.com/x#refresh_token=secret123'))
+        self.assertNotIn('secret123', knowledge._clean_url(
+            'https://example.com/x?refresh_token=secret123'))
+        self.assertNotIn('secret123', knowledge._clean_url(
+            'https://example.com/x?refresh%5Ftoken=secret123'))
+
+    def test_transcript_urls_and_basic_auth_are_scrubbed(self):
+        captured = []
+        def complete(messages):
+            captured.extend(messages)
+            return 'Cited [1].'
+        core = self._core(completion=complete)
+        core.answer('Price?', transcript='see https://ex.com/x?access%5Ftoken=secret123 '
+                                         'Authorization: Basic dXNlcjpwYXNz',
+                    project='acme')
+        blob = json.dumps(captured)
+        self.assertNotIn('secret123', blob)
+        self.assertNotIn('dXNlcjpwYXNz', blob)
 
     def test_authorization_bearer_alphabetic_token_redacted(self):
         class History:
@@ -600,6 +617,19 @@ class AskCliTests(unittest.TestCase):
                                       '--limit', '1'])
         self.assertEqual(code, 0)
         self.assertIn('--limit applies only to --search', err)
+
+    def test_root_documents_warn_they_are_not_searched(self):
+        (Path(self.docs) / 'root.md').write_text('root price notes', encoding='utf-8')
+        code, _, err = self._capture(['--docs', self.docs, '--search', 'Acme renews'])
+        self.assertEqual(code, 0)
+        self.assertIn('are not searched', err)
+
+    def test_default_fake_quotes_retrieved_evidence(self):
+        code, out, _ = self._capture(['--question', 'When does Acme renew?',
+                                      '--docs', self.docs, '--provider', 'fake'])
+        self.assertEqual(code, 0)
+        self.assertIn('Acme renews in September.', out)
+        self.assertIn('no model was called', out)
 
     def test_list_nonblank_question_is_rejected(self):
         err = self._run('--docs', self.docs, '--list-projects', '--question', 'ignored')

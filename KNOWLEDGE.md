@@ -54,8 +54,9 @@ assistant claim nor a user request proves an action happened.
 
 ## Scope and web fallback
 
-`all_projects=True` searches every eligible direct child project (max 100, each
-contributing a BM25-scored candidate pool of up to 100 chunks) plus sessions; it
+`all_projects=True` searches every eligible direct child project (max 100) plus
+sessions, ranking the full eligible corpus in one FTS index; above 10,000 chunks
+it falls back to per-project FTS candidate pools (a bounded approximation). It
 cannot be combined with `project`.
 `web_fallback=True` runs `web_policy.plan_web` after local retrieval:
 one model call decides whether local evidence suffices and, if not, drafts a generic

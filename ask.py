@@ -29,9 +29,11 @@ except ImportError:
 
 def fake_completion_factory():
     def complete(messages):
-        # Cite only what the prompt actually contains: claiming [1] with no
-        # retrieved evidence would be a fabricated citation.
-        count = 0
+        # Extractive offline answer: quote the top retrieved snippet so the
+        # default path actually answers from evidence instead of only
+        # describing it. Cite only what the prompt actually contains —
+        # claiming [1] with no evidence would be fabricated.
+        evidence = []
         for message in messages or []:
             content = message.get('content', '') if isinstance(message, dict) else ''
             if not isinstance(content, str):
@@ -40,13 +42,15 @@ def fake_completion_factory():
                 payload = json.loads(content)
             except ValueError:
                 continue
-            evidence = payload.get('evidence') if isinstance(payload, dict) else None
-            if isinstance(evidence, list):
-                count += len(evidence)
-        if count:
-            return ('Offline demo answer (fake provider — configure MODEL_API_KEY '
-                    'and --provider meta for a real model). Grounded in the '
-                    f'{count} retrieved source(s) below [1].')
+            items = payload.get('evidence') if isinstance(payload, dict) else None
+            if isinstance(items, list):
+                evidence = items
+        if evidence:
+            snippet = ' '.join(str(evidence[0].get('text', '')).split())[:220]
+            if snippet:
+                return (f'Offline extractive answer (fake provider — no model was '
+                        f'called): "{snippet}" [1]. Configure MODEL_API_KEY with '
+                        f'--provider meta for a synthesized answer.')
         return ('Offline demo answer (fake provider). No local evidence '
                 'matched, so nothing is cited.')
     return complete
@@ -210,6 +214,12 @@ def main(argv=None):
 
     subs = sorted(sub.name for sub in docs.iterdir()
                     if sub.is_dir() and not sub.name.startswith('.') and not sub.is_symlink())
+    if subs and not args.list_projects:
+        root_files = [entry.name for entry in docs.iterdir()
+                      if entry.is_file() and entry.suffix.lower() in ('.md', '.txt', '.rst')]
+        if root_files:
+            print(f'Warning: document files at the docs root ({", ".join(root_files[:3])}) '
+                  'are not searched; only project subfolders are.', file=sys.stderr)
     if not subs and not args.list_projects:
         # A docs directory full of files but no project subfolders is the
         # most common layout mistake: say exactly what to change instead
@@ -223,7 +233,12 @@ def main(argv=None):
              'or pass the parent directory as --docs.')
     if args.list_projects:
         if args.json:
-            print(json.dumps({'projects': [{'name': name} for name in subs]}, indent=2))
+            payload = {'projects': [{'name': name} for name in subs]}
+            if not subs:
+                payload['warning'] = (f'No project folders under {docs}. Create one folder '
+                                      'per project containing .md/.txt/.rst files, or pass '
+                                      'the parent directory as --docs.')
+            print(json.dumps(payload, indent=2))
         elif subs:
             print('Projects:')
             for name in subs:
@@ -231,7 +246,8 @@ def main(argv=None):
             import shlex as _shlex
             print(f'\nAsk one: python ask.py --docs {_shlex.quote(str(docs))} --project {_shlex.quote(subs[0])} --question "..."')
         else:
-            print(f'No project folders under {docs}. Create one folder per project containing .md/.txt/.rst files.')
+            print(f'No project folders under {docs}. Create one folder per project '
+                  'containing .md/.txt/.rst files, or pass the parent directory as --docs.')
         return 0
     project = args.project
     if project is None and not args.all:

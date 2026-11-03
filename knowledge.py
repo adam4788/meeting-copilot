@@ -93,10 +93,15 @@ def _clean(text):
         return prefix + '[REDACTED]' if _credential_like(token) else match.group(0)
     text = re.sub(r'(?i)\b(authorization\s*[:=]\s*bearer\s+)([^\s,;]+)',
                   lambda m: m.group(1) + '[REDACTED]', text)
+    text = re.sub(r'(?i)\b(authorization\s*[:=]\s*(?:basic|token|digest)\s+)[^\s,;]+',
+                  r'\1[REDACTED]', text)
     text = re.sub(r'(?i)\b(bearer\s+)([A-Za-z0-9._~+/=-]+)', _bearer, text)
     text = re.sub(r'(?i)\b(api[_-]?key|password|secret|access[_-]?token|refresh[_-]?token|authorization)\s*[=:]\s*[^\s,;]+', r'\1=[REDACTED]', text)
     text = re.sub(r'\b(?:sk-|ghp_|github_pat_)[A-Za-z0-9_-]{12,}', '[REDACTED]', text)
     text = re.sub(r'-----BEGIN [^-]*PRIVATE KEY-----.*?(?:-----END [^-]*PRIVATE KEY-----|$)', '[REDACTED PRIVATE KEY]', text, flags=re.S)
+    # URLs embedded in free text (transcripts, documents) carry the same
+    # credential risk as web-result URLs.
+    text = re.sub(r'https?://[^\s<>"\']+', lambda m: _clean_url(m.group(0)), text)
     return text
 
 
@@ -107,11 +112,15 @@ def _clean_url(url):
     carry credentials are rewritten, and only their sensitive parts.
     """
     raw = str(url or '')
-    sensitive = {'key', 'apikey', 'token', 'accesstoken', 'auth',
-                 'authorization', 'signature', 'sig', 'password', 'secret'}
     def _key(name):
         from urllib.parse import unquote_plus
         return re.sub(r'[^a-z0-9]', '', unquote_plus(str(name)).lower())
+    def _sensitive(name):
+        from urllib.parse import unquote_plus
+        parts = [part for part in re.split(r'[^a-z0-9]+', unquote_plus(str(name)).lower()) if part]
+        return (any(part in ('key', 'token', 'secret', 'password', 'auth',
+                             'authorization', 'signature', 'sig') for part in parts)
+                or _key(name) in ('apikey', 'accesstoken', 'refreshtoken'))
     changed = False
     # Userinfo password: scheme://user:pass@host
     match = re.match(r'^([a-zA-Z][a-zA-Z0-9+.-]*://)([^/?#@]*):([^/?#@]*)@', raw)
@@ -124,7 +133,7 @@ def _clean_url(url):
         parts = []
         for part in query.split('&'):
             key, eq, _value = part.partition('=')
-            if eq and _key(key) in sensitive:
+            if eq and _sensitive(key):
                 parts.append(f'{key}=REDACTED')
                 changed = True
             else:
@@ -136,14 +145,14 @@ def _clean_url(url):
             cleaned_fragment = _clean(fragment)
             # Fragment parameters use the same sensitive keys as queries.
             frag_parts = []
-            for part in fragment.split('&'):
+            for part in cleaned_fragment.split('&'):
                 k, eq, _v = part.partition('=')
-                if eq and _key(k) in sensitive:
+                if eq and _sensitive(k):
                     frag_parts.append(f'{k}=REDACTED')
                     changed = True
                 else:
                     frag_parts.append(part)
-            raw = head + '#' + ('&'.join(frag_parts) if changed else cleaned_fragment)
+            raw = head + '#' + '&'.join(frag_parts)
     return raw
 
 
@@ -831,18 +840,29 @@ class KnowledgeEngine:
         with self._lock:
             docs = []
             if all_projects:
+                per_project = []
+                total_docs = 0
                 for entry in self.projects()[:100]:
                     selected = Path(entry['path'])
                     folder = selected.resolve()
                     if folder.parent != self.project_root or selected.is_symlink():
                         continue
-                    # Candidates come from the project's own FTS ranking
-                    # (same tokenizer and BM25 the final rank uses), then
-                    # one combined rank orders the union. A Python-scored
-                    # shortlist kept discarding BM25's winner on phrase,
-                    # accent, and length-normalization edge cases.
-                    docs.extend(self._rank(self._files(folder), terms,
-                                           min(100, max(limit * 10, 30))))
+                    files = self._files(folder)
+                    per_project.append(files)
+                    total_docs += len(files)
+                if total_docs <= 10000:
+                    # One index over the full eligible corpus: BM25
+                    # statistics are global, so all-project ranking is
+                    # exactly the ranker's own ordering (no shortlist can
+                    # discard its winner).
+                    for files in per_project:
+                        docs.extend(files)
+                else:
+                    # Very large corpora: per-project FTS candidates as a
+                    # bounded approximation (see KNOWLEDGE.md).
+                    for files in per_project:
+                        docs.extend(self._rank(files, terms,
+                                               min(100, max(limit * 10, 30))))
             elif project:
                 selected = self.project_root / project
                 folder = selected.resolve()

@@ -17,7 +17,7 @@ python eval_retrieval.py             # synthetic recall@k + latency percentiles 
 python ask.py --docs ./sample-docs --list-projects
 python ask.py --docs ./sample-docs --search "unit price"
 python ask.py --question "What is the unit price?" --docs ./sample-docs --provider fake
-python ask.py --question "What is the unit price?" --docs ./sample-docs --transcript ./sample-docs/transcript.txt
+python ask.py --question "What is the unit price?" --docs ./sample-docs --transcript ./sample-docs/transcript.sample
 MODEL_API_KEY=YOUR_REAL_KEY python ask.py --question "..." --docs ./sample-docs --provider meta
 ```
 
