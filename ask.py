@@ -140,14 +140,29 @@ def fake_completion_factory():
                               'do', 'does', 'did', 'can', 'could', 'should',
                               'would', 'will')
                     and bool(terms) and _content_terms(body) <= terms)
+        _INTERROGATIVES = ('what', 'when', 'where', 'which', 'who', 'whom',
+                           'whose', 'why', 'how', 'is', 'are', 'was', 'were',
+                           'do', 'does', 'did', 'can', 'could', 'should',
+                           'would', 'will')
         def _is_question_text(value):
-            body = _speaker_body(value).rstrip()
-            return body.endswith('?') and bool(_term_hits(terms, body))
+            # Mostly-question text: interrogative in form and carrying few
+            # content terms beyond the question's own. An answer followed
+            # by a trailing 'Any questions?' is not mostly-question.
+            body = _speaker_body(value).strip()
+            if not _term_hits(terms, body):
+                return False
+            extra = _content_terms(body) - terms
+            if body.rstrip().endswith('?') and len(extra) <= 2:
+                return True
+            first = body.split()[0].strip('?:.,').lower() if body.split() else ''
+            if first in _INTERROGATIVES and ('.' not in body.rstrip('?') or len(extra) <= 3):
+                return True
+            return False
         def _strip_echo_prefix(line):
             # 'Alice: what is alpha beta? approved' -> 'approved': question
             # segments never score, even repeated on the same line.
             result = line
-            for _ in range(4):
+            for _ in range(100):
                 if '?' not in result:
                     return '' if _is_echo(result) else result
                 head, _, tail = result.partition('?')
@@ -180,7 +195,8 @@ def fake_completion_factory():
             for idx, item in enumerate(evidence):
                 item_body = _term_hits(terms, item.get('text', ''))
                 item_all = _term_hits(terms, f"{item.get('title', '')} {item.get('text', '')}")
-                item_passage = _passage(item.get('text', ''), terms)
+                cleaned_text = _strip_echo_prefix(str(item.get('text', '')))
+                item_passage = _passage(cleaned_text, terms)
                 item_passage_hits = (set() if (_is_echo(item_passage)
                                                or _is_question_text(item_passage))
                                      else _term_hits(terms, item_passage))

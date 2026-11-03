@@ -143,6 +143,7 @@ def _clean(text, _depth=0):
                 return match.group(0)
             if re.search(r'(?i)\btoken\b', prefix) and not re.search(r'[_-]token', prefix) \
                     and '=' not in prefix and (re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,11}', value)
+                                              or (' ' in value and not any(ch in value for ch in '._~+/='))
                                               or not _credential_like(value)):
                 return match.group(0)
         return prefix + '[REDACTED]' + close
@@ -156,6 +157,8 @@ def _clean(text, _depth=0):
     def _token_assignment(match):
         value = match.group(2)
         if re.fullmatch(r'\d{4}[-/]\d{2}[-/]\d{2}|\d{4}[A-Za-z]\d?', value):
+            return match.group(0)
+        if re.fullmatch(r'[\w.-]+\.(md|txt|rst|pdf|docx|json|csv|py|js|html)', value):
             return match.group(0)
         head, sep, tail = re.split(r'(?i)(%26|%3B)', value, maxsplit=1)[0], '', ''
         parts = re.split(r'(?i)(%26|%3B)', value, maxsplit=1)
@@ -175,7 +178,16 @@ def _clean(text, _depth=0):
             return match.group(1) + '[REDACTED]' + sep + tail
         return match.group(0)
     text = re.sub(r'(?i)\b(token\s*[:=]\s*"?)([^\s,;&"]+)', _token_assignment, text)
-    text = re.sub(r'(?i)\b(jwt\s*[:=]\s*"?)([^\s,;&"]+)', _token_assignment, text)
+    def _jwt_assignment(match):
+        value = match.group(2)
+        if '=' in match.group(1):
+            return match.group(1) + ('[REDACTED]' if len(value) >= 2 else value)
+        shaped = ((any(ch.isupper() for ch in value) and any(ch.islower() for ch in value) and len(value) >= 6)
+                  or any(ch.isdigit() for ch in value)
+                  or (any(ch in value for ch in '._~+/=') and len(value) >= 8)
+                  or len(value) >= 16)
+        return match.group(1) + ('[REDACTED]' if shaped else value)
+    text = re.sub(r'(?i)\b(jwt\s*[:=]\s*"?)([^\s,;&"]+)', _jwt_assignment, text)
     def _cookie_line(match):
         def _pair(pair_match):
             name, value = pair_match.group(1), pair_match.group(2)
@@ -260,6 +272,13 @@ def _clean_url(url, _depth=0):
         # normalized when they actually hide a sensitive assignment, so
         # ordinary values like q=dogs%26cats stay byte-for-byte intact.
         key, eq, _value = part.partition('=')
+        if eq and _key(key) in ('sessionid', 'phpsessid', 'jsessionid') \
+                and _value.isdigit() and len(_value) <= 8:
+            return part, False
+        if eq and _key(key) in ('signature', 'sig'):
+            if _credential_like(_value) or len(_value) >= 8:
+                return f'{key}=REDACTED', True
+            return part, False
         if in_fragment and eq and _key(key) == 'key':
             if _credential_like(_value) or len(_value) >= 16:
                 return f'{key}=REDACTED', True
@@ -1080,15 +1099,20 @@ class KnowledgeEngine:
         # session_id=42 still retrieve), minus credential-shaped values
         # assigned to credential keys, which providers must never see.
         blocked = set()
-        _cred_keys = r'(?:token|password|passwd|secret|api[_-]?key|authorization|session(?:_id|id)?|credential|jwt|private[_-]?key)'
+        _cred_keys = r'(token|password|passwd|secret|api[_-]?key|authorization|session(?:_id|id)?|credential|jwt|private[_-]?key)'
+        def _strong_shape(key_name, value):
+            if key_name.startswith(('jwt', 'private')):
+                return len(value) >= 6
+            return ((len(value) >= 12 and value.isalnum() and any(ch.isdigit() for ch in value))
+                    or (any(ch in value for ch in '._~+/=') and len(value) >= 8
+                        and any(ch.isdigit() for ch in value))
+                    or (len(value) >= 8 and value.isupper() and any(ch.isdigit() for ch in value)))
         for assign in re.finditer(r'(?i)' + _cred_keys + r'"?\s*[:=]\s*"([^"]*)"', question):
-            assigned = assign.group(1)
-            if len(assigned) >= 6:
-                blocked.update(re.findall(r'\w{2,}', assigned.lower()))
+            if _strong_shape(assign.group(1).lower(), assign.group(2)):
+                blocked.update(re.findall(r'\w{2,}', assign.group(2).lower()))
         for assign in re.finditer(r'(?i)' + _cred_keys + r'"?\s*[:=]\s*"?([^\s,;&"]+)', question):
-            assigned = assign.group(1)
-            if _credential_like(assigned) or len(assigned) >= 12:
-                blocked.update(re.findall(r'\w{2,}', assigned.lower()))
+            if _strong_shape(assign.group(1).lower(), assign.group(2)):
+                blocked.update(re.findall(r'\w{2,}', assign.group(2).lower()))
         for bearer in re.finditer(r'(?i)(?:\bbearer|authorization\s*[:=]\s*(?:bearer|basic|token|digest|apikey|api[- ]?key))\s+([^\s,;&"]+)', question):
             if _credential_like(bearer.group(1)) or len(bearer.group(1)) >= 12:
                 blocked.update(re.findall(r'\w{2,}', bearer.group(1).lower()))

@@ -378,6 +378,46 @@ class CoreAcceptanceTests(NoHermesTestCase):
         self.assertEqual(knowledge._clean_url('https://example.com/?q=dogs%26cats'),
                          'https://example.com/?q=dogs%26cats')
 
+    def test_round19_credential_and_benign_shapes(self):
+        import knowledge
+        self.assertEqual(knowledge._clean('jwt: alphaSecret'), 'jwt: [REDACTED]')
+        self.assertEqual(knowledge._clean('jwt=ab'), 'jwt=[REDACTED]')
+        self.assertEqual(knowledge._clean('JWT: authentication'), 'JWT: authentication')
+        self.assertEqual(knowledge._clean('Token: launch-plan.md'), 'Token: launch-plan.md')
+        self.assertEqual(knowledge._clean('Token: "release 2026"'), 'Token: "release 2026"')
+        self.assertEqual(knowledge._clean_url('https://example.com/?signature=design&sessionid=42'),
+                         'https://example.com/?signature=design&sessionid=42')
+        self.assertNotIn('abcDEF123456', knowledge._clean_url(
+            'https://example.com/?signature=abcDEF123456'))
+
+    def test_benign_token_label_terms_still_retrieve(self):
+        seen = []
+        class Hist:
+            def search(self, terms):
+                seen.extend(terms)
+                return []
+        core = self._core(completion=lambda messages: 'x [1].', history=Hist())
+        core.search('Token: Q3-planning', project='acme')
+        self.assertIn('q3', seen)
+        self.assertIn('planning', seen)
+
+    def test_fake_question_forms_are_not_answers(self):
+        import ask
+        complete = ask.fake_completion_factory()
+        def run(payload):
+            return complete([{'role': 'user', 'content': json.dumps(payload)}])
+        out = run({'question': 'What is alpha beta?',
+                   'transcript': 'Alice: ' + 'What is alpha beta? ' * 5, 'evidence': []})
+        self.assertNotIn('What is alpha beta?', out)
+        out = run({'question': 'What is alpha beta?', 'transcript': '',
+                   'evidence': [{'citation': 1, 'title': 'd',
+                                 'text': 'What is alpha beta? Pending.'}]})
+        self.assertIn('does not directly answer', out)
+        out = run({'question': 'What is alpha beta?', 'transcript': '',
+                   'evidence': [{'citation': 1, 'title': 'd',
+                                 'text': 'Alpha beta launched Monday. Any questions?'}]})
+        self.assertIn('launched Monday', out)
+
     def test_round18_credential_and_benign_shapes(self):
         import knowledge
         blob = ' '.join([
