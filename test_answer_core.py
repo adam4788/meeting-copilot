@@ -378,6 +378,44 @@ class CoreAcceptanceTests(NoHermesTestCase):
         self.assertEqual(knowledge._clean_url('https://example.com/?q=dogs%26cats'),
                          'https://example.com/?q=dogs%26cats')
 
+    def test_round20_terms_come_from_cleaned_question(self):
+        import knowledge
+        seen = []
+        class Hist:
+            def search(self, terms):
+                seen.extend(terms)
+                return []
+        core = self._core(completion=lambda messages: 'x [1].', history=Hist())
+        for query in ('password=hunter2 price', 'jwt=ab price',
+                      'token="super secret phrase" price', 'jwt%3DalphaSecret price'):
+            seen.clear()
+            core.search(query, project='acme')
+            joined = ' '.join(seen)
+            for sentinel in ('hunter2', 'alphasecret', 'super', 'phrase'):
+                self.assertNotIn(sentinel, joined, (query, seen))
+        seen.clear()
+        core.search('JWT: authentication workflow', project='acme')
+        self.assertIn('authentication', seen)
+        # Cleaner performance stays linear on unbroken alphanumeric text.
+        import time
+        started = time.perf_counter()
+        self.assertEqual(knowledge._clean('a' * 16000), 'a' * 16000)
+        self.assertLess(time.perf_counter() - started, 1.0)
+
+    def test_fake_unpunctuated_question_and_many_repetitions(self):
+        import ask
+        complete = ask.fake_completion_factory()
+        def run(payload):
+            return complete([{'role': 'user', 'content': json.dumps(payload)}])
+        out = run({'question': 'Is alpha beta approved?',
+                   'transcript': 'Is alpha beta approved or still awaiting review',
+                   'evidence': []})
+        self.assertNotIn('transcript itself says', out)
+        out = run({'question': 'What is alpha beta?',
+                   'transcript': 'Alice: ' + 'What is alpha beta? ' * 101 + 'alpha beta shipped',
+                   'evidence': []})
+        self.assertIn('alpha beta shipped', out)
+
     def test_round19_credential_and_benign_shapes(self):
         import knowledge
         self.assertEqual(knowledge._clean('jwt: alphaSecret'), 'jwt: [REDACTED]')
@@ -472,8 +510,11 @@ class CoreAcceptanceTests(NoHermesTestCase):
             self.assertNotIn(sentinel, blob)
         self.assertEqual(knowledge._clean('Session: "2024/01/01"'), 'Session: "2024/01/01"')
         self.assertEqual(knowledge._clean('Token: "ERC-20"'), 'Token: "ERC-20"')
+        # Cookie-context session values are credentials even when
+        # date-shaped; the bare label form stays preserved.
         self.assertEqual(knowledge._clean('Cookie: session=2024Q3; theme=dark'),
-                         'Cookie: session=2024Q3; theme=dark')
+                         'Cookie: session=[REDACTED]; theme=dark')
+        self.assertEqual(knowledge._clean('session=2024Q3'), 'session=2024Q3')
         self.assertEqual(knowledge._clean_url('https://example.com/docs#key=overview'),
                          'https://example.com/docs#key=overview')
 

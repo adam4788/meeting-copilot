@@ -147,10 +147,12 @@ def _clean(text, _depth=0):
                                               or not _credential_like(value)):
                 return match.group(0)
         return prefix + '[REDACTED]' + close
-    text = re.sub(r'(?i)("?(?:' + _names + r')"?\s*[:=]\s*")((?:\\.|[^"\\])*)(")',
-                  _quoted_value, text)
-    text = re.sub(r"(?i)('?(?:" + _names + r")'?\s*[:=]\s*')([^']*)(')",
-                  _quoted_value, text)
+    if ('"' in text or "'" in text) and re.search(
+            r'(?i)(token|password|passwd|secret|key|session|credential|jwt|auth)', text):
+        text = re.sub(r'(?i)("?(?:' + _names + r')"?\s*[:=]\s*")((?:\\.|[^"\\])*)(")',
+                      _quoted_value, text)
+        text = re.sub(r"(?i)('?(?:" + _names + r")'?\s*[:=]\s*')([^']*)(')",
+                      _quoted_value, text)
     def _at_value_end(match):
         rest = match.string[match.end():]
         return rest == '' or rest[0] in '\n,;)]}"\''
@@ -192,7 +194,7 @@ def _clean(text, _depth=0):
         def _pair(pair_match):
             name, value = pair_match.group(1), pair_match.group(2)
             lowered = name.lower()
-            if re.fullmatch(r'\d{4}[A-Za-z]\d?', value.strip('"')):
+            if 'sess' not in lowered and re.fullmatch(r'\d{4}[A-Za-z]\d?', value.strip('"')):
                 return pair_match.group(0)
             if (any(part in lowered for part in ('sess', 'auth', 'token', 'sid', 'csrf', 'xsrf', 'jwt', 'login', 'awsalb'))
                     or (any(ch in value for ch in '._~+/=') and len(value) >= 8)
@@ -276,6 +278,8 @@ def _clean_url(url, _depth=0):
                 and _value.isdigit() and len(_value) <= 8:
             return part, False
         if eq and _key(key) in ('signature', 'sig'):
+            if _value.islower() and _value.isalpha() and len(_value) <= 12:
+                return part, False
             if _credential_like(_value) or len(_value) >= 8:
                 return f'{key}=REDACTED', True
             return part, False
@@ -1095,29 +1099,11 @@ class KnowledgeEngine:
         if all_projects and project:
             raise ValueError('Choose all projects or one project, not both')
         limit = max(0, min(int(limit), 20))
-        # Terms come from the raw question (so benign identifiers like
-        # session_id=42 still retrieve), minus credential-shaped values
-        # assigned to credential keys, which providers must never see.
-        blocked = set()
-        _cred_keys = r'(token|password|passwd|secret|api[_-]?key|authorization|session(?:_id|id)?|credential|jwt|private[_-]?key)'
-        def _strong_shape(key_name, value):
-            if key_name.startswith(('jwt', 'private')):
-                return len(value) >= 6
-            return ((len(value) >= 12 and value.isalnum() and any(ch.isdigit() for ch in value))
-                    or (any(ch in value for ch in '._~+/=') and len(value) >= 8
-                        and any(ch.isdigit() for ch in value))
-                    or (len(value) >= 8 and value.isupper() and any(ch.isdigit() for ch in value)))
-        for assign in re.finditer(r'(?i)' + _cred_keys + r'"?\s*[:=]\s*"([^"]*)"', question):
-            if _strong_shape(assign.group(1).lower(), assign.group(2)):
-                blocked.update(re.findall(r'\w{2,}', assign.group(2).lower()))
-        for assign in re.finditer(r'(?i)' + _cred_keys + r'"?\s*[:=]\s*"?([^\s,;&"]+)', question):
-            if _strong_shape(assign.group(1).lower(), assign.group(2)):
-                blocked.update(re.findall(r'\w{2,}', assign.group(2).lower()))
-        for bearer in re.finditer(r'(?i)(?:\bbearer|authorization\s*[:=]\s*(?:bearer|basic|token|digest|apikey|api[- ]?key))\s+([^\s,;&"]+)', question):
-            if _credential_like(bearer.group(1)) or len(bearer.group(1)) >= 12:
-                blocked.update(re.findall(r'\w{2,}', bearer.group(1).lower()))
-        terms = list(dict.fromkeys(term for term in re.findall(r'\w{2,}', question.lower())
-                                   if term not in _STOPWORDS and term not in blocked))[:20]
+        # Terms come from the cleaned question, so whatever the prompt
+        # cleaner redacts can never reach history/search providers as a
+        # term, and whatever it preserves (session_id=42, Token:
+        # Q3-planning, JWT: authentication) still retrieves.
+        terms = list(dict.fromkeys(term for term in re.findall(r'\w{2,}', _clean(question).lower()) if term not in _STOPWORDS))[:20]
         if not terms or not limit:
             return []
         with self._lock:

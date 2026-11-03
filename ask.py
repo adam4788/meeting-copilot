@@ -162,7 +162,7 @@ def fake_completion_factory():
             # 'Alice: what is alpha beta? approved' -> 'approved': question
             # segments never score, even repeated on the same line.
             result = line
-            for _ in range(100):
+            for _ in range(line.count('?') + 1):
                 if '?' not in result:
                     return '' if _is_echo(result) else result
                 head, _, tail = result.partition('?')
@@ -182,7 +182,8 @@ def fake_completion_factory():
             if not window:
                 continue
             passage = _passage(window, terms)
-            hits = _term_hits(terms, passage)
+            hits = (set() if _is_question_text(passage)
+                    else _term_hits(terms, passage))
             if len(hits) > len(best_hits):
                 best_line, best_hits = passage, hits
         doc_hits, body_hits, passage_hits = set(), set(), set()
