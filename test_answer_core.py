@@ -378,6 +378,57 @@ class CoreAcceptanceTests(NoHermesTestCase):
         self.assertEqual(knowledge._clean_url('https://example.com/?q=dogs%26cats'),
                          'https://example.com/?q=dogs%26cats')
 
+    def test_round22_cleaner_and_stream_boundaries(self):
+        import knowledge, time
+        self.assertEqual(knowledge._clean('api_key: zebra'), 'api_key: [REDACTED]')
+        self.assertNotIn('SECRET123456', knowledge._clean(
+            'https://example.com/?q=token%2525252525252525253DSECRET123456'))
+        for sample in ('authorization' + ' ' * 16384 + 'X',
+                       'Cookie: ' + 'a' * 16384, 'a-' * 8192 + '!'):
+            started = time.perf_counter()
+            knowledge._clean(sample)
+            self.assertLess(time.perf_counter() - started, 2.0)
+
+    def test_stream_close_before_iteration_closes_provider(self):
+        closed = []
+        class ProviderIter:
+            def __iter__(self):
+                return iter(['chunk [1].'])
+            def close(self):
+                closed.append(True)
+        class Streaming:
+            def __call__(self, messages):
+                raise AssertionError('non-stream path must not be used')
+            def stream_chunks(self, messages):
+                return ProviderIter()
+        core = self._core(completion=Streaming())
+        _header, stream = core.answer_stream('What is the price?', project='acme')
+        stream.close()
+        self.assertEqual(closed, [True])
+
+    def test_fake_response_marker_boundaries(self):
+        import ask
+        complete = ask.fake_completion_factory()
+        def run(payload):
+            return complete([{'role': 'user', 'content': json.dumps(payload)}])
+        out = run({'question': 'What is alpha beta?', 'transcript': '',
+                   'evidence': [{'citation': 1, 'title': 'd',
+                                 'text': 'Is alpha beta approved? The budget discussion is tomorrow.'}]})
+        self.assertIn('does not directly answer', out)
+        out = run({'question': 'What is alpha beta?',
+                   'transcript': 'Is alpha beta approved? Yes, it shipped today.',
+                   'evidence': []})
+        self.assertIn('shipped today', out)
+        out = run({'question': 'What is alpha beta?',
+                   'transcript': 'Alpha beta launched Monday. Is alpha beta approved?',
+                   'evidence': []})
+        self.assertIn('launched Monday', out)
+        self.assertNotIn('Is alpha beta approved?', out)
+        out = run({'question': 'What is alpha beta?', 'transcript': '',
+                   'evidence': [{'citation': 1, 'title': 'd',
+                                 'text': 'Is alpha beta approved? Alice: Yes, it shipped today.'}]})
+        self.assertIn('shipped today', out)
+
     def test_round21_cleaner_shapes_and_perf(self):
         import knowledge, time
         self.assertNotIn('SENSITIVE123', knowledge._clean(
@@ -573,7 +624,9 @@ class CoreAcceptanceTests(NoHermesTestCase):
         out = run({'question': 'what is alpha beta?',
                    'transcript': 'Alice: what is alpha beta? approved for launch',
                    'evidence': []})
-        self.assertNotIn('approved for launch', out)
+        # Same-line response remainder after the stripped question counts.
+        self.assertIn('approved for launch', out)
+        self.assertNotIn('what is alpha beta?', out.split('says:')[-1])
         out = run({'question': 'what is alpha beta?',
                    'transcript': '[10:00] Alice: what is alpha beta?\nBob: alpha beta approved',
                    'evidence': []})
@@ -629,13 +682,13 @@ class CoreAcceptanceTests(NoHermesTestCase):
                    'evidence': [{'citation': 1, 'title': 'd',
                                  'text': 'alphabet betamax unrelated'}]})
         self.assertIn('transcript itself says', out)
-        # The line after an echoed question shares no terms with it, so it
-        # is not presented as the answer (it could be about anything).
+        # A response-word line after an echoed question ('approved ...')
+        # counts as the transcript's answer; the question itself does not.
         out = run({'question': 'what is alpha beta?',
                    'transcript': 'what is alpha beta?\napproved for launch',
                    'evidence': []})
-        self.assertNotIn('approved for launch', out)
-        self.assertIn('No local evidence matched', out)
+        self.assertIn('approved for launch', out)
+        self.assertNotIn('what is alpha beta?', out.split('says:')[-1])
         # With speaker labels the echo is still ignored, and a following
         # matching line is used.
         out = run({'question': 'what is alpha beta?',

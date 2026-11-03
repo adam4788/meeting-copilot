@@ -146,7 +146,7 @@ def fake_completion_factory():
                            'do', 'does', 'did', 'can', 'could', 'should',
                            'would', 'will')
         _RESPONSE_START = ('yes', 'no', 'approved', 'confirmed', 'shipped',
-                           'launched', 'done', 'agreed', 'correct', 'it', 'the')
+                           'launched', 'done', 'agreed', 'correct')
         def _is_question_sentence(sentence):
             body = _speaker_body(sentence).strip()
             if not _term_hits(terms, body):
@@ -160,7 +160,7 @@ def fake_completion_factory():
             kept = [s for s in sentences if s.strip() and not _is_question_sentence(s)]
             return ' '.join(kept)
         def _starts_with_response(value):
-            words = _re.findall(r"[a-z']+", str(value).lower())
+            words = _re.findall(r"[a-z']+", _speaker_body(value).lower())
             return bool(words) and words[0] in _RESPONSE_START
         def _is_question_text(value):
             # Mostly-question text: interrogative in form and carrying few
@@ -194,6 +194,7 @@ def fake_completion_factory():
         best_line, best_hits = '', set()
         lines = str(transcript).splitlines()
         for i in range(len(lines)):
+            raw_window = ' '.join(part.strip() for part in lines[i:i + 3] if part.strip())
             kept = [part for part in (_strip_echo_prefix(part) for part in lines[i:i + 3])
                     if part and part.strip()]
             window = ' '.join(kept)
@@ -203,8 +204,12 @@ def fake_completion_factory():
             cleaned_passage = _non_question_text(passage)
             hits = (set() if _is_question_text(cleaned_passage)
                     else _term_hits(terms, cleaned_passage))
-            if not hits and cleaned_passage and _starts_with_response(cleaned_passage) \
-                    and _term_hits(terms, window):
+            if hits:
+                passage = cleaned_passage
+            elif cleaned_passage and _starts_with_response(cleaned_passage) \
+                    and _term_hits(terms, raw_window):
+                # Response remainder after a stripped question on the same
+                # line(s): the raw window still holds the question terms.
                 hits = set(terms)
                 passage = cleaned_passage
             if len(hits) > len(best_hits):

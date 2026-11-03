@@ -92,7 +92,7 @@ def _clean(text, _depth=0):
     # Percent-encoded credential assignments (single/double-encoded JSON):
     # redact just the value in place so benign encoded text nearby (e.g.
     # %22launch plan%22) stays byte-for-byte intact.
-    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])?token|password|passwd|secret|api[ _-]?key|authorization|session(?:_id|id)?|credential|phpsessid|jsessionid|jwt|private(?:[_-]|%5[Ff])?key)(?:%253[ad]|%3[ad])(?:[^\s&;%]|%(?!26|3[bB]))+',
+    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]{0,24}?[_-])?token|password|passwd|secret|api[ _-]?key|authorization|session(?:_id|id)?|credential|phpsessid|jsessionid|jwt|private(?:[_-]|%5[Ff])?key)(?:%253[ad]|%3[ad])(?:[^\s&;%]|%(?!26|3[bB]))+',
                   r'\1=[REDACTED]', text)
     _q = r'(?:%2522|%22)'
     _c = r'(?:%253[ad]|%3[ad])'
@@ -106,11 +106,11 @@ def _clean(text, _depth=0):
     def _bearer(match):
         prefix, token = match.group(1), match.group(2)
         return prefix + '[REDACTED]' if _credential_like(token) else match.group(0)
-    text = re.sub(r'(?i)\b(authorization\s*[:=]\s*bearer\s+)([^\s,;]+)',
+    text = re.sub(r'(?i)\b(authorization\s{0,8}[:=]\s{0,8}bearer\s{1,8})([^\s,;]+)',
                   lambda m: m.group(1) + '[REDACTED]', text)
-    text = re.sub(r'(?i)\b(authorization\s*[:=]\s*(?:basic|token|digest|apikey|api[- ]?key)\s+)[^\s,;]+',
+    text = re.sub(r'(?i)\b(authorization\s{0,8}[:=]\s{0,8}(?:basic|token|digest|apikey|api[- ]?key)\s{1,8})[^\s,;]+',
                   r'\1[REDACTED]', text)
-    text = re.sub(r'(?i)\b(authorization\s*[-–—:]?\s*(?:bearer|basic|token|digest)\s+)[^\s,;]+',
+    text = re.sub(r'(?i)\b(authorization[ \t]{0,8}[-–—:]?[ \t]{0,8}(?:bearer|basic|token|digest)\s{1,8})[^\s,;]+',
                   r'\1[REDACTED]', text)
     text = re.sub(r'(?i)\b(bearer\s+)([A-Za-z0-9._~+/=-]+)', _bearer, text)
     def _session_value(match):
@@ -201,7 +201,7 @@ def _clean(text, _depth=0):
                     or len(value) >= 24):
                 return f'{name.strip()}=[REDACTED]'
             return pair_match.group(0)
-        return re.sub(r'([A-Za-z0-9_.-]+)\s*=\s*("[^"]*"|[^\s;]+)', _pair, match.group(0))
+        return re.sub(r'([A-Za-z0-9_.-]{1,64})\s{0,4}=\s{0,4}("[^"]*"|[^\s;]+)', _pair, match.group(0))
     text = re.sub(r'(?im)^.*\b(?:set-cookie|cookie)\s*:.*$', _cookie_line, text)
     def _session_assignment(match):
         value = match.group(2)
@@ -232,8 +232,12 @@ def _clean(text, _depth=0):
     text = re.sub(r'(?i)\b(session(?:_id|id)?\s*[:=]\s*"?)((?:[^\s,;&"%]|%(?!26|3[bB]))+)', _session_assignment, text)
     text = re.sub(r'(?i)\b(credential\s*[:=]\s*"?)((?:[^\s,;&"%]|%(?!26|3[bB]))+)',
                   lambda m: m.group(1) + ('[REDACTED]' if ('=' in m.group(1) and len(m.group(2)) >= 3) or _credential_like(m.group(2)) else m.group(2)), text)
-    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])token|csrftoken|xsrftoken|password|passwd|secret|private[_-]?key|client[ _-]?secret|authorization|phpsessid|jsessionid|sid)"?\s*[=:]\s*"?(?:[^\s,;&"%]|%(?!26|3[bB]))+', r'\1=[REDACTED]', text)
-    text = re.sub(r'(?i)\b(api[ _-]?key\s*[:=]\s*"?)([^\s,;&"]+)', _token_assignment, text)
+    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]{0,24}?[_-])token|csrftoken|xsrftoken|password|passwd|secret|private[_-]?key|client[ _-]?secret|authorization|phpsessid|jsessionid|sid)"?\s*[=:]\s*"?(?:[^\s,;&"%]|%(?!26|3[bB]))+', r'\1=[REDACTED]', text)
+    def _api_key_assignment(match):
+        if '_' in match.group(1) or '-' in match.group(1) or '=' in match.group(1):
+            return match.group(1) + ('[REDACTED]' if len(match.group(2)) >= 2 else match.group(2))
+        return _token_assignment(match)
+    text = re.sub(r'(?i)\b(api[ _-]?key\s*[:=]\s*"?)([^\s,;&"]+)', _api_key_assignment, text)
     # ALL-CAPS env-style assignments: MCP_API_KEY=..., SERVICE_AUTH_TOKEN=...
     text = re.sub(r'\b([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|AUTH)[A-Z0-9_]*\s*=\s*)[^\s,;]+',
                   r'\1[REDACTED]', text)
@@ -305,7 +309,15 @@ def _clean_url(url, _depth=0):
         # only rewrite when a sensitive key actually surfaces.
         from urllib.parse import unquote_plus
         decoded = unquote_plus(part)
-        if decoded != part and _depth < 8:
+        if decoded != part:
+            if _depth >= 8:
+                # Deeply encoded input: if a credential key is still
+                # visible after 8 decodes, fail closed rather than pass
+                # the value through.
+                if re.search(r'(?i)(token|password|secret|key|session|credential|jwt|auth)', decoded):
+                    key, eq, _v = part.partition('=')
+                    return (f'{key}=REDACTED', True) if eq else ('REDACTED', True)
+                return part, False
             processed, flag = _redact_part(decoded, in_fragment=in_fragment, _depth=_depth + 1)
             if flag:
                 return processed, True
@@ -966,38 +978,65 @@ class KnowledgeEngine:
                 raise err from exc
             raise RuntimeError(f'Model request failed ({type(exc).__name__}).') from None
 
-        def guarded():
-            # The provider request starts on first iteration, not when the
-            # generator is created: recheck cancellation at consumption time.
-            if aborted():
-                raise _Aborted('cancelled before lazy stream consumption')
-            yielded = False
-            try:
-                for chunk in chunks:  # type: ignore
-                    yielded = True
-                    yield chunk
-            except _Aborted:
-                raise
-            except NotImplementedError:
-                if not self._standalone_mode:
-                    raise
-                raise NotImplementedError('streaming_unsupported:provider-not-implemented') from None
-            except Exception as exc:
-                if default_meta_route and not yielded:
-                    raise NotImplementedError('streaming_unsupported:default-meta-route-failed') from exc
-                if not self._standalone_mode:
-                    raise
-                # Standalone: provider exception text can embed
-                # credentials/endpoints — surface the failure type only.
-                raise RuntimeError(f'Model request failed ({type(exc).__name__}).') from None
-            finally:
+        _standalone_mode = self._standalone_mode
+        class _GuardedStream:
+            """Iterator whose close() always closes the provider iterator,
+            even before iteration starts or after a pre-iteration abort
+            (a plain generator's finally cannot run in those cases)."""
+            def __init__(self):
+                self._started = False
+                self._closed = False
+                self._yielded = False
+                self._iterator = None
+            def __iter__(self):
+                return self
+            def close(self):
+                if self._closed:
+                    return
+                self._closed = True
                 _close = getattr(chunks, 'close', None)
                 if callable(_close):
                     try:
                         _close()
                     except Exception:
                         pass
-        return header, guarded()
+            def __next__(self):
+                if self._closed:
+                    raise StopIteration
+                if not self._started:
+                    self._started = True
+                    # The provider request starts on first iteration, not
+                    # when the stream is created: recheck cancellation at
+                    # consumption time.
+                    if aborted():
+                        self.close()
+                        raise _Aborted('cancelled before lazy stream consumption')
+                    self._iterator = iter(chunks)
+                try:
+                    chunk = next(self._iterator)
+                except StopIteration:
+                    self.close()
+                    raise
+                except _Aborted:
+                    self.close()
+                    raise
+                except NotImplementedError:
+                    self.close()
+                    if not _standalone_mode:
+                        raise
+                    raise NotImplementedError('streaming_unsupported:provider-not-implemented') from None
+                except Exception as exc:
+                    self.close()
+                    if default_meta_route and not self._yielded:
+                        raise NotImplementedError('streaming_unsupported:default-meta-route-failed') from exc
+                    if not _standalone_mode:
+                        raise
+                    # Standalone: provider exception text can embed
+                    # credentials/endpoints — surface the failure type only.
+                    raise RuntimeError(f'Model request failed ({type(exc).__name__}).') from None
+                self._yielded = True
+                return chunk
+        return header, _GuardedStream()
 
     @staticmethod
     def _preselect(docs, terms, limit, token_cache=None):
