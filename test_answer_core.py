@@ -355,6 +355,22 @@ class CoreAcceptanceTests(NoHermesTestCase):
         self.assertNotIn('secret123', knowledge._clean_url(
             'https://example.com/x?refresh%5Ftoken=secret123'))
 
+    def test_semicolon_params_and_ordinary_sort_key(self):
+        import knowledge
+        self.assertNotIn('SENTINEL1', knowledge._clean_url(
+            'https://example.test/?page=one;access_token=SENTINEL1'))
+        self.assertEqual(knowledge._clean_url('https://example.com/?sort_key=price'),
+                         'https://example.com/?sort_key=price')
+        self.assertNotIn('SENTINEL2', knowledge._clean_url(
+            'https://example.com/?api_key=SENTINEL2&ok=1'))
+
+    def test_deeply_nested_fragment_urls_do_not_recurse(self):
+        import knowledge
+        nested = 'https://example.com/#a'
+        for _ in range(400):
+            nested = 'https://example.com/#' + nested
+        self.assertIsInstance(knowledge._clean(nested), str)
+
     def test_round7_credential_shapes_are_scrubbed(self):
         import knowledge
         samples = [
@@ -635,6 +651,47 @@ class AskCliTests(unittest.TestCase):
                                       '--limit', '1'])
         self.assertEqual(code, 0)
         self.assertIn('--limit applies only to --search', err)
+
+    def test_list_projects_excludes_ineligible_folders(self):
+        (Path(self.docs) / '__pycache__').mkdir()
+        (Path(self.docs) / 'node_modules').mkdir()
+        code, out, _ = self._capture(['--docs', self.docs, '--list-projects', '--json'])
+        self.assertEqual(code, 0)
+        names = [p['name'] for p in json.loads(out)['projects']]
+        self.assertEqual(names, ['acme'])
+
+    def test_json_payloads_carry_warnings(self):
+        (Path(self.docs) / 'root.md').write_text('root notes', encoding='utf-8')
+        code, out, _ = self._capture(['--docs', self.docs, '--search', 'Acme',
+                                      '--transcript', 'ignored.txt', '--json'])
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        blob = ' '.join(payload.get('warnings', []))
+        self.assertIn('are not searched', blob)
+        self.assertIn('--transcript is ignored', blob)
+
+    def test_fake_prefers_transcript_over_unrelated_document(self):
+        (Path(self.docs) / 'acme' / 'notes.md').write_text(
+            'The launch plan requires renewal and budget approval.\n', encoding='utf-8')
+        transcript = Path(self.docs) / 'input.txt'
+        transcript.write_text('Alice: the launch date is November 17.\n', encoding='utf-8')
+        code, out, _ = self._capture(['--question', 'When is the launch date?',
+                                      '--docs', self.docs, '--provider', 'fake',
+                                      '--transcript', str(transcript)])
+        self.assertEqual(code, 0)
+        answer = out.split('\n\nSources')[0]
+        self.assertIn('transcript itself says', answer)
+        self.assertIn('November 17', answer)
+
+    def test_fake_does_not_quote_unrelated_document_as_answer(self):
+        (Path(self.docs) / 'acme' / 'notes.md').write_text(
+            'The launch plan requires renewal and budget approval.\n', encoding='utf-8')
+        code, out, _ = self._capture(['--question', 'When is the launch date?',
+                                      '--docs', self.docs, '--provider', 'fake'])
+        self.assertEqual(code, 0)
+        answer = out.split('\n\nSources')[0]
+        self.assertIn('does not directly answer', answer)
+        self.assertNotIn('requires renewal and budget approval', answer)
 
     def test_root_documents_warn_they_are_not_searched(self):
         (Path(self.docs) / 'root.md').write_text('root price notes', encoding='utf-8')

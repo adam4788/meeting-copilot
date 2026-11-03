@@ -57,9 +57,13 @@ def build_corpus(root, projects=12, docs_per_project=5):
                 f'Project {p} document {d} discusses {topic} in ordinary prose. {detail}\n',
                 encoding='utf-8')
             if d == 0:
+                # The detail query must identify one project: topic+color
+                # repeats every 12 projects, so an unqualified detail phrase
+                # is genuinely ambiguous at scale and no ranker could pass
+                # a parity gate on it. Docs already state "Project {p}".
                 queries.append({'query': f'{words} {marker}',
                                 'topic_query': words,
-                                'detail_query': detail,
+                                'detail_query': f'{detail} project {p}',
                                 'topic': topic,
                                 'project': project.name,
                                 'expected': f'{topic}-{d}.md'})

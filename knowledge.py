@@ -83,7 +83,7 @@ def _credential_like(value):
             or len(value) >= 32)
 
 
-def _clean(text):
+def _clean(text, _depth=0):
     text = str(text)
     # Percent-encoded JSON blobs (e.g. %22auth_token%22%3A...) hide their
     # key names from the assignment rules below; decode them first when a
@@ -119,11 +119,13 @@ def _clean(text):
     text = re.sub(r'-----BEGIN [^-]*PRIVATE KEY-----.*?(?:-----END [^-]*PRIVATE KEY-----|$)', '[REDACTED PRIVATE KEY]', text, flags=re.S)
     # URLs embedded in free text (transcripts, documents) carry the same
     # credential risk as web-result URLs.
-    text = re.sub(r'https?://[^\s<>"\']+', lambda m: _clean_url(m.group(0)), text)
+    text = re.sub(r'https?://[^\s<>"\']+',
+                  lambda m: _clean_url(m.group(0), _depth=_depth + 1) if _depth < 3 else '[removed URL]',
+                  text)
     return text
 
 
-def _clean_url(url):
+def _clean_url(url, _depth=0):
     """Redact credential-bearing URL parts (userinfo, sensitive query keys).
 
     Ordinary URLs return byte-for-byte unchanged: only URLs that actually
@@ -138,9 +140,11 @@ def _clean_url(url):
     def _sensitive(name):
         from urllib.parse import unquote_plus
         parts = [part for part in re.split(r'[^a-z0-9]+', unquote_plus(str(name)).lower()) if part]
-        return (any(part in ('key', 'token', 'secret', 'password', 'auth',
+        return (any(part in ('token', 'secret', 'password', 'auth',
                              'authorization', 'signature', 'sig') for part in parts)
-                or _key(name) in ('apikey', 'accesstoken', 'refreshtoken'))
+                or _key(name) in ('key', 'apikey', 'accesstoken', 'refreshtoken',
+                                  'clientsecret')
+                or ('api' in parts and 'key' in parts))
     changed = False
     # Userinfo password: scheme://user:pass@host
     match = re.match(r'^([a-zA-Z][a-zA-Z0-9+.-]*://)([^/?#@]*):([^/?#@]*)@', raw)
@@ -152,29 +156,29 @@ def _clean_url(url):
         query, hashmark, fragment = rest.partition('#')
         # Encoded pair delimiters (%26, %3B) otherwise hide later keys.
         query = re.sub(r'(?i)%26|%3B', '&', query)
-        parts = []
-        for part in query.split('&'):
+        tokens = re.split(r'([&;])', query)
+        for i, part in enumerate(tokens):
+            if i % 2 == 1:
+                continue
             key, eq, _value = part.partition('=')
             if eq and _sensitive(key):
-                parts.append(f'{key}=REDACTED')
+                tokens[i] = f'{key}=REDACTED'
                 changed = True
-            else:
-                parts.append(part)
-        raw = base + '?' + '&'.join(parts) + (hashmark + fragment if hashmark else '')
+        raw = base + '?' + ''.join(tokens) + (hashmark + fragment if hashmark else '')
     if '#' in raw:
         head, _, fragment = raw.partition('#')
         if '=' in fragment:
-            cleaned_fragment = _clean(re.sub(r'(?i)%26|%3B', '&', fragment))
+            cleaned_fragment = _clean(re.sub(r'(?i)%26|%3B', '&', fragment), _depth=_depth)
             # Fragment parameters use the same sensitive keys as queries.
-            frag_parts = []
-            for part in cleaned_fragment.split('&'):
+            frag_tokens = re.split(r'([&;])', cleaned_fragment)
+            for i, part in enumerate(frag_tokens):
+                if i % 2 == 1:
+                    continue
                 k, eq, _v = part.partition('=')
                 if eq and _sensitive(k):
-                    frag_parts.append(f'{k}=REDACTED')
+                    frag_tokens[i] = f'{k}=REDACTED'
                     changed = True
-                else:
-                    frag_parts.append(part)
-            raw = head + '#' + '&'.join(frag_parts)
+            raw = head + '#' + ''.join(frag_tokens)
     return raw
 
 

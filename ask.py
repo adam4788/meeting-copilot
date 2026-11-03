@@ -27,13 +27,38 @@ except ImportError:
     from answer_core import AnswerCore, DisabledSearch, NoHistory
 
 
+_STOPWORDS = {'what', 'when', 'where', 'which', 'who', 'whom', 'whose', 'why',
+              'how', 'does', 'did', 'the', 'a', 'an', 'of', 'for', 'to', 'in',
+              'on', 'about', 'give', 'me', 'tell', 'please', 'according',
+              'meeting', 'say', 'said', 'is', 'are', 'was', 'were', 'do'}
+
+
+def _content_terms(value):
+    import re as _re
+    return {tok for tok in _re.findall(r'[a-z0-9]+', str(value).lower())
+            if len(tok) >= 3 and tok not in _STOPWORDS}
+
+
+def _term_hits(terms, value):
+    tokens = _content_terms(value)
+    hits = set()
+    for term in terms:
+        for tok in tokens:
+            if tok == term or (len(term) >= 4 and tok.startswith(term)) or \
+                    (len(tok) >= 4 and term.startswith(tok)):
+                hits.add(term)
+                break
+    return hits
+
+
 def fake_completion_factory():
     def complete(messages):
-        # Extractive offline answer: quote the top retrieved snippet so the
-        # default path actually answers from evidence instead of only
-        # describing it. Cite only what the prompt actually contains —
-        # claiming [1] with no evidence would be fabricated.
-        evidence = []
+        # Extractive offline answer: quote the top retrieved snippet only
+        # when it actually shares content terms with the question. An
+        # unrelated snippet is evidence, not an answer; if the transcript
+        # itself matches better, say so (uncited) instead of dressing the
+        # document up as the answer.
+        evidence, question, transcript = [], '', ''
         for message in messages or []:
             content = message.get('content', '') if isinstance(message, dict) else ''
             if not isinstance(content, str):
@@ -42,18 +67,43 @@ def fake_completion_factory():
                 payload = json.loads(content)
             except ValueError:
                 continue
-            items = payload.get('evidence') if isinstance(payload, dict) else None
-            if isinstance(items, list):
-                evidence = items
+            if not isinstance(payload, dict):
+                continue
+            if isinstance(payload.get('evidence'), list):
+                evidence = payload['evidence']
+            if isinstance(payload.get('question'), str):
+                question = payload['question']
+            if isinstance(payload.get('transcript'), str):
+                transcript = payload['transcript']
+        terms = _content_terms(question)
         if evidence:
-            snippet = ' '.join(str(evidence[0].get('text', '')).split())[:220]
-            if snippet:
-                title = ' '.join(str(evidence[0].get('title', '')).split())[:80]
+            top = evidence[0]
+            snippet = ' '.join(str(top.get('text', '')).split())[:220]
+            doc_hits = _term_hits(terms, f"{top.get('title', '')} {top.get('text', '')}")
+            best_line, best_hits = '', set()
+            for line in str(transcript).splitlines():
+                hits = _term_hits(terms, line)
+                if len(hits) > len(best_hits):
+                    best_line, best_hits = line.strip(), hits
+            if snippet and len(doc_hits) >= 2 and len(doc_hits) >= len(best_hits):
+                title = ' '.join(str(top.get('title', '')).split())[:80]
                 redacted = ' (searched snippet redacted)' if 'REDACTED' in snippet else ''
                 from_line = f' From {title}:' if title else ''
                 return (f'Offline extractive answer (fake provider — no model was '
                         f'called){redacted}.{from_line} "{snippet}" [1]. Configure '
                         f'MODEL_API_KEY with --provider meta for a synthesized answer.')
+            if best_line and len(best_hits) >= 1 and len(best_hits) > len(doc_hits):
+                quote = ' '.join(best_line.split())[:220]
+                return ('Offline extractive answer (fake provider — no model was '
+                        'called): the retrieved documents do not directly answer '
+                        f'this; the transcript itself says: "{quote}" (transcript, '
+                        'uncited). Configure MODEL_API_KEY with --provider meta '
+                        'for a synthesized answer.')
+            return ('Offline extractive answer (fake provider — no model was '
+                    'called): retrieved evidence does not directly answer this '
+                    'question, so no snippet is presented as an answer. See the '
+                    'sources below, or configure MODEL_API_KEY with --provider '
+                    'meta for a synthesized answer.')
         return ('Offline demo answer (fake provider). No local evidence '
                 'matched, so nothing is cited.')
     return complete
@@ -203,31 +253,41 @@ def main(argv=None):
              '  List projects: python ask.py --docs ./sample-docs --list-projects')
     if args.project and args.all and not args.list_projects:
         fail('Choose --project NAME or --all, not both.')
+    # Warnings go to stderr for humans and into JSON payloads for machines.
+    cli_warnings = []
+    def warn(message):
+        cli_warnings.append(message)
+        print(f'Warning: {message}', file=sys.stderr)
     if args.limit is not None and args.search is None:
-        print('Warning: --limit applies only to --search and is ignored here.', file=sys.stderr)
+        warn('--limit applies only to --search and is ignored here.')
     if args.list_projects and args.all:
-        print('Warning: --all is ignored with --list-projects.', file=sys.stderr)
+        warn('--all is ignored with --list-projects.')
     if (args.list_projects or args.search is not None) and args.question is not None and not args.question.strip():
-        print('Warning: --question is ignored in this mode.', file=sys.stderr)
+        warn('--question is ignored in this mode.')
     if args.model and args.provider == 'fake':
-        print('Warning: --model is ignored with --provider fake.', file=sys.stderr)
+        warn('--model is ignored with --provider fake.')
     if (args.list_projects or args.search is not None) and args.provider != 'fake':
-        print('Warning: --provider/--model are ignored in this mode; no model is called.', file=sys.stderr)
+        warn('--provider/--model are ignored in this mode; no model is called.')
     if args.search is not None and args.transcript is not None:
-        print('Warning: --transcript is ignored with --search; evidence comes from docs only.', file=sys.stderr)
+        warn('--transcript is ignored with --search; evidence comes from docs only.')
     if args.list_projects and args.project is not None:
-        print('Warning: --project is ignored with --list-projects.', file=sys.stderr)
+        warn('--project is ignored with --list-projects.')
     if args.list_projects and args.transcript is not None:
-        print('Warning: --transcript is ignored with --list-projects.', file=sys.stderr)
+        warn('--transcript is ignored with --list-projects.')
 
+    import re as _re
+    _denied = _re.compile(r'(auth|credential|secret|password|token|config|\.env)', _re.I)
+    _skip = {'node_modules', 'venv', 'env', 'build', 'dist', '__pycache__', 'profiles'}
     subs = sorted(sub.name for sub in docs.iterdir()
-                    if sub.is_dir() and not sub.name.startswith('.') and not sub.is_symlink())
+                  if sub.is_dir() and not sub.name.startswith('.')
+                  and not sub.is_symlink() and not _denied.search(sub.name)
+                  and sub.name.lower() not in _skip)
     if subs:
         root_files = [entry.name for entry in docs.iterdir()
                       if entry.is_file() and entry.suffix.lower() in ('.md', '.txt', '.rst')]
         if root_files:
-            print(f'Warning: document files at the docs root ({", ".join(root_files[:3])}) '
-                  'are not searched; only project subfolders are.', file=sys.stderr)
+            warn(f'document files at the docs root ({", ".join(root_files[:3])}) '
+                 'are not searched; only project subfolders are.')
     if not subs and not args.list_projects:
         # A docs directory full of files but no project subfolders is the
         # most common layout mistake: say exactly what to change instead
@@ -246,6 +306,9 @@ def main(argv=None):
                 payload['warning'] = (f'No project folders under {docs}. Create one folder '
                                       'per project containing .md/.txt/.rst files, or pass '
                                       'the parent directory as --docs.')
+                cli_warnings.append(payload['warning'])
+            if cli_warnings:
+                payload['warnings'] = list(cli_warnings)
             print(json.dumps(payload, indent=2))
         elif subs:
             print('Projects:')
@@ -283,9 +346,14 @@ def main(argv=None):
                                 all_projects=args.all)
         except ValueError as exc:
             fail(f'Invalid request: {exc}')
+        if len(found) >= search_limit:
+            warn(f'results hit the --limit cap ({search_limit}); more evidence may exist. '
+                 'Raise --limit (max 20) or narrow the terms.')
         if args.json:
-            print(json.dumps({'query': args.search, 'count': len(found), 'sources': found},
-                             indent=2, default=str))
+            payload = {'query': args.search, 'count': len(found), 'sources': found}
+            if cli_warnings:
+                payload['warnings'] = list(cli_warnings)
+            print(json.dumps(payload, indent=2, default=str))
         else:
             _print_sources(found)
         return 0
@@ -331,6 +399,8 @@ def main(argv=None):
         # ask.py never wires session history, so the engine's prior-session
         # caveat is stale here even for a live provider.
         result['warnings'] = [w for w in result['warnings'] if 'prior-session' not in w]
+    if cli_warnings:
+        result['warnings'] = list(cli_warnings) + list(result.get('warnings') or [])
     total = time.monotonic() - started
     failed = bool(result.get('provider_error'))
     if args.json:
