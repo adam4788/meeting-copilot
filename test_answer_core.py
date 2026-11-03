@@ -378,6 +378,39 @@ class CoreAcceptanceTests(NoHermesTestCase):
         self.assertEqual(knowledge._clean_url('https://example.com/?q=dogs%26cats'),
                          'https://example.com/?q=dogs%26cats')
 
+    def test_round23_spaced_labels_and_stream_iteration(self):
+        import knowledge
+        self.assertEqual(knowledge._clean('refresh token "SessionSecret-42"'),
+                         'refresh token [REDACTED]')
+        self.assertNotIn('SessionSecret-42', knowledge._clean(
+            'refresh token SessionSecret-42'))
+        self.assertEqual(knowledge._clean('refresh token is required'),
+                         'refresh token is required')
+        self.assertEqual(knowledge._clean('session id=alpha beta'),
+                         'session id=alpha beta')
+        self.assertNotIn('SessionSecret-42', knowledge._clean(
+            'session id=SessionSecret-42'))
+        self.assertNotIn('SECRET123456', knowledge._clean(
+            'abcdefghijklmnopqrstuvwxyzabcdefghij_token=SECRET123456'))
+        # Iterator creation failures are sanitized and close the provider.
+        closed = []
+        class Broken:
+            def __iter__(self):
+                raise RuntimeError('provider SECRET123')
+            def close(self):
+                closed.append(True)
+        class Provider:
+            def __call__(self, messages):
+                return 'x [1].'
+            def stream_chunks(self, messages):
+                return Broken()
+        core = self._core(completion=Provider())
+        _header, stream = core.answer_stream('What is the price?', project='acme')
+        with self.assertRaises(RuntimeError) as ctx:
+            next(stream)
+        self.assertNotIn('SECRET123', str(ctx.exception))
+        self.assertEqual(closed, [True])
+
     def test_round22_cleaner_and_stream_boundaries(self):
         import knowledge, time
         self.assertEqual(knowledge._clean('api_key: zebra'), 'api_key: [REDACTED]')

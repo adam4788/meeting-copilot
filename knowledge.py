@@ -92,7 +92,7 @@ def _clean(text, _depth=0):
     # Percent-encoded credential assignments (single/double-encoded JSON):
     # redact just the value in place so benign encoded text nearby (e.g.
     # %22launch plan%22) stays byte-for-byte intact.
-    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]{0,24}?[_-])?token|password|passwd|secret|api[ _-]?key|authorization|session(?:_id|id)?|credential|phpsessid|jsessionid|jwt|private(?:[_-]|%5[Ff])?key)(?:%253[ad]|%3[ad])(?:[^\s&;%]|%(?!26|3[bB]))+',
+    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]{0,64}?[_-])?token|password|passwd|secret|api[ _-]?key|authorization|session(?:_id|id)?|credential|phpsessid|jsessionid|jwt|private(?:[_-]|%5[Ff])?key)(?:%253[ad]|%3[ad])(?:[^\s&;%]|%(?!26|3[bB]))+',
                   r'\1=[REDACTED]', text)
     _q = r'(?:%2522|%22)'
     _c = r'(?:%253[ad]|%3[ad])'
@@ -127,10 +127,10 @@ def _clean(text, _depth=0):
                 or (token.isdigit() and len(token) >= 9):
             return match.group(1) + '[REDACTED]'
         return match.group(0)
-    text = re.sub(r'(?i)\b(session\s+)([A-Za-z0-9._~+/=-]+)', _session_value, text)
+    text = re.sub(r'(?i)\b(session\s+)([A-Za-z0-9._~+/-]+)', _session_value, text)
     # Quoted values redact whole: password: "abc def" and {"token":"x"}
     # are credentials by context whatever their shape.
-    _names = (r'(?:[a-z][a-z0-9_-]*[_-])?token|csrftoken|xsrftoken|private[_-]?key|jwt|api[ _-]?key|'
+    _names = (r'(?:[a-z][a-z0-9_-]{0,64}?[_-])?token|csrftoken|xsrftoken|private[_-]?key|jwt|api[ _-]?key|'
               r'password|passwd|secret|client[ _-]?secret|authorization|credential|'
               r'session(?:id)?|sid')
     def _quoted_value(match):
@@ -190,6 +190,13 @@ def _clean(text, _depth=0):
                   or len(value) >= 16)
         return match.group(1) + ('[REDACTED]' if shaped else value)
     text = re.sub(r'(?i)\b(jwt\s*[:=]\s*"?)([^\s,;&"]+)', _jwt_assignment, text)
+    def _label_value(match):
+        quoted = match.group(2)
+        raw = quoted if quoted is not None else match.group(3)
+        if quoted is not None or _credential_like(raw):
+            return match.group(1) + ' [REDACTED]'
+        return match.group(0)
+    text = re.sub(r'(?i)\b((?:refresh|access|session|auth)[ -]token|api[ -]key|private[ -]key)\s+(?:"([^"]*)"|([^\s,;]+))', _label_value, text)
     def _cookie_line(match):
         def _pair(pair_match):
             name, value = pair_match.group(1), pair_match.group(2)
@@ -219,7 +226,8 @@ def _clean(text, _depth=0):
         if re.fullmatch(r'\d{4}[A-Za-z]\d?', value):
             return match.group(0)
         lowered_name = match.group(1).lower()
-        if ('session_id' in lowered_name or 'sessionid' in lowered_name) \
+        if (('session_id' in lowered_name or 'sessionid' in lowered_name)
+                or ('_' in lowered_name and 'session' in lowered_name)) \
                 and '=' in match.group(1) and len(value) >= 3:
             return match.group(1) + '[REDACTED]'
         if value.isalnum() and len(value) >= 10 and any(ch.isdigit() for ch in value):
@@ -229,10 +237,10 @@ def _clean(text, _depth=0):
         if _credential_like(value) or (value.isdigit() and len(value) >= 9):
             return match.group(1) + '[REDACTED]'
         return match.group(0)
-    text = re.sub(r'(?i)\b(session(?:_id|id)?\s*[:=]\s*"?)((?:[^\s,;&"%]|%(?!26|3[bB]))+)', _session_assignment, text)
+    text = re.sub(r'(?i)\b(session(?:[ _-]id|id)?\s*[:=]\s*"?)((?:[^\s,;&"%]|%(?!26|3[bB]))+)', _session_assignment, text)
     text = re.sub(r'(?i)\b(credential\s*[:=]\s*"?)((?:[^\s,;&"%]|%(?!26|3[bB]))+)',
                   lambda m: m.group(1) + ('[REDACTED]' if ('=' in m.group(1) and len(m.group(2)) >= 3) or _credential_like(m.group(2)) else m.group(2)), text)
-    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]{0,24}?[_-])token|csrftoken|xsrftoken|password|passwd|secret|private[_-]?key|client[ _-]?secret|authorization|phpsessid|jsessionid|sid)"?\s*[=:]\s*"?(?:[^\s,;&"%]|%(?!26|3[bB]))+', r'\1=[REDACTED]', text)
+    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]{0,64}?[_-])token|csrftoken|xsrftoken|password|passwd|secret|private[_-]?key|client[ _-]?secret|authorization|phpsessid|jsessionid|sid)"?\s*[=:]\s*"?(?:[^\s,;&"%]|%(?!26|3[bB]))+', r'\1=[REDACTED]', text)
     def _api_key_assignment(match):
         if '_' in match.group(1) or '-' in match.group(1) or '=' in match.group(1):
             return match.group(1) + ('[REDACTED]' if len(match.group(2)) >= 2 else match.group(2))
@@ -314,7 +322,8 @@ def _clean_url(url, _depth=0):
                 # Deeply encoded input: if a credential key is still
                 # visible after 8 decodes, fail closed rather than pass
                 # the value through.
-                if re.search(r'(?i)(token|password|secret|key|session|credential|jwt|auth)', decoded):
+                if re.search(r'(?i)(token|password|secret|key|session|credential|jwt|auth)', decoded) \
+                        or re.search(r'(?i)%253[ad]|%3[ad]', decoded):
                     key, eq, _v = part.partition('=')
                     return (f'{key}=REDACTED', True) if eq else ('REDACTED', True)
                 return part, False
@@ -1011,7 +1020,20 @@ class KnowledgeEngine:
                     if aborted():
                         self.close()
                         raise _Aborted('cancelled before lazy stream consumption')
-                    self._iterator = iter(chunks)
+                    try:
+                        self._iterator = iter(chunks)
+                    except NotImplementedError:
+                        self.close()
+                        if not _standalone_mode:
+                            raise
+                        raise NotImplementedError('streaming_unsupported:provider-not-implemented') from None
+                    except Exception as exc:
+                        self.close()
+                        if default_meta_route and not self._yielded:
+                            raise NotImplementedError('streaming_unsupported:default-meta-route-failed') from exc
+                        if not _standalone_mode:
+                            raise
+                        raise RuntimeError(f'Model request failed ({type(exc).__name__}).') from None
                 try:
                     chunk = next(self._iterator)
                 except StopIteration:

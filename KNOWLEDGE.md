@@ -37,7 +37,9 @@ Files are bounded to 256 KB; at most the first 32,000 characters of each file,
 600 chunks, 3,000 examined files and eight directory levels per selected project.
 Chunks are 2,000 characters. Hidden directories/files, dependency/build trees,
 symlinks and auth/config/credential/secret/password/token filenames are excluded.
-File contents are cached for 15 seconds (at most 64 project entries; scans cycling more projects than that re-read within the TTL), so edits can take that long to appear.
+File contents are cached for 15 seconds (at most 64 cached project entries,
+each holding up to 600 chunks; scans cycling more projects than that re-read
+within the TTL), so edits can take that long to appear.
 An in-memory SQLite FTS5/BM25 index ranks cached chunks and session candidates.
 The Python SQLite build must include FTS5. No project index is persisted.
 Indexes are cached per engine (LRU, bounded by entry count and total indexed
