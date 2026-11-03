@@ -117,8 +117,12 @@ def _clean(text, _depth=0):
         token = match.group(2)
         if re.fullmatch(r'\d{4}-\d{2}-\d{2}([T ].*)?', token) or (token.isdigit() and len(token) <= 8):
             return match.group(0)
-        if '/' in token and re.fullmatch(r'[A-Za-z][A-Za-z0-9/_-]*', token):
+        if re.fullmatch(r'\d{4}/\d{2}/\d{2}', token):
             return match.group(0)
+        if '/' in token:
+            segments = token.split('/')
+            if all(re.fullmatch(r'[a-z]+(-[a-z]+)*|\d{4}[A-Za-z]?\d?|\d+', seg) for seg in segments):
+                return match.group(0)
         if (any(ch in token for ch in '._~+/=-') and len(token) >= 8) or len(token) >= 24 \
                 or (token.isdigit() and len(token) >= 9):
             return match.group(1) + '[REDACTED]'
@@ -126,7 +130,7 @@ def _clean(text, _depth=0):
     text = re.sub(r'(?i)\b(session\s+)([A-Za-z0-9._~+/=-]+)', _session_value, text)
     # Quoted values redact whole: password: "abc def" and {"token":"x"}
     # are credentials by context whatever their shape.
-    _names = (r'(?:[a-z][a-z0-9_-]*[_-])?token|csrftoken|xsrftoken|api[ _-]?key|'
+    _names = (r'(?:[a-z][a-z0-9_-]*[_-])?token|csrftoken|xsrftoken|private[_-]?key|api[ _-]?key|'
               r'password|passwd|secret|client[ _-]?secret|authorization|credential|'
               r'session(?:id)?|sid')
     def _quoted_value(match):
@@ -159,9 +163,9 @@ def _clean(text, _depth=0):
         mixed = (any(ch.isupper() for ch in head) and any(ch.islower() for ch in head)
                  and any(ch.isdigit() for ch in head))
         long_alnum = len(head) >= 12 and any(ch.isdigit() for ch in head) and head.isalnum()
-        if (('=' in match.group(1) and len(head) >= 3)
-                or (mixed and _at_value_end(match)) or (long_alnum and _at_value_end(match))
-                or (any(ch in head for ch in '._~+/=-') and len(head) >= 8)
+        shaped = (mixed or long_alnum) and not head[:1].isupper()
+        if (('=' in match.group(1) and len(head) >= 3) or shaped
+                or (any(ch in head for ch in '._~+/=') and len(head) >= 8)
                 or len(head) >= 24):
             return match.group(1) + '[REDACTED]' + sep + tail
         return match.group(0)
@@ -170,21 +174,25 @@ def _clean(text, _depth=0):
         def _pair(pair_match):
             name, value = pair_match.group(1), pair_match.group(2)
             lowered = name.lower()
-            if (any(part in lowered for part in ('sess', 'auth', 'token', 'sid', 'csrf', 'xsrf', 'jwt', 'login'))
-                    or _credential_like(value)):
-                return f'{name}=[REDACTED]'
+            if (any(part in lowered for part in ('sess', 'auth', 'token', 'sid', 'csrf', 'xsrf', 'jwt', 'login', 'awsalb'))
+                    or (any(ch in value for ch in '._~+/=') and len(value) >= 8)
+                    or len(value) >= 24):
+                return f'{name.strip()}=[REDACTED]'
             return pair_match.group(0)
-        return re.sub(r'([A-Za-z0-9_.-]+)=([^\s;]+)', _pair, match.group(0))
+        return re.sub(r'([A-Za-z0-9_.-]+)\s*=\s*([^\s;]+)', _pair, match.group(0))
     text = re.sub(r'(?im)^.*\b(?:set-cookie|cookie)\s*:.*$', _cookie_line, text)
     def _session_assignment(match):
         value = match.group(2)
         if re.fullmatch(r'\d{4}-\d{2}-\d{2}([T ].*)?', value) or (value.isdigit() and len(value) <= 8):
             return match.group(0)
-        if '/' in value and re.fullmatch(r'[A-Za-z][A-Za-z0-9/_-]*', value):
+        if re.fullmatch(r'\d{4}/\d{2}/\d{2}', value):
             return match.group(0)
-        if ':' in match.group(1) and _at_value_end(match) and len(value) >= 8 \
-                and any(ch.isupper() for ch in value) and any(ch.islower() for ch in value) \
-                and any(ch.isdigit() for ch in value):
+        if '/' in value:
+            segments = value.split('/')
+            if all(re.fullmatch(r'[a-z]+(-[a-z]+)*|\d{4}[A-Za-z]?\d?|\d+', seg) for seg in segments):
+                return match.group(0)
+        if len(value) >= 8 and any(ch.isupper() for ch in value) \
+                and any(ch.islower() for ch in value) and any(ch.isdigit() for ch in value):
             return match.group(1) + '[REDACTED]'
         if ':' in match.group(1) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,19}', value):
             return match.group(0)
@@ -194,7 +202,7 @@ def _clean(text, _depth=0):
     text = re.sub(r'(?i)\b(session(?:_id|id)?\s*[:=]\s*"?)((?:[^\s,;&"%]|%(?!26|3[bB]))+)', _session_assignment, text)
     text = re.sub(r'(?i)\b(credential\s*[:=]\s*"?)((?:[^\s,;&"%]|%(?!26|3[bB]))+)',
                   lambda m: m.group(1) + ('[REDACTED]' if ('=' in m.group(1) and len(m.group(2)) >= 3) or _credential_like(m.group(2)) else m.group(2)), text)
-    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])token|csrftoken|xsrftoken|api[ _-]?key|password|passwd|secret|client[ _-]?secret|authorization|session_id|sessionid|phpsessid|jsessionid|sid)"?\s*[=:]\s*"?(?:[^\s,;&"%]|%(?!26|3[bB]))+', r'\1=[REDACTED]', text)
+    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])token|csrftoken|xsrftoken|api[ _-]?key|password|passwd|secret|private[_-]?key|client[ _-]?secret|authorization|session_id|sessionid|phpsessid|jsessionid|sid)"?\s*[=:]\s*"?(?:[^\s,;&"%]|%(?!26|3[bB]))+', r'\1=[REDACTED]', text)
     # ALL-CAPS env-style assignments: MCP_API_KEY=..., SERVICE_AUTH_TOKEN=...
     text = re.sub(r'\b([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|AUTH)[A-Z0-9_]*\s*=\s*)[^\s,;]+',
                   r'\1[REDACTED]', text)
@@ -227,9 +235,9 @@ def _clean_url(url, _depth=0):
         parts = [part for part in re.split(r'[^a-z0-9]+', unquote_plus(str(name)).lower()) if part]
         return (any(part in ('token', 'secret', 'password', 'auth',
                              'authorization', 'signature', 'sig',
-                             'sessionid', 'credential', 'credentials') for part in parts)
+                             'sessionid', 'credential', 'credentials', 'jwt') for part in parts)
                 or _key(name) in ('key', 'apikey', 'accesstoken', 'refreshtoken',
-                                  'clientsecret', 'sessionid', 'jsessionid', 'phpsessid')
+                                  'clientsecret', 'sessionid', 'jsessionid', 'phpsessid', 'jwt')
                 or ('api' in parts and 'key' in parts))
     def _redact_part(part):
         # One &-separated part. Encoded delimiters (%26/%3B/%3D) are only

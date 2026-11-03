@@ -378,6 +378,23 @@ class CoreAcceptanceTests(NoHermesTestCase):
         self.assertEqual(knowledge._clean_url('https://example.com/?q=dogs%26cats'),
                          'https://example.com/?q=dogs%26cats')
 
+    def test_round16_credential_and_benign_shapes(self):
+        import knowledge
+        blob = ' '.join([
+            knowledge._clean('session=AbCd1234/zzzz'),
+            knowledge._clean('Cookie: AWSALB=abcdefghijk; theme=dark'),
+            knowledge._clean('Cookie: auth = secretValue; theme = dark'),
+            knowledge._clean('{"private_key":"abcDEF123456"}'),
+            knowledge._clean('token: abcDEF123456 is active'),
+            knowledge._clean('session: AbCd1234 for production'),
+            knowledge._clean_url('https://example.com/?jwt=abc123xyz&ok=1'),
+        ])
+        for sentinel in ('AbCd1234', 'abcdefghijk', 'secretValue', 'abcDEF123456', 'abc123xyz'):
+            self.assertNotIn(sentinel, blob)
+        self.assertEqual(knowledge._clean('Cookie: color=blue2026'), 'Cookie: color=blue2026')
+        self.assertEqual(knowledge._clean('Token: cost-per-token'), 'Token: cost-per-token')
+        self.assertEqual(knowledge._clean('Session: 2026/11/02'), 'Session: 2026/11/02')
+
     def test_round15_credential_and_benign_shapes(self):
         import knowledge
         blob = ' '.join([
@@ -407,11 +424,20 @@ class CoreAcceptanceTests(NoHermesTestCase):
                    'evidence': [{'citation': 1, 'title': 'd',
                                  'text': 'alphabet betamax unrelated'}]})
         self.assertIn('transcript itself says', out)
+        # The line after an echoed question shares no terms with it, so it
+        # is not presented as the answer (it could be about anything).
         out = run({'question': 'what is alpha beta?',
                    'transcript': 'what is alpha beta?\napproved for launch',
                    'evidence': []})
-        self.assertIn('approved for launch', out)
-        self.assertNotIn('what is alpha beta?', out.split('says:')[-1])
+        self.assertNotIn('approved for launch', out)
+        self.assertIn('No local evidence matched', out)
+        # With speaker labels the echo is still ignored, and a following
+        # matching line is used.
+        out = run({'question': 'what is alpha beta?',
+                   'transcript': 'Alice: what is alpha beta?\nBob: alpha beta approved',
+                   'evidence': []})
+        self.assertIn('alpha beta approved', out)
+        self.assertNotIn('Alice: what is', out)
         out = run({'question': 'when is alpha beta approved',
                    'transcript': 'Alice: alpha\nBob: beta is approved',
                    'evidence': []})

@@ -40,6 +40,12 @@ symlinks and auth/config/credential/secret/password/token filenames are excluded
 File contents are cached for 15 seconds, so edits can take that long to appear.
 An in-memory SQLite FTS5/BM25 index ranks cached chunks and session candidates.
 The Python SQLite build must include FTS5. No project index is persisted.
+Indexes are cached per engine (LRU, bounded by entry count and total indexed
+characters, not by RSS); each lookup fingerprints the corpus with SHA-256, so
+warm cost is linear in corpus size, a cyclic working set larger than the cache
+rebuilds, ranking is serialized per engine, and corpora above the character
+budget are queried uncached. These are deliberate simplicity/correctness
+tradeoffs, not latency guarantees.
 
 Sessions use `state.db` through a read-only SQLite URI and `query_only=ON`.
 The engine discovers table/column schema before querying. FTS selects at most

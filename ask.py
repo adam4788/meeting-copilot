@@ -57,18 +57,12 @@ def _passage(text, terms):
         return flat[:220]
     lowered = flat.lower()
     positions = {}
-    for term in terms:
-        found = []
-        idx = lowered.find(term)
-        while idx >= 0:
-            found.append(idx)
-            idx = lowered.find(term, idx + 1)
-        if not found:
-            match = _re.search(r'[a-z0-9]*' + _re.escape(term[:4]) + r'[a-z0-9]*', lowered)
-            if match:
-                found.append(match.start())
-        if found:
-            positions[term] = found
+    for match in _re.finditer(r'[a-z0-9]+', lowered):
+        tok = match.group(0)
+        for term in terms:
+            if tok == term or tok in (term + 's', term + 'es') or term in (tok + 's', tok + 'es'):
+                positions.setdefault(term, []).append(match.start())
+                break
     if not positions:
         return flat[:220]
     # Choose the 220-char window containing the most distinct query terms,
@@ -122,14 +116,20 @@ def fake_completion_factory():
         # Score what will actually be quoted: the best 220-char passage of
         # each transcript line / document, not whole bodies with widely
         # separated term mentions.
+        def _is_echo(line):
+            body = line.strip()
+            if not body.endswith('?'):
+                return False
+            if ':' in body[:60]:
+                body = body.split(':', 1)[1].strip()
+            return bool(terms) and _content_terms(body) <= terms
         best_line, best_hits = '', set()
         lines = str(transcript).splitlines()
         for i in range(len(lines)):
-            window = ' '.join(part.strip() for part in lines[i:i + 3] if part.strip())
+            kept = [part.strip() for part in lines[i:i + 3]
+                    if part.strip() and not _is_echo(part)]
+            window = ' '.join(kept)
             if not window:
-                continue
-            # A line that merely repeats the question is not an answer.
-            if window.rstrip().endswith('?') and _content_terms(window) <= terms:
                 continue
             passage = _passage(window, terms)
             hits = _term_hits(terms, passage)
@@ -168,7 +168,8 @@ def fake_completion_factory():
             # Never present the question itself as the answer: if the
             # passage opens with the echoed question, quote what follows.
             head, sep, tail = quote.partition('?')
-            if sep and tail.strip() and _content_terms(head) <= terms:
+            head_body = head.split(':', 1)[1] if ':' in head[:60] else head
+            if sep and tail.strip() and _content_terms(head_body) <= terms:
                 quote = tail.strip()
             lead = ('the retrieved documents do not directly answer this; '
                     if evidence else 'no documents matched; ')
