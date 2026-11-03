@@ -6,6 +6,7 @@ import time
 import sqlite3
 import json
 import threading
+import unicodedata
 from contextlib import closing
 
 try:
@@ -24,6 +25,14 @@ def _completion_supports_streaming(complete):
     return callable(getattr(complete, 'stream_chunks', None))
 
 
+def _fts_tokens(text):
+    """Tokenize the way SQLite FTS5 (unicode61) does for preselection:
+    accents fold away and underscores separate tokens."""
+    normalized = unicodedata.normalize('NFKD', str(text).lower())
+    stripped = ''.join(ch for ch in normalized if not unicodedata.combining(ch))
+    return re.findall(r'[^\W_]+', stripped)
+
+
 def _resolve_override(override):
     """Unwrap a provider object to the callable the engine actually invokes."""
     return getattr(override, 'complete', override)
@@ -36,7 +45,11 @@ class _Aborted(Exception):
 
 
 def _clean(text):
-    text = re.sub(r'(?i)\b(api[_-]?key|password|secret|token|access[_-]?token|refresh[_-]?token|authorization)\s*[=:]\s*[^\s,;]+', r'\1=[REDACTED]', text)
+    # Bearer credentials first: the generic key=value rule below would
+    # otherwise redact only the word "Bearer" and leave the token itself.
+    text = re.sub(r'(?i)\b(authorization\s*[:=]\s*bearer\s+)[^\s,;]+', r'\1[REDACTED]', text)
+    text = re.sub(r'(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}', 'Bearer [REDACTED]', text)
+    text = re.sub(r'(?i)\b(api[_-]?key|password|secret|access[_-]?token|refresh[_-]?token|authorization)\s*[=:]\s*[^\s,;]+', r'\1=[REDACTED]', text)
     text = re.sub(r'\b(?:sk-|ghp_|github_pat_)[A-Za-z0-9_-]{12,}', '[REDACTED]', text)
     text = re.sub(r'-----BEGIN [^-]*PRIVATE KEY-----.*?(?:-----END [^-]*PRIVATE KEY-----|$)', '[REDACTED PRIVATE KEY]', text, flags=re.S)
     return text
@@ -177,12 +190,21 @@ class KnowledgeEngine:
             for record in records or []:
                 if not isinstance(record, dict):
                     continue
-                item = dict(record)
-                if 'title' in item:
-                    item['title'] = _clean(str(item.get('title', '')))[:160]
-                if 'text' in item:
-                    item['text'] = _clean(str(item.get('text', '')))[:2000]
-                cleaned.append(item)
+                # Whitelist the evidence contract: provider metadata and
+                # extra fields never reach callers or completions, and
+                # identifier/source fields get the same redaction as text.
+                def _scrub(value, limit=None):
+                    cleaned_value = _clean(str(value))
+                    cleaned_value = re.sub(r'(?i)\btoken\s*[:=]\s*[^\s,;]+',
+                                           'token=[REDACTED]', cleaned_value)
+                    return cleaned_value[:limit] if limit else cleaned_value
+                cleaned.append({
+                    'id': _scrub(record.get('id', '')),
+                    'title': _scrub(record.get('title', ''), 160),
+                    'source': _scrub(record.get('source', '')),
+                    'text': _scrub(record.get('text', ''), 2000),
+                    'updated_at': record.get('updated_at'),
+                })
             return cleaned
         path = self.hermes_home / 'state.db'
         if not path.is_file():
@@ -613,18 +635,25 @@ class KnowledgeEngine:
         """
         if not docs:
             return []
-        wanted = set(terms)
+        wanted = set()
+        for term in terms:
+            wanted.update(_fts_tokens(term))
         scored = []
         for position, doc in enumerate(docs):
             try:
-                tokens = set(re.findall(r'\w+', str(doc.get('text', '')).lower()))
+                counts = {}
+                for token in _fts_tokens(doc.get('text', '')):
+                    if token in wanted:
+                        counts[token] = counts.get(token, 0) + 1
             except Exception:
                 continue
-            hits = len(wanted & tokens)
-            if hits:
-                scored.append((-hits, position, doc))
-        scored.sort(key=lambda item: (item[0], item[1]))
-        return [doc for _, _, doc in scored[:limit]]
+            if counts:
+                # Distinct coverage first (mirrors multi-term relevance),
+                # then term frequency so a strongly matching later document
+                # is not cut purely by file order before BM25 can rank it.
+                scored.append((-len(counts), -sum(counts.values()), position, doc))
+        scored.sort(key=lambda item: (item[0], item[1], item[2]))
+        return [doc for _, _, _, doc in scored[:limit]]
 
     @staticmethod
     def _rank(docs, terms, limit):

@@ -95,6 +95,13 @@ class AnswerCore:
             web_fallback=web_fallback)
 
     def answer_stream(self, *args, **kwargs):
+        # The injected completion IS the provider in standalone mode:
+        # silently swapping it for a host-selected provider would break
+        # the injection boundary (and could reach the network).
+        for key in ('answer_provider', 'answer_model'):
+            if kwargs.get(key) is not None:
+                raise ValueError(f'{key} is not supported by AnswerCore; '
+                                 'inject the completion provider instead')
         return self.engine.answer_stream(*args, **kwargs)
 
     def search(self, question, project=None, limit=6, all_projects=False):

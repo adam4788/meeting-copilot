@@ -245,14 +245,29 @@ class CoreAcceptanceTests(NoHermesTestCase):
             return 'Cited [1].'
         class SecretHistory:
             def search(self, terms):
-                return [{'id': 'h1', 'title': 'note password=hunter2',
-                         'source': 'history:test',
-                         'text': 'quasar password=hunter2 token: hunter2',
-                         'updated_at': None}]
+                return [{'id': 'h1 password=hunter2', 'title': 'note password=hunter2',
+                         'source': 'history:test token: hunter2',
+                         'text': 'quasar password=hunter2 token: hunter2 '
+                                 'Authorization: Bearer sentinel987',
+                         'updated_at': None, 'extra': 'password=hunter2'}]
         core = self._core(completion=complete, history=SecretHistory())
         result = core.answer('quasar price?', transcript='t', project='acme')
         self.assertNotIn('hunter2', json.dumps(captured))
         self.assertNotIn('hunter2', json.dumps(result, default=str))
+        self.assertNotIn('sentinel987', json.dumps(result, default=str))
+        self.assertNotIn('extra', json.dumps(result, default=str))
+
+    def test_answer_stream_rejects_provider_override(self):
+        core = self._core()
+        with self.assertRaisesRegex(ValueError, 'not supported by AnswerCore'):
+            core.answer_stream('Price?', answer_provider='meta')
+        with self.assertRaisesRegex(ValueError, 'not supported by AnswerCore'):
+            core.answer_stream('Price?', answer_model='anything')
+
+    def test_ordinary_token_wording_is_not_redacted(self):
+        import knowledge
+        self.assertEqual(knowledge._clean('Token: meeting agenda'), 'Token: meeting agenda')
+        self.assertIn('[REDACTED]', knowledge._clean('Authorization: Bearer sentinel987'))
 
 
 class AskCliTests(unittest.TestCase):
@@ -460,6 +475,38 @@ class AskCliTests(unittest.TestCase):
                                  '--provider', 'fake'])
             self.assertEqual(code, 0)
             self.assertEqual(os.environ.get('MODEL_API_KEY'), 'sentinel-value')
+
+    def test_parser_errors_are_json_when_requested(self):
+        import ask
+        import io
+        import json as _json
+        from contextlib import redirect_stdout, redirect_stderr
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            with self.assertRaises(SystemExit) as ctx:
+                ask.main(['--docs', self.docs, '--question', 'hi',
+                          '--json', '--limit', 'oops'])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn('invalid int value', _json.loads(out.getvalue())['error'])
+
+    def test_limit_warns_outside_search_mode(self):
+        code, _, err = self._capture(['--question', 'Q?', '--docs', self.docs,
+                                      '--limit', '1'])
+        self.assertEqual(code, 0)
+        self.assertIn('--limit applies only to --search', err)
+
+    def test_list_conflict_has_no_ignored_warning(self):
+        import ask
+        import io
+        import json as _json
+        from contextlib import redirect_stdout, redirect_stderr
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            with self.assertRaises(SystemExit):
+                ask.main(['--docs', self.docs, '--list-projects', '--project',
+                          'acme', '--all', '--json'])
+        self.assertNotIn('ignored', err.getvalue())
+        self.assertIn('not both', _json.loads(out.getvalue())['error'])
 
 
 class RetrievalEvalTests(unittest.TestCase):

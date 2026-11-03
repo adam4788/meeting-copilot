@@ -118,8 +118,20 @@ def _print_sources(sources):
             print(f'      {snippet[:200]}')
 
 
+class _CliParser(argparse.ArgumentParser):
+    """ArgumentParser that honors --json for its own errors too."""
+
+    def error(self, message):
+        argv = getattr(self, '_argv', [])
+        if '--json' in argv:
+            print(json.dumps({'error': message}, indent=2))
+            raise SystemExit(2)
+        super().error(message)
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='Standalone grounded Q&A (no Hermes required).')
+    parser = _CliParser(description='Standalone grounded Q&A (no Hermes required).')
+    parser._argv = list(argv) if argv is not None else sys.argv[1:]
     parser.add_argument('--question', default=None, help='Question to answer.')
     parser.add_argument('--docs', default=None, help='Directory of project documents (.md/.txt/.rst).')
     parser.add_argument('--transcript', default=None, help='Transcript file (Meetily JSON, segments JSON, or text); - reads stdin.')
@@ -170,6 +182,10 @@ def main(argv=None):
              '  List projects: python ask.py --docs ./sample-docs --list-projects')
     if args.limit < 1 or args.limit > 20:
         fail('--limit must be between 1 and 20.')
+    if args.project and args.all:
+        fail('Choose --project NAME or --all, not both.')
+    if args.search is None and not args.list_projects and args.limit != 6:
+        print('Warning: --limit applies only to --search and is ignored here.', file=sys.stderr)
     if args.model and args.provider == 'fake':
         print('Warning: --model is ignored with --provider fake.', file=sys.stderr)
     if (args.list_projects or args.search is not None) and args.provider != 'fake':
@@ -180,8 +196,6 @@ def main(argv=None):
         print('Warning: --project is ignored with --list-projects.', file=sys.stderr)
     if args.list_projects and args.transcript is not None:
         print('Warning: --transcript is ignored with --list-projects.', file=sys.stderr)
-    if args.project and args.all:
-        fail('Choose --project NAME or --all, not both.')
 
     subs = sorted(sub.name for sub in docs.iterdir()
                     if sub.is_dir() and not sub.name.startswith('.') and not sub.is_symlink())
@@ -196,8 +210,6 @@ def main(argv=None):
         else:
             print(f'No project folders under {docs}. Create one folder per project containing .md/.txt/.rst files.')
         return 0
-    if args.project and args.all:
-        raise SystemExit('Choose --project NAME or --all, not both.')
     project = args.project
     if project is None and not args.all:
         if len(subs) == 1:

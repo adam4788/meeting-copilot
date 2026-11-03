@@ -373,6 +373,21 @@ class IncrementalRetrievalTests(KnowledgeTests):
         hits = self.engine._rank(short, ['new'], 6)
         self.assertEqual([h['text'] for h in hits], ['brand new rollout'])
 
+    def test_preselect_mirrors_fts_tokenization_and_frequency(self):
+        # FTS5 folds accents and splits on underscores; preselection must
+        # not discard documents the ranker itself would match.
+        docs = [{'text': 'café menu'}, {'text': 'alpha_beta launch'}]
+        self.assertEqual([d['text'] for d in KnowledgeEngine._preselect(docs, ['cafe'], 6)],
+                         ['café menu'])
+        self.assertEqual([d['text'] for d in KnowledgeEngine._preselect(docs, ['alpha'], 6)],
+                         ['alpha_beta launch'])
+        # Same distinct coverage: higher term frequency wins the shortlist
+        # slot over mere file order, so BM25 sees the stronger document.
+        docs = [{'text': f'alpha once {i}'} for i in range(6)]
+        docs.append({'text': 'alpha ' * 30})
+        short = KnowledgeEngine._preselect(docs, ['alpha'], 6)
+        self.assertIn('alpha ' * 30, [d['text'] for d in short])
+
 
 class LargeCorpusBoundTests(KnowledgeTests):
     def test_unchanged_large_project_skips_rereads_after_expiry(self):
