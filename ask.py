@@ -44,8 +44,7 @@ def _term_hits(terms, value):
     hits = set()
     for term in terms:
         for tok in tokens:
-            if tok == term or (len(term) >= 4 and tok.startswith(term)) or \
-                    (len(tok) >= 4 and term.startswith(tok)):
+            if tok == term or tok in (term + 's', term + 'es') or term in (tok + 's', tok + 'es'):
                 hits.add(term)
                 break
     return hits
@@ -74,13 +73,17 @@ def _passage(text, terms):
         return flat[:220]
     # Choose the 220-char window containing the most distinct query terms,
     # not merely the window around the earliest stray mention.
+    import bisect as _bisect
     candidates = ({0} | {max(0, pos - 40) for found in positions.values() for pos in found}
                   | {pos for found in positions.values() for pos in found}
                   | {max(0, pos - 219) for found in positions.values() for pos in found})
     start, best_score = 0, -1
     for cand in sorted(candidates):
-        score = sum(1 for term, found in positions.items()
-                    if any(cand <= pos and pos + len(term) <= cand + 220 for pos in found))
+        score = 0
+        for term, found in positions.items():
+            i = _bisect.bisect_left(found, cand)
+            if i < len(found) and found[i] + len(term) <= cand + 220:
+                score += 1
         if score > best_score:
             start, best_score = cand, score
     snippet = flat[start:start + 220]
@@ -120,8 +123,15 @@ def fake_completion_factory():
         # each transcript line / document, not whole bodies with widely
         # separated term mentions.
         best_line, best_hits = '', set()
-        for line in str(transcript).splitlines():
-            passage = _passage(line, terms)
+        lines = str(transcript).splitlines()
+        for i in range(len(lines)):
+            window = ' '.join(part.strip() for part in lines[i:i + 3] if part.strip())
+            if not window:
+                continue
+            # A line that merely repeats the question is not an answer.
+            if window.rstrip().endswith('?') and _content_terms(window) <= terms:
+                continue
+            passage = _passage(window, terms)
             hits = _term_hits(terms, passage)
             if len(hits) > len(best_hits):
                 best_line, best_hits = passage, hits
@@ -155,6 +165,11 @@ def fake_completion_factory():
         transcript_required = 1 if len(terms) <= 1 else 2
         if best_line and len(best_hits) >= transcript_required and len(best_hits) > len(passage_hits):
             quote = _passage(best_line, terms)
+            # Never present the question itself as the answer: if the
+            # passage opens with the echoed question, quote what follows.
+            head, sep, tail = quote.partition('?')
+            if sep and tail.strip() and _content_terms(head) <= terms:
+                quote = tail.strip()
             lead = ('the retrieved documents do not directly answer this; '
                     if evidence else 'no documents matched; ')
             return ('Offline extractive answer (fake provider — no model was '

@@ -378,6 +378,45 @@ class CoreAcceptanceTests(NoHermesTestCase):
         self.assertEqual(knowledge._clean_url('https://example.com/?q=dogs%26cats'),
                          'https://example.com/?q=dogs%26cats')
 
+    def test_round15_credential_and_benign_shapes(self):
+        import knowledge
+        blob = ' '.join([
+            knowledge._clean('phpsessid%3DabcDEF123456'),
+            knowledge._clean('%2522phpsessid%2522%253A%2522abcDEF123456%2522'),
+            knowledge._clean('Cookie: AWSALB=abcDEF123456; theme=dark'),
+            knowledge._clean('token: abcdef123456'),
+            knowledge._clean('session: AbCd1234'),
+        ])
+        self.assertNotIn('abcDEF123456', blob)
+        self.assertNotIn('abcdef123456', blob)
+        self.assertNotIn('AbCd1234', blob)
+        self.assertIn('theme=dark', blob)
+        self.assertEqual(knowledge._clean('session=planning/2027Q1'),
+                         'session=planning/2027Q1')
+        self.assertEqual(knowledge._clean('Session: planning/2027Q1'),
+                         'Session: planning/2027Q1')
+        self.assertEqual(knowledge._clean('Token: LongTerm2027 roadmap'),
+                         'Token: LongTerm2027 roadmap')
+
+    def test_fake_exact_tokens_question_echo_and_line_windows(self):
+        import ask
+        complete = ask.fake_completion_factory()
+        def run(payload):
+            return complete([{'role': 'user', 'content': json.dumps(payload)}])
+        out = run({'question': 'alpha beta', 'transcript': 'alpha beta now approved',
+                   'evidence': [{'citation': 1, 'title': 'd',
+                                 'text': 'alphabet betamax unrelated'}]})
+        self.assertIn('transcript itself says', out)
+        out = run({'question': 'what is alpha beta?',
+                   'transcript': 'what is alpha beta?\napproved for launch',
+                   'evidence': []})
+        self.assertIn('approved for launch', out)
+        self.assertNotIn('what is alpha beta?', out.split('says:')[-1])
+        out = run({'question': 'when is alpha beta approved',
+                   'transcript': 'Alice: alpha\nBob: beta is approved',
+                   'evidence': []})
+        self.assertIn('beta is approved', out)
+
     def test_round14_credential_and_benign_shapes(self):
         import knowledge
         blob = ' '.join([

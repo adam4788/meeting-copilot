@@ -92,11 +92,11 @@ def _clean(text, _depth=0):
     # Percent-encoded credential assignments (single/double-encoded JSON):
     # redact just the value in place so benign encoded text nearby (e.g.
     # %22launch plan%22) stays byte-for-byte intact.
-    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])?token|password|passwd|secret|api[ _-]?key|authorization|session(?:_id|id)?|credential)(?:%253[ad]|%3[ad])(?:[^\s&;%]|%(?!26|3[bB]))+',
+    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])?token|password|passwd|secret|api[ _-]?key|authorization|session(?:_id|id)?|credential|phpsessid|jsessionid)(?:%253[ad]|%3[ad])(?:[^\s&;%]|%(?!26|3[bB]))+',
                   r'\1=[REDACTED]', text)
     _q = r'(?:%2522|%22)'
     _c = r'(?:%253[ad]|%3[ad])'
-    text = re.sub(r'(?i)(' + _q + r'[\w%-]*?(?:token|secret|password|api[\w%-]*?key|authorization|session_id|sessionid|credential)'
+    text = re.sub(r'(?i)(' + _q + r'[\w%-]*?(?:token|secret|password|api[\w%-]*?key|authorization|session_id|sessionid|credential|phpsessid|jsessionid)'
                   + _q + r'?\s*' + _c + r'\s*' + _q + r'?)(?:[^%]|%(?!22))*?(%22|%2522(?=%257D|%7D|%2C|,|&|$)|&|$)',
                   r'\1REDACTED\2', text)
     # Bearer credentials first: the generic key=value rule below would
@@ -116,6 +116,8 @@ def _clean(text, _depth=0):
     def _session_value(match):
         token = match.group(2)
         if re.fullmatch(r'\d{4}-\d{2}-\d{2}([T ].*)?', token) or (token.isdigit() and len(token) <= 8):
+            return match.group(0)
+        if '/' in token and re.fullmatch(r'[A-Za-z][A-Za-z0-9/_-]*', token):
             return match.group(0)
         if (any(ch in token for ch in '._~+/=-') and len(token) >= 8) or len(token) >= 24 \
                 or (token.isdigit() and len(token) >= 9):
@@ -143,6 +145,9 @@ def _clean(text, _depth=0):
                   _quoted_value, text)
     text = re.sub(r"(?i)('?(?:" + _names + r")'?\s*[:=]\s*')([^']*)(')",
                   _quoted_value, text)
+    def _at_value_end(match):
+        rest = match.string[match.end():]
+        return rest == '' or rest[0] in '\n,;)]}"\''
     def _token_assignment(match):
         value = match.group(2)
         head, sep, tail = re.split(r'(?i)(%26|%3B)', value, maxsplit=1)[0], '', ''
@@ -153,19 +158,34 @@ def _clean(text, _depth=0):
             head = value
         mixed = (any(ch.isupper() for ch in head) and any(ch.islower() for ch in head)
                  and any(ch.isdigit() for ch in head))
-        if (('=' in match.group(1) and len(head) >= 3) or mixed
+        long_alnum = len(head) >= 12 and any(ch.isdigit() for ch in head) and head.isalnum()
+        if (('=' in match.group(1) and len(head) >= 3)
+                or (mixed and _at_value_end(match)) or (long_alnum and _at_value_end(match))
                 or (any(ch in head for ch in '._~+/=-') and len(head) >= 8)
                 or len(head) >= 24):
             return match.group(1) + '[REDACTED]' + sep + tail
         return match.group(0)
     text = re.sub(r'(?i)\b(token\s*[:=]\s*"?)([^\s,;&"]+)', _token_assignment, text)
     def _cookie_line(match):
-        return re.sub(r'(?i)(\b(?:session(?:_id|id)?|jsessionid|phpsessid|auth(?:_token|token)?|token|csrftoken|xsrftoken|sid)\s*=\s*)[^\s;]+', r'\1[REDACTED]', match.group(0))
+        def _pair(pair_match):
+            name, value = pair_match.group(1), pair_match.group(2)
+            lowered = name.lower()
+            if (any(part in lowered for part in ('sess', 'auth', 'token', 'sid', 'csrf', 'xsrf', 'jwt', 'login'))
+                    or _credential_like(value)):
+                return f'{name}=[REDACTED]'
+            return pair_match.group(0)
+        return re.sub(r'([A-Za-z0-9_.-]+)=([^\s;]+)', _pair, match.group(0))
     text = re.sub(r'(?im)^.*\b(?:set-cookie|cookie)\s*:.*$', _cookie_line, text)
     def _session_assignment(match):
         value = match.group(2)
         if re.fullmatch(r'\d{4}-\d{2}-\d{2}([T ].*)?', value) or (value.isdigit() and len(value) <= 8):
             return match.group(0)
+        if '/' in value and re.fullmatch(r'[A-Za-z][A-Za-z0-9/_-]*', value):
+            return match.group(0)
+        if ':' in match.group(1) and _at_value_end(match) and len(value) >= 8 \
+                and any(ch.isupper() for ch in value) and any(ch.islower() for ch in value) \
+                and any(ch.isdigit() for ch in value):
+            return match.group(1) + '[REDACTED]'
         if ':' in match.group(1) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,19}', value):
             return match.group(0)
         if _credential_like(value) or (value.isdigit() and len(value) >= 9):
@@ -1010,7 +1030,7 @@ class KnowledgeEngine:
                 self._index_cache[fingerprint] = (index, total_chars)
                 # Bounded by entries and total indexed characters: a few
                 # huge corpora cannot crowd out memory without limit.
-                while (len(self._index_cache) > 64
+                while (len(self._index_cache) > 128
                        or sum(chars for _i, chars in self._index_cache.values()) > 50000000):
                     oldest = next(iter(self._index_cache))
                     self._index_cache.pop(oldest)[0].close()
