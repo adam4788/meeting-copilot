@@ -378,6 +378,66 @@ class CoreAcceptanceTests(NoHermesTestCase):
         self.assertEqual(knowledge._clean_url('https://example.com/?q=dogs%26cats'),
                          'https://example.com/?q=dogs%26cats')
 
+    def test_round23b_stream_and_api_key_boundaries(self):
+        import knowledge
+        self.assertEqual(knowledge._clean('api_key=x'), 'api_key=[REDACTED]')
+        self.assertEqual(knowledge._clean('api key: zebra'), 'api key: [REDACTED]')
+        self.assertEqual(knowledge._clean('API key: architecture'), 'API key: architecture')
+        # Distinct iterator from iter() is closed; throwing close attrs
+        # cannot escape; cancellation lands between items.
+        events = []
+        class DistinctIter:
+            def __iter__(self):
+                return self
+            def __next__(self):
+                return 'chunk [1].'
+            def close(self):
+                events.append('iter')
+        class Iterable:
+            def __iter__(self):
+                return DistinctIter()
+            def close(self):
+                events.append('chunks')
+        class Provider:
+            def __call__(self, messages):
+                return 'x [1].'
+            def stream_chunks(self, messages):
+                return Iterable()
+        core = self._core(completion=Provider())
+        _header, stream = core.answer_stream('What is the price?', project='acme')
+        next(stream)
+        stream.close()
+        self.assertEqual(events, ['iter', 'chunks'])
+
+        state = {'abort': False}
+        class Provider2:
+            def __call__(self, messages):
+                return 'x [1].'
+            def stream_chunks(self, messages):
+                return iter(['one [1].', 'two [1].'])
+        core2 = self._core(completion=Provider2())
+        _header, stream2 = core2.answer_stream(
+            'What is the price?', project='acme',
+            should_abort=lambda: state['abort'])
+        self.assertEqual(next(stream2), 'one [1].')
+        state['abort'] = True
+        with self.assertRaises(knowledge._Aborted):
+            next(stream2)
+
+    def test_fake_response_must_follow_the_question(self):
+        import ask
+        complete = ask.fake_completion_factory()
+        def run(payload):
+            return complete([{'role': 'user', 'content': json.dumps(payload)}])
+        out = run({'question': 'What is alpha beta?',
+                   'transcript': 'Yes, the budget was approved.\nWhat is alpha beta?',
+                   'evidence': []})
+        self.assertNotIn('budget was approved', out)
+        out = run({'question': 'What is alpha beta?',
+                   'transcript': 'What is alpha beta?\nYes, it shipped today.',
+                   'evidence': []})
+        self.assertIn('shipped today', out)
+
     def test_round23_spaced_labels_and_stream_iteration(self):
         import knowledge
         self.assertEqual(knowledge._clean('refresh token "SessionSecret-42"'),

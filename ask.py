@@ -195,8 +195,20 @@ def fake_completion_factory():
         lines = str(transcript).splitlines()
         for i in range(len(lines)):
             raw_window = ' '.join(part.strip() for part in lines[i:i + 3] if part.strip())
-            kept = [part for part in (_strip_echo_prefix(part) for part in lines[i:i + 3])
-                    if part and part.strip()]
+            # A response only counts when it follows a question segment
+            # in the window; a statement made before the question was
+            # asked is not its answer.
+            kept = []
+            question_seen = False
+            response_after_question = False
+            for part in lines[i:i + 3]:
+                stripped = _strip_echo_prefix(part)
+                if stripped != part.strip() or _is_echo(part):
+                    question_seen = True
+                if stripped and stripped.strip():
+                    if question_seen and _starts_with_response(stripped):
+                        response_after_question = True
+                    kept.append(stripped)
             window = ' '.join(kept)
             if not window:
                 continue
@@ -206,7 +218,7 @@ def fake_completion_factory():
                     else _term_hits(terms, cleaned_passage))
             if hits:
                 passage = cleaned_passage
-            elif cleaned_passage and _starts_with_response(cleaned_passage) \
+            elif cleaned_passage and response_after_question \
                     and _term_hits(terms, raw_window):
                 # Response remainder after a stripped question on the same
                 # line(s): the raw window still holds the question terms.

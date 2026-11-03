@@ -242,9 +242,11 @@ def _clean(text, _depth=0):
                   lambda m: m.group(1) + ('[REDACTED]' if ('=' in m.group(1) and len(m.group(2)) >= 3) or _credential_like(m.group(2)) else m.group(2)), text)
     text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]{0,64}?[_-])token|csrftoken|xsrftoken|password|passwd|secret|private[_-]?key|client[ _-]?secret|authorization|phpsessid|jsessionid|sid)"?\s*[=:]\s*"?(?:[^\s,;&"%]|%(?!26|3[bB]))+', r'\1=[REDACTED]', text)
     def _api_key_assignment(match):
-        if '_' in match.group(1) or '-' in match.group(1) or '=' in match.group(1):
-            return match.group(1) + ('[REDACTED]' if len(match.group(2)) >= 2 else match.group(2))
-        return _token_assignment(match)
+        # Config spellings (api_key=, lowercase api key:) blanket-redact;
+        # the capitalized prose label 'API key: <topic>' keeps shape checks.
+        if match.group(1)[:1].isupper() and '=' not in match.group(1):
+            return _token_assignment(match)
+        return match.group(1) + ('[REDACTED]' if len(match.group(2)) >= 1 else match.group(2))
     text = re.sub(r'(?i)\b(api[ _-]?key\s*[:=]\s*"?)([^\s,;&"]+)', _api_key_assignment, text)
     # ALL-CAPS env-style assignments: MCP_API_KEY=..., SERVICE_AUTH_TOKEN=...
     text = re.sub(r'\b([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|AUTH)[A-Z0-9_]*\s*=\s*)[^\s,;]+',
@@ -1003,15 +1005,27 @@ class KnowledgeEngine:
                 if self._closed:
                     return
                 self._closed = True
-                _close = getattr(chunks, 'close', None)
-                if callable(_close):
+                # Close the distinct iterator iter() returned (if any) as
+                # well as the provider iterable itself; even a throwing
+                # close attribute must not escape.
+                for target in (self._iterator, chunks):
+                    if target is None:
+                        continue
                     try:
-                        _close()
+                        _close = getattr(target, 'close', None)
                     except Exception:
-                        pass
+                        continue
+                    if callable(_close):
+                        try:
+                            _close()
+                        except Exception:
+                            pass
             def __next__(self):
                 if self._closed:
                     raise StopIteration
+                if self._started and aborted():
+                    self.close()
+                    raise _Aborted('cancelled during stream consumption')
                 if not self._started:
                     self._started = True
                     # The provider request starts on first iteration, not
