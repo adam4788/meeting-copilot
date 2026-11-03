@@ -96,7 +96,7 @@ def _clean(text, _depth=0):
                   r'\1=[REDACTED]', text)
     _q = r'(?:%2522|%22)'
     _c = r'(?:%253[ad]|%3[ad])'
-    text = re.sub(r'(?i)(' + _q + r'[\w%-]*?(?:token|secret|password|api[\w%-]*?key|private[\w%-]*?key|authorization|session_id|sessionid|credential|phpsessid|jsessionid|jwt)'
+    text = re.sub(r'(?i)(' + _q + r'[\w%-]{0,40}?(?:token|secret|password|api[\w%-]{0,30}?key|private[\w%-]{0,30}?key|authorization|session_id|sessionid|credential|phpsessid|jsessionid|jwt)'
                   + _q + r'?\s*' + _c + r'\s*' + _q + r'?)(?:[^%]|%(?!22))*?(%22|%2522(?=%257D|%7D|%2C|,|&|$)|&|$)',
                   r'\1REDACTED\2', text)
     # Bearer credentials first: the generic key=value rule below would
@@ -151,7 +151,7 @@ def _clean(text, _depth=0):
             r'(?i)(token|password|passwd|secret|key|session|credential|jwt|auth)', text):
         text = re.sub(r'(?i)("?(?:' + _names + r')"?\s*[:=]\s*")((?:\\.|[^"\\])*)(")',
                       _quoted_value, text)
-        text = re.sub(r"(?i)('?(?:" + _names + r")'?\s*[:=]\s*')([^']*)(')",
+        text = re.sub(r"(?i)('?(?:" + _names + r")'?\s*[:=]\s*')((?:\\.|[^'\\])*)(')",
                       _quoted_value, text)
     def _at_value_end(match):
         rest = match.string[match.end():]
@@ -232,12 +232,13 @@ def _clean(text, _depth=0):
     text = re.sub(r'(?i)\b(session(?:_id|id)?\s*[:=]\s*"?)((?:[^\s,;&"%]|%(?!26|3[bB]))+)', _session_assignment, text)
     text = re.sub(r'(?i)\b(credential\s*[:=]\s*"?)((?:[^\s,;&"%]|%(?!26|3[bB]))+)',
                   lambda m: m.group(1) + ('[REDACTED]' if ('=' in m.group(1) and len(m.group(2)) >= 3) or _credential_like(m.group(2)) else m.group(2)), text)
-    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])token|csrftoken|xsrftoken|api[ _-]?key|password|passwd|secret|private[_-]?key|client[ _-]?secret|authorization|phpsessid|jsessionid|sid)"?\s*[=:]\s*"?(?:[^\s,;&"%]|%(?!26|3[bB]))+', r'\1=[REDACTED]', text)
+    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])token|csrftoken|xsrftoken|password|passwd|secret|private[_-]?key|client[ _-]?secret|authorization|phpsessid|jsessionid|sid)"?\s*[=:]\s*"?(?:[^\s,;&"%]|%(?!26|3[bB]))+', r'\1=[REDACTED]', text)
+    text = re.sub(r'(?i)\b(api[ _-]?key\s*[:=]\s*"?)([^\s,;&"]+)', _token_assignment, text)
     # ALL-CAPS env-style assignments: MCP_API_KEY=..., SERVICE_AUTH_TOKEN=...
     text = re.sub(r'\b([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|AUTH)[A-Z0-9_]*\s*=\s*)[^\s,;]+',
                   r'\1[REDACTED]', text)
     # Scheme-less userinfo (user:pass@host) carries a password without a URL.
-    text = re.sub(r'(?<![\w@.])(?=[\w.+-]*[A-Za-z])[\w.+-]+:[^\s/@:]+@', '[REDACTED]@', text)
+    text = re.sub(r'(?<![\w@.])(?=[\w.+-]{0,64}[A-Za-z])[\w.+-]{1,64}:[^\s/@:]{1,128}@', '[REDACTED]@', text)
     text = re.sub(r'\b(?:sk-|ghp_|github_pat_)[A-Za-z0-9_-]{12,}', '[REDACTED]', text)
     text = re.sub(r'-----BEGIN [^-]*PRIVATE KEY-----.*?(?:-----END [^-]*PRIVATE KEY-----|$)', '[REDACTED PRIVATE KEY]', text, flags=re.S)
     # URLs embedded in free text (transcripts, documents) carry the same
@@ -269,7 +270,7 @@ def _clean_url(url, _depth=0):
                 or _key(name) in ('key', 'apikey', 'accesstoken', 'refreshtoken',
                                   'clientsecret', 'sessionid', 'jsessionid', 'phpsessid', 'jwt', 'privatekey')
                 or ('api' in parts and 'key' in parts))
-    def _redact_part(part, in_fragment=False):
+    def _redact_part(part, in_fragment=False, _depth=0):
         # One &-separated part. Encoded delimiters (%26/%3B/%3D) are only
         # normalized when they actually hide a sensitive assignment, so
         # ordinary values like q=dogs%26cats stay byte-for-byte intact.
@@ -304,8 +305,8 @@ def _clean_url(url, _depth=0):
         # only rewrite when a sensitive key actually surfaces.
         from urllib.parse import unquote_plus
         decoded = unquote_plus(part)
-        if decoded != part:
-            processed, flag = _redact_part(decoded)
+        if decoded != part and _depth < 8:
+            processed, flag = _redact_part(decoded, in_fragment=in_fragment, _depth=_depth + 1)
             if flag:
                 return processed, True
             if '://' in decoded:
@@ -316,7 +317,7 @@ def _clean_url(url, _depth=0):
                         return decoded[:nested.start()] + cleaned + decoded[nested.end():], True
         subs = re.split(r'(?i)%26|%3B', part)
         if len(subs) > 1:
-            processed = [_redact_part(sub) for sub in subs]
+            processed = [_redact_part(sub, in_fragment=in_fragment, _depth=_depth + 1) for sub in subs]
             if any(flag for _part, flag in processed):
                 return '&'.join(part for part, _flag in processed), True
         return part, False
@@ -989,6 +990,13 @@ class KnowledgeEngine:
                 # Standalone: provider exception text can embed
                 # credentials/endpoints — surface the failure type only.
                 raise RuntimeError(f'Model request failed ({type(exc).__name__}).') from None
+            finally:
+                _close = getattr(chunks, 'close', None)
+                if callable(_close):
+                    try:
+                        _close()
+                    except Exception:
+                        pass
         return header, guarded()
 
     @staticmethod

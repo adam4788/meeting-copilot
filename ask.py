@@ -90,6 +90,7 @@ def _passage(text, terms):
 
 def fake_completion_factory():
     def complete(messages):
+        import re as _re
         # Extractive offline answer: quote the top retrieved snippet only
         # when it actually shares content terms with the question. An
         # unrelated snippet is evidence, not an answer; if the transcript
@@ -144,6 +145,23 @@ def fake_completion_factory():
                            'whose', 'why', 'how', 'is', 'are', 'was', 'were',
                            'do', 'does', 'did', 'can', 'could', 'should',
                            'would', 'will')
+        _RESPONSE_START = ('yes', 'no', 'approved', 'confirmed', 'shipped',
+                           'launched', 'done', 'agreed', 'correct', 'it', 'the')
+        def _is_question_sentence(sentence):
+            body = _speaker_body(sentence).strip()
+            if not _term_hits(terms, body):
+                return False
+            if body.rstrip().endswith('?'):
+                return True
+            first = body.split()[0].strip('?:.,').lower() if body.split() else ''
+            return first in _INTERROGATIVES
+        def _non_question_text(value):
+            sentences = _re.split(r'(?<=[.?!])\s+', str(value))
+            kept = [s for s in sentences if s.strip() and not _is_question_sentence(s)]
+            return ' '.join(kept)
+        def _starts_with_response(value):
+            words = _re.findall(r"[a-z']+", str(value).lower())
+            return bool(words) and words[0] in _RESPONSE_START
         def _is_question_text(value):
             # Mostly-question text: interrogative in form and carrying few
             # content terms beyond the question's own. An answer followed
@@ -182,8 +200,13 @@ def fake_completion_factory():
             if not window:
                 continue
             passage = _passage(window, terms)
-            hits = (set() if _is_question_text(passage)
-                    else _term_hits(terms, passage))
+            cleaned_passage = _non_question_text(passage)
+            hits = (set() if _is_question_text(cleaned_passage)
+                    else _term_hits(terms, cleaned_passage))
+            if not hits and cleaned_passage and _starts_with_response(cleaned_passage) \
+                    and _term_hits(terms, window):
+                hits = set(terms)
+                passage = cleaned_passage
             if len(hits) > len(best_hits):
                 best_line, best_hits = passage, hits
         doc_hits, body_hits, passage_hits = set(), set(), set()
@@ -196,11 +219,16 @@ def fake_completion_factory():
             for idx, item in enumerate(evidence):
                 item_body = _term_hits(terms, item.get('text', ''))
                 item_all = _term_hits(terms, f"{item.get('title', '')} {item.get('text', '')}")
-                cleaned_text = _strip_echo_prefix(str(item.get('text', '')))
+                cleaned_text = _non_question_text(_strip_echo_prefix(str(item.get('text', ''))))
                 item_passage = _passage(cleaned_text, terms)
                 item_passage_hits = (set() if (_is_echo(item_passage)
                                                or _is_question_text(item_passage))
                                      else _term_hits(terms, item_passage))
+                if not item_passage_hits and cleaned_text and _starts_with_response(cleaned_text) \
+                        and _term_hits(terms, str(item.get('text', ''))):
+                    # 'Is alpha beta approved? Yes, it shipped today.': the
+                    # short response after the question is the answer.
+                    item_passage_hits = set(terms)
                 if (len(item_passage_hits), len(item_body)) > (len(passage_hits), len(body_hits)):
                     top, body_hits, doc_hits = item, item_body, item_all
                     passage_hits, snippet = item_passage_hits, item_passage

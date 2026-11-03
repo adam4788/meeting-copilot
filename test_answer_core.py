@@ -378,6 +378,53 @@ class CoreAcceptanceTests(NoHermesTestCase):
         self.assertEqual(knowledge._clean_url('https://example.com/?q=dogs%26cats'),
                          'https://example.com/?q=dogs%26cats')
 
+    def test_round21_cleaner_shapes_and_perf(self):
+        import knowledge, time
+        self.assertNotIn('SENSITIVE123', knowledge._clean(
+            "Explain password='abc\\' SENSITIVE123' launch"))
+        self.assertEqual(knowledge._clean('API key: architecture'), 'API key: architecture')
+        self.assertNotIn('secretA123', knowledge._clean('API key: secretA123'))
+        self.assertNotIn('abc12345', knowledge._clean('api_key=abc12345'))
+        out = knowledge._clean('https://example.com/?q=%' + '25' * 1000 + '41')
+        self.assertIsInstance(out, str)
+        started = time.perf_counter()
+        knowledge._clean('%22' * 1000 + 'token')
+        knowledge._clean('-' * 16000 + 'a')
+        self.assertLess(time.perf_counter() - started, 2.0)
+
+    def test_stream_close_closes_provider_iterator(self):
+        closed = []
+        class ProviderIter:
+            def __iter__(self):
+                return iter(['chunk [1].'])
+            def close(self):
+                closed.append(True)
+        class Streaming:
+            def __call__(self, messages):
+                raise AssertionError('non-stream path must not be used')
+            def stream_chunks(self, messages):
+                return ProviderIter()
+        core = self._core(completion=Streaming())
+        _header, stream = core.answer_stream('What is the price?', project='acme')
+        iterator = iter(stream)
+        next(iterator)
+        iterator.close()
+        self.assertEqual(closed, [True])
+
+    def test_fake_sentence_level_question_filtering(self):
+        import ask
+        complete = ask.fake_completion_factory()
+        def run(payload):
+            return complete([{'role': 'user', 'content': json.dumps(payload)}])
+        out = run({'question': 'What is alpha beta?', 'transcript': '',
+                   'evidence': [{'citation': 1, 'title': 'd',
+                                 'text': 'We discussed other things. Is alpha beta approved or still waiting for legal signoff?'}]})
+        self.assertIn('does not directly answer', out)
+        out = run({'question': 'What is alpha beta?', 'transcript': '',
+                   'evidence': [{'citation': 1, 'title': 'd',
+                                 'text': 'Is alpha beta approved? Yes, it shipped today.'}]})
+        self.assertIn('shipped today', out)
+
     def test_round20_terms_come_from_cleaned_question(self):
         import knowledge
         seen = []
