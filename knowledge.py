@@ -92,7 +92,7 @@ def _clean(text, _depth=0):
     # Percent-encoded credential assignments (single/double-encoded JSON):
     # redact just the value in place so benign encoded text nearby (e.g.
     # %22launch plan%22) stays byte-for-byte intact.
-    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])?token|password|passwd|secret|api[ _-]?key|authorization|session(?:_id|id)?|credential|phpsessid|jsessionid)(?:%253[ad]|%3[ad])(?:[^\s&;%]|%(?!26|3[bB]))+',
+    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])?token|password|passwd|secret|api[ _-]?key|authorization|session(?:_id|id)?|credential|phpsessid|jsessionid|jwt|private(?:[_-]|%5[Ff])?key)(?:%253[ad]|%3[ad])(?:[^\s&;%]|%(?!26|3[bB]))+',
                   r'\1=[REDACTED]', text)
     _q = r'(?:%2522|%22)'
     _c = r'(?:%253[ad]|%3[ad])'
@@ -108,7 +108,7 @@ def _clean(text, _depth=0):
         return prefix + '[REDACTED]' if _credential_like(token) else match.group(0)
     text = re.sub(r'(?i)\b(authorization\s*[:=]\s*bearer\s+)([^\s,;]+)',
                   lambda m: m.group(1) + '[REDACTED]', text)
-    text = re.sub(r'(?i)\b(authorization\s*[:=]\s*(?:basic|token|digest)\s+)[^\s,;]+',
+    text = re.sub(r'(?i)\b(authorization\s*[:=]\s*(?:basic|token|digest|apikey|api[- ]?key)\s+)[^\s,;]+',
                   r'\1[REDACTED]', text)
     text = re.sub(r'(?i)\b(authorization\s*[-–—:]?\s*(?:bearer|basic|token|digest)\s+)[^\s,;]+',
                   r'\1[REDACTED]', text)
@@ -139,10 +139,11 @@ def _clean(text, _depth=0):
         if not stripped.startswith(('"', "'")):
             # Unquoted prose keys: quoted dates and ordinary Token: topics
             # are content, not credentials.
-            if 'session' in prefix.lower() and re.fullmatch(r'\d{4}-\d{2}-\d{2}([T ].*)?', value):
+            if 'session' in prefix.lower() and re.fullmatch(r'\d{4}[-/]\d{2}[-/]\d{2}([T ].*)?', value):
                 return match.group(0)
             if re.search(r'(?i)\btoken\b', prefix) and not re.search(r'[_-]token', prefix) \
-                    and '=' not in prefix and not _credential_like(value):
+                    and '=' not in prefix and (re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,11}', value)
+                                              or not _credential_like(value)):
                 return match.group(0)
         return prefix + '[REDACTED]' + close
     text = re.sub(r'(?i)("?(?:' + _names + r')"?\s*[:=]\s*")((?:\\.|[^"\\])*)(")',
@@ -163,7 +164,9 @@ def _clean(text, _depth=0):
         mixed = (any(ch.isupper() for ch in head) and any(ch.islower() for ch in head)
                  and any(ch.isdigit() for ch in head))
         long_alnum = len(head) >= 12 and any(ch.isdigit() for ch in head) and head.isalnum()
-        shaped = (mixed or long_alnum) and not head[:1].isupper()
+        upper_alnum = (len(head) >= 8 and any(ch.isupper() for ch in head)
+                       and any(ch.isdigit() for ch in head) and not any(ch.islower() for ch in head))
+        shaped = ((mixed or long_alnum) and not head[:1].isupper()) or upper_alnum
         if (('=' in match.group(1) and len(head) >= 3) or shaped
                 or (any(ch in head for ch in '._~+/=') and len(head) >= 8)
                 or len(head) >= 24):
@@ -174,12 +177,14 @@ def _clean(text, _depth=0):
         def _pair(pair_match):
             name, value = pair_match.group(1), pair_match.group(2)
             lowered = name.lower()
+            if re.fullmatch(r'\d{4}[A-Za-z]\d?', value.strip('"')):
+                return pair_match.group(0)
             if (any(part in lowered for part in ('sess', 'auth', 'token', 'sid', 'csrf', 'xsrf', 'jwt', 'login', 'awsalb'))
                     or (any(ch in value for ch in '._~+/=') and len(value) >= 8)
                     or len(value) >= 24):
                 return f'{name.strip()}=[REDACTED]'
             return pair_match.group(0)
-        return re.sub(r'([A-Za-z0-9_.-]+)\s*=\s*([^\s;]+)', _pair, match.group(0))
+        return re.sub(r'([A-Za-z0-9_.-]+)\s*=\s*("[^"]*"|[^\s;]+)', _pair, match.group(0))
     text = re.sub(r'(?im)^.*\b(?:set-cookie|cookie)\s*:.*$', _cookie_line, text)
     def _session_assignment(match):
         value = match.group(2)
@@ -194,6 +199,10 @@ def _clean(text, _depth=0):
         if len(value) >= 8 and any(ch.isupper() for ch in value) \
                 and any(ch.islower() for ch in value) and any(ch.isdigit() for ch in value):
             return match.group(1) + '[REDACTED]'
+        if re.fullmatch(r'\d{4}[A-Za-z]\d?', value):
+            return match.group(0)
+        if value.isalnum() and len(value) >= 10 and any(ch.isdigit() for ch in value):
+            return match.group(1) + '[REDACTED]'
         if ':' in match.group(1) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,19}', value):
             return match.group(0)
         if _credential_like(value) or (value.isdigit() and len(value) >= 9):
@@ -202,7 +211,7 @@ def _clean(text, _depth=0):
     text = re.sub(r'(?i)\b(session(?:_id|id)?\s*[:=]\s*"?)((?:[^\s,;&"%]|%(?!26|3[bB]))+)', _session_assignment, text)
     text = re.sub(r'(?i)\b(credential\s*[:=]\s*"?)((?:[^\s,;&"%]|%(?!26|3[bB]))+)',
                   lambda m: m.group(1) + ('[REDACTED]' if ('=' in m.group(1) and len(m.group(2)) >= 3) or _credential_like(m.group(2)) else m.group(2)), text)
-    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])token|csrftoken|xsrftoken|api[ _-]?key|password|passwd|secret|private[_-]?key|client[ _-]?secret|authorization|session_id|sessionid|phpsessid|jsessionid|sid)"?\s*[=:]\s*"?(?:[^\s,;&"%]|%(?!26|3[bB]))+', r'\1=[REDACTED]', text)
+    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])token|csrftoken|xsrftoken|api[ _-]?key|password|passwd|secret|private[_-]?key|client[ _-]?secret|authorization|session_id|sessionid|phpsessid|jsessionid|jwt|sid)"?\s*[=:]\s*"?(?:[^\s,;&"%]|%(?!26|3[bB]))+', r'\1=[REDACTED]', text)
     # ALL-CAPS env-style assignments: MCP_API_KEY=..., SERVICE_AUTH_TOKEN=...
     text = re.sub(r'\b([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|AUTH)[A-Z0-9_]*\s*=\s*)[^\s,;]+',
                   r'\1[REDACTED]', text)
@@ -237,13 +246,17 @@ def _clean_url(url, _depth=0):
                              'authorization', 'signature', 'sig',
                              'sessionid', 'credential', 'credentials', 'jwt') for part in parts)
                 or _key(name) in ('key', 'apikey', 'accesstoken', 'refreshtoken',
-                                  'clientsecret', 'sessionid', 'jsessionid', 'phpsessid', 'jwt')
+                                  'clientsecret', 'sessionid', 'jsessionid', 'phpsessid', 'jwt', 'privatekey')
                 or ('api' in parts and 'key' in parts))
-    def _redact_part(part):
+    def _redact_part(part, in_fragment=False):
         # One &-separated part. Encoded delimiters (%26/%3B/%3D) are only
         # normalized when they actually hide a sensitive assignment, so
         # ordinary values like q=dogs%26cats stay byte-for-byte intact.
         key, eq, _value = part.partition('=')
+        if in_fragment and eq and _key(key) == 'key':
+            if _credential_like(_value) or len(_value) >= 16:
+                return f'{key}=REDACTED', True
+            return part, False
         if eq and _key(key) == 'session':
             if re.fullmatch(r'\d{4}[A-Za-z]\d?', _value):
                 return part, False
@@ -308,7 +321,7 @@ def _clean_url(url, _depth=0):
             for i, part in enumerate(frag_tokens):
                 if i % 2 == 1:
                     continue
-                frag_tokens[i], did = _redact_part(part)
+                frag_tokens[i], did = _redact_part(part, in_fragment=True)
                 changed = changed or did
             raw = head + '#' + ''.join(frag_tokens)
     return raw
@@ -353,7 +366,14 @@ class KnowledgeEngine:
         self._index_cache = OrderedDict()
         self._index_cache_lock = threading.Lock()
 
+    def _cache_put(self, key, value):
+        self._cache[key] = value
+        while len(self._cache) > 64:
+            self._cache.pop(next(iter(self._cache)))
+
     def close(self):
+        self._cache.clear()
+        self._token_cache.clear()
         with self._index_cache_lock:
             for index, _chars in self._index_cache.values():
                 try:
@@ -423,7 +443,7 @@ class KnowledgeEngine:
             # TTL expired but nothing changed on disk: reuse docs without re-reads.
             try:
                 if self._fingerprint(folder) == cached[1]:
-                    self._cache[key] = (time.monotonic(), cached[1], cached[2])
+                    self._cache_put(key, (time.monotonic(), cached[1], cached[2]))
                     return cached[2]
             except Exception:
                 pass
@@ -440,7 +460,7 @@ class KnowledgeEngine:
             for name in sorted(files):
                 visited += 1
                 if visited > 3000:
-                    self._cache[key] = (time.monotonic(), tuple(prints), docs)
+                    self._cache_put(key, (time.monotonic(), tuple(prints), docs))
                     return docs
                 p = Path(base) / name
                 if name.startswith('.') or _DENIED.search(name) or p.is_symlink() or p.suffix.lower() not in ('.md', '.txt', '.rst'):
@@ -459,7 +479,7 @@ class KnowledgeEngine:
                             break
                 except OSError:
                     continue
-        self._cache[key] = (time.monotonic(), tuple(prints), docs)
+        self._cache_put(key, (time.monotonic(), tuple(prints), docs))
         return docs
 
     def _sessions(self, terms):
@@ -1049,7 +1069,19 @@ class KnowledgeEngine:
         if all_projects and project:
             raise ValueError('Choose all projects or one project, not both')
         limit = max(0, min(int(limit), 20))
-        terms = list(dict.fromkeys(term for term in re.findall(r'\w{2,}', _clean(question).lower()) if term not in _STOPWORDS))[:20]
+        # Terms come from the raw question (so benign identifiers like
+        # session_id=42 still retrieve), minus credential-shaped values
+        # assigned to credential keys, which providers must never see.
+        blocked = set()
+        for assign in re.finditer(r'(?i)(?:token|password|passwd|secret|api[_-]?key|authorization|session(?:_id|id)?|credential|jwt|private[_-]?key)\s*[:=]\s*"?([^\s,;&"]+)', question):
+            assigned = assign.group(1)
+            if _credential_like(assigned) or len(assigned) >= 12:
+                blocked.update(re.findall(r'\w{2,}', assigned.lower()))
+        for bearer in re.finditer(r'(?i)\bbearer\s+([^\s,;&"]+)', question):
+            if _credential_like(bearer.group(1)) or len(bearer.group(1)) >= 12:
+                blocked.update(re.findall(r'\w{2,}', bearer.group(1).lower()))
+        terms = list(dict.fromkeys(term for term in re.findall(r'\w{2,}', question.lower())
+                                   if term not in _STOPWORDS and term not in blocked))[:20]
         if not terms or not limit:
             return []
         with self._lock:

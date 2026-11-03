@@ -378,6 +378,44 @@ class CoreAcceptanceTests(NoHermesTestCase):
         self.assertEqual(knowledge._clean_url('https://example.com/?q=dogs%26cats'),
                          'https://example.com/?q=dogs%26cats')
 
+    def test_round17_credential_and_benign_shapes(self):
+        import knowledge
+        blob = ' '.join([
+            knowledge._clean('jwt=abcDEF123456'),
+            knowledge._clean('private_key%3DabcDEF123456'),
+            knowledge._clean_url('https://example.com/?private_key=abcDEF123456&ok=1'),
+            knowledge._clean('Authorization: ApiKey abcDEF123456'),
+            knowledge._clean('Cookie: auth="abc def ghi"; theme=dark'),
+            knowledge._clean('token: ABCDEF123456'),
+            knowledge._clean('session: abcdef123456'),
+        ])
+        for sentinel in ('abcDEF123456', 'abc def', 'ABCDEF123456', 'abcdef123456'):
+            self.assertNotIn(sentinel, blob)
+        self.assertEqual(knowledge._clean('Session: "2024/01/01"'), 'Session: "2024/01/01"')
+        self.assertEqual(knowledge._clean('Token: "ERC-20"'), 'Token: "ERC-20"')
+        self.assertEqual(knowledge._clean('Cookie: session=2024Q3; theme=dark'),
+                         'Cookie: session=2024Q3; theme=dark')
+        self.assertEqual(knowledge._clean_url('https://example.com/docs#key=overview'),
+                         'https://example.com/docs#key=overview')
+
+    def test_fake_same_line_and_timestamped_echoes(self):
+        import ask
+        complete = ask.fake_completion_factory()
+        def run(payload):
+            return complete([{'role': 'user', 'content': json.dumps(payload)}])
+        out = run({'question': 'what is alpha beta?',
+                   'transcript': 'Alice: what is alpha beta? approved for launch',
+                   'evidence': []})
+        self.assertNotIn('approved for launch', out)
+        out = run({'question': 'what is alpha beta?',
+                   'transcript': '[10:00] Alice: what is alpha beta?\nBob: alpha beta approved',
+                   'evidence': []})
+        self.assertIn('alpha beta approved', out)
+        self.assertNotIn('what is alpha beta?', out)
+        out = run({'question': 'what is alpha beta?', 'transcript': '',
+                   'evidence': [{'citation': 1, 'title': 'd', 'text': 'What is alpha beta?'}]})
+        self.assertIn('does not directly answer', out)
+
     def test_round16_credential_and_benign_shapes(self):
         import knowledge
         blob = ' '.join([
@@ -577,6 +615,9 @@ class CoreAcceptanceTests(NoHermesTestCase):
         core = self._core(completion=lambda messages: 'x [1].', history=Hist())
         core.search('what is the token=secretSENTINEL42 price', project='acme')
         self.assertNotIn('secretsentinel42', seen)
+        seen.clear()
+        core.search('session_id=42 price', project='acme')
+        self.assertIn('42', seen)
 
     def test_round9_credential_and_benign_shapes(self):
         import knowledge

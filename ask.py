@@ -116,18 +116,44 @@ def fake_completion_factory():
         # Score what will actually be quoted: the best 220-char passage of
         # each transcript line / document, not whole bodies with widely
         # separated term mentions.
+        def _speaker_body(body):
+            body = body.strip()
+            import re as _re2
+            body = _re2.sub(r'^\[[^\]]*\]\s*', '', body)
+            for _ in range(3):
+                head, sep, tail = body.partition(':')
+                if sep and len(head.split()) <= 4 and len(head) <= 40:
+                    body = tail.strip()
+                else:
+                    break
+            return body
         def _is_echo(line):
-            body = line.strip()
-            if not body.endswith('?'):
-                return False
-            if ':' in body[:60]:
-                body = body.split(':', 1)[1].strip()
-            return bool(terms) and _content_terms(body) <= terms
+            body = _speaker_body(line)
+            if body.endswith('?'):
+                return bool(terms) and _content_terms(body) <= terms
+            # Unpunctuated echo: an interrogative restatement of the
+            # question ('what is alpha beta' without '?'). Declarative
+            # short answers ('The unit price is $99') are not echoes.
+            first = body.split()[0].strip('?:.,').lower() if body.split() else ''
+            return (first in ('what', 'when', 'where', 'which', 'who', 'whom',
+                              'whose', 'why', 'how', 'is', 'are', 'was', 'were',
+                              'do', 'does', 'did', 'can', 'could', 'should',
+                              'would', 'will')
+                    and bool(terms) and _content_terms(body) <= terms)
+        def _strip_echo_prefix(line):
+            # 'Alice: what is alpha beta? approved' -> 'approved': the
+            # question segment never scores, even on the same line.
+            if '?' not in line:
+                return '' if _is_echo(line) else line
+            head, _, tail = line.partition('?')
+            if _content_terms(_speaker_body(head)) <= terms and tail.strip():
+                return tail.strip()
+            return '' if _is_echo(line) else line
         best_line, best_hits = '', set()
         lines = str(transcript).splitlines()
         for i in range(len(lines)):
-            kept = [part.strip() for part in lines[i:i + 3]
-                    if part.strip() and not _is_echo(part)]
+            kept = [part for part in (_strip_echo_prefix(part) for part in lines[i:i + 3])
+                    if part and part.strip()]
             window = ' '.join(kept)
             if not window:
                 continue
@@ -146,7 +172,8 @@ def fake_completion_factory():
                 item_body = _term_hits(terms, item.get('text', ''))
                 item_all = _term_hits(terms, f"{item.get('title', '')} {item.get('text', '')}")
                 item_passage = _passage(item.get('text', ''), terms)
-                item_passage_hits = _term_hits(terms, item_passage)
+                item_passage_hits = (set() if _is_echo(item_passage)
+                                     else _term_hits(terms, item_passage))
                 if (len(item_passage_hits), len(item_body)) > (len(passage_hits), len(body_hits)):
                     top, body_hits, doc_hits = item, item_body, item_all
                     passage_hits, snippet = item_passage_hits, item_passage
