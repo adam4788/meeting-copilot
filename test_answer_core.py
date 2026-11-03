@@ -1255,6 +1255,30 @@ class AskCliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn('--limit applies only to --search', err)
 
+    def test_doctor_reports_searchable_content(self):
+        code, out, _ = self._capture(['--docs', self.docs, '--doctor'])
+        self.assertEqual(code, 0)
+        self.assertIn('acme: 1 file(s), 1 searchable chunk(s)', out)
+        self.assertIn('Ready.', out)
+        code, out, _ = self._capture(['--docs', self.docs, '--doctor', '--json'])
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertTrue(payload['ok'])
+        self.assertEqual(payload['projects'][0]['chunks'], 1)
+
+    def test_doctor_empty_docs_is_actionable_failure(self):
+        empty = Path(self.docs) / 'elsewhere'
+        empty.mkdir()
+        code, out, _ = self._capture(['--docs', str(empty), '--doctor', '--json'])
+        self.assertEqual(code, 2)
+        payload = json.loads(out)
+        self.assertFalse(payload['ok'])
+        self.assertEqual(payload['projects'], [])
+
+    def test_doctor_rejects_mixed_modes(self):
+        err = self._run('--docs', self.docs, '--doctor', '--search', 'x')
+        self.assertIn('Choose one mode', str(err.code))
+
     def test_list_projects_excludes_ineligible_folders(self):
         (Path(self.docs) / '__pycache__').mkdir()
         (Path(self.docs) / 'node_modules').mkdir()

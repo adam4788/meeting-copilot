@@ -395,6 +395,8 @@ def main(argv=None):
                         help='Evidence-only search over docs; no model call is made.')
     parser.add_argument('--list-projects', action='store_true',
                         help='List project folders under --docs and exit.')
+    parser.add_argument('--doctor', action='store_true',
+                        help='Check docs layout, searchable content, transcript, and provider readiness; no model call.')
     parser.add_argument('--limit', type=int, default=None, help='Evidence limit for --search (1-20, default 6).')
     parser.add_argument('--json', action='store_true',
                         help='Emit one machine-readable JSON object on stdout (supported by all modes).')
@@ -443,9 +445,11 @@ def main(argv=None):
         fail('Choose --search TERMS or --question, not both.')
     if args.list_projects and (args.search is not None or (args.question or '').strip()):
         fail('Choose one mode: --list-projects, --search, or --question.')
+    if args.doctor and (args.list_projects or args.search is not None or (args.question or '').strip()):
+        fail('Choose one mode: --doctor, --list-projects, --search, or --question.')
     if args.search is not None and not args.search.strip():
         fail('Search terms cannot be empty.')
-    if not args.list_projects and args.search is None and not (args.question or '').strip():
+    if not args.list_projects and not args.doctor and args.search is None and not (args.question or '').strip():
         fail('What do you want to do?\n'
              '  Ask:          python ask.py --docs ./sample-docs --question "What is the unit price?"\n'
              '  Search docs:  python ask.py --docs ./sample-docs --search "unit price"\n'
@@ -487,7 +491,7 @@ def main(argv=None):
         if root_files:
             warn(f'document files at the docs root ({", ".join(root_files[:3])}) '
                  'are not searched; only project subfolders are.')
-    if not subs and not args.list_projects:
+    if not subs and not args.list_projects and not args.doctor:
         # A docs directory full of files but no project subfolders is the
         # most common layout mistake: say exactly what to change instead
         # of silently returning no sources.
@@ -498,6 +502,62 @@ def main(argv=None):
         fail(f'No project folders under {docs}.{detail} '
              'Expected layout: <docs>/<project>/*.md|txt|rst — '
              'or pass the parent directory as --docs.')
+    if args.doctor:
+        # First-run self-check: report exactly what the engine can search,
+        # whether a transcript loads, and whether the provider is ready.
+        # Never calls a model and never prints a key value.
+        def _never_called(messages):
+            raise AssertionError('doctor mode must not call a model')
+        core = AnswerCore(project_root=docs, completion=_never_called,
+                          search=DisabledSearch(), history=NoHistory())
+        problems = []
+        project_reports = []
+        for name in subs:
+            try:
+                chunks = core.engine._files((docs / name).resolve())
+            except Exception as exc:
+                problems.append(f'project {name}: cannot scan ({type(exc).__name__})')
+                chunks = []
+            files = {chunk.get('source', '') for chunk in chunks}
+            project_reports.append({'name': name, 'files': len(files),
+                                    'chunks': len(chunks)})
+            if not chunks:
+                problems.append(f'project {name}: no searchable .md/.txt/.rst content found')
+        transcript_report = None
+        if args.transcript is not None:
+            try:
+                loaded = load_transcript(args.transcript)
+                transcript_report = {'ok': True, 'characters': len(loaded or '')}
+            except (OSError, ValueError) as exc:
+                transcript_report = {'ok': False, 'error': str(exc)}
+                problems.append(f'transcript: {exc}')
+        if args.provider == 'meta' and not os.environ.get('MODEL_API_KEY'):
+            problems.append('provider meta: MODEL_API_KEY is not set')
+        provider_report = {'provider': args.provider,
+                           'ready': not (args.provider == 'meta'
+                                         and not os.environ.get('MODEL_API_KEY'))}
+        ok = bool(project_reports) and all(r['chunks'] for r in project_reports) and not problems
+        payload = {'docs': str(docs), 'projects': project_reports,
+                   'provider': provider_report, 'problems': problems, 'ok': ok}
+        if transcript_report is not None:
+            payload['transcript'] = transcript_report
+        if cli_warnings:
+            payload['warnings'] = list(cli_warnings)
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f'Doctor for {docs}')
+            for report in project_reports:
+                print(f"  - {report['name']}: {report['files']} file(s), {report['chunks']} searchable chunk(s)")
+            if not project_reports:
+                print('  - no project folders found (expected <docs>/<project>/*.md|txt|rst)')
+            print(f"Provider: {args.provider} ({'ready' if provider_report['ready'] else 'MODEL_API_KEY not set'})")
+            if transcript_report is not None:
+                print(f"Transcript: {'ok, ' + str(transcript_report['characters']) + ' characters' if transcript_report['ok'] else 'failed: ' + transcript_report['error']}")
+            for problem in problems:
+                print(f'Problem: {problem}')
+            print('Ready.' if ok else 'Not ready: fix the problems above, then run --list-projects.')
+        return 0 if ok else 2
     if args.list_projects:
         if args.json:
             payload = {'projects': [{'name': name} for name in subs]}

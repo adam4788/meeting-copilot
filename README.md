@@ -14,6 +14,7 @@ without network access unless you opt into a provider:
 ```sh
 python demo_standalone.py            # offline fixture demo, exits nonzero on failure
 python eval_retrieval.py             # synthetic recall@k + latency percentiles (not production accuracy)
+python ask.py --docs ./sample-docs --doctor          # first-run check: layout, searchable chunks, provider
 python ask.py --docs ./sample-docs --list-projects
 python ask.py --docs ./sample-docs --search "unit price"
 python ask.py --question "What is the unit price?" --docs ./sample-docs --provider fake
