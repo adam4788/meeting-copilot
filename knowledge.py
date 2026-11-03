@@ -105,16 +105,27 @@ def _clean(text, _depth=0):
     text = re.sub(r'(?i)\b(authorization\s*[-–—:]?\s*(?:bearer|basic|token|digest)\s+)[^\s,;]+',
                   r'\1[REDACTED]', text)
     text = re.sub(r'(?i)\b(bearer\s+)([A-Za-z0-9._~+/=-]+)', _bearer, text)
-    text = re.sub(r'(?i)\b(session\s+)([A-Za-z0-9._~+/=-]+)',
-                  lambda m: m.group(1) + ('[REDACTED]' if _credential_like(m.group(2)) else m.group(2)), text)
+    def _session_value(match):
+        token = match.group(2)
+        if re.fullmatch(r'\d{4}-\d{2}-\d{2}([T ].*)?', token) or token.isdigit():
+            return match.group(0)
+        return match.group(1) + ('[REDACTED]' if _credential_like(token) else token)
+    text = re.sub(r'(?i)\b(session\s+)([A-Za-z0-9._~+/=-]+)', _session_value, text)
+    # Quoted values redact whole: password: "abc def" and {"token":"x"}
+    # are credentials by context whatever their shape.
+    _names = (r'(?:[a-z][a-z0-9_-]*[_-])?token|csrftoken|xsrftoken|api[ _-]?key|'
+              r'password|passwd|secret|client[ _-]?secret|authorization|credential|'
+              r'session(?:id)?|sid')
+    text = re.sub(r'(?i)("?(?:' + _names + r')"?\s*[:=]\s*")[^"]*(")',
+                  r'\1[REDACTED]\2', text)
     text = re.sub(r'(?i)\b(token\s*[:=]\s*"?)([^\s,;"]+)',
                   lambda m: m.group(1) + ('[REDACTED]' if _credential_like(m.group(2)) else m.group(2)), text)
-    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])token|api[_-]?key|password|passwd|secret|client[_-]?secret|authorization|session(?:id)?|sid)"?\s*[=:]\s*"?[^\s,;"]+', r'\1=[REDACTED]', text)
+    text = re.sub(r'(?i)\b((?:[a-z][a-z0-9_-]*[_-])token|csrftoken|xsrftoken|api[ _-]?key|password|passwd|secret|client[ _-]?secret|authorization|credential|session(?:id)?|sid)"?\s*[=:]\s*"?[^\s,;"]+', r'\1=[REDACTED]', text)
     # ALL-CAPS env-style assignments: MCP_API_KEY=..., SERVICE_AUTH_TOKEN=...
     text = re.sub(r'\b([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|AUTH)[A-Z0-9_]*\s*=\s*)[^\s,;]+',
                   r'\1[REDACTED]', text)
     # Scheme-less userinfo (user:pass@host) carries a password without a URL.
-    text = re.sub(r'(?<![\w@.])[\w.+-]+:[^\s/@:]+@', '[REDACTED]@', text)
+    text = re.sub(r'(?<![\w@.])(?=[\w.+-]*[A-Za-z])[\w.+-]+:[^\s/@:]+@', '[REDACTED]@', text)
     text = re.sub(r'\b(?:sk-|ghp_|github_pat_)[A-Za-z0-9_-]{12,}', '[REDACTED]', text)
     text = re.sub(r'-----BEGIN [^-]*PRIVATE KEY-----.*?(?:-----END [^-]*PRIVATE KEY-----|$)', '[REDACTED PRIVATE KEY]', text, flags=re.S)
     # URLs embedded in free text (transcripts, documents) carry the same
@@ -141,10 +152,29 @@ def _clean_url(url, _depth=0):
         from urllib.parse import unquote_plus
         parts = [part for part in re.split(r'[^a-z0-9]+', unquote_plus(str(name)).lower()) if part]
         return (any(part in ('token', 'secret', 'password', 'auth',
-                             'authorization', 'signature', 'sig') for part in parts)
+                             'authorization', 'signature', 'sig', 'session',
+                             'sessionid', 'credential', 'credentials') for part in parts)
                 or _key(name) in ('key', 'apikey', 'accesstoken', 'refreshtoken',
-                                  'clientsecret')
+                                  'clientsecret', 'sessionid')
                 or ('api' in parts and 'key' in parts))
+    def _redact_part(part):
+        # One &-separated part. Encoded delimiters (%26/%3B/%3D) are only
+        # normalized when they actually hide a sensitive assignment, so
+        # ordinary values like q=dogs%26cats stay byte-for-byte intact.
+        key, eq, _value = part.partition('=')
+        if eq and _sensitive(key):
+            return f'{key}=REDACTED', True
+        if not eq:
+            from urllib.parse import unquote_plus
+            dkey, deq, _dv = unquote_plus(part).partition('=')
+            if deq and _sensitive(dkey):
+                return f'{dkey}=REDACTED', True
+        subs = re.split(r'(?i)%26|%3B', part)
+        if len(subs) > 1:
+            processed = [_redact_part(sub) for sub in subs]
+            if any(flag for _part, flag in processed):
+                return '&'.join(part for part, _flag in processed), True
+        return part, False
     changed = False
     # Userinfo password: scheme://user:pass@host
     match = re.match(r'^([a-zA-Z][a-zA-Z0-9+.-]*://)([^/?#@]*):([^/?#@]*)@', raw)
@@ -155,29 +185,24 @@ def _clean_url(url, _depth=0):
         base, _, rest = raw.partition('?')
         query, hashmark, fragment = rest.partition('#')
         # Encoded pair delimiters (%26, %3B) otherwise hide later keys.
-        query = re.sub(r'(?i)%26|%3B', '&', query)
         tokens = re.split(r'([&;])', query)
         for i, part in enumerate(tokens):
             if i % 2 == 1:
                 continue
-            key, eq, _value = part.partition('=')
-            if eq and _sensitive(key):
-                tokens[i] = f'{key}=REDACTED'
-                changed = True
+            tokens[i], did = _redact_part(part)
+            changed = changed or did
         raw = base + '?' + ''.join(tokens) + (hashmark + fragment if hashmark else '')
     if '#' in raw:
         head, _, fragment = raw.partition('#')
         if '=' in fragment:
-            cleaned_fragment = _clean(re.sub(r'(?i)%26|%3B', '&', fragment), _depth=_depth)
+            cleaned_fragment = _clean(fragment, _depth=_depth)
             # Fragment parameters use the same sensitive keys as queries.
             frag_tokens = re.split(r'([&;])', cleaned_fragment)
             for i, part in enumerate(frag_tokens):
                 if i % 2 == 1:
                     continue
-                k, eq, _v = part.partition('=')
-                if eq and _sensitive(k):
-                    frag_tokens[i] = f'{k}=REDACTED'
-                    changed = True
+                frag_tokens[i], did = _redact_part(part)
+                changed = changed or did
             raw = head + '#' + ''.join(frag_tokens)
     return raw
 
@@ -846,13 +871,29 @@ class KnowledgeEngine:
         scored.sort(key=lambda item: (item[0], item[1]))
         return [doc for _, _, doc in scored[:limit]]
 
+    _INDEX_CACHE = {}
+    _INDEX_CACHE_LOCK = threading.Lock()
+
     @staticmethod
     def _rank(docs, terms, limit):
-        # The transient FTS index is memory-only; never writes project files.
-        with closing(sqlite3.connect(':memory:')) as index:
-            index.execute('CREATE VIRTUAL TABLE docs USING fts5(text)')
-            index.executemany('INSERT INTO docs(rowid,text) VALUES (?,?)', [(i + 1, d['text']) for i, d in enumerate(docs)])
-            query = ' OR '.join('"' + term + '"' for term in terms)
+        # Memory-only FTS indexes, cached by corpus fingerprint (source,
+        # length, content hash): warm searches over an unchanged corpus
+        # reuse the index instead of rebuilding it per query. Content
+        # changes produce a new fingerprint, so stale text cannot rank.
+        fingerprint = tuple((str(d.get('source', '')), len(d['text']),
+                             hash(d['text'])) for d in docs)
+        query = ' OR '.join('"' + term + '"' for term in terms)
+        with KnowledgeEngine._INDEX_CACHE_LOCK:
+            index = KnowledgeEngine._INDEX_CACHE.get(fingerprint)
+            if index is None:
+                index = sqlite3.connect(':memory:', check_same_thread=False)
+                index.execute('CREATE VIRTUAL TABLE docs USING fts5(text)')
+                index.executemany('INSERT INTO docs(rowid,text) VALUES (?,?)',
+                                  [(i + 1, d['text']) for i, d in enumerate(docs)])
+                KnowledgeEngine._INDEX_CACHE[fingerprint] = index
+                while len(KnowledgeEngine._INDEX_CACHE) > 2:
+                    oldest = next(iter(KnowledgeEngine._INDEX_CACHE))
+                    KnowledgeEngine._INDEX_CACHE.pop(oldest).close()
             rows = index.execute('SELECT rowid FROM docs WHERE docs MATCH ? ORDER BY bm25(docs) LIMIT ?', (query, limit)).fetchall()
         return [docs[row[0] - 1].copy() for row in rows]
 

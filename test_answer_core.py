@@ -355,6 +355,41 @@ class CoreAcceptanceTests(NoHermesTestCase):
         self.assertNotIn('secret123', knowledge._clean_url(
             'https://example.com/x?refresh%5Ftoken=secret123'))
 
+    def test_round8_credential_and_benign_shapes(self):
+        import knowledge
+        secrets = [
+            knowledge._clean('api key: secretA123'),
+            knowledge._clean('Cookie: csrftoken=secretB123; theme=dark'),
+            knowledge._clean('{"token":"secretE"}'),
+            knowledge._clean('password: "abc def ghi"'),
+            knowledge._clean_url('https://host/x?sessionid=secretC123&X-Amz-Credential=secretD123'),
+            knowledge._clean_url('https://host/x?api%5Fkey%3Dabc12345'),
+            knowledge._clean_url('https://host/x?ok=1%26refresh_token=abc12345'),
+        ]
+        blob = ' '.join(secrets)
+        for sentinel in ('secretA123', 'secretB123', 'secretE', 'abc def',
+                         'secretC123', 'secretD123', 'abc12345'):
+            self.assertNotIn(sentinel, blob)
+        # Benign content survives byte-for-byte.
+        self.assertEqual(knowledge._clean('session 2026-11-02 planning'),
+                         'session 2026-11-02 planning')
+        self.assertEqual(knowledge._clean('Meeting at 10:30@home'),
+                         'Meeting at 10:30@home')
+        self.assertEqual(knowledge._clean_url('https://example.com/?q=dogs%26cats'),
+                         'https://example.com/?q=dogs%26cats')
+
+    def test_rank_index_cache_invalidates_on_content_change(self):
+        import knowledge
+        docs = [dict(id=f'd{i}', title=f'doc{i}', source=f's{i}',
+                     text=('alpha beta gamma ' * 20) + f' unique{i}',
+                     updated_at=None) for i in range(50)]
+        first = knowledge.KnowledgeEngine._rank(docs, ['alpha', 'unique7'], 3)
+        again = knowledge.KnowledgeEngine._rank(docs, ['alpha', 'unique7'], 3)
+        self.assertEqual([d['source'] for d in first], [d['source'] for d in again])
+        docs[7] = dict(docs[7], text='zeta omega replaced content ' * 10)
+        changed = knowledge.KnowledgeEngine._rank(docs, ['zeta'], 3)
+        self.assertTrue(changed and changed[0]['source'] == 's7')
+
     def test_semicolon_params_and_ordinary_sort_key(self):
         import knowledge
         self.assertNotIn('SENTINEL1', knowledge._clean_url(
