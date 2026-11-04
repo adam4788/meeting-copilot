@@ -13,6 +13,7 @@ from test_overlay_descendants import OverlayDescendantTests
 from test_overlay_portability import OverlayPortabilityTests
 from test_overlay_reader_eof import ReaderEOFTests
 from test_overlay_eof_recovery import EOFRecoveryTests
+from test_overlay_channel_health import ChannelHealthTests
 from test_overlay_startup_admission import StartupAdmissionTests
 
 
@@ -58,6 +59,28 @@ def main():
         ("or (eof is not None and eof.is_set()))", "or eof is None or eof.is_set())")])],
         ReaderEOFTests('test_missing_pipe_evidence_cannot_confirm'))
     if sys.platform in ('darwin', 'linux'):
+        verify('protocol text-mode decode must not lose EOF', [mutate(OverlayBridge, '_check_helper_protocol', [
+            ('text=False', 'text=True'),
+            ("output = output.decode('utf-8', errors='strict')", 'pass')])],
+            ChannelHealthTests('test_malformed_protocol_exit_zero_allows_hide_and_new_start'))
+        verify('protocol EOF recorded before strict decoding', [mutate(OverlayBridge, '_check_helper_protocol', [
+            ("self._stdout_eof[target].set()\n            output = output.decode('utf-8', errors='strict')",
+             "output = output.decode('utf-8', errors='strict')\n            self._stdout_eof[target].set()")])],
+            ChannelHealthTests('test_malformed_protocol_exit_zero_allows_hide_and_new_start'))
+        verify('protocol decoding stays strict', [mutate(OverlayBridge, '_check_helper_protocol', [
+            ("errors='strict'", "errors='ignore'")])],
+            ChannelHealthTests('test_protocol_decode_is_strict_even_around_valid_token'))
+        verify('protocol arbitrary exception/closed handle is not EOF', [mutate(OverlayBridge, '_check_helper_protocol', [
+            ('finally:\n            with self.lock:',
+             'finally:\n            self._stdout_eof[target].set()\n            with self.lock:')])],
+            ChannelHealthTests('test_protocol_read_exception_and_closed_handle_are_not_eof'))
+        verify('protocol live holder cannot invent EOF', [mutate(OverlayBridge, '_recover_stdout_eof', [
+            ('pass  # includes EAGAIN: a live holder is not EOF', 'eof.set()')])],
+            ChannelHealthTests('test_protocol_live_pipe_holder_retains_uncertainty_until_real_eof'))
+        for entry in ('fresh_direct', 'fresh_controller', 'repeated_direct', 'repeated_controller'):
+            verify(f'active stdout EOF rejects {entry} Show', [mutate(OverlayBridge, '_read_clicks', [
+                ('self._reader_failed.add(process)', 'pass  # lost active EOF health')])],
+                ChannelHealthTests(f'test_{entry}_show_rejects_active_stdout_eof'))
         verify('reader failure recovers real EOF', [
             patch.object(OverlayBridge, '_recover_stdout_eof', lambda *args: None)],
             EOFRecoveryTests('test_decode_failure_recovers_only_after_actual_eof'))
@@ -86,11 +109,15 @@ def main():
             mutate(OverlayBridge, '_reap_locked', [
                 ("eof is not None and eof.is_set()", "True")])],
             OverlayDescendantTests('test_retired_line_is_not_eof_from_escaped_stdout_holder'))
+        # An exited child's EOF now supplies independent unhealthy evidence;
+        # remove both guards to recreate the original dead-Show acceptance.
         verify('already dead helper cannot commit Show', [mutate(MeetingState, 'overlay_show', [
             ('and alive is True', 'and True'),
+            ("and process not in getattr(bridge, '_reader_failed', ())", 'and True'),
             ("and not isinstance(getattr(process, 'returncode', None), int)", 'and True')])],
             StartupAdmissionTests('test_show_rejects_helper_exited_before_startup_commit'))
         verify('direct Show rejects cached dead launch', [mutate(OverlayBridge, 'show_overlay', [
+            ('if process in self._reader_failed:', 'if False:'),
             ("if self.stopping or isinstance(getattr(process, 'returncode', None), int):", 'if False:')])],
             StartupAdmissionTests('test_direct_show_does_not_report_cached_dead_launch'))
         verify('reused Show rejects cached exit', [mutate(MeetingState, '_overlay_show', [
@@ -102,8 +129,8 @@ def main():
              'alive = process.poll() is None if process is not None else True')])],
             StartupAdmissionTests('test_startup_liveness_probe_is_bounded_and_off_lifecycle_lock'))
     suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(cls)
-                               for cls in (ReaderEOFTests, EOFRecoveryTests, OverlayPortabilityTests,
-                                           OverlayDescendantTests, StartupAdmissionTests))
+                               for cls in (ReaderEOFTests, EOFRecoveryTests, ChannelHealthTests,
+                                           OverlayPortabilityTests, OverlayDescendantTests, StartupAdmissionTests))
     if not unittest.TextTestRunner(verbosity=1).run(suite).wasSuccessful():
         raise SystemExit(1)
     print('Restored production: GREEN')

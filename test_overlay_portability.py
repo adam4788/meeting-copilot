@@ -21,6 +21,7 @@ class OverlayPortabilityTests(unittest.TestCase):
                 'test_run_forwards_snapshot_to_actual_os_pipe']),
             'test_overlay_teardown.py': ('OverlayTeardownTests', None),
             'test_overlay_eof_recovery.py': ('EOFRecoveryTests', None),
+            'test_overlay_channel_health.py': ('ChannelHealthTests', None),
         }
         # Reload declarations under a simulated platform, not the actual OS.
         # Guard before running anything, so a missing skip cannot spawn a child.

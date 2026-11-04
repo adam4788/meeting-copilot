@@ -909,7 +909,7 @@ class OverlayBridge:
             target = subprocess.Popen(
                 [self.helper_path] + list(getattr(self, 'helper_args', None) or []) + ['--protocol-version'],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+                stderr=subprocess.DEVNULL, text=False, start_new_session=True)
             with self.lock:
                 self._process_groups[target] = target.pid
                 self._register_stdout_locked(target)
@@ -917,7 +917,11 @@ class OverlayBridge:
                 self.process = target
             try:
                 output, _ = target.communicate(timeout=2)
-                self._stdout_eof[target].set()  # communicate completed its actual read
+                # Binary communicate finishes the actual read before decoding.
+                # Text-mode communicate can close stdout then raise on invalid
+                # bytes, stranding an unset EOF obligation on a closed stream.
+                self._stdout_eof[target].set()
+                output = output.decode('utf-8', errors='strict')
             finally:
                 with self.lock:
                     self._stdout_busy.discard(target)
@@ -1366,9 +1370,15 @@ class OverlayBridge:
             else:
                 # Only normal iterator exhaustion proves EOF, never an early
                 # reader return/break or IO exception.
-                eof = self._stdout_eof.get(process)
-                if eof is not None:
-                    eof.set()
+                with self.lock:
+                    # EOF proves pipe retirement, but an active display can no
+                    # longer deliver clicks even if its process is still alive.
+                    # Retired readers must not taint a replacement lifecycle.
+                    if not self.stopping and process is self.process:
+                        self._reader_failed.add(process)
+                    eof = self._stdout_eof.get(process)
+                    if eof is not None:
+                        eof.set()
         except (OSError, ValueError):
             with self.lock:
                 self._reader_failed.add(process)
