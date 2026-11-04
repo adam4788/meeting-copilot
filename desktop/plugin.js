@@ -17,14 +17,23 @@ export default {
     // wall clock nor HTTP arrival can establish pane creation order.
     const orderKey = Symbol.for('meeting-copilot.pane-creation.v1');
     const order = globalThis[orderKey] ||= { client: globalThis.crypto?.randomUUID?.(), next: 0 };
+    const registration = order.registration = (order.registration || 0) + 1;
+    let active = true;
+    let paneRegistration = null;
+    const registered = () => active && order.registration === registration;
     const lifecycles = new Set();
+    const notify = (kind, message) => { try { host.notify({ kind, message }); } catch (e) {} };
     function releaseOverlayPane(life) {
       lifecycles.delete(life);
-      if (!life.pane || life.released) return;
+      if (life.release) return life.release;
+      if (!life.pane) return Promise.resolve({ accepted: false });
       life.released = true;
-      api('/overlay/release', { pane: life.pane, action: ++life.action }).catch(() => {});
+      life.release = api('/overlay/release', { pane: life.pane, action: ++life.action });
+      // Observe cleanup failures too; Restart still receives the rejection.
+      life.release.catch(() => notify('warning', 'Capture pause could not be confirmed. The abandoned lease expires within 30 seconds plus the watchdog check; verify capture has stopped.'));
+      return life.release;
     }
-    function MeetingPane() {
+    function MeetingPane({ registration: paneEntry }) {
       const qc = useQueryClient();
       const SCOPE_KEY = 'meeting-copilot.scope.v2';
       const loadScope = () => {
@@ -83,7 +92,18 @@ export default {
       // polls use touch=false so only this heartbeat extends the 30s watchdog.
       useEffect(() => {
         if (status.error) return undefined;
-        const beat = () => api('/heartbeat', {}).catch(() => {});
+        const beat = async () => {
+          const life = overlayActionAt.current;
+          // A rejected/uncertain claim is not authority, and must not fall back
+          // to unscoped heartbeats or fresh revision tickets.
+          if (!life.mounted || !life.pane || life.released) return;
+          try {
+            const result = await api('/heartbeat', { pane: life.pane });
+            if (result?.accepted === false && life.mounted) setOverlayMsg('Pane lease expired or ownership changed. Capture will pause; close and reopen this pane.');
+          } catch (e) {
+            if (life.mounted) setOverlayMsg('Heartbeat failed. Capture will pause if the connection does not recover within 30 seconds.');
+          }
+        };
         const timer = setInterval(beat, 10000);
         return () => clearInterval(timer);
       }, [!!status.error]);
@@ -128,7 +148,10 @@ export default {
       function newOverlayLifecycle() {
         const life = { at: 0, owner: null, pane: null, claim: null, action: 0,
           creation: ++order.next,
-          mounted: true, syncedKey: null, released: false };
+          alive: true, syncedKey: null, released: false,
+          get mounted() { return this.alive && registered() && paneEntry.active && paneRegistration === paneEntry; },
+          set mounted(value) { this.alive = value; } };
+        paneEntry.life = life;
         lifecycles.add(life);
         return life;
       }
@@ -136,22 +159,30 @@ export default {
       if (!overlayActionAt.current) overlayActionAt.current = newOverlayLifecycle();
       async function claimOverlayPane(life) {
         if (!life.claim) life.claim = Promise.resolve().then(() => {
+          if (!life.mounted) return null;
           if (!order.client || !Number.isSafeInteger(life.creation)) throw new Error('Pane creation ordering is unavailable.');
           return api('/overlay/lifecycle');
         }).then(async ticket => {
           if (!life.mounted) return null;
           if (!ticket.epoch) throw new Error('Update/restart the backend for pane creation ordering.');
+          life.claimAttempted = true;
           return api('/overlay/claim', { revision: ticket.revision, epoch: ticket.epoch,
             client: order.client, creation: life.creation });
         }).then(result => {
           if (!result && !life.mounted) return null;
-          if (result?.reason === 'different_renderer') throw new Error('Another desktop renderer owns this backend. Return to that window, or close all Meeting Copilot panes and restart the backend when other sessions are idle.');
+          if (result?.reason === 'different_renderer') throw new Error('Another desktop renderer owns this backend. A reloaded renderer cannot renew its capture lease: the watchdog initiates stop within 32 seconds of the last owner heartbeat. Verify capture has stopped. Return to the original window, or close all Meeting Copilot panes and restart the backend when other sessions are idle, then reopen.');
           if (result?.accepted === false) throw new Error('Another pane owns the overlay. Close and reopen this pane to take ownership.');
           if (!result?.pane) throw new Error('Overlay lifecycle protocol unavailable. Update/restart the backend and reopen the pane.');
           life.pane = result.pane;
           if (!life.mounted) releaseOverlayPane(life);
           return result.pane;
         }).catch(e => {
+          if (!life.claimAttempted) {
+            // GET cannot commit. Retry on the next user action using the SAME
+            // creation identity; never replay a possibly committed POST.
+            life.claim = null;
+            throw new Error(`${String(e.message || e)} Retry the action to look up lifecycle authorization, or close and reopen the pane.`);
+          }
           // A lost claim response may already have committed. Do not mint a
           // new creation ID on retry: reopening is an explicit new lifecycle.
           throw new Error(`${String(e.message || e)} Close and reopen this pane to retry lifecycle authorization.`);
@@ -210,6 +241,7 @@ export default {
       // 2.5s status poll heals a missed invalidation, and a failed refresh
       // must not masquerade as a failed destructive action.
       async function act(path, body = {}) {
+        if (!overlayActionAt.current.mounted) return false;
         setPending(true); setError('');
         try {
           if (path === '/pause' || path === '/clear') {
@@ -669,14 +701,28 @@ export default {
     }
     const paneId = `${ID}:pane`;
     const visibility = typeof host.paneVisibility === 'function' ? host.paneVisibility(paneId) : null;
-    const registerPane = () => ctx.register({ id: 'pane', area: 'panes', title: 'Meeting Copilot', data: { placement: 'right', width: '440px' }, render: () => h(MeetingPane) });
+    const registerPane = () => {
+      const entry = { active: true, life: null };
+      paneRegistration = entry;
+      const remove = ctx.register({ id: 'pane', area: 'panes', title: 'Meeting Copilot', data: { placement: 'right', width: '440px' },
+        render: () => registered() && entry.active && paneRegistration === entry ? h(MeetingPane, { registration: entry }) : null });
+      return () => {
+        if (!registered() || paneRegistration !== entry || !entry.active) return;
+        entry.active = false;
+        paneRegistration = null;
+        if (entry.life) { entry.life.mounted = false; releaseOverlayPane(entry.life); }
+        remove();
+      };
+    };
     let removePane = registerPane();
     const openPane = () => {
+      if (!registered()) return;
       if (!removePane) removePane = registerPane();
       if (typeof host.revealPane === 'function') host.revealPane(paneId);
       else host.notify({ kind: 'error', message: 'Update Hermes Desktop to reopen contributed panes.' });
     };
     const togglePane = () => {
+      if (!registered()) return;
       // Read current host state on click, not a potentially stale render closure.
       if (visibility?.get() && typeof removePane === 'function') {
         removePane();
@@ -684,12 +730,31 @@ export default {
       } else openPane();
     };
     async function restartPlugin() {
-      let pauseOk = true;
-      try { await api('/pause', {}); } catch (e) { pauseOk = false; }
-      try { if (typeof removePane === 'function') removePane(); } catch (e) {}
-      removePane = null;
-      openPane();
-      try { host.notify({ kind: pauseOk ? 'info' : 'warning', message: pauseOk ? 'Meeting Copilot restarted. Capture paused and pane reopened. If answers still look stale, restart the gateway itself when other sessions are idle.' : 'Pane reopened, but capture pause failed. Restart the gateway itself when other sessions are idle.' }); } catch (e) {}
+      if (!registered()) return;
+      const entry = paneRegistration, remove = removePane;
+      if (!entry) { openPane(); return; }
+      if (entry.restarting) return;
+      entry.restarting = true;
+      const life = entry.life;
+      const current = () => registered() && paneRegistration === entry && removePane === remove && entry.life === life;
+      try {
+        if (life) {
+          // Retire callbacks/heartbeats BEFORE awaiting. A new pane may open
+          // meanwhile; this continuation never owns that registration.
+          life.mounted = false;
+          if (life.claim) await life.claim;
+          if (life.pane) {
+            const released = await releaseOverlayPane(life);
+            if (released?.accepted !== true) throw new Error('Pane ownership changed; release was not accepted.');
+          }
+        }
+        if (!current()) return;
+        remove(); removePane = null;
+        openPane();
+        notify('info', 'Meeting Copilot pane reopened. Its owned capture was paused before reopening; Resume requires consent.');
+      } catch (e) {
+        if (current()) notify('warning', `Restart was not completed: ${String(e.message || e)} Close and reopen the pane. Capture pause is not confirmed; the abandoned lease will expire.`);
+      } finally { entry.restarting = false; }
     };
     function StatusButton() {
       const visible = visibility ? useValue(visibility) : false;
@@ -733,6 +798,7 @@ export default {
         life.mounted = false;
         releaseOverlayPane(life);
       }
+      active = false;
     };
   },
 };

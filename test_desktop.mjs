@@ -3,6 +3,283 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { webcrypto } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { createInterface } from 'node:readline';
+
+async function realBackend(t) {
+  const child = spawn('python', ['-B', '-u', 'lifecycle_test_backend.py'], { cwd: new URL('.', import.meta.url), stdio: ['pipe', 'pipe', 'pipe'] });
+  let id = 0, stderr = '';
+  const waiting = new Map(), errors = [], traffic = [];
+  child.stderr.on('data', data => { stderr += data; });
+  const lines = createInterface({ input: child.stdout });
+  lines.on('line', line => {
+    try {
+      const data = JSON.parse(line), pending = waiting.get(data.id);
+      assert.ok(pending, 'unexpected backend reply');
+      waiting.delete(data.id);
+      if (data.error) { errors.push(data.error); pending.reject(new Error(data.error)); }
+      else pending.resolve(data.result);
+    } catch (error) { errors.push(error); }
+  });
+  const exited = new Promise(resolve => child.on('exit', (code, signal) => {
+    for (const pending of waiting.values()) pending.reject(new Error(`backend exited: ${code}/${signal}: ${stderr}`));
+    waiting.clear(); resolve(code);
+  }));
+  t.after(async () => {
+    child.stdin.end();
+    assert.equal(await exited, 0, stderr);
+    assert.deepEqual(errors, []);
+    assert.equal(stderr, '', 'no swallowed backend/thread errors');
+    lines.close();
+  });
+  const rpc = message => new Promise((resolve, reject) => {
+    const key = ++id; waiting.set(key, { resolve, reject });
+    child.stdin.write(JSON.stringify({ ...message, id: key }) + '\n');
+  });
+  const rest = async (path, options = {}) => {
+    const reply = await rpc({ path, ...options });
+    traffic.push({ path, ...options, requestBody: options.body, ...reply });
+    if (reply.code >= 400) throw new Error(`${reply.code}: ${JSON.stringify(reply.body)}`);
+    return reply.body;
+  };
+  const mount = (globals = {}, transport = rest) => {
+    const timers = new Map(); let next = 0;
+    const status = {};
+    const p = pane('', true, false, '', { 3: true, 4: 'macos' }, transport, status, {
+      setInterval: fn => { timers.set(++next, fn); return next; },
+      clearInterval: key => timers.delete(key), ...globals,
+    }, { effects: true });
+    return { ...p,
+      async refresh() { Object.assign(status, await rest('/status')); return p.rerender(); },
+      async heartbeat() { for (const fn of timers.values()) await fn(); await rpc({ command: 'inspect' }); } };
+  };
+  return { rpc, rest, mount, traffic };
+}
+
+test('real renderer heartbeat cannot keep abandoned capture alive after reload', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t);
+  const owner = backend.mount();
+  await button(owner.tree, 'Start listening').props.onClick();
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, true);
+  // No cleanup: the first renderer vanished. A fresh JS global has a new ID.
+  const reloaded = backend.mount();
+  await button(reloaded.tree, 'Start listening').props.onClick();
+  assert.equal(backend.traffic.filter(r => r.path === '/overlay/claim').at(-1).body.reason, 'different_renderer');
+  for (let i = 0; i < 4; i++) {
+    await reloaded.heartbeat();
+    await reloaded.pollStatus();
+    await backend.rpc({ command: 'tick', seconds: 10 });
+  }
+  const stopped = await backend.rpc({ command: 'inspect' });
+  assert.equal(stopped.running, false, 'rejected renderer must not renew abandoned capture');
+  assert.equal(stopped.stops, 1);
+  reloaded.unmount();
+});
+
+test('real current owner renews capture; superseded heartbeat and status do not', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t);
+  const globals = { globalThis: { crypto: webcrypto } };
+  const old = backend.mount(globals);
+  await button(old.tree, 'Start listening').props.onClick();
+  const stalePane = old.requests.find(r => r.path === '/start').body.pane;
+  const current = backend.mount(globals);
+  await button(current.tree, 'Start listening').props.onClick();
+  for (let i = 0; i < 5; i++) {
+    await backend.rpc({ command: 'tick', seconds: 10 });
+    await current.heartbeat();
+  }
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, true);
+  const before = (await backend.rpc({ command: 'inspect' })).seen;
+  for (let i = 0; i < 4; i++) {
+    await old.heartbeat(); await old.pollStatus();
+    // A heartbeat already queued in transport before re-registration.
+    await backend.rest('/heartbeat', { method: 'POST', body: { pane: stalePane } });
+    await backend.rpc({ command: 'tick', seconds: 10 });
+  }
+  const after = await backend.rpc({ command: 'inspect' });
+  assert.equal(after.seen, before, 'stale owner cannot extend lease');
+  assert.equal(after.running, false);
+  assert.equal(backend.traffic.filter(r => r.path === '/heartbeat').at(-1).body.accepted, false);
+  old.unmount(); current.unmount();
+  await backend.rpc({ command: 'inspect' });
+});
+
+function gate() {
+  let resolve;
+  const promise = new Promise(r => { resolve = r; });
+  return { promise, resolve };
+}
+function command(p, label) { return p.contributions.find(c => c.area === 'palette' && c.data.label === label).data.run; }
+
+test('real Restart waits for fenced release before reopening and never leaves capture active', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t), entered = gate(), resume = gate();
+  t.after(() => resume.resolve());
+  const p = backend.mount({}, async (path, options) => {
+    if (path === '/overlay/release') { entered.resolve(); await resume.promise; }
+    return backend.rest(path, options);
+  });
+  await button(p.tree, 'Start listening').props.onClick();
+  const original = p.contributions.find(c => c.area === 'panes');
+  const restarting = command(p, 'Restart Meeting Copilot')();
+  // This gate also exposes the old unscoped Pause path without hanging RED.
+  await Promise.race([entered.promise, restarting]);
+  const whilePending = p.contributions.find(c => c.area === 'panes');
+  resume.resolve(); await restarting;
+  await backend.rpc({ command: 'inspect' });
+  assert.equal(whilePending, original, 'must await release before replacing pane');
+  assert.ok(!p.requests.some(r => r.path === '/pause' && !r.body.pane));
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, false);
+  assert.notEqual(p.contributions.find(c => c.area === 'panes'), original);
+  await button(p.rerender(), 'Start listening').props.onClick();
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, true, 'replacement remains functional');
+  p.unmount(); await backend.rpc({ command: 'inspect' });
+});
+
+test('real overlapping Restart cannot remove or pause a newly opened pane', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t), entered = gate(), resume = gate();
+  t.after(() => resume.resolve());
+  const p = backend.mount({}, async (path, options) => {
+    if (path === '/overlay/release' || path === '/pause') { entered.resolve(); await resume.promise; }
+    return backend.rest(path, options);
+  });
+  await button(p.tree, 'Start listening').props.onClick();
+  command(p, 'Open Meeting Copilot')();
+  const restarting = command(p, 'Restart Meeting Copilot')();
+  await entered.promise;
+  const opener = p.contributions.find(c => c.area === 'statusBar.right');
+  nodes(opener.render()).find(n => n.type === 'button').props.onClick();
+  command(p, 'Open Meeting Copilot')();
+  const replacement = p.contributions.find(c => c.area === 'panes');
+  await button(p.rerender(), 'Start listening').props.onClick();
+  resume.resolve(); await restarting;
+  assert.equal(p.contributions.find(c => c.area === 'panes'), replacement);
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, true);
+  p.unmount(); await backend.rpc({ command: 'inspect' });
+});
+
+test('real Restart cannot retire a newer effect lifecycle in the same registration', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t), entered = gate(), resume = gate();
+  t.after(() => resume.resolve());
+  const p = backend.mount({}, async (path, options) => {
+    const result = await backend.rest(path, options);
+    if (path === '/overlay/release') { entered.resolve(); await resume.promise; }
+    return result;
+  });
+  await button(p.tree, 'Start listening').props.onClick();
+  const original = p.contributions.find(c => c.area === 'panes');
+  const restarting = command(p, 'Restart Meeting Copilot')();
+  await entered.promise;
+  await button(p.replayEffects(), 'Start listening').props.onClick();
+  resume.resolve(); await restarting;
+  await backend.rpc({ command: 'inspect' });
+  assert.equal(p.contributions.find(c => c.area === 'panes'), original);
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, true);
+  p.unmount(); await backend.rpc({ command: 'inspect' });
+});
+
+test('real lookup retry restores Start Pause and Clear without replaying a claim', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t);
+  let lookups = 0;
+  const p = backend.mount({}, (path, options) => {
+    if (path === '/overlay/lifecycle' && ++lookups === 1) throw new Error('transient GET');
+    return backend.rest(path, options);
+  });
+  await settle();
+  await button(p.tree, 'Start listening').props.onClick();
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, true);
+  await backend.rpc({ command: 'segment', text: 'Synthetic integration meeting' });
+  await button(await p.refresh(), 'Clear meeting').props.onClick();
+  assert.deepEqual((await backend.rest('/status')).segments, []);
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, true, 'Clear restarts the authorized capture');
+  await button(await p.refresh(), 'Pause listening').props.onClick();
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, false);
+  assert.equal(lookups, 2);
+  assert.equal(backend.traffic.filter(r => r.path === '/overlay/claim').length, 1);
+  const controls = backend.traffic.filter(r => ['/start', '/clear', '/pause'].includes(r.path));
+  assert.deepEqual(controls.map(r => r.code), [200, 200, 200]);
+  assert.ok(controls.every(r => r.requestBody.pane && r.requestBody.action > 0));
+  assert.ok(controls[0].requestBody.action < controls[1].requestBody.action);
+  assert.ok(controls[1].requestBody.action < controls[2].requestBody.action);
+  p.unmount(); await backend.rpc({ command: 'inspect' });
+});
+
+test('real committed claim with lost reply never replays; explicit new mount recovers', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t), committed = gate();
+  const globals = { globalThis: { crypto: webcrypto } };
+  const old = backend.mount(globals, async (path, options) => {
+    const result = await backend.rest(path, options);
+    if (path === '/overlay/claim') { committed.resolve(); throw new Error('claim committed, response lost'); }
+    return result;
+  });
+  await committed.promise;
+  for (let i = 0; i < 2; i++) await button(old.tree, 'Start listening').props.onClick();
+  await old.heartbeat();
+  assert.equal(backend.traffic.filter(r => r.path === '/overlay/claim').length, 1);
+  assert.ok(!backend.traffic.some(r => ['/start', '/heartbeat'].includes(r.path)));
+  old.unmount();
+  const newer = backend.mount(globals);
+  await button(newer.tree, 'Start listening').props.onClick();
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, true);
+  newer.unmount(); await backend.rpc({ command: 'inspect' });
+});
+
+test('real failed Restart release stays closed to callbacks and expires instead of legacy fallback', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t);
+  const p = backend.mount({}, (path, options) => {
+    if (path === '/overlay/release') throw new Error('release transport lost');
+    return backend.rest(path, options);
+  });
+  await button(p.tree, 'Start listening').props.onClick();
+  const original = p.contributions.find(c => c.area === 'panes');
+  await command(p, 'Restart Meeting Copilot')();
+  assert.equal(p.contributions.find(c => c.area === 'panes'), original);
+  assert.ok(!p.requests.some(r => r.path === '/pause'));
+  assert.ok(p.notices.some(n => n.kind === 'warning' && /not completed/.test(n.message)), 'unconfirmed pause is visible');
+  await p.heartbeat();
+  assert.equal((await backend.rpc({ command: 'tick', seconds: 32 })).running, false);
+  p.unmount();
+  assert.equal(p.requests.filter(r => r.path === '/overlay/release').length, 1, 'uncertain release is not replayed');
+});
+
+test('superseded registration callbacks cannot restart open or heartbeat a newer pane', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t);
+  const globals = { globalThis: { crypto: webcrypto } };
+  const old = backend.mount(globals);
+  await button(old.tree, 'Start listening').props.onClick();
+  const restart = command(old, 'Restart Meeting Copilot'), open = command(old, 'Open Meeting Copilot');
+  const current = backend.mount(globals);
+  await button(current.tree, 'Start listening').props.onClick();
+  const requests = old.requests.length;
+  await restart(); open(); await old.heartbeat();
+  assert.equal(old.requests.length, requests);
+  assert.equal(old.revealed.length, 0);
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, true);
+  old.unregister();
+  await backend.rpc({ command: 'inspect' });
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, true);
+  current.unmount(); await backend.rpc({ command: 'inspect' });
+});
+
+test('transient lifecycle GET retries but uncertain claim never replays', async () => {
+  let lookups = 0;
+  const p = lifecyclePane({ '/overlay/lifecycle': () => {
+    if (++lookups === 1) throw new Error('temporary lookup failure');
+    return { revision: 0, epoch: 'backend-epoch' };
+  } }, { 3: true, 4: 'macos' });
+  await settle();
+  await button(p.tree, 'Start listening').props.onClick();
+  assert.equal(lookups, 2);
+  assert.equal(p.requests.filter(r => r.path === '/overlay/claim').length, 1);
+  assert.equal(p.requests.filter(r => r.path === '/start').length, 1);
+  p.unmount();
+  let claims = 0;
+  const uncertain = lifecyclePane({ '/overlay/claim': () => { claims++; throw new Error('response lost after commit'); } }, { 3: true, 4: 'macos' });
+  await settle();
+  for (let i = 0; i < 2; i++) await button(uncertain.tree, 'Start listening').props.onClick();
+  assert.equal(claims, 1);
+  assert.ok(!uncertain.requests.some(r => r.path === '/start'));
+  uncertain.unmount();
+});
 
 test('capture recovery confirms changed source before destructive restart', async () => {
   for (const accept of [false, true]) {
@@ -39,22 +316,34 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
   const requests = [];
   const contributions = [];
   const revealed = [];
+  const notices = [];
   const effects = [];
   let effectIndex = 0;
   let pendingEffects = [];
+  let statusQuery;
   let visible = false;
   const visibility = { get: () => visible };
   const ctx = {
     rest: async (path, options = {}) => {
       requests.push({ path, ...options });
-      const defaults = { '/overlay/lifecycle': { revision: 0, epoch: 'backend-epoch' }, '/overlay/claim': { pane: 'test-pane' }, '/overlay/show': { shown: true, owner: 'test-owner' } };
+      const defaults = { '/overlay/lifecycle': { revision: 0, epoch: 'backend-epoch' }, '/overlay/claim': { pane: 'test-pane' }, '/overlay/show': { shown: true, owner: 'test-owner' }, '/overlay/release': { accepted: true } };
+      if (typeof respond === 'function') return respond(path, options);
       const r = respond[path] || defaults[path];
       return typeof r === 'function' ? r(path, options) : (r || {});
     },
     register: item => {
       contributions.push(item);
       if (item.area === 'panes') registered = item;
-      return () => { contributions.splice(contributions.indexOf(item), 1); if (item.area === 'panes') visible = false; };
+      return () => {
+        const index = contributions.indexOf(item);
+        if (index < 0) return;
+        contributions.splice(index, 1);
+        if (item.area === 'panes') {
+          visible = false;
+          for (const effect of effects) effect?.cleanup?.();
+          effects.length = 0; values.length = 0;
+        }
+      };
     },
   };
   const h = (type, props, ...children) => typeof type === 'function'
@@ -85,12 +374,12 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
       }
     },
     useQueryClient: () => ({ invalidateQueries: qcBehavior.failInvalidate ? async () => { throw new Error('invalidate failed'); } : async () => {} }),
-    useQuery: options => ({ data: options.queryKey[1] === 'status'
+    useQuery: options => { if (options.queryKey[1] === 'status') statusQuery = options; return ({ data: options.queryKey[1] === 'status'
       ? { capabilities: supported ? { all_projects: true, automatic_web_fallback: true, independent_models: true, macos_transcription: true, overlay: true, overlay_stream: true, overlay_cancel: true } : undefined, ...statusExtra }
       : options.queryKey[1] === 'projects' ? [{ name: 'alpha', path: '/projects/alpha' }]
-      : options.queryKey[1] === 'models' ? { providers: [{ id: 'openai-codex', label: 'Codex', models: [{ id: 'gpt-test', label: 'Test model' }] }] } : [] }),
+      : options.queryKey[1] === 'models' ? { providers: [{ id: 'openai-codex', label: 'Codex', models: [{ id: 'gpt-test', label: 'Test model' }] }] } : [] }); },
     useValue: atom => atom.get(),
-    host: { paneVisibility: () => visibility, revealPane: id => { revealed.push(id); visible = true; } }, Button: 'button', Input: 'input', Textarea: 'textarea', Badge: 'badge', PALETTE_AREA: 'palette',
+    host: { notify: notice => notices.push(notice), paneVisibility: () => visibility, revealPane: id => { revealed.push(id); visible = true; } }, Button: 'button', Input: 'input', Textarea: 'textarea', Badge: 'badge', PALETTE_AREA: 'palette',
     ...browserGlobals,
   });
   const render = () => {
@@ -99,7 +388,8 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
     for (const effect of pendingEffects) effect();
     return tree;
   };
-  return { tree: render(), rerender: render, requests, contributions, revealed, unregister,
+  return { tree: render(), rerender: render, requests, contributions, revealed, notices, unregister,
+    pollStatus: () => statusQuery.queryFn(),
     unmount: () => { for (const effect of effects) effect?.cleanup?.(); },
     replayEffects: () => { for (const effect of effects) effect?.cleanup?.(); effects.length = 0; return render(); } };
 }
@@ -145,8 +435,9 @@ for (const failedPath of ['/overlay/lifecycle', '/overlay/claim']) test(`failed 
   assert.match(text, /network unavailable/);
   assert.match(text, /[Rr]eopen|[Cc]lose and reopen/);
   await button(p.rerender(), 'Show overlay').props.onClick();
-  assert.equal(p.requests.filter(r => r.path === '/overlay/lifecycle').length, 1);
-  assert.equal(p.requests.filter(r => r.path === failedPath).length, 1);
+  const expected = failedPath === '/overlay/lifecycle' ? 2 : 1;
+  assert.equal(p.requests.filter(r => r.path === '/overlay/lifecycle').length, expected);
+  assert.equal(p.requests.filter(r => r.path === failedPath).length, expected);
   assert.ok(!p.requests.some(r => r.path === '/overlay/show'));
   p.unmount();
 });
@@ -261,7 +552,7 @@ test('started capture carries the capability and cleanup supersedes it', async (
   assert.ok(release.body.action > start.body.action);
 });
 
-test('creation identity precedes delayed lookup across overlapping plugin registrations', async () => {
+test('superseded plugin registration cannot commit its delayed lifecycle lookup', async () => {
   const shared = { crypto: webcrypto };
   const globals = { globalThis: shared, setInterval: () => 0, clearInterval: () => {} };
   let deliverOld;
@@ -275,11 +566,10 @@ test('creation identity precedes delayed lookup across overlapping plugin regist
   // The newer pane has claimed before the old GET is even handled.
   deliverOld({ revision: 1, epoch: 'backend-epoch' });
   await settle();
-  const oldClaim = older.requests.find(r => r.path === '/overlay/claim').body;
+  assert.ok(!older.requests.some(r => r.path === '/overlay/claim'), 'retired registration cannot commit');
   const newClaim = newer.requests.find(r => r.path === '/overlay/claim').body;
-  assert.equal(oldClaim.client, newClaim.client, 'module re-registration preserves ordering domain');
-  assert.ok(oldClaim.creation < newClaim.creation, 'creation order must not be GET completion order');
-  assert.equal(oldClaim.epoch, 'backend-epoch');
+  assert.equal(newClaim.creation, 2, 'creation identity is assigned before either GET finishes');
+  assert.equal(newClaim.epoch, 'backend-epoch');
   older.rerender();
   older.rerender();
   older.unregister();
@@ -428,12 +718,14 @@ test('status bar toggles open, hide, and reopen without capture changes', () => 
   assert.equal(requests.length, 0);
 });
 
-test('restart command pauses capture and reopens exactly one pane', async () => {
-  const { contributions, revealed, requests } = pane('');
+test('restart command releases owned capture and reopens exactly one pane', async () => {
+  const { contributions, revealed, requests } = lifecyclePane();
+  await settle();
   const restart = contributions.find(c => c.area === 'palette' && c.data.label === 'Restart Meeting Copilot');
   assert.ok(restart, 'A restart command must be discoverable in Cmd+K');
   await restart.data.run();
-  assert.ok(requests.some(r => r.path === '/pause'), 'Restart must pause capture first');
+  assert.ok(requests.some(r => r.path === '/overlay/release' && r.body.pane), 'Restart must release owned capture first');
+  assert.ok(!requests.some(r => r.path === '/pause'), 'never fall back to legacy Pause');
   assert.equal(contributions.filter(c => c.area === 'panes').length, 1, 'Restart must leave exactly one pane registration');
   assert.deepEqual(revealed, ['meeting-copilot-live:pane']);
 });

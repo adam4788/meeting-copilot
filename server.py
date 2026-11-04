@@ -57,6 +57,13 @@ class OverlayActionRequest(OverlayScopeRequest):
     action: int = Field(ge=1, strict=True)
 
 
+class LeaseRequest(BaseModel):
+    model_config = {'extra': 'forbid'}
+    pane: str | None = Field(default=None, min_length=1, max_length=100)
+    revision: int | None = Field(default=None, ge=0, strict=True)
+    epoch: str | None = Field(default=None, min_length=1, max_length=100)
+
+
 class LifecycleControlRequest(BaseModel):
     # No ignored/typoed authorization may fall back to legacy admission.
     model_config = {'extra': 'forbid'}
@@ -369,12 +376,26 @@ class MeetingState:
             self.pane_seen = time.monotonic()
             self.last_seen = self.pane_seen
 
-    def heartbeat(self):
-        """Pane-originated lease ping. Overlay helper polls use touch=False."""
-        with self.lock:
-            listening = self.listening
-        self._touch_pane_seen()
-        return {'listening': listening}
+    def heartbeat(self, body=None):
+        """Renew only the current owner; reads cannot confer capture authority.
+
+        Revision/epoch is the explicit trusted API-client path, never a
+        renderer fallback. An expired lease cannot be revived by a late ping.
+        """
+        body = body or LeaseRequest()
+        with self.overlay_lock:
+            if body.pane is not None:
+                accepted = (body.pane == self.overlay_pane
+                            and body.revision is None and body.epoch is None)
+            elif body.revision is not None or body.epoch is not None:
+                accepted = (body.revision == self.overlay_revision and body.epoch == self.overlay_epoch)
+            else:
+                accepted = self.overlay_revision == 0
+            accepted = accepted and time.monotonic() - self.pane_seen <= 30
+            if accepted:
+                self._touch_pane_seen()
+            with self.lock:
+                return {'accepted': accepted, 'listening': self.listening}
 
     def watchdog(self, capture_generation=None):
         if capture_generation is None:
@@ -988,6 +1009,8 @@ class MeetingState:
             self.overlay_lease_seq += 1
             self.overlay_pane = secrets.token_hex(16)
             self.overlay_action = 0
+            # Claim is explicit authorization, not a passive status read.
+            self._touch_pane_seen()
             pane = self.overlay_pane
         if old is not None:
             old.hide_overlay()
@@ -1051,6 +1074,7 @@ class MeetingState:
             if pane is not None and not self._accept_overlay_action_locked(pane, action):
                 return {'shown': self.overlay is not None, 'accepted': False}
             cleaned = self._clean_overlay_scope(scope)
+            self._touch_pane_seen()  # explicit, admitted Show (not status polling)
             if self.overlay is not None:
                 try:
                     alive = self.overlay.process is not None and self.overlay.process.poll() is None
@@ -1201,7 +1225,9 @@ class MeetingState:
 
     def status(self, touch=True):
         if touch:
-            self._touch_pane_seen()
+            # Preserve pre-pane API compatibility only. After the first claim,
+            # unscoped status (including rejected/reloaded renderers) is read-only.
+            self.heartbeat()
         with self.lock:
             # Order snapshots at capture, not delivery. Includes successive
             # snapshots within one meeting/capture epoch (e.g. corrections).
@@ -1318,8 +1344,8 @@ def make_router(state):
         return state.status(touch=True)
 
     @router.post('/heartbeat')
-    def heartbeat():
-        return state.heartbeat()
+    def heartbeat(body: LeaseRequest | None = None):
+        return state.heartbeat(body)
 
     @router.post('/start')
     def start(body: CaptureRequest):
