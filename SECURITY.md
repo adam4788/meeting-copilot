@@ -20,9 +20,12 @@
 
 The in-pane key editor is restricted to the native Desktop owner of the active
 backend home. It reuses Hermes’ private `.env` storage and atomic-write lock,
-never returns key material, and does not hot-reload running workers. Shared/hosted
-authentication alone does not authorize credential edits. See the full
-[trust boundary and restart guidance](docs/meta-api-key.md).
+never returns key material, and does not hot-reload running workers. New scoped
+requests can change immediately; existing requests/workers retain snapshots and
+removal can expose an inherited fallback. Ambiguous parser syntax is refused
+before mutation, not silently repaired. Shared/hosted authentication alone does
+not authorize credential edits. See the full
+[trust boundary and activation guidance](docs/meta-api-key.md).
 
 ## Limitations
 

@@ -1,6 +1,7 @@
 """Credential editor tests: synthetic keys, isolated homes, no live services."""
 import contextlib
 import importlib
+import importlib.util
 import json
 import os
 import tempfile
@@ -27,6 +28,17 @@ class CredentialTests(unittest.TestCase):
         self.host = patch.object(self.mod, '_host', return_value=self.fake_host())
         self.host.start()
         self.addCleanup(self.host.stop)
+        if importlib.util.find_spec('agent') is None:
+            # Portable filesystem/UI unit tests only; installed-host integration
+            # tests run separately and NEVER substitute scope/tokenizer helpers.
+            import io
+            from dotenv import dotenv_values
+            from types import SimpleNamespace
+            scope = patch.object(self.mod, '_scope', return_value=SimpleNamespace(
+                _parse_env_text=lambda text: dict(dotenv_values(stream=io.StringIO(text), interpolate=False)),
+                current_secret_scope=lambda: None, get_secret=os.environ.get))
+            scope.start()
+            self.addCleanup(scope.stop)
         self.app = FastAPI()
         self.owner = True
         self.principal = {'profile_id': str(self.home), 'capabilities': frozenset({'http:owner'})}
@@ -71,7 +83,7 @@ class CredentialTests(unittest.TestCase):
             'revision': revision if revision is not None else self.status()['revision']})
 
     def test_save_readback_remove_preserves_other_credentials_and_never_publishes(self):
-        before = '# untouched\nOTHER_KEY="fake-other-key"\nMULTI="first\nsecond"\n'
+        before = '# untouched\nOTHER_KEY="fake-other-key"\nSINGLE="single line"\n'
         path = self.home / '.env'
         path.write_text(before)
         path.chmod(0o600)
@@ -79,9 +91,9 @@ class CredentialTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         status = self.status()
         self.assertTrue(status['saved'])
-        self.assertFalse(status['runtime_configured'])
+        self.assertFalse(status['request_configured'])
         self.assertFalse(status['verified'])
-        self.assertTrue(status['reload_required'])
+        self.assertEqual(status['activation'], 'process')
         self.assertEqual(os.environ['MODEL_API_KEY'], '')
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertTrue(path.read_text().startswith(before))
@@ -91,13 +103,13 @@ class CredentialTests(unittest.TestCase):
         self.assertEqual(path.read_text(), before)
         self.assertFalse(self.status()['saved'])
 
-    def test_process_key_remains_in_force_until_explicit_restart(self):
+    def test_unscoped_process_key_is_unchanged_by_edit(self):
         with patch.dict(os.environ, {'MODEL_API_KEY': 'fake-inherited-key'}):
             self.assertEqual(self.save().status_code, 200)
             status = self.status()
-            self.assertTrue(status['runtime_configured'])
-            self.assertTrue(status['reload_required'])
-            self.assertTrue(status['runtime_override'])
+            self.assertTrue(status['request_configured'])
+            self.assertEqual(status['activation'], 'process')
+            self.assertTrue(status['process_differs_from_saved'])
             self.assertEqual(os.environ['MODEL_API_KEY'], 'fake-inherited-key')
 
     def test_stale_revision_refuses_concurrent_edits(self):
@@ -224,7 +236,7 @@ status = client.get('/credentials/meta')
 assert status.status_code == 200
 response = client.post('/credentials/meta', json={'action': 'save', 'key': 'fake-host-integration-key', 'revision': status.json()['revision']})
 assert response.status_code == 200
-assert response.json()['saved'] and not response.json()['runtime_configured']
+assert response.json()['saved'] and not response.json()['request_configured']
 assert os.environ.get('MODEL_API_KEY', '') == ''
 path = Path(os.environ['HERMES_HOME']) / '.env'
 assert path.stat().st_mode & 0o777 == 0o600
@@ -338,19 +350,20 @@ assert client.get('/credentials/meta').json()['verified'] is False
         self.assertEqual(self.mod._provenance(path), provenance)
         self.assertFalse(list(self.home.glob('.env-stage-*')))
 
-    def test_remove_does_not_resurrect_key_from_unrelated_multiline_on_startup(self):
+    def test_ambiguous_multiline_refused_not_silently_repaired(self):
         import subprocess
         import sys
         path = self.home / '.env'
         unrelated = 'OTHER="first\nMODEL_API_KEY=fake-embedded-key\nlast"\n'
         path.write_text(unrelated + 'export MODEL_API_KEY="fake-real-assignment"\n')
         path.chmod(0o600)
-        response = self.client.post('/credentials/meta', json={'action': 'remove', 'revision': self.status()['revision']})
-        self.assertEqual(response.status_code, 200)
-        self.assertFalse(response.json()['saved'])
-        self.assertEqual(path.read_text(), unrelated)
-        from dotenv import dotenv_values
-        self.assertNotIn('MODEL_API_KEY', dotenv_values(path))
+        original = path.read_bytes()
+        self.assertEqual(self.client.get('/credentials/meta').status_code, 503)
+        response = self.client.post('/credentials/meta', json={'action': 'remove', 'revision': self.mod._revision(path, original)})
+        self.assertEqual(response.status_code, 503)
+        self.assertIn('Unsupported credential file', response.json()['detail'])
+        self.assertEqual(path.read_bytes(), original)
+        self.assertFalse((self.home / '.env.lock').exists())
         env = {'HOME': str(self.home), 'HERMES_HOME': str(self.home), 'PATH': os.defpath,
                'TMPDIR': str(self.home), 'HERMES_LAUNCHD_LABEL': 'ai.hermes.gateway.test-only'}
         result = subprocess.run([sys.executable, '-c',

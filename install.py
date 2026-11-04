@@ -49,7 +49,7 @@ config_schema:
     type: secret
     env: MODEL_API_KEY
     label: Meta API key
-    description: Used for Muse Voice and Meta answers. Never paste into chat. Pause capture and safely restart the gateway after changing this key; configuration is not provider verification.
+    description: Used for Muse Voice and Meta answers. Never paste into chat. Pause capture before editing; new scoped requests can change immediately, while existing requests and workers retain loaded keys. Process-based code may need a safe restart. Configuration is not provider verification.
 ''', encoding='utf-8')
     dashboard = target / 'dashboard'
     (dashboard / 'manifest.json').write_text(json.dumps({

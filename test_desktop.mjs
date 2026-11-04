@@ -86,7 +86,7 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
 }
 test('Meta key form saves explicitly, clears input, reads back, and never caches secrets', async () => {
   let saved = false;
-  const info = () => ({ saved, runtime_configured: false, verified: false, reload_required: saved, revision: 'r'.repeat(64) });
+  const info = () => ({ saved, request_configured: false, verified: false, activation: 'host-scoped', revision: 'r'.repeat(64) });
   const ui = pane('', true, false, '', {}, {
     '/credentials/meta': (_path, opts) => {
       if (opts.method === 'POST') {
@@ -116,16 +116,34 @@ test('Meta key form saves explicitly, clears input, reads back, and never caches
   tree = ui.rerender();
   assert.ok(saved, 'save changed the backend fixture');
   assert.equal(ui.requests.at(-1).method, undefined, 'separate exact-target readback');
-  assert.match(JSON.stringify(tree), /Saved.*restart/i);
+  assert.match(JSON.stringify(tree), /Saved — new scoped requests can use the key immediately/i);
   assert.match(JSON.stringify(tree), /Not verified/i);
   assert.ok(!JSON.stringify(tree).includes('fake-ui-key-only'));
+});
+
+test('Meta key explains scoped activation, process fallback and snapshot limits', async () => {
+  for (const activation of ['host-scoped', 'process']) {
+    const ui = pane('', true, false, '', {}, { '/credentials/meta': () => ({
+      saved: true, request_configured: true, process_configured: true,
+      process_differs_from_saved: true, activation, verified: false, revision: 'r'.repeat(64),
+    }) });
+    await nodes(ui.tree).find(n => n.type === 'button' && n.children.includes('Recheck key status')).props.onClick();
+    const text = JSON.stringify(ui.rerender());
+    assert.match(text, /Configured for this status request/);
+    assert.match(text, /new scoped requests.*immediately/i);
+    assert.match(text, /saved file.*precedence.*inherited/i);
+    assert.match(text, /existing requests.*workers.*retain/i);
+    assert.match(text, /process.environment.*fallback/i);
+    assert.match(text, /Not verified with Meta/);
+    assert.doesNotMatch(text, /does not override it|before using the new key|Configured in running backend/);
+  }
 });
 
 test('Meta key save errors do not echo transport secrets or claim readiness', async () => {
   const ui = pane('', true, false, '', {}, {
     '/credentials/meta': (_path, opts) => {
       if (opts.method === 'POST') throw new Error('fake-ui-key-only');
-      return { saved: false, runtime_configured: false, verified: false, revision: 'r'.repeat(64) };
+      return { saved: false, request_configured: false, verified: false, revision: 'r'.repeat(64) };
     },
   });
   const button = (tree, text) => nodes(tree).find(n => n.type === 'button' && n.children.includes(text));
@@ -158,10 +176,13 @@ test('Meta key label matches accessible name and invalid lengths explain bounds'
   }
 });
 
-for (const race of [false, true]) test(`Meta key pane effects reach isolated backend (interleaving=${race})`, async t => {
-  const { spawn } = await import('node:child_process');
+for (const realHost of [false, true]) for (const race of [false, true]) test(`Meta key pane effects reach isolated backend (host=${realHost}, interleaving=${race})`, async t => {
+  const { spawn, spawnSync } = await import('node:child_process');
+  if (realHost && spawnSync(process.env.PYTHON || 'python', ['-c', "import agent.secret_scope, hermes_cli.web_server_profiles"]).status !== 0) {
+    t.skip('Installed Hermes host unavailable'); return;
+  }
   const { createInterface } = await import('node:readline');
-  const child = spawn(process.env.PYTHON || 'python', ['-u', 'test_credentials.py', '--ui-bridge'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(process.env.PYTHON || 'python', ['-u', realHost ? 'test_credential_host_scope.py' : 'test_credentials.py', '--ui-bridge'], { stdio: ['pipe', 'pipe', 'pipe'] });
   const lines = createInterface({ input: child.stdout });
   const pending = [];
   let stderr = '';

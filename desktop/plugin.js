@@ -32,14 +32,14 @@ export default {
           setInfo(current); setNotice('');
         } catch (_) {
           setInfo(null);
-          setNotice('Key settings unavailable on this connection. Use the local Desktop owner connection or Hermes Settings → Plugins → Meeting Copilot. Older backends may need a gateway restart.');
+          setNotice('Key settings unavailable: this connection, host, file permissions or credential syntax may be unsupported. Multiline or ambiguous files need manual host-administrator review; this editor will not repair them. Use the local Desktop owner connection.');
         } finally { inFlight.current = false; setWorking(false); }
       }
       useEffect(() => { recheck(); return () => { if (input.current) input.current.value = ''; }; }, []);
       async function change(action) {
         if (inFlight.current || !info?.revision) return;
-        if (action === 'remove' && (typeof window === 'undefined' || !window.confirm || !window.confirm('Remove the saved Meta key from this profile? Running workers may still use their loaded key until you pause capture and restart the gateway.'))) return;
-        if (action === 'save' && info.saved && (typeof window === 'undefined' || !window.confirm || !window.confirm('Replace this profile’s saved Meta key? This also changes MODEL_API_KEY for other tools using it after restart.'))) return;
+        if (action === 'remove' && (typeof window === 'undefined' || !window.confirm || !window.confirm('Remove the saved Meta key from this profile? New scoped requests can change immediately or fall back to an inherited key. Existing requests and workers may retain their loaded key. Pause capture first.'))) return;
+        if (action === 'save' && info.saved && (typeof window === 'undefined' || !window.confirm || !window.confirm('Replace this profile’s saved Meta key? New scoped requests, including other tools using MODEL_API_KEY, can change immediately. Existing requests and workers may retain their loaded key. Pause capture first.'))) return;
         const body = { action, revision: info.revision };
         if (action === 'save') {
           const value = input.current?.value || '';
@@ -59,7 +59,7 @@ export default {
             return;
           }
           setInfo(current);
-          setNotice(action === 'save' ? 'Saved — restart the gateway safely before using the new key.' : 'Saved key removed — pause capture and restart the gateway to drop loaded credentials.');
+          setNotice(action === 'save' ? 'Saved — new scoped requests can use the key immediately; existing requests and workers may retain their loaded key. Not verified with Meta.' : 'Saved key removed — new scoped requests may fall back to an inherited key. Existing requests and workers may retain their loaded key. Removal is not revocation.');
         } catch (_) {
           setInfo(null);
           setNotice('The key change could not be confirmed. Recheck key status before trying again; another settings edit or an unsupported host may have blocked it.');
@@ -68,7 +68,7 @@ export default {
       return h('section', { style: card, 'aria-label': 'Meta API key settings' },
         h('strong', null, 'Meta API key'),
         h('p', { style: muted, role: 'status' }, info
-          ? `${info.saved ? 'Saved in this profile' : 'No saved key'} · ${info.runtime_configured ? 'Configured in running backend' : 'Not configured in running backend'} · Not verified with Meta`
+          ? `${info.saved ? 'Saved in this profile' : 'No saved key'} · ${info.request_configured ? 'Configured for this status request' : 'Not configured for this status request'} · Not verified with Meta`
           : 'Key status not checked'),
         h('label', { style: { display: 'grid', gap: 6 } }, 'Meta API key',
           h('input', { ref: input, type: 'password', autoComplete: 'new-password', spellCheck: false,
@@ -81,11 +81,13 @@ export default {
           h(Button, { variant: 'secondary', disabled: working || !info?.saved, onClick: () => change('remove') }, 'Remove saved key'),
           h(Button, { variant: 'secondary', disabled: working, onClick: recheck }, 'Recheck key status')),
         notice && h('p', { role: 'status', style: muted }, notice),
-        info?.runtime_override && h('p', { role: 'status', style: muted }, 'The running backend has a different process-environment key. Saving or removing here does not override it. If it is supplied by your service or secret manager, update that source too; restarting alone may keep the old key.'),
-        h('details', { open: !!info?.reload_required },
-          h('summary', { style: { ...muted, cursor: 'pointer', marginTop: 8 } }, 'Safe restart & verification'),
-          h('p', { style: muted }, 'Pause capture. Wait for all gateway sessions and answers to finish, then use Hermes’ gateway restart control for this connection. Reopen this pane and Recheck key status. Do not restart while another session is working.'),
-          h('p', { style: muted }, 'Saving is configuration only, not a Meta authentication test. After restart, select Meta for answers and try a non-sensitive question; test Muse Voice separately with consent. An answer fallback or configured badge does not verify Meta or audio permissions.')),
+        info?.process_differs_from_saved && h('p', { role: 'status', style: muted }, 'A different process-environment key remains available as fallback after removal, or to unscoped code. Update its service or secret-manager source too; restarting alone may retain it.'),
+        h('p', { style: muted }, info?.activation === 'host-scoped' ? 'This status used a host-scoped credential snapshot, not every running worker.' : 'This status used the process environment; process-based code may need a safe gateway restart to load file changes.'),
+        h('p', { style: muted }, 'New scoped requests can change immediately: the saved file takes precedence over inherited keys in the supported single-profile host. Existing requests and workers may retain old keys. Other host secret sources may override the file. Pause capture before editing; removal is not revocation.'),
+        h('details', null,
+          h('summary', { style: { ...muted, cursor: 'pointer', marginTop: 8 } }, 'Safe transition & verification'),
+          h('p', { style: muted }, 'Wait for existing answers to finish, then start capture again to take a fresh credential snapshot. For process-based code, wait for all gateway sessions to finish before using Hermes’ gateway restart control for this connection. Reopen this pane and Recheck key status. Do not restart while another session is working.'),
+          h('p', { style: muted }, 'Saving is configuration only, not a Meta authentication test. Select Meta for answers and try a non-sensitive question; test Muse Voice separately with consent. An answer fallback or configured badge does not verify Meta or audio permissions.')),
         h('p', { style: { ...muted, marginBottom: 0 } }, 'Used for Muse Voice and Meta answers. Stored only in this backend’s active HERMES_HOME/.env; never returned by this editor. Saving does not reload the gateway or change a running capture.'));
     }
     function MeetingPane() {

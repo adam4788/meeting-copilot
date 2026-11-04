@@ -16,9 +16,9 @@ import tempfile
 from pathlib import Path
 
 if __package__:
-    from .credential_env import KEY, bindings as _bindings, saved as _saved
+    from .credential_env import KEY, UnsupportedEnvFile, bindings, saved as _saved
 else:
-    from credential_env import KEY, bindings as _bindings, saved as _saved
+    from credential_env import KEY, UnsupportedEnvFile, bindings, saved as _saved
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -26,6 +26,18 @@ from fastapi.responses import JSONResponse
 _revision_secret = secrets.token_bytes(32)
 _KEY_SHAPE = re.compile(r'[A-Za-z0-9._~+/=-]{8,4096}\Z')
 _UNAVAILABLE = 'Key settings unavailable. Use Hermes Settings → Plugins → Meeting Copilot, or check the active home permissions and host version.'
+_UNSUPPORTED_FILE = 'Unsupported credential file syntax. No changes made. Multiline values or parser differences require manual review with the host administrator; this editor will not rewrite unrelated data.'
+
+
+def _scope():
+    from agent import secret_scope
+    return secret_scope
+
+
+def _bindings(raw):
+    # Use the installed host tokenizer on the same immutable bytes, not a
+    # second file read or a copied approximation of the host's parser.
+    return bindings(raw, host_parser=_scope()._parse_env_text)
 
 
 def _host():
@@ -211,21 +223,31 @@ def _revision(path, raw):
 
 def _status(path, raw):
     saved = _saved(_bindings(raw))
-    runtime = os.environ.get(KEY, '').strip()
-    return {'saved': bool(saved), 'runtime_configured': len(runtime) >= 8,
-            'runtime_override': bool(runtime) and runtime != saved,
-            'reload_required': saved != runtime, 'verified': False,
+    process = os.environ.get(KEY, '').strip()
+    scope = _scope()
+    # _host already requires the owner's scope. Read that same trusted snapshot
+    # without importing a provider module (which could run a startup bridge).
+    request_key = scope.get_secret(KEY, '') or ''
+    return {'saved': bool(saved), 'request_configured': len(request_key.strip()) >= 8,
+            'process_configured': len(process) >= 8,
+            'process_differs_from_saved': bool(process) and process != saved,
+            'activation': 'host-scoped' if scope.current_secret_scope() is not None else 'process',
+            'verified': False,
             'revision': _revision(path, raw)}
 
 
 def _write(host, path, raw, action, key):
-    bindings = _bindings(raw)
-    # Preserve every unrelated binding/comment, including multiline values.
-    text = ''.join(b.original.string for b in bindings if b.key != KEY)
+    parsed = _bindings(raw)
+    # dotenv attaches preceding blank lines to the next binding. Preserve those
+    # too; only the target assignment itself is removed.
+    text = ''.join(b.original.string if b.key != KEY else
+                   re.findall(r'\A(?:[ \t]*(?:\r\n|\n|\r))*', b.original.string)[0]
+                   for b in parsed)
     if action == 'save':
         if text and not text.endswith('\n'):
             text += '\n'
         text += KEY + '=' + key + '\n'
+    _bindings(text.encode('utf-8'))  # validate the candidate before any mutation
     # Stage Hermes' 0600 temp + fsync writer inside a checked private directory.
     # The shared .env.lock serializes publication with Hermes config writers.
     _path()
@@ -276,6 +298,8 @@ def make_router():
             _host()
             path = _path()
             return _response(_status(path, _read(path)))
+        except UnsupportedEnvFile:
+            raise HTTPException(503, _UNSUPPORTED_FILE) from None
         except Exception:  # noqa: BLE001 -- credential boundary: sanitize all failures
             raise HTTPException(503, _UNAVAILABLE) from None
 
@@ -307,6 +331,7 @@ def make_router():
             host = _host()
             host.require_env_writable(KEY, action)
             path = _path()
+            _bindings(_read(path))  # refuse before even creating .env.lock
             # Blocking filesystem work runs off the ASGI event loop; the active
             # context propagates, and no key is passed to a subprocess/argv.
             import asyncio
@@ -321,6 +346,8 @@ def make_router():
             return _response(await asyncio.to_thread(apply))
         except HTTPException:
             raise
+        except UnsupportedEnvFile:
+            raise HTTPException(503, _UNSUPPORTED_FILE) from None
         except Exception:  # noqa: BLE001 -- credential boundary: sanitize all failures
             raise HTTPException(503, _UNAVAILABLE) from None
         finally:

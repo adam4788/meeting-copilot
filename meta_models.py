@@ -30,8 +30,9 @@ def _load_dotenv_key_once():
     """Seed the launch owner's key once; never publish routed profile secrets.
 
     A genuinely nonempty service environment wins. Empty/whitespace inherited
-    placeholders do not block a saved key. Editing and startup share dotenv
-    bindings (last assignment wins, no expansion, multiline values stay whole).
+    placeholders do not block a saved key. Editing and startup reject multiline
+    files (last assignment wins, no expansion). This is startup/unscoped
+    precedence ONLY; a host-built request scope can prefer its saved file.
     """
     if os.environ.get('MODEL_API_KEY', '').strip():
         return
@@ -62,7 +63,12 @@ _load_dotenv_key_once()
 
 
 def resolve_model_api_key():
-    """Use Hermes' trusted context-local scope, never a foreign launch key."""
+    """Use the host's snapshot, never a foreign launch key.
+
+    New host-scoped requests may see file edits immediately and prefer the file
+    over inherited keys. Existing closures/workers keep their captured value.
+    Unscoped owner code reads its process key; edits do not mutate that key.
+    """
     try:
         scope = _secret_scope()
         if scope is None:

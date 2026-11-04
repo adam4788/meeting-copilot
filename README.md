@@ -56,10 +56,13 @@ host-backed factories the plugin uses by default.
 ## Meta API key
 
 In the pane, open **Meta API key**, paste into the masked field and explicitly
-**Save key**. Never paste a credential into chat. Saved, running-backend configured
+**Save key**. Never paste a credential into chat. Saved, status-request configured
 and provider-verified status are separate; saving does not verify Meta or reload
-workers. Pause capture and safely restart the active gateway before using a changed
-key. **Remove saved key** does not remove inherited service-environment values.
+workers. Pause capture before editing: new host-scoped requests can use the saved
+key immediately, ahead of inherited keys, while existing requests/workers retain
+their snapshots. Process-based code may need a safe gateway restart. **Remove saved
+key** can expose an inherited fallback; it is not credential revocation. Ambiguous
+or multiline `.env` files are refused without rewriting unrelated data.
 See [key setup and security boundaries](docs/meta-api-key.md), including the
 Settings → Plugins fallback for hosts without native-owner credential editing.
 

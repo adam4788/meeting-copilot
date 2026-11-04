@@ -12,8 +12,9 @@ Three different facts are shown:
 
 - **Saved in this profile**: a value exists in the backend's active
   `$HERMES_HOME/.env` (default `~/.hermes/.env`).
-- **Configured in running backend**: the backend process currently has a
-  plausibly nonempty key. This is not proof of valid credentials or model access.
+- **Configured for this status request**: the same trusted resolver used by Meta
+  and ASR sees a plausibly nonempty key in this request's snapshot. This does not
+  describe every running worker, validate credentials, or prove model access.
 - **Not verified with Meta**: this editor does not make a billable request,
   authenticate against Meta, or test audio permissions. It never marks a key
   verified merely because saving worked.
@@ -24,19 +25,36 @@ settings edit invalidates the pane's revision rather than being overwritten.
 
 ## Safely apply changes
 
-This editor is deliberately **disk-only**. Existing Meta answer closures and
-Muse Voice/audio workers can retain their loaded key. We do not mutate shared
-`os.environ`, automatically restart the gateway, or promise immediate readiness.
+The editor writes **only disk**, but that does **not** mean restart-only activation:
 
-1. Pause capture; wait for answers and other gateway sessions to finish.
-2. Use Hermes' gateway restart control for the connection/profile you are using.
+| Consumer | Effect of saving/removing the file |
+| --- | --- |
+| New requests under the supported single-profile Hermes `_config_profile_scope` | The host reads a fresh scope; the saved file takes precedence over inherited process keys immediately. Removal can expose the inherited fallback. Host external/managed secret sources can override the file. |
+| Existing scoped requests, Meta completion closures, running ASR workers | Keep their previously captured key. They are not hot-reloaded or revoked. |
+| Unscoped owner/process-based code | Continues using its process environment. A safe restart may be needed to load file changes; a nonempty inherited service key can still win at startup. |
+| Foreign/multiplexed profiles | Never borrow the launch owner's key. Editing is unavailable in these scopes. Their host-owned precedence is not changed by this editor. |
+
+No shared `os.environ` mutation, automatic restart or provider check occurs on edit.
+**Removal is not revocation.** A previously loaded file key may also remain in the
+process environment, even if it did not originate in a service secret manager.
+
+Status uses `request_configured`, `activation` (`host-scoped` or `process`),
+`process_configured`, and `process_differs_from_saved`, plus `saved`, `verified`
+(always false), and an opaque `revision`. The process flags describe only the
+environment, not an effective override of a bound request scope. There is no
+`reload_required`/`runtime_override` assertion. The POST response still belongs
+to its pre-write request scope; the pane's separate GET reads a fresh snapshot.
+
+1. **Before editing**, pause capture and wait for existing answers to finish.
+   After editing, recheck status and start capture again to take a fresh snapshot.
+2. For process-based code, use Hermes' gateway restart control when needed.
    For a CLI-managed service, `hermes gateway restart` must target that same
    active profile/home. Coordinate with other active sessions first.
 3. Reopen the pane and select **Recheck key status**.
-4. If the backend still has a different process-environment key, update/remove
+4. If the backend has a different process-environment key, update/remove
    the value in the service environment or secret manager that supplies it.
-   Saving/removing the file does not override an inherited process key, and a
-   restart may continue to inherit it. Never put a key in shell command arguments.
+   Saving does not erase that fallback, even when new scoped requests prefer the
+   file. Removal or a restart may expose it. Never put keys in shell arguments.
 5. Select **Meta** as the answer provider and try a non-sensitive question.
    Test Muse Voice separately with participant consent. A fallback answer does
    not verify Meta; a working text answer does not verify Muse Voice permission.
@@ -49,7 +67,8 @@ if the configured badge remains false, use the host's supported secret setup.
 The editor does not bypass provider selection or add a competing runtime resolver.
 Removal deletes only the saved `MODEL_API_KEY` assignments, not credentials in
 other profiles, service environments, keychains, provider pools or already-running
-workers. Other tools using this profile's `MODEL_API_KEY` are affected after reload.
+workers. Other tools using this profile's `MODEL_API_KEY` can change on their next
+scoped request, not only after restart.
 
 ## Existing Hermes support and compatibility
 
@@ -87,7 +106,7 @@ merely satisfying the manifest's minimum Hermes version.
   Remote/shared dashboards and standalone demo servers cannot use this editor.
 - `.env` must be a private, owner-owned regular file with one hardlink. Symlink,
   shared-writable directory ancestry (except root/owner-owned sticky temporary
-  ancestors), malformed dotenv, wrong owner and permissive
+  ancestors), malformed/ambiguous dotenv, wrong owner and permissive
   credential files fail closed. Native macOS extended ACLs on the home, lock or
   `.env`, including inheritable ACLs, are refused before any secret temporary
   file is opened. Ancestor allow ACLs are also refused; standard deny-only
@@ -96,8 +115,17 @@ merely satisfying the manifest's minimum Hermes version.
   credential file or rewrite unrelated entries to repair them. Fix permissions
   through the host/administrator if needed. The `.env.lock` contains no secrets;
   owner-owned read-only sharing of that lock is allowed, write sharing is not.
-- Updates reuse Hermes' cross-process `.env.lock`, preserve unrelated bytes
-  (including multiline values/comments), and stage its private temporary file +
+- Files containing multiline values, BOMs, or any binding that python-dotenv and
+  the **installed host tokenizer** interpret differently are unsupported. GET,
+  Save and Remove report this without mutating the file, creating a lock, or
+  staging secrets. Validation repeats under the lock and on the candidate. Each
+  binding is compared independently so duplicates cannot hide a discrepancy.
+  In particular, an embedded `MODEL_API_KEY=` inside an unrelated multiline
+  value must never produce a successful removal. Refusal does not disable an
+  already effective credential; manually review the file with the administrator.
+  Do not use another editor as an automatic bypass for this warning.
+- Updates reuse Hermes' cross-process `.env.lock`, preserve supported unrelated
+  bytes (including blank lines, comments and CRLF), and stage its private temporary file +
   fsync writer inside an ACL-checked private directory beside `.env`. Only a
   checked candidate is atomically published. Existing mode, owner and group
   are retained. Custom extended attributes and file flags are explicitly refused,
@@ -111,9 +139,11 @@ merely satisfying the manifest's minimum Hermes version.
 - The pane compares the POST revision with its subsequent GET revision, not just
   the saved flag. A different writer between those requests produces a conflict
   notice, never confirmation that this pane's key was saved.
-- Startup and editing share non-interpolating dotenv bindings, including export,
-  quotes, duplicate assignments and multiline values. Empty/whitespace inherited
-  keys no longer block a saved key; actual nonempty process keys retain precedence.
+- Startup and editing use non-interpolating dotenv bindings; multiline files are
+  refused, not partially rewritten. Supported single-line export/quotes/duplicates
+  must agree with the host tokenizer before edits. Empty/whitespace inherited keys
+  do not block the launchd startup bridge; nonempty process keys retain precedence
+  **only for that startup bridge/unscoped code**, not fresh host-scoped requests.
   Runtime Meta resolution uses Hermes' trusted `agent.secret_scope` API. Foreign
   scopes cannot borrow the launch key; missing scope on a routed request fails
   closed. ASR snapshots the scoped key before its thread starts and removes the
@@ -135,8 +165,8 @@ merely satisfying the manifest's minimum Hermes version.
 `python -m unittest test_credentials -v` exercises synthetic keys in isolated
 homes: authorization, malformed/bounded input, no reflection, failure handling,
 private modes, real macOS ACL rejection, extended-metadata preservation/refusal,
-symlinks/hardlinks, unrelated multiline preservation, actual startup post-remove, duplicate
-assignments, stale/concurrent edits, save/remove and process-env precedence.
+symlinks/hardlinks, ambiguous multiline refusal, startup fail-closed, duplicate
+assignments, stale/concurrent edits, save/remove and unchanged process environment.
 When Hermes is installed, a clean child process additionally uses the **real host
 lock/writer**, simulates startup, and exercises `selected_completion('meta', …)`
 with a fake HTTP provider; Muse Voice handshake construction uses the same key.
@@ -147,12 +177,20 @@ synthetic profiles to check empty/nonempty startup precedence through fake Meta
 model and ASR HTTP transports, trusted owner/foreign/unbound/multiplex scopes,
 and scope retention through the actual ASR thread and subprocess boundary.
 
+`python -m unittest test_credential_host_scope -v` uses the **installed**
+`_config_profile_scope`, `secret_scope` tokenizer/resolver and host lock/writer,
+not stub mappings. It checks refusal before any mutation, both parsers after a
+successful removal, actual scoped Meta and ASR transports before/after save/remove
+with empty/nonempty inherited environments, retained closures/worker snapshots,
+and real foreign-profile scopes. Only provider transports and the owner principal
+(normally supplied by authenticated host middleware) are synthetic.
+
 `node --test --test-name-pattern='Meta key' test_desktop.mjs` exercises the real
 uncompiled pane event handlers. One test connects them over private test-only
 stdio to the actual ASGI credential routes and a real isolated private `.env`,
 proving Save/Remove effects, readback and an actual interleaved second writer.
-Only host auth/locking seams are faked
-there; no unauthenticated network listener or real provider is involved. The
+The installed-host variants use the real request scope/tokenizer/lock/writer;
+portable variants substitute host seams. No unauthenticated listener or real provider is involved. The
 React/SDK stand-ins test behavior, not browser visual acceptance. No live Meta
 credential, installed plugin, user `.env` or gateway was touched.
 
@@ -166,9 +204,16 @@ loss across its thread/child boundary and first-import owner-scope compatibility
 With a fresh isolated `HOME`/`HERMES_HOME`/`TMPDIR` and an allowlisted process
 environment containing no live credentials:
 
-- Targeted credential/runtime/model/ASR/macOS suite: **86 tests, passed**.
-- Full `npm test`: **584 Python tests, passed (3 Windows-only skips)**;
-  JavaScript syntax check passed; **74 desktop tests, passed**.
+- Follow-up regressions first failed on ambiguous-file acceptance, misleading
+  status semantics, and UI activation guidance. A CRLF/blank-line preservation
+  test also caught dotenv attaching blank lines to the removed assignment.
+- Targeted `python -m unittest test_credentials test_credential_runtime
+  test_credential_host_scope test_meta_models test_meta_asr test_macos_audio -v`:
+  **90 tests passed, none skipped**.
+- Targeted `node --test --test-name-pattern='Meta key' test_desktop.mjs`:
+  **8 tests passed, none skipped**, including both installed-host pane variants.
+- Full `npm test`: **588 Python tests, passed (3 Windows-only skips)**;
+  JavaScript syntax check passed; **77 desktop tests, passed**.
 - Real macOS ACL tests and the real Hermes lock/writer integration ran, not skipped.
 - Provider HTTP/ASR transports were fake. No live provider, device capture,
   gateway restart, deployment installation, push or merge was performed.
