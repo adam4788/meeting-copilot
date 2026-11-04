@@ -43,6 +43,16 @@ The deterministic suite includes buffered native events across identical questio
 
 The reviewer backend probe's partial-publication gate was reproduced using the real MeetingState, BackendTransport, and bridge worker. All four new backend repros and all eight initial JavaScript repros failed before their production fixes. The cancellation test also demonstrably passed with an injected cancellation exception before callback checking was added; it now fails on the test thread even when production catches that exception. Its successful cancellation side effect is asserted independently, and the fixed test passed twenty repeated runs.
 
-Verified in this scratch tree: full `npm test` passed (607 Python tests, three platform/opt-in Windows skips; 85 JavaScript tests), all three mutation suites produced assertion-failure RED results and restored GREEN runs, the focused follow-up/revision/blocker/privacy set passed 41 tests, the Swift compiled self-test/protocol check passed independently, and `git diff --check` passed. Full output is retained in `.followup-npm-test.log`.
+Before integration, full `npm test` passed (607 Python tests, three platform/opt-in Windows skips; 85 JavaScript tests). The earlier output remains in `.followup-npm-test.log`.
 
-This worktree remains at `e8e1ac9`; local main is `a593c59`. No integration, commits, installs, live providers, or hardware capture were performed. Integration must preserve the intervening main fixes (including Meta credential discovery and capture consent wording), then rerun the entire suite. Passing scratch-tree checks is not a merge-ready assertion.
+The isolated branch `fix/overlay-lifecycle-integration-592040a28c` was rebased without conflicts onto fetched `origin/main` at `a593c5931d69b72462cfff3169c1d3d70fa6cae7`. Both intervening upstream commits (`ec09d65`, Meta credential discovery, and `a593c59`, cloud transcription capture consent disclosure) are ancestors. `git range-diff` confirmed the overlay commit was unchanged by rebase; upstream-only credential/audio files remain identical to origin/main.
+
+Integrated-tree verification:
+
+- `TMPDIR="$PWD/.test-tmp" npm test`: 608 Python tests passed with three platform/opt-in Windows skips; JavaScript syntax passed; 86 desktop tests passed.
+- `TMPDIR="$PWD/.test-tmp" python -B -m unittest test_overlay_followup test_overlay_revision test_overlay_blockers test_overlay_privacy test_overlay_bridge test_server test_meta_asr test_meta_models test_macos_audio -v`: 253 tests passed.
+- All three documented mutation scripts passed: targeted assertion-failure RED checks and restored GREEN suites, including the integrated 86-test desktop suite.
+- `TMPDIR="$PWD/.test-tmp" swiftc -parse-as-library native/macos_overlay.swift -o .test-tmp/integrated-overlay-self-test`: compiled successfully; `--self-test` reported `overlay state tests passed`; `--protocol-version` reported `meeting-overlay/2`.
+- `git diff --check` and `git diff origin/main...HEAD --check`: passed.
+
+Integration logs and the compiled verification binary are retained only in untracked `.test-tmp/`, never staged. No merge into main, push, deployment, install, live-provider call, or hardware capture was performed. The main checkout was not touched; this local integration branch awaits parent review.
