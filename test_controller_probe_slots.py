@@ -3,6 +3,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -40,6 +41,185 @@ class FakeDisplay:
 
 
 class ControllerProbeSlotTests(CheckedThreads):
+    def test_sampled_alive_before_publication_requires_uncontradicted_evidence(self):
+        # No reader runs for this inert child: model delayed EOF notification,
+        # with wait() already recording exit on the exact Popen handle.
+        for action in ('status', 'start', 'show', 'waiters'):
+            for exited in (False, True):
+                with self.subTest(action=action, exited=exited):
+                    self._check_sampled_alive(action, exited)
+
+    def _check_sampled_alive(self, action, exited):
+        starts, results, workers = [], {}, []
+        state = server.MeetingState(audio_factory=lambda: SimpleNamespace(
+            start=lambda **kwargs: starts.append(True), stop=lambda: None))
+        sampled, release, joined = (threading.Event() for _ in range(3))
+        wait_lock = threading.Lock()
+        seen = set()
+        event_wait = threading.Event.wait
+        child = subprocess.Popen(
+            [sys.executable, '-c', 'import sys; sys.stdin.read()'],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        stdin = child.stdin
+        assert stdin is not None
+        display = FakeDisplay(child)
+        state.overlay = display
+        real_poll = child.poll
+        count = 4 if action == 'waiters' else 1
+
+        def poll():
+            workers.append(threading.current_thread())
+            self.assertEqual(threading.current_thread().name, 'meeting-overlay-probe')
+            for lock in (state.lock, state.lifecycle_lock, state.overlay_lock):
+                self.assertFalse(lock._is_owned(), 'poll must not own control locks')  # pyright: ignore[reportAttributeAccessIssue]
+            value = real_poll()
+            if len(workers) == 1:
+                self.assertIsNone(value, 'gate must follow an actual live sample')
+                sampled.set()
+                self.checked_wait(release, 5, 'release sampled-live poll')
+            return value
+
+        def observed_wait(event, timeout=None):
+            name = threading.current_thread().name
+            if (name.startswith('late-sample-caller-') and timeout == .05
+                    and any(job['done'] is event for job in state._overlay_probe_jobs.values())):
+                with wait_lock:
+                    seen.add(name)
+                    if len(seen) == count:
+                        joined.set()
+            return event_wait(event, timeout)
+
+        def call(index):
+            try:
+                if action == 'status':
+                    value = state.status(touch=False)
+                elif action == 'start':
+                    value = state.start(True, backend='native')
+                elif action == 'show':
+                    value = state.overlay_show({})
+                else:
+                    value = state._overlay_process_alive(child)
+                results[index] = value
+            except HTTPException as exc:
+                results[index] = exc
+
+        callers = [threading.Thread(target=self.checked_callback(lambda i=i: call(i)),
+                                    name=f'late-sample-caller-{i}') for i in range(count)]
+        try:
+            with patch.object(child, 'poll', self.checked_callback(poll)), \
+                    patch.object(threading.Event, 'wait', observed_wait), \
+                    patch.object(state, '_start_overlay_lease_locked'):
+                self.assertIsNone(state._overlay_process_alive(child))
+                self.assertTrue(sampled.wait(1))
+                job = state._overlay_probe_jobs[child]
+                self.assertFalse(job['done'].is_set())
+                if exited:
+                    stdin.close()
+                    self.assertEqual(child.wait(timeout=3), 0)
+                    self.assertEqual(child.returncode, 0)
+                for caller in callers:
+                    caller.start()
+                self.assertTrue(joined.wait(1), 'late callers must join before publication')
+                release.set()
+                for caller in callers:
+                    caller.join(2)
+                    self.assertFalse(caller.is_alive())
+                if action == 'waiters':
+                    self.assertEqual(results, {i: None if exited else True for i in range(count)})
+                    self.assertEqual(len(workers), 1, 'all waiters share one worker')
+                elif action == 'status':
+                    self.assertIs(results[0]['overlay_shown'], None if exited else True)
+                    self.assertEqual(bool(results[0]['overlay_cleanup_error']), exited)
+                    self.assertFalse(results[0]['overlay_stop_confirmed'])
+                elif exited:
+                    self.assertIsInstance(results[0], HTTPException)
+                    self.assertEqual(results[0].status_code, 409 if action == 'start' else 503)
+                    self.assertFalse(state.listening)
+                    self.assertEqual(starts, [])
+                    self.assertIs(state.pending_overlay, display)
+                elif action == 'start':
+                    self.assertTrue(results[0]['listening'])
+                    self.assertEqual(starts, [True])
+                else:
+                    self.assertTrue(results[0]['shown'])
+                    self.assertTrue(results[0]['reused'])
+        finally:
+            release.set()
+            for caller in callers:
+                if caller.ident is not None:
+                    caller.join(2)
+                    self.assertFalse(caller.is_alive())
+            for worker in workers:
+                worker.join(2)
+                self.assertFalse(worker.is_alive())
+            state.overlay_hide()
+            if state.listening:
+                state.pause(retain_tail=False)
+            if not stdin.closed:
+                stdin.close()
+            child.wait(timeout=3)
+
+    def test_known_exit_at_each_start_guard_requires_fresh_evidence(self):
+        for boundary in (1, 2, 3):
+            with self.subTest(boundary=boundary):
+                self._check_exit_at_start_guard(boundary)
+
+    def _check_exit_at_start_guard(self, boundary):
+        starts, workers = [], []
+        state = server.MeetingState(audio_factory=lambda: SimpleNamespace(
+            start=lambda **kwargs: starts.append(True), stop=lambda: None))
+        child = subprocess.Popen(
+            [sys.executable, '-c', 'import sys; sys.stdin.read()'],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        stdin = child.stdin
+        assert stdin is not None
+        display = FakeDisplay(child)
+        state.overlay = display
+        release = threading.Event()
+        guard, real_poll = state._overlay_admission_guard, child.poll
+        calls = []
+
+        def poll():
+            workers.append(threading.current_thread())
+            for lock in (state.lock, state.lifecycle_lock, state.overlay_lock):
+                self.assertFalse(lock._is_owned())  # pyright: ignore[reportAttributeAccessIssue]
+            if child.returncode is not None:
+                self.checked_wait(release, 5, 'release admission refresh')
+            return real_poll()
+
+        @contextmanager
+        def gated_guard(ticket, *args, **kwargs):
+            calls.append(ticket)
+            if len(calls) == boundary:
+                stdin.close()
+                self.assertEqual(child.wait(timeout=3), 0)
+            with guard(ticket, *args, **kwargs):
+                yield
+
+        try:
+            with patch.object(child, 'poll', self.checked_callback(poll)), \
+                    patch.object(state, '_overlay_admission_guard', gated_guard):
+                started = time.monotonic()
+                with self.assertRaises(HTTPException) as denied:
+                    state.start(True, backend='native')
+                self.assertEqual(denied.exception.status_code, 409)
+                self.assertLess(time.monotonic() - started, .5)
+                self.assertEqual(starts, [])
+                self.assertFalse(state.listening)
+                self.assertIs(state.pending_overlay, display)
+                self.assertEqual(len(calls), boundary)
+        finally:
+            release.set()
+            for worker in workers:
+                worker.join(2)
+                self.assertFalse(worker.is_alive())
+            state.overlay_hide()
+            if state.listening:
+                state.pause(retain_tail=False)
+            if not stdin.closed:
+                stdin.close()
+            child.wait(timeout=3)
+
     def test_status_probe_shares_with_concurrent_start_or_show(self):
         for action in ('start', 'show'):
             with self.subTest(action=action):

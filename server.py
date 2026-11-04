@@ -1195,8 +1195,11 @@ class MeetingState:
         slot stays occupied until actual worker exit, including after done is
         signaled. Same-process callers may join only before completion is
         published; callers arriving afterward get unknown until worker exit.
-        Workers acquire no controller/publication locks; each caller waits at
-        most 50ms.
+        Publication is not a fresh OS sample: every waiter vetoes healthy
+        evidence contradicted by that handle's known returncode at consumption.
+        Poll runs without control/publication locks; each caller waits at most
+        50ms (subject to scheduling). This is an observation, not a guarantee
+        that the child cannot exit after the last check.
         """
         if process is None:
             return False
@@ -1223,7 +1226,15 @@ class MeetingState:
                         job['done'].set()
                 job['worker'] = threading.Thread(target=inspect_process, name='meeting-overlay-probe', daemon=True)
                 job['worker'].start()
-        return job['alive'] if job['done'].wait(.05) else None
+        if not job['done'].wait(.05):
+            return None
+        # Publication can lag the OS sample (including inside a poll wrapper).
+        # Each waiter checks the exact handle again, without invoking poll on
+        # a control thread. A known exit contradicts this healthy sample; it
+        # does not itself prove group/reader cleanup or authorize admission.
+        if job['alive'] is True and isinstance(getattr(process, 'returncode', None), int):
+            return None
+        return job['alive']
 
     def _reconcile_overlay_admission(self, *, for_show=False):
         """Discover autonomous bridge retirement before Start or Show.
@@ -1264,9 +1275,13 @@ class MeetingState:
         publication = self.overlay_lock if code == 503 else nullcontext()
         display = getattr(bridge, 'lock', nullcontext()) if code == 503 else nullcontext()
         with publication, display, getattr(bridge, '_admission_lock', nullcontext()):
+            process = getattr(bridge, 'process', None)
+            # Plain cached exit evidence can veto a previously healthy ticket.
+            # Never poll here: freshness/cleanup is established off these locks.
             retired = bridge is not None and (
                 getattr(bridge, 'stopping', False) is True
-                or getattr(bridge, 'process', None) in getattr(bridge, '_reader_failed', ())
+                or isinstance(getattr(process, 'returncode', None), int)
+                or process in getattr(bridge, '_reader_failed', ())
                 or getattr(bridge, '_lifecycle_epoch', 0) != epoch)
             if (not retired and self.overlay is bridge and self.pending_overlay is None
                     and not self.overlay_cleanup_error):
@@ -1278,7 +1293,7 @@ class MeetingState:
         # A clean exit in the reconciliation/commit gap is not an unconfirmed
         # helper. Reap outside all admission/publication locks, then continue
         # only if lifecycle ownership is still empty and cleanup is confirmed.
-        if retired and self._overlay_process_alive(bridge.process) is False:
+        if retired and self._overlay_process_alive(process) is False:
             if self.pending_overlay is bridge:
                 self._finish_overlay_cleanup()
             if self.overlay is None and self.pending_overlay is None and not self.overlay_cleanup_error:
