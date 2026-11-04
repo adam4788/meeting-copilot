@@ -64,6 +64,22 @@ with ExitStack() as stack:
             state.listening = m['listening']
             state.add_segment({'text': 'Synthetic question?'})
             result = {'code': 200, 'body': {}}
+        elif m.get('control') == 'adapter-fault':
+            action = m['action']
+            if action in ('start', 'pause'):
+                stack.enter_context(patch.object(audio, 'start' if action == 'start' else 'stop', side_effect=RuntimeError('synthetic-sensitive-adapter-diagnostic')))
+                stack.enter_context(patch.object(state, '_start_stop_retry_locked'))
+            else:
+                from types import SimpleNamespace
+                def fail_forget(*args):
+                    raise RuntimeError('synthetic-sensitive-clear-diagnostic')
+                state.bridge = SimpleNamespace(note_cleared=fail_forget)
+            result = {'code': 200, 'body': {}}
+        elif m.get('control') == 'cleanup-recover':
+            assert state.pending_overlay is not None
+            bridge = state.pending_overlay
+            bridge.hide_overlay = type(bridge).hide_overlay.__get__(bridge)
+            result = {'code': 200, 'body': {}}
         elif m.get('control') == 'segment':
             state.add_segment({'text': 'Synthetic question?'})
             result = {'code': 200, 'body': {}}

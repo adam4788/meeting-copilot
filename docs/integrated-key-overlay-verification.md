@@ -178,3 +178,50 @@ credentials, fake audio/overlay helpers, and network connections forbidden.
 this is not live Hermes Desktop/native hardware acceptance. The full npm suite
 and the opt-in React gate are separate because React/jsdom are not project
 runtime dependencies. No main merge, push, install, live app, or real-key access.
+
+## Follow-up: unrelated actions must not suppress shutdown evidence
+
+The action-generation fence above was too broad: an enabled, authorized Pause
+could finish while a 409/503 credential response was delayed, then suppress its
+unconfirmed-shutdown warning when status was unavailable. The pane now tracks
+an **overlay generation separately from the ordered control action counter**.
+Ordinary Pause/Start do not replace the overlay. Show attempts and local overlay
+retirement advance the overlay generation; credential retirement updates its own
+expected generation so readback can refine that same retirement. Pane identity,
+owner identity, and mount checks still fence obsolete results.
+
+TDD evidence against `5486f93` before the production changes:
+
+- Delayed 409 and 503 after legitimate Pause lost Retry hide in both normal and
+  StrictMode runs. The corresponding newer-owner cases already passed and must
+  remain green.
+- Authorized Start adapter/transport errors and Pause/Clear transport errors
+  reflected synthetic sensitive diagnostics. Pause stop and Clear forget errors
+  also leaked through the real router's status. All six scenarios failed in both
+  effect modes before the fix.
+- A production-router regression failed five subcases: Start, Pause, Clear forget,
+  Clear overlay teardown, and Clear invalidation. Each now returns fixed,
+  actionable recovery instructions rather than exception text. Stop uncertainty,
+  retry counts, and fail-closed capture behavior remain intact.
+
+Frontend catches preserve only object-identity-tagged local lifecycle messages,
+including the actionable different-renderer warning. Unknown Start/Pause/Clear
+transport errors receive action-specific recovery guidance rather than their raw
+message. The credential 409 response, transition details, secret handling and
+cloud-consent code are unchanged.
+
+Verified after the fixes:
+
+- Full `npm test`: **716 Python tests, OK (3 skips); 134 Node tests passed**.
+  Two old tests expected raw `snapshot locked` text; their expectations now
+  require safe Clear recovery guidance and explicitly forbid that raw diagnostic.
+- Real React/ReactDOM/jsdom with the production offline router: **48 scenarios
+  passed, 0 failed** (normal and StrictMode). Added cases cover both delayed
+  status codes after Pause, newer-owner protection, Retry hide recovery, and
+  authorized adapter/transport failures for Start/Pause/Clear.
+- Swift compile and `--self-test`: **overlay state tests passed**;
+  `--protocol-version`: **meeting-overlay/2**.
+- `git diff --check` passed. Runs used isolated homes and synthetic credentials;
+  the full Python suite also ran with outbound socket connections forbidden.
+
+These are offline tests, not live capture/provider/Desktop acceptance.

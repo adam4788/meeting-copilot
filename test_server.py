@@ -1663,7 +1663,8 @@ class ClearBoundaryFailureTests(unittest.TestCase):
         with TestClient(app) as client:
             self.assertEqual(client.post('/clear').status_code, 200)
             status = client.get('/status').json()
-            self.assertIn('snapshot locked', status['meetily_clear_error'])
+            self.assertIn('try Clear again', status['meetily_clear_error'])
+            self.assertNotIn('snapshot locked', status['meetily_clear_error'])
             # A later Clear that installs the boundary clears the flag.
             class WorkingBridge:
                 def note_cleared(self):
@@ -1738,7 +1739,8 @@ class ClearBoundaryFailureRestartTests(unittest.TestCase):
         with TestClient(app) as client:
             self.assertEqual(client.post('/clear').status_code, 200)
             status = client.get('/status').json()
-            self.assertIn('snapshot locked', status['meetily_clear_error'])
+            self.assertIn('try Clear again', status['meetily_clear_error'])
+            self.assertNotIn('snapshot locked', status['meetily_clear_error'])
             # Fail closed: capture stopped, no restart on unforgotten state.
             self.assertFalse(status['listening'])
             self.assertTrue(stopped)

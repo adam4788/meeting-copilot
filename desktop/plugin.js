@@ -27,7 +27,7 @@ export default {
       const [notice, setNotice] = useState('');
       const [overlayNotice, setOverlayNotice] = useState('');
       const currentTransition = target => target && life.mounted && target.life === life
-        && target.pane === life.pane && target.owner === life.owner && target.action === life.action;
+        && target.pane === life.pane && target.owner === life.owner && target.overlayGeneration === life.overlayGeneration;
       function reflectOverlay(written, target) {
         if (!currentTransition(target) || !written) return;
         if (written.overlay_credentials === 'retired') {
@@ -64,7 +64,7 @@ export default {
           body.key = value;
         }
         // A delayed edit/readback may describe an overlay the user replaced.
-        const target = { life, pane: life.pane, owner: life.owner, action: life.action };
+        const target = { life, pane: life.pane, owner: life.owner, overlayGeneration: life.overlayGeneration };
         erase(); inFlight.current = true; setWorking(true); setNotice('');
         try {
           const written = await api('/credentials/meta', body);
@@ -277,7 +277,7 @@ export default {
       const scopeSeq = useRef(0);
       // Owner is minted by Show, not a pane-local counter that resets on remount.
       function newOverlayLifecycle() {
-        const life = { at: 0, owner: null, pane: null, claim: null, action: 0,
+        const life = { at: 0, owner: null, pane: null, claim: null, action: 0, overlayGeneration: 0,
           creation: ++order.next,
           alive: true, syncedKey: null, released: false,
           get mounted() { return this.alive && registered() && paneEntry.active && paneRegistration === paneEntry; },
@@ -315,11 +315,11 @@ export default {
             // GET cannot commit. Retry on the next user action using the SAME
             // creation identity; never replay a possibly committed POST.
             life.claim = null;
-            throw new Error(`${detail} Retry the action to look up lifecycle authorization, or close and reopen the pane.`);
+            throw lifecycleError(`${detail} Retry the action to look up lifecycle authorization, or close and reopen the pane.`);
           }
           // A lost claim response may already have committed. Do not mint a
           // new creation ID on retry: reopening is an explicit new lifecycle.
-          throw new Error(`${detail} Close and reopen this pane to retry lifecycle authorization.`);
+          throw lifecycleError(`${detail} Close and reopen this pane to retry lifecycle authorization.`);
         });
         return life.claim;
       }
@@ -386,9 +386,19 @@ export default {
             body = { ...body, pane, action: ++life.action };
           }
           const response = await api(path, body);
-          if (path === '/clear') { retireLocalOverlay(); setOverlayMsg(response?.overlay_cleanup_error || ''); }
+          if (path === '/clear') { retireLocalOverlay(); setOverlayMsg(response?.overlay_cleanup_error ? 'Overlay shutdown is not confirmed. Retry hide overlay and verify the window is gone before sharing.' : ''); }
         }
-        catch (e) { setError(String(e.message || e)); return false; }
+        catch (e) {
+          // Only local, tagged lifecycle messages are trusted. Transport and
+          // adapter diagnostics can contain credentials or meeting content.
+          const recovery = {
+            '/start': 'Start was not confirmed. Check audio permissions, the selected recording/provider and backend connection. Verify capture state; Pause before retrying Start.',
+            '/pause': 'Pause was not confirmed; audio may still be active. Retry Pause / Retry stop and verify the OS capture indicator. Check the backend connection.',
+            '/clear': 'Clear was not confirmed. Check the backend connection and retry Clear. Do not assume the meeting was cleared or capture stopped.',
+          };
+          setError(lifecycleErrors.has(e) ? e.message : (recovery[path] || 'Action was not confirmed. Check the backend connection and retry.'));
+          return false;
+        }
         finally { setPending(false); }
         try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }); }
         catch (e) {}
@@ -421,11 +431,13 @@ export default {
       function reflectCredentialOverlay(written, target) {
         const life = overlayActionAt.current;
         if (!life.mounted || target?.life !== life || target.pane !== life.pane
-            || target.owner !== life.owner || target.action !== life.action) return false;
+            || target.owner !== life.owner || target.overlayGeneration !== life.overlayGeneration) return false;
         retireLocalOverlay();
         // Subsequent readback for this edit can refine shutdown, but only until
-        // another owner/action supersedes this exact retirement.
+        // another overlay replaces this retirement. Pause/ordinary Start use
+        // action ordering, but must not discard evidence about the same helper.
         target.owner = life.owner;
+        target.overlayGeneration = life.overlayGeneration;
         life.credentialShutdownUnconfirmed = written.overlay_stop_confirmed !== true;
         setOverlayMsg(life.credentialShutdownUnconfirmed
           ? 'Overlay shutdown is not confirmed. Retry hide overlay and verify the window is gone before sharing.'
@@ -433,6 +445,7 @@ export default {
       }
       function retireLocalOverlay() {
         const life = overlayActionAt.current;
+        life.overlayGeneration += 1;
         life.owner = null; life.syncedKey = null; life.credentialShutdownUnconfirmed = false;
         scopeSeq.current += 1;
         setOverlayOn(false); setScopeStale(false); setOverlayMsg('');
@@ -453,6 +466,9 @@ export default {
             if (hidden?.overlay_stop_confirmed === false) throw new Error(hidden.overlay_cleanup_error || 'Overlay shutdown is not confirmed.');
             retireLocalOverlay();
           } else {
+            // Fence even a lost/in-flight Show response: it may create a new
+            // owner before a delayed credential response reaches this pane.
+            life.overlayGeneration += 1;
             const shown = await api('/overlay/show', { pane, action, scope: { ...scope, ...overlayQuery, seq: scopeSeq.current } });
             if (!life.mounted || life.action !== action) return;
             if (shown?.accepted === false || !shown?.owner) throw new Error('This pane no longer owns the overlay. Reopen the pane to take ownership.');
@@ -491,7 +507,7 @@ export default {
           if (life.mounted && ok && (newMeeting || sourceChanged)) { resetMeetingInputs(); retireLocalOverlay(); }
           return ok;
         } catch (e) {
-          if (life.mounted) setError(String(e.message || e));
+          if (life.mounted) setError(lifecycleErrors.has(e) ? e.message : 'Start was not confirmed. Check the backend connection; close and reopen this pane to retry authorization.');
           return false;
         } finally { if (life.mounted) setPending(false); }
       }

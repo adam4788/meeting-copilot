@@ -11,6 +11,14 @@ const cases = [
   ['delayed-status-fallback', { DELAYED_STATUS: '1' }],
   ['valid-claim-rejection', { CLAIM_CONFLICT: '1' }],
 ];
+for (const code of ['409', '503']) {
+  cases.push([`delayed-${code}-pause`, { DELAYED_FAILURE: code }]);
+  cases.push([`delayed-${code}-new-owner`, { DELAYED_FAILURE: code, REPLACE_OVERLAY: '1' }]);
+}
+for (const action of ['start', 'pause', 'clear']) {
+  cases.push([`authorized-${action}-adapter`, { ACTION_DIAGNOSTIC: action }]);
+  cases.push([`authorized-${action}-transport`, { ACTION_DIAGNOSTIC: action, ACTION_TRANSPORT_FAULT: '/' + action }]);
+}
 for (const fault of ['lookup', 'claim']) {
   for (const action of ['start', 'pause', 'clear']) {
     cases.push([`${fault}-${action}`, { INITIAL_LIFECYCLE_FAULT: fault, LIFECYCLE_ACTION: action }]);

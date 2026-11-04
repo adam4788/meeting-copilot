@@ -372,9 +372,9 @@ class MeetingState:
         except HTTPException:
             self.pause(retain_tail=False)
             raise
-        except Exception as exc:
+        except Exception:
             self.pause()
-            raise HTTPException(503, f'Audio could not start: {type(exc).__name__}: {str(exc)[:300]}') from exc
+            raise HTTPException(503, 'Audio could not start. Check audio permissions, the selected recording/provider and backend connection. Verify capture has stopped before retrying Start.') from None
         threading.Thread(target=self.watchdog, args=(capture_generation,), name='meeting-capture-lease', daemon=True).start()
         return {'listening': self.listening}
 
@@ -497,12 +497,12 @@ class MeetingState:
                                               or info.get('stop_confirmed') is False
                                               or info.get('state', info.get('status')) == 'stopping')):
                 raise RuntimeError('Adapter is still stopping')
-        except Exception as exc:
+        except Exception:
             with self.lock:
                 self.stop_error = ('Capture stop is not confirmed; audio may still be active. '
                                    'Retry Pause / Retry stop. If it persists, quit the capture process or '
                                    'revoke microphone/system-audio permissions and verify the OS indicator. '
-                                   f'Attempt {self.stop_attempts}/3: {type(exc).__name__}: {str(exc)[:200]}')
+                                   f'Attempt {self.stop_attempts}/3.')
                 self.retiring_generations.clear()
             return False
         with self.lock:
@@ -1353,8 +1353,8 @@ class MeetingState:
         self._overlay_invalidation_error = None
         try:
             self._invalidate_overlay_locked(bridge)
-        except Exception as exc:
-            self._overlay_invalidation_error = f'Overlay invalidation failed: {type(exc).__name__}: {str(exc)[:200]}'
+        except Exception:
+            self._overlay_invalidation_error = 'Overlay invalidation failed; shutdown is not confirmed. Retry hide overlay and verify the window is gone before sharing.'
         self.overlay = None
         self.pending_overlay = bridge
         self.overlay_owner = None
@@ -1388,8 +1388,8 @@ class MeetingState:
                         process = getattr(bridge, 'process', None)
                         if process is not None and process.poll() is None:
                             raise RuntimeError('Overlay process is still running')
-                    except Exception as exc:
-                        job['error'] = f'Overlay teardown failed: {type(exc).__name__}: {str(exc)[:300]}'
+                    except Exception:
+                        job['error'] = 'Overlay teardown failed; shutdown is not confirmed. Retry hide overlay and verify the window is gone before sharing.'
                     finally:
                         job['done'].set()
                 threading.Thread(target=cleanup, name='meeting-overlay-cleanup', daemon=True).start()
@@ -1772,10 +1772,10 @@ def make_router(state):
                 if callable(forget):
                     try:
                         forget()
-                    except Exception as exc:
+                    except Exception:
                         state.meetily_clear_error = (
-                            'Could not install the Meetily forget boundary: %s. '
-                            'Clear otherwise completed; try Clear again or start a new meeting.' % exc)
+                            'Could not install the Meetily forget boundary. '
+                            'Clear otherwise completed; try Clear again or start a new meeting.')
                     else:
                         state.meetily_clear_error = None
             was_listening = state.listening

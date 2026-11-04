@@ -20,6 +20,7 @@ async function rest(path,options={}){
  if(failReadback&&path==='/credentials/meta'&&!options.method)throw new Error('synthetic-sensitive-readback');
  if(failStatus&&path==='/status')throw new Error('synthetic-sensitive-status');
  const r=await rpc({path,...options});traffic.push({path,method:options.method||'GET',code:r.code});
+ if(process.env.ACTION_TRANSPORT_FAULT===path)throw new Error('synthetic-sensitive-action-transport');
  if(holdWrite&&path==='/credentials/meta'&&options.method){heldWrite=r;await new Promise(resolve=>releaseWrite=resolve);}
  if(holdStatus&&path==='/status'){heldStatus=r;await new Promise(resolve=>releaseStatus=resolve);}
  if(r.code>=400)throw new Error('HTTP '+r.code+' '+JSON.stringify(r.body));return r.body;
@@ -83,6 +84,67 @@ const reports=[];
  await key('fake-review-key-one');await click('Save key');
  assert.equal((await probe()).saved_v1,true);
  await click('Show overlay');await refresh();assert.equal(status.overlay_shown,true);
+ if(process.env.ACTION_DIAGNOSTIC){
+  const action=process.env.ACTION_DIAGNOSTIC;
+  await act(async()=>document.querySelector('[aria-label="Capture permission"]').click());
+  if(action==='pause'){await click('Start listening');await refresh();assert.equal(status.listening,true);}
+  if(action==='clear'){await rpc({control:'segment'});await refresh();}
+  if(!process.env.ACTION_TRANSPORT_FAULT)await rpc({control:'adapter-fault',action});
+  await click({start:'Start listening',pause:'Pause listening',clear:'Clear meeting'}[action]);
+  assert.ok(traffic.some(t=>t.path==='/'+action),'authorized action must reach the real router');
+  assert.doesNotMatch(document.body.textContent,/synthetic-sensitive/,'action catch must never reflect raw diagnostics');
+  await refresh();
+  const raw=await rpc({path:'/status'});
+  assert.doesNotMatch(JSON.stringify(raw)+document.body.textContent+stderr,/synthetic-sensitive/,'response and status must be safe too');
+  if(action==='start')assert.match(document.body.textContent,/Check.*(audio|backend)|Retry.*Start/i);
+  if(action==='pause'){
+   assert.match(document.body.textContent,/Retry.*(Pause|stop)|verify.*(capture|indicator)/i);
+   if(!process.env.ACTION_TRANSPORT_FAULT){assert.equal(raw.body.stop_confirmed,false);assert.equal((await probe()).running,true);assert.ok(button('Retry stop'));}
+  }
+  if(action==='clear')assert.match(document.body.textContent,/Clear.*(again|confirmed)|Retry.*Clear/i);
+  console.log('PASS authorized '+action+' '+(process.env.ACTION_TRANSPORT_FAULT?'transport':'adapter')+' diagnostics');return;
+ }
+ if(process.env.DELAYED_FAILURE){
+  await act(async()=>document.querySelector('[aria-label="Capture permission"]').click());
+  await click('Start listening');await refresh();assert.equal(status.listening,true);
+  await rpc({control:process.env.DELAYED_FAILURE==='409'?'conflict-shutdown-fault':'write-shutdown-fault'});
+  holdWrite=true;
+  await key('fake-review-key-two');await clickPending('Save key');await until(()=>heldWrite);
+  assert.equal(heldWrite.code,Number(process.env.DELAYED_FAILURE));
+  assert.equal(heldWrite.body.overlay_credentials,'retired');
+  assert.equal(heldWrite.body.overlay_stop_confirmed,false);
+  assert.match(heldWrite.body.detail,/overlay_shutdown_unconfirmed/);
+  if(heldWrite.code===409)assert.match(heldWrite.body.detail,/changed|Recheck/i,'original conflict remains actionable');
+  assert.doesNotMatch(JSON.stringify(heldWrite),/synthetic-sensitive/);
+  failStatus=true;failReadback=true;
+  await clickPending('Pause listening');
+  await until(()=>traffic.some(t=>t.path==='/pause'&&t.code===200)&&!button('Pause listening')?.disabled);
+  assert.equal((await probe()).running,false,'legitimate Pause completed, without replacing overlay');
+  let newer;
+  if(process.env.REPLACE_OVERLAY){
+   await rpc({control:'cleanup-recover'});
+   await clickPending('Hide overlay');await until(()=>button('Show overlay')&&!button('Show overlay').disabled);
+   await clickPending('Show overlay');await until(()=>button('Hide overlay')&&!button('Hide overlay').disabled);
+   newer=await probe();assert.ok(newer.overlay_owner);
+  }
+  releaseWrite();await flush();
+  if(newer){
+   assert.ok(button('Hide overlay'),'delayed error must not retire the new owner');
+   assert.equal(button('Retry hide overlay'),undefined);
+   assert.doesNotMatch(document.body.textContent,/shutdown is not confirmed|overlay was closed/i);
+   assert.equal((await probe()).overlay_owner,newer.overlay_owner);
+   await click('Hide overlay');
+  }else{
+   assert.ok(button('Retry hide overlay'),'uncertainty must survive intervening Pause and failed status');
+   assert.equal(button('Show overlay'),undefined);
+   assert.ok([...document.querySelectorAll('[role="alert"]')].some(e=>visible(e)&&/shutdown is not confirmed/.test(e.textContent)));
+   await rpc({control:'cleanup-recover'});await click('Retry hide overlay');
+   assert.ok(button('Show overlay'),'confirmed retry recovers');
+   assert.equal(button('Retry hide overlay'),undefined);
+  }
+  assert.doesNotMatch(document.body.textContent+stderr,/synthetic-sensitive|fake-review-key/);
+  console.log('PASS delayed '+process.env.DELAYED_FAILURE+' after Pause: '+(newer?'new owner fenced':'warning retained'));return;
+ }
  if(process.env.DELAYED_STATUS){
   await rpc({control:'refresh-fault'});failReadback=true;holdStatus=true;
   await key('fake-review-key-two');await clickPending('Save key');await until(()=>heldStatus);
