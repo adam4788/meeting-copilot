@@ -3,6 +3,7 @@ import subprocess
 import sys
 import threading
 import time
+import unittest
 from contextlib import contextmanager
 from unittest.mock import patch
 
@@ -15,6 +16,8 @@ from thread_test_support import CheckedThreads
 
 @contextmanager
 def real_display(show=True, child_code=None):
+    if sys.platform not in ('darwin', 'linux'):
+        raise unittest.SkipTest('POSIX pipe/select helper required')
     process = subprocess.Popen(
         [sys.executable, '-u', '-c', child_code or 'import time; print("ready", flush=True); time.sleep(60)'],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -50,6 +53,7 @@ def real_display(show=True, child_code=None):
                 stream.close()
 
 
+@unittest.skipUnless(sys.platform in ('darwin', 'linux'), 'POSIX pipe/select helper required')
 class OverlayTeardownTests(CheckedThreads):
     def finish_denied_cleanup(self, bridge, state):
         # A bounded API return may precede worker completion. Drain the denied

@@ -39,6 +39,105 @@ class StartupAdmissionTests(CheckedThreads):
             self.assertIsNone(state.pending_overlay)
             self.assertTrue(state.overlay_hide()['overlay_stop_confirmed'])
 
+    def test_show_rejects_helper_exited_before_startup_commit(self):
+        from test_overlay_teardown import real_display
+        with real_display(show=False) as (bridge, process):
+            state = server.MeetingState()
+            def start():
+                bridge.process = process
+                return process
+            real_show = bridge.show_overlay
+            def show_then_exit():
+                result = real_show()
+                process.terminate()
+                process.wait(timeout=3)
+                return result
+            with patch('overlay_bridge.OverlayBridge', return_value=bridge), \
+                    patch.object(bridge, 'start_helper', side_effect=start), \
+                    patch.object(bridge, 'show_overlay', side_effect=show_then_exit), \
+                    patch.object(state, '_start_overlay_lease_locked') as lease:
+                with self.assertRaises(HTTPException) as rejected:
+                    state.overlay_show({})
+                self.assertEqual(rejected.exception.status_code, 503)
+                self.assertIsNone(state.overlay)
+                lease.assert_not_called()
+            state.overlay_hide()
+
+    def test_direct_show_does_not_report_cached_dead_launch(self):
+        from test_overlay_teardown import real_display
+        with real_display(show=False) as (bridge, process):
+            process.terminate()
+            process.wait(timeout=3)
+            def start():
+                bridge.process = process
+                return process
+            with patch.object(bridge, 'start_helper', side_effect=start):
+                self.assertFalse(bridge.show_overlay()['shown'])
+
+    def test_reused_show_rejects_observed_exit_during_scope_update(self):
+        from test_overlay_teardown import real_display
+        with real_display() as (bridge, process):
+            state = server.MeetingState()
+            state.overlay = bridge
+            real_scope = bridge.set_scope
+            def scope(value):
+                result = real_scope(value)
+                process.terminate()
+                process.wait(timeout=3)
+                return result
+            with patch.object(bridge, 'set_scope', side_effect=scope), \
+                    patch.object(state, '_start_overlay_lease_locked') as lease:
+                with self.assertRaises(HTTPException) as rejected:
+                    state.overlay_show({})
+                self.assertEqual(rejected.exception.status_code, 503)
+                self.assertIsNone(state.overlay)
+                lease.assert_not_called()
+            state.overlay_hide()
+
+    def test_startup_liveness_probe_is_bounded_and_off_lifecycle_lock(self):
+        from test_overlay_teardown import real_display
+        with real_display(show=False) as (bridge, process):
+            state = server.MeetingState()
+            entered, release = threading.Event(), threading.Event()
+            errors = []
+            real_poll = process.poll
+            def poll():
+                entered.set()
+                self.checked_wait(release, 5, 'release startup liveness probe')
+                return real_poll()
+            def start():
+                bridge.process = process
+                return process
+            def show():
+                try:
+                    state.overlay_show({})
+                except HTTPException as exc:
+                    errors.append(exc.status_code)
+            worker = threading.Thread(target=self.checked_callback(show))
+            try:
+                with patch('overlay_bridge.OverlayBridge', return_value=bridge), \
+                        patch.object(bridge, 'start_helper', side_effect=start), \
+                        patch.object(process, 'poll', side_effect=poll):
+                    worker.start()
+                    self.assertTrue(entered.wait(2))
+                    self.assertTrue(state.lifecycle_lock.acquire(timeout=.2))
+                    state.lifecycle_lock.release()
+                    worker.join(1.5)
+                    self.assertFalse(worker.is_alive(), 'Show blocked on process.poll')
+                    self.assertEqual(errors, [503])
+                    self.assertIsNone(state.overlay)
+                    self.assertIs(state.pending_overlay, bridge)
+            finally:
+                release.set()
+                worker.join(3)
+                for job in state._overlay_probe_jobs.values():
+                    self.assertTrue(job['done'].wait(2))
+                if bridge._cleanup_job:
+                    self.assertTrue(bridge._cleanup_job['done'].wait(2))
+                if state._overlay_cleanup_job:
+                    self.assertTrue(state._overlay_cleanup_job['done'].wait(2))
+                state.overlay_hide()
+
     def test_retirement_between_reconcile_and_admission_denies_start_and_show(self):
         from test_overlay_teardown import real_display
         for action in ('start', 'show'):

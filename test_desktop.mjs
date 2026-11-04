@@ -250,7 +250,10 @@ test('actual macOS parser cleanup failure renders unconfirmed and scoped Retry s
   p.unmount(); await backend.rpc({ command: 'inspect' });
 });
 
-test('real denied overlay cleanup stays visible across Clear and failed Hide; retry confirms shutdown', { timeout: 10000 }, async t => {
+test('real denied overlay cleanup stays visible across Clear and failed Hide; retry confirms shutdown', {
+  timeout: 10000,
+  skip: !['darwin', 'linux'].includes(process.platform), // real POSIX pipe/select helper
+}, async t => {
   const backend = await realBackend(t);
   const p = backend.mount();
   await button(p.tree, 'Start listening').props.onClick();

@@ -1,5 +1,6 @@
 """Merge-blocker regressions: deterministic, offline lifecycle boundaries."""
 import json
+import sys
 import threading
 import unittest
 from unittest.mock import Mock, patch
@@ -142,6 +143,7 @@ class BlockerTests(CheckedThreads):
             {'id': 'x' * 200 + 'b', 'text': 'When is launch?'}])
         self.assertEqual(len({r['id'] for r in rows}), 2)
 
+    @unittest.skipUnless(sys.platform in ('darwin', 'linux'), 'POSIX pipe/select required')
     def test_blocked_real_pipe_cannot_stall_scope_and_hide(self):
         import os
         import subprocess
@@ -180,6 +182,7 @@ class BlockerTests(CheckedThreads):
         self.assertTrue(scope_completed, 'scope blocked on helper IO under publication lock')
         self.assertTrue(hide_completed, 'hide could not retire blocked writer')
 
+    @unittest.skipUnless(sys.platform in ('darwin', 'linux'), 'POSIX pipe/select required')
     def test_real_fd_writer_roundtrip_and_full_pipe_deadline(self):
         import os
         import time

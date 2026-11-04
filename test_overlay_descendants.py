@@ -37,6 +37,9 @@ if {escape_group!r}: os.setsid()
 root.joinpath('child-ready').write_text(str(os.getpid()))
 deadline = time.monotonic() + 20
 while not root.joinpath('release').exists() and time.monotonic() < deadline:
+    if root.joinpath('write').exists() and not root.joinpath('wrote').exists():
+        print('{{"type":"error","code":"late-retired-line"}}', flush=True)
+        root.joinpath('wrote').touch()
     time.sleep(.01)
 '''
         parent_code = f'''
@@ -147,6 +150,43 @@ class OverlayDescendantTests(CheckedThreads):
             reader.join(3)
             self.assertFalse(reader.is_alive())
             self.assertTrue(bridge.hide_overlay()['stop_confirmed'])
+
+    def test_escaped_child_closing_pipes_is_outside_confirmation_boundary(self):
+        # This pins a limitation, not a promise of arbitrary tree containment.
+        with real_family(inherit_stdout=False, escape_group=True) as (bridge, process, root):
+            wait_until(lambda: bridge.hide_overlay()['stop_confirmed'])
+            self.assertIsNone(bridge.process)
+            os.kill(int(root.joinpath('child-ready').read_text()), 0)
+            # Fixture cleanup releases its private gate, never signals that PID.
+
+    def test_retired_line_is_not_eof_from_escaped_stdout_holder(self):
+        with real_family(escape_group=True) as (bridge, process, root):
+            assert bridge._reader is not None and process.stdout is not None
+            bridge.invalidate()
+            process.terminate()  # owned handle, never a numeric PID signal
+            process.wait(timeout=3)
+            with self.assertRaises(ProcessLookupError):
+                os.killpg(process.pid, 0)
+            root.joinpath('write').touch()
+            wait_until(lambda: root.joinpath('wrote').exists())
+            # Give the actual reader a chance to consume the retired line.
+            # Either a blocked drain or an exited reader must not imply EOF.
+            bridge._reader.join(.15)
+            for _ in range(2):
+                started = time.monotonic()
+                result = bridge.hide_overlay()
+                self.assertLess(time.monotonic() - started, .8)
+                os.kill(int(root.joinpath('child-ready').read_text()), 0)
+                self.assertFalse(result['stop_confirmed'], 'retired line is not pipe EOF')
+                self.assertIs(bridge.process, process)
+                self.assertFalse(process.stdout.closed)
+                self.assertIsNone(bridge._sticky_error)
+                self.assertTrue(bridge.lock.acquire(timeout=.2))
+                bridge.lock.release()
+            root.joinpath('release').touch()
+            bridge._reader.join(3)
+            self.assertFalse(bridge._reader.is_alive())
+            wait_until(lambda: bridge.hide_overlay()['stop_confirmed'])
 
     def test_parent_exit_does_not_confirm_live_descendant_or_reader(self):
         for inherit_stdout in (True, False):

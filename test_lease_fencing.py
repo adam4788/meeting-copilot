@@ -302,6 +302,8 @@ class LeaseFencingTests(CheckedThreads):
         display = Mock(lock=threading.RLock(), stopping=False,
                        _admission_lock=threading.RLock(), _lifecycle_epoch=0)
         display.show_overlay.return_value = {'shown': True}
+        display.process.poll.return_value = None  # explicit live-helper evidence
+        display.process.returncode = None
         display.set_scope.return_value = {}
         with patch('overlay_bridge.OverlayBridge', return_value=display), patch.object(self.state, '_start_overlay_lease_locked'):
             self.post('/overlay/show', {'pane': pane, 'action': 1, 'scope': {}})

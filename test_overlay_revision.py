@@ -2,6 +2,8 @@
 import json
 import os
 import select
+import sys
+import unittest
 import threading
 from unittest.mock import Mock, patch
 
@@ -261,6 +263,7 @@ class RevisionTests(CheckedThreads):
         self.assertEqual(overlay.answers['row']['answer'], 'Safe answer')
         engine.answer.assert_called_once()
 
+    @unittest.skipUnless(sys.platform in ('darwin', 'linux'), 'POSIX pipe/select required')
     def test_run_forwards_snapshot_to_actual_os_pipe(self):
         reader, writer = os.pipe()
         stream = os.fdopen(writer, 'wb', buffering=0)

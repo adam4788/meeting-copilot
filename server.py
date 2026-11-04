@@ -1152,6 +1152,10 @@ class MeetingState:
             job['error'] = f'Overlay startup worker could not start: {exc}'
             job['done'].set()
         job['done'].wait(3)
+        # Observe startup liveness off the lifecycle/publication locks. A hung
+        # poll remains bounded and cannot turn uncertainty into Show success.
+        process = getattr(job['bridge'], 'process', None)
+        alive = self._overlay_process_alive(process) if process is not None else True
         with self.lifecycle_lock:
             self._expire_capture()
             with self.overlay_lock:
@@ -1161,6 +1165,9 @@ class MeetingState:
                 with getattr(bridge, 'lock', nullcontext()):
                     shown = (job['done'].is_set() and not job['error']
                              and bool(job['result'].get('shown'))
+                             and alive is True
+                             and getattr(bridge, 'process', None) is process
+                             and not isinstance(getattr(process, 'returncode', None), int)
                              and getattr(bridge, 'stopping', False) is not True)
                     if current and shown:
                         self.pending_overlay = None
@@ -1290,6 +1297,12 @@ class MeetingState:
                     self.overlay.update(self.status())
                 except Exception:
                     pass
+                # Scope publication/status may observe an exit after the
+                # reconciliation probe. Do not commit a known-dead reuse.
+                process = getattr(self.overlay, 'process', None)
+                if isinstance(getattr(process, 'returncode', None), int):
+                    self._retire_overlay_locked()
+                    raise _unavailable('Overlay helper exited during Show; retry Hide / Show.')
                 if not self.listening and self.pending_stop is None:
                     self._touch_pane_seen()  # idle display lease only
                 self._start_overlay_lease_locked()
