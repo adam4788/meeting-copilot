@@ -223,6 +223,8 @@ class RevisionTests(CheckedThreads):
             self.assertIsNone(state.overlay)
 
     def test_legacy_helper_protocol_is_rejected_with_upgrade_instruction(self):
+        if bridge.sys.platform not in ('darwin', 'linux'):
+            self.skipTest('real POSIX helper script requires macOS or Linux')
         import tempfile
         from pathlib import Path
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:

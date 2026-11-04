@@ -51,17 +51,22 @@ class PrivacyTests(CheckedThreads):
                 if not release.wait(3):
                     raise AssertionError('pre-stop tap barrier timeout')
             return original_ask(*args)
-        helper = Mock()
+        helper = Mock(stdin=None, stdout=None)
         helper.poll.return_value = None
-        helper.wait.return_value = 0
+        def terminate():
+            helper.poll.return_value = 0
+        helper.terminate.side_effect = terminate
+        def start_helper():
+            # This tests reservation fencing, not POSIX launch. Inject at the
+            # platform boundary so the same assertions run on Windows.
+            overlay.process = helper
+            return helper
         try:
             with patch.object(overlay, 'ask', side_effect=held_ask):
                 self.assertTrue(self.click(overlay))
                 self.assertTrue(entered.wait(3))
                 overlay.stop()
-                with patch.object(overlay, '_helper_available', return_value=True), \
-                        patch.object(overlay, '_check_helper_protocol', return_value=True), \
-                        patch.object(bridge.subprocess, 'Popen', return_value=helper), \
+                with patch.object(overlay, 'start_helper', side_effect=start_helper), \
                         patch.object(overlay, '_read_clicks'), \
                         patch.object(overlay, '_start_poller_locked'), \
                         patch.object(overlay, '_start_pusher_locked'):

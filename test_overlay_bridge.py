@@ -405,6 +405,8 @@ class ClickTests(CheckedThreads):
         self.assertLessEqual(overlay._push_queue.qsize(), 8)
 
     def test_helper_exit_is_reaped_without_leaked_process(self):
+        if bridge.sys.platform not in ('darwin', 'linux'):
+            self.skipTest('real overlay helper launch requires macOS or Linux')
         import subprocess
         overlay = bridge.OverlayBridge(transport=self._slot_transport([]))
         import sys as _sys

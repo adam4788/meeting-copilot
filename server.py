@@ -1501,6 +1501,10 @@ class MeetingState:
                 if alive is None:
                     uncertain_overlay = True
                 if alive is False:
+                    # Parent exit is not group/reader cleanup evidence. Keep
+                    # visibility unknown until the bridge reaper clears its
+                    # owned handle; status must not bypass that confirmation.
+                    uncertain_overlay = uncertain_overlay or overlay.process is not None
                     overlay = None
             # The last session descriptor lets the pane compare the full
             # session key (backend + recording/model/source) before starting:

@@ -51,6 +51,19 @@ def real_display(show=True, child_code=None):
 
 
 class OverlayTeardownTests(CheckedThreads):
+    def finish_denied_cleanup(self, bridge, state):
+        # A bounded API return may precede worker completion. Drain the denied
+        # attempt at its explicit gate before restoring real signals, so the
+        # next retry tests a fresh attempt rather than reusing old evidence.
+        outer = state._overlay_cleanup_job
+        if outer is not None:
+            self.assertTrue(outer['done'].wait(2))
+        job = bridge._cleanup_job
+        if job is not None:
+            self.assertTrue(job['done'].wait(2))
+            job['worker'].join(2)
+            self.assertFalse(job['worker'].is_alive())
+
     def bounded(self, fn):
         result = []
         worker = threading.Thread(target=self.checked_callback(lambda: result.append(fn())), daemon=True)
@@ -86,6 +99,7 @@ class OverlayTeardownTests(CheckedThreads):
                     self.assertEqual(starts, [])
                     self.assertIs(state.pending_overlay, bridge)
                     self.assertIsNone(state.status(touch=False)['overlay_shown'])
+                    self.finish_denied_cleanup(bridge, state)
                 self.assertTrue(self.bounded(bridge.hide_overlay)['stop_confirmed'])
                 self.assertTrue(state.start(True, 'native')['listening'])
                 self.assertIsNone(state.pending_overlay)
@@ -355,6 +369,7 @@ class OverlayTeardownTests(CheckedThreads):
                 self.assertIsNone(status['overlay_shown'])
                 self.assertIsNone(state.overlay)
                 self.assertIs(bridge.process, process)
+                self.finish_denied_cleanup(bridge, state)
             self.assertTrue(self.bounded(state.overlay_hide)['overlay_stop_confirmed'])
 
     def test_retired_bridge_cannot_be_reused_by_controller(self):

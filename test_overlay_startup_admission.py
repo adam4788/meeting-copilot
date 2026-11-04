@@ -13,6 +13,32 @@ from thread_test_support import CheckedThreads
 
 
 class StartupAdmissionTests(CheckedThreads):
+    def require_supported_helper_platform(self):
+        # These tests exercise real POSIX helper launch, not injected launch.
+        # Keep the controller-only tests running in the Windows CI matrix.
+        if overlay_bridge.sys.platform not in ('darwin', 'linux'):
+            self.skipTest('real overlay helper launch requires macOS or Linux')
+
+    def test_windows_helper_is_unsupported_without_spawning(self):
+        bridge = overlay_bridge.OverlayBridge(helper=sys.executable)
+        state = server.MeetingState()
+        with patch.object(overlay_bridge, 'sys', SimpleNamespace(platform='win32')), \
+                patch.object(overlay_bridge.subprocess, 'Popen') as spawn, \
+                patch.object(overlay_bridge, 'OverlayBridge', return_value=bridge):
+            self.assertFalse(bridge.helper_status()['available'])
+            self.assertIn('not supported', bridge.helper_status()['error'])
+            self.assertIsNone(bridge.start_helper())
+            self.assertFalse(bridge.show_overlay()['shown'])
+            with self.assertRaises(HTTPException) as rejected:
+                state.overlay_show({})
+            self.assertEqual(rejected.exception.status_code, 503)
+            self.assertIn('not supported', rejected.exception.detail)
+            spawn.assert_not_called()
+            self.assertIsNone(bridge.process)
+            self.assertIsNone(state.overlay)
+            self.assertIsNone(state.pending_overlay)
+            self.assertTrue(state.overlay_hide()['overlay_stop_confirmed'])
+
     def test_retirement_between_reconcile_and_admission_denies_start_and_show(self):
         from test_overlay_teardown import real_display
         for action in ('start', 'show'):
@@ -120,6 +146,7 @@ class StartupAdmissionTests(CheckedThreads):
                     state.overlay_hide()
 
     def test_delayed_spawn_cannot_block_watchdog_or_rebind_new_owner(self):
+        self.require_supported_helper_platform()
         from test_overlay_teardown import real_display
         spawned, release = threading.Event(), threading.Event()
         stopped = threading.Event()
@@ -233,6 +260,7 @@ class StartupAdmissionTests(CheckedThreads):
                 state.overlay_hide()
 
     def test_valid_real_protocol_start_show_reuse_and_clean_exit(self):
+        self.require_supported_helper_platform()
         state = server.MeetingState(audio_factory=lambda: SimpleNamespace(
             start=lambda **kw: None, stop=lambda: None))
         bridge = overlay_bridge.OverlayBridge(helper=sys.executable)
@@ -254,6 +282,7 @@ class StartupAdmissionTests(CheckedThreads):
             state.overlay_hide()
 
     def test_protocol_timeout_retains_child_without_blocking_pause(self):
+        self.require_supported_helper_platform()
         stopped, spawned, denied = threading.Event(), threading.Event(), threading.Event()
         state = server.MeetingState(audio_factory=lambda: SimpleNamespace(
             start=lambda **kw: None, stop=stopped.set))

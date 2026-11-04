@@ -405,6 +405,9 @@ class OverlayBridge:
         self._cleanup_lock = threading.Lock()
         self._cleanup_job = None
         self._signal_jobs = {}
+        # Only launch-created sessions are eligible for group confirmation.
+        # Never infer ownership from getpgid() of an arbitrary injected handle.
+        self._process_groups = {}
         self.cleanup_error = None
         self._reader = None
 
@@ -901,8 +904,9 @@ class OverlayBridge:
             target = subprocess.Popen(
                 [self.helper_path] + list(getattr(self, 'helper_args', None) or []) + ['--protocol-version'],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True)
+                stderr=subprocess.DEVNULL, text=True, start_new_session=True)
             with self.lock:
+                self._process_groups[target] = target.pid
                 self.process = target
             output, _ = target.communicate(timeout=2)
             valid = target.returncode == 0 and output.strip() == 'meeting-overlay/2'
@@ -936,12 +940,13 @@ class OverlayBridge:
             if self.stopping:
                 return None
         argv = [self.helper_path] + list(getattr(self, 'helper_args', None) or [])
-        kwargs = dict(stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                      stderr=subprocess.DEVNULL, text=True, bufsize=1)
-        if sys.platform != 'win32':
-            kwargs['start_new_session'] = True
         try:
-            self.process = subprocess.Popen(argv, **kwargs)
+            target = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      stderr=subprocess.DEVNULL, text=True, bufsize=1,
+                                      start_new_session=True)
+            with self.lock:
+                self._process_groups[target] = target.pid
+                self.process = target
         except (OSError, ValueError, TypeError):
             self.process = None
             return None
@@ -1349,6 +1354,28 @@ class OverlayBridge:
                 worker.start()
         worker.join(.05)
 
+    def _group_gone(self, target):
+        """Observe only our launch-created group; never signal a stale PGID.
+
+        Popen.poll/communicate may already have reaped the session leader on
+        another thread. A check-then-killpg would race PID/group reuse, so only
+        the owned Popen receives TERM/KILL. Surviving descendants deliberately
+        leave shutdown unconfirmed. A reused group also fails closed (it is
+        never signaled). ESRCH proves absence only of this process group, not
+        daemonized descendants that escaped it; helpers must not daemonize.
+        """
+        import os
+        pgid = self._process_groups.get(target)
+        if pgid is None:
+            return True  # injected non-session handle: parent + reader only
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        return False
+
     def _reap_locked(self, process):
         """Bounded caller wait; no buffered IO or process methods on caller.
 
@@ -1375,24 +1402,23 @@ class OverlayBridge:
                             deadline = time.monotonic() + .15
                             while target.poll() is None and time.monotonic() < deadline:
                                 time.sleep(.01)
-                        job['confirmed'] = target.poll() is not None
+                        parent_gone = target.poll() is not None
+                        group_gone = self._group_gone(target)
+                        # An escaped/inherited pipe can outlive even the group.
+                        # Never publish success before the reader has finished,
+                        # and never strand a reaper in an unbounded reader join.
+                        if parent_gone and group_gone and reader is not None and reader is not threading.current_thread():
+                            reader.join(.05)
+                        reader_gone = reader is None or not reader.is_alive()
+                        job['confirmed'] = parent_gone and group_gone and reader_gone
+                        if job['confirmed']:
+                            for stream in (getattr(target, 'stdout', None), getattr(target, 'stdin', None)):
+                                if stream is not None:
+                                    stream.close()
                     except Exception:
                         job['confirmed'] = False
                     finally:
                         job['done'].set()
-                    if job['confirmed']:
-                        # EOF can be delayed (e.g. inherited pipe descriptors).
-                        # Never close buffered stdout while its reader owns it.
-                        # This worker owns only retired resources, no lifecycle
-                        # or publication locks, and never changes bridge state.
-                        if reader is not None and reader is not threading.current_thread():
-                            reader.join()
-                        for stream in (getattr(target, 'stdout', None), getattr(target, 'stdin', None)):
-                            if stream is not None:
-                                try:
-                                    stream.close()
-                                except (OSError, ValueError):
-                                    pass
                 job['worker'] = threading.Thread(target=reap, name='overlay-reaper', daemon=True)
                 job['worker'].start()
         job['done'].wait(.5)
@@ -1400,10 +1426,12 @@ class OverlayBridge:
         if confirmed:
             if self.process is target:
                 self.process = None
+            self._process_groups.pop(target, None)
             self.cleanup_error = None
         else:
-            self.cleanup_error = ('Overlay shutdown is not confirmed; the old window may still display '
-                                  'meeting content. Retry Hide / Clear. If it persists, quit the overlay helper.')
+            self.cleanup_error = ('Overlay shutdown is not confirmed; the helper, its process group, '
+                                  'or pipe reader may still be alive and meeting content may remain visible. '
+                                  'Retry Hide / Clear. If it persists, quit the overlay helper and its descendants.')
         return confirmed
 
     def _retire_lifecycle_locked(self):
