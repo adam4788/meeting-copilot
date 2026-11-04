@@ -96,7 +96,7 @@ class BlockerTests(CheckedThreads):
     def test_clear_retires_overlay_without_waiting_for_poll(self):
         state, overlay, engine = self.backend()
         overlay.answers['row']['answer'] = 'PRIVATE'
-        clear = next(r.endpoint for r in server.make_router(state).routes if r.path == '/clear')
+        clear = next(r.endpoint for r in server.make_router(state).routes if getattr(r, 'path', None) == '/clear')
         clear()
         before = len(overlay.pushed)
         overlay.push()
@@ -312,7 +312,7 @@ class BlockerTests(CheckedThreads):
         writer.start()
         try:
             self.assertTrue(arrived.wait(2))
-            clear = next(r.endpoint for r in server.make_router(state).routes if r.path == '/clear')
+            clear = next(r.endpoint for r in server.make_router(state).routes if getattr(r, 'path', None) == '/clear')
             clear()
             count = len(overlay.pushed)
         finally:
@@ -334,7 +334,7 @@ class BlockerTests(CheckedThreads):
         frame = {'type': 'snapshot', 'snapshot_id': overlay.snapshot_id,
                  'transcript': [{'text': 'PRIVATE'}], 'questions': []}
         writer = threading.Thread(target=lambda: overlay._emit(frame), daemon=True)
-        endpoint = next(r.endpoint for r in server.make_router(state).routes if r.path == '/clear')
+        endpoint = next(r.endpoint for r in server.make_router(state).routes if getattr(r, 'path', None) == '/clear')
         def clear():
             attempted.set()
             endpoint()

@@ -9,7 +9,17 @@ from types import SimpleNamespace
 from contextlib import ExitStack
 from unittest.mock import patch
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
+import warnings
+# Starlette 1.x still supports our httpx test transport, but announces its next
+# transport at import. Silence only that exact import-time migration notice;
+# the Node harness still rejects every runtime/backend/thread stderr message.
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        'ignore',
+        message=r'Using `httpx` with `starlette\.testclient` is deprecated; install `httpx2` instead\.',
+        module=r'fastapi\.testclient',
+    )
+    from fastapi.testclient import TestClient
 import server
 
 

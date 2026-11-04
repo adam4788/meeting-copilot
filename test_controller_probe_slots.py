@@ -4,6 +4,7 @@ import subprocess
 import sys
 import threading
 import time
+import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -42,6 +43,7 @@ class FakeDisplay:
 
 
 class ControllerProbeSlotTests(CheckedThreads):
+    @unittest.skipUnless(os.name == 'posix', 'healthy real-child evidence requires POSIX wait primitives')
     def test_sampled_alive_before_publication_requires_uncontradicted_evidence(self):
         # No reader runs for this inert child: model delayed EOF notification,
         # with wait() already recording exit on the exact Popen handle.
@@ -180,6 +182,7 @@ class ControllerProbeSlotTests(CheckedThreads):
                 stdin.close()
             child.wait(timeout=3)
 
+    @unittest.skipUnless(os.name == 'posix', 'healthy real-child evidence requires POSIX wait primitives')
     def test_known_exit_at_each_start_guard_requires_fresh_evidence(self):
         for boundary in (1, 2, 3):
             with self.subTest(boundary=boundary):
@@ -425,6 +428,7 @@ class ControllerProbeSlotTests(CheckedThreads):
                 kill.assert_not_called()
                 killpg.assert_not_called()
 
+    @unittest.skipUnless(os.name == 'posix', 'healthy real-child evidence requires POSIX wait primitives')
     def test_completed_live_probe_cannot_authorize_later_status_or_start(self):
         for action in ('status', 'start'):
             with self.subTest(action=action):

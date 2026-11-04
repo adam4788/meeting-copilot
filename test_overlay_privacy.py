@@ -350,7 +350,7 @@ class PrivacyTests(CheckedThreads):
                     if transition == 'clear':
                         # Real Clear route; avoid attaching capture after clear.
                         state.pause()
-                        clear = next(r.endpoint for r in server.make_router(state).routes if r.path == '/clear')
+                        clear = next(r.endpoint for r in server.make_router(state).routes if getattr(r, 'path', None) == '/clear')
                         clear()
                     elif transition == 'pause':
                         state.pause()

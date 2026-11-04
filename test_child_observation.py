@@ -41,6 +41,36 @@ def observe_exit(child):
 
 
 class ChildObservationTests(CheckedThreads):
+    def test_unsupported_native_observation_cannot_authorize_capture(self):
+        from types import SimpleNamespace
+        from fastapi import HTTPException
+        from test_controller_probe_slots import FakeDisplay
+        starts = []
+        state = server.MeetingState(audio_factory=lambda: SimpleNamespace(
+            start=lambda **kwargs: starts.append(True), stop=lambda: None))
+        with inert_child() as child:
+            display = FakeDisplay(child)
+            state.overlay = display
+            try:
+                # No global platform mutation and no invented healthy evidence.
+                # Windows lacks the POSIX primitives; this exercises that refusal.
+                with patch.object(overlay_bridge, 'os', SimpleNamespace(name='nt')):
+                    self.assertIsNone(state._overlay_process_alive(child))
+                    status = state.status(touch=False)
+                    self.assertIsNone(status['overlay_shown'])
+                    self.assertFalse(status['overlay_stop_confirmed'])
+                    with self.assertRaises(HTTPException) as denied:
+                        state.start(True, backend='native')
+                    self.assertEqual(denied.exception.status_code, 409)
+                    self.assertFalse(state.listening)
+                    self.assertEqual(starts, [])
+                    self.assertIsNone(child.poll(), 'refusal must not kill a live child')
+            finally:
+                state.overlay_hide()
+                for job in state._overlay_probe_jobs.values():
+                    job['worker'].join(2)
+                    self.assertFalse(job['worker'].is_alive())
+
     def require_waitid(self):
         if not all(hasattr(os, name) for name in ('waitid', 'P_PID', 'WEXITED', 'WNOWAIT', 'WNOHANG')):
             self.skipTest('native non-reaping waitid unavailable')

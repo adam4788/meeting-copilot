@@ -4,6 +4,7 @@ import importlib
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,11 +14,20 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 
+# The editor deliberately refuses platforms without verified POSIX permission/ACL
+# inspection. Keep authorization and input validation tests portable; only tests
+# requiring successful filesystem access use this gate. Never mock ACLs to pass.
+credential_filesystem_test = unittest.skipUnless(
+    sys.platform in ('darwin', 'linux'), 'credential filesystem safety requires macOS/Linux')
+
+
 class CredentialTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.home = Path(self.temp.name)
+        # macOS tempfile may use /var -> /private/var. Canonicalize only the
+        # newly-created test home; production still rejects symlink ancestry.
+        self.home = Path(self.temp.name).resolve()
         self.env = patch.dict(os.environ, {'HERMES_HOME': str(self.home), 'MODEL_API_KEY': ''})
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -51,10 +61,10 @@ class CredentialTests(unittest.TestCase):
         self.client = TestClient(self.app)
 
     def fake_host(self):
-        import fcntl
         from types import SimpleNamespace
         @contextlib.contextmanager
         def lock(path):
+            import fcntl  # only exercised by supported-platform filesystem tests
             with open(str(path) + '.lock', 'a') as f:
                 os.chmod(f.name, 0o600)
                 fcntl.flock(f, fcntl.LOCK_EX)
@@ -82,6 +92,7 @@ class CredentialTests(unittest.TestCase):
         return self.client.post('/credentials/meta', json={'action': 'save', 'key': key,
             'revision': revision if revision is not None else self.status()['revision']})
 
+    @credential_filesystem_test
     def test_missing_tokenizer_has_actionable_secret_free_error(self):
         from types import SimpleNamespace
         with patch.object(self.mod, '_scope', return_value=SimpleNamespace()):
@@ -96,6 +107,38 @@ class CredentialTests(unittest.TestCase):
             self.assertIn('credential_tokenizer_unavailable', response.text)
             self.assertFalse((self.home / '.env.lock').exists())
 
+    def test_unsupported_permission_platform_fails_closed_without_mutation(self):
+        from types import SimpleNamespace
+        path = self.home / '.env'
+        original = b'OTHER=fake-original-key\n'
+        path.write_bytes(original)
+        path.chmod(0o600)
+        before = path.stat()
+        host = self.mod._host.return_value
+        # Shadow only the credential module's platform, never global sys/os.
+        # This is a capability simulation on POSIX and native refusal on Windows.
+        with patch.object(self.mod, 'sys', SimpleNamespace(platform='win32')), \
+                patch.object(host, '_env_write_lock') as lock, \
+                patch.object(host, '_write_env_lines') as writer:
+            with self.assertRaisesRegex(RuntimeError, 'permissions unsupported'):
+                self.mod._check_acl(path)
+            for response in (self.client.get('/credentials/meta'),
+                             self.save(revision='0' * 64),
+                             self.client.post('/credentials/meta', json={
+                                 'action': 'remove', 'revision': '0' * 64})):
+                self.assertEqual(response.status_code, 503)
+                self.assertNotIn('fake-', response.text)
+            lock.assert_not_called()
+            writer.assert_not_called()
+        self.assertEqual(path.read_bytes(), original)
+        after = path.stat()
+        for field in ('st_ino', 'st_mode', 'st_size', 'st_mtime_ns', 'st_ctime_ns'):
+            self.assertEqual(getattr(after, field), getattr(before, field))
+        self.assertFalse((self.home / '.env.lock').exists())
+        self.assertFalse(list(self.home.glob('.env-stage-*')))
+        self.assertEqual(os.environ['MODEL_API_KEY'], '')
+
+    @credential_filesystem_test
     def test_save_readback_remove_preserves_other_credentials_and_never_publishes(self):
         before = '# untouched\nOTHER_KEY="fake-other-key"\nSINGLE="single line"\n'
         path = self.home / '.env'
@@ -117,6 +160,7 @@ class CredentialTests(unittest.TestCase):
         self.assertEqual(path.read_text(), before)
         self.assertFalse(self.status()['saved'])
 
+    @credential_filesystem_test
     def test_unscoped_process_key_is_unchanged_by_edit(self):
         with patch.dict(os.environ, {'MODEL_API_KEY': 'fake-inherited-key'}):
             self.assertEqual(self.save().status_code, 200)
@@ -126,6 +170,7 @@ class CredentialTests(unittest.TestCase):
             self.assertTrue(status['process_differs_from_saved'])
             self.assertEqual(os.environ['MODEL_API_KEY'], 'fake-inherited-key')
 
+    @credential_filesystem_test
     def test_stale_revision_refuses_concurrent_edits(self):
         revision = self.status()['revision']
         self.assertEqual(self.save(revision=revision).status_code, 200)
@@ -167,6 +212,7 @@ class CredentialTests(unittest.TestCase):
         self.assertEqual(self.save(revision='0' * 64).status_code, 403)
         self.assertFalse((self.home / '.env').exists())
 
+    @credential_filesystem_test
     def test_current_profile_selector_from_sdk_is_accepted_but_arbitrary_queries_are_not(self):
         self.assertEqual(self.client.get('/credentials/meta?profile=current').status_code, 200)
         self.assertEqual(self.client.get('/credentials/meta?key=fake-secret').status_code, 400)
@@ -186,6 +232,7 @@ class CredentialTests(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
         self.assertNotIn('fake-secret', r.text)
 
+    @credential_filesystem_test
     def test_symlinks_hardlinks_and_unsafe_permissions_fail_closed(self):
         target = self.home / 'elsewhere'
         target.write_text('OTHER=fake-secret\n')
@@ -202,6 +249,7 @@ class CredentialTests(unittest.TestCase):
         self.assertEqual(self.client.get('/credentials/meta').status_code, 503)
         self.assertEqual(target.read_text(), 'OTHER=fake-secret\n')
 
+    @credential_filesystem_test
     def test_duplicate_definitions_remove_all_without_touching_other_lines(self):
         path = self.home / '.env'
         path.write_text('export MODEL_API_KEY="fake-first"\nOTHER=fake-other\nMODEL_API_KEY=fake-last\n')
@@ -210,6 +258,7 @@ class CredentialTests(unittest.TestCase):
         self.assertEqual(path.read_text().count('MODEL_API_KEY='), 1)
         self.assertIn('OTHER=fake-other\n', path.read_text())
 
+    @credential_filesystem_test
     def test_disk_failure_is_sanitized_and_does_not_change_runtime(self):
         with patch.object(self.mod, '_write', side_effect=OSError('fake-secret')):
             r = self.save()
@@ -217,6 +266,7 @@ class CredentialTests(unittest.TestCase):
         self.assertNotIn('fake-secret', r.text)
         self.assertEqual(os.environ['MODEL_API_KEY'], '')
 
+    @credential_filesystem_test
     def test_parallel_writers_only_one_revision_wins(self):
         from concurrent.futures import ThreadPoolExecutor
         revision = self.status()['revision']
@@ -236,6 +286,7 @@ class CredentialTests(unittest.TestCase):
             return await next(request)
         self.assertEqual(self.client.get('/credentials/meta').status_code, 403)
 
+    @credential_filesystem_test
     def test_malformed_file_and_lock_symlinks_never_get_rewritten(self):
         path = self.home / '.env'
         path.write_text('OTHER="unterminated\n')
@@ -247,6 +298,7 @@ class CredentialTests(unittest.TestCase):
         self.assertEqual(self.client.get('/credentials/meta').status_code, 503)
         self.assertFalse((self.home / 'elsewhere').exists())
 
+    @credential_filesystem_test
     def test_host_helpers_and_restart_provider_routing_in_isolated_child(self):
         import importlib.util
         import subprocess
@@ -307,6 +359,7 @@ assert client.get('/credentials/meta').json()['verified'] is False
         self.assertEqual(result.returncode, 0, 'Isolated host integration failed (output intentionally withheld)')
         self.assertNotIn('fake-host-integration-key', result.stdout + result.stderr)
 
+    @credential_filesystem_test
     def test_private_home_under_sticky_temp_parent_is_safe_but_shared_home_is_not(self):
         parent = self.home / 'sticky'
         parent.mkdir(mode=0o1777)
@@ -319,6 +372,7 @@ assert client.get('/credentials/meta').json()['verified'] is False
             nested.chmod(0o777)
             self.assertEqual(self.client.get('/credentials/meta').status_code, 503)
 
+    @credential_filesystem_test
     def test_macos_acls_refused_before_secret_temp_open_and_metadata_preserved(self):
         import subprocess
         import sys
@@ -345,6 +399,7 @@ assert client.get('/credentials/meta').json()['verified'] is False
                 finally:
                     subprocess.run(['/bin/chmod', '-N', str(target)], check=True, capture_output=True)
 
+    @credential_filesystem_test
     def test_existing_extended_metadata_is_refused_not_discarded(self):
         path = self.home / '.env'
         path.write_bytes(b'OTHER=fake-unrelated-key\n')
@@ -366,6 +421,7 @@ assert client.get('/credentials/meta').json()['verified'] is False
             self.assertEqual(os.getxattr(path, name), b'preserve-me')
         self.assertEqual(path.read_bytes(), b'OTHER=fake-unrelated-key\n')
 
+    @credential_filesystem_test
     def test_generated_metadata_preserved_or_refused_before_publication(self):
         path = self.home / '.env'
         original = b'OTHER=fake-unrelated-key\n'
@@ -386,6 +442,7 @@ assert client.get('/credentials/meta').json()['verified'] is False
         self.assertEqual(self.mod._provenance(path), provenance)
         self.assertFalse(list(self.home.glob('.env-stage-*')))
 
+    @credential_filesystem_test
     def test_ambiguous_multiline_refused_not_silently_repaired(self):
         import subprocess
         import sys
@@ -407,6 +464,7 @@ assert client.get('/credentials/meta').json()['verified'] is False
             env=env, capture_output=True, timeout=30)
         self.assertEqual(result.returncode, 0, 'Startup resurrected removed key (output withheld)')
 
+    @credential_filesystem_test
     def test_status_is_uncacheable_and_never_claims_provider_verification(self):
         self.assertEqual(self.save().status_code, 200)
         r = self.client.get('/credentials/meta')

@@ -802,7 +802,11 @@ test('Meta key label matches accessible name and invalid lengths explain bounds'
   }
 });
 
-for (const realHost of [false, true]) for (const race of [false, true]) test(`Meta key pane effects reach isolated backend (host=${realHost}, interleaving=${race})`, async t => {
+for (const realHost of [false, true]) for (const race of [false, true]) test(`Meta key pane effects reach isolated backend (host=${realHost}, interleaving=${race})`, {
+  // Real credential writes require production POSIX permission/ACL inspection.
+  // Mocked pane authorization/validation/error tests above still run everywhere.
+  skip: !['darwin', 'linux'].includes(process.platform),
+}, async t => {
   const { spawn, spawnSync } = await import('node:child_process');
   if (realHost && spawnSync(process.env.PYTHON || 'python', ['-c', "import agent.secret_scope, hermes_cli.web_server_profiles"]).status !== 0) {
     t.skip('Installed Hermes host unavailable'); return;

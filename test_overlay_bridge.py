@@ -1203,7 +1203,7 @@ class BackendGenerationAdmissionTests(CheckedThreads):
             def __exit__(self, *args):
                 return lock.__exit__(*args)
         state.lock = Gate()
-        clear = next(r.endpoint for r in server.make_router(state).routes if r.path == '/clear')
+        clear = next(r.endpoint for r in server.make_router(state).routes if getattr(r, 'path', None) == '/clear')
         def submit():
             try:
                 results.append(state.assist('Who approves?', row_id='row',

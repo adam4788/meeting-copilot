@@ -18,13 +18,38 @@ class CredentialRuntimeTests(unittest.TestCase):
             home = Path(directory)
             (home / '.env').write_text('MODEL_API_KEY=fake-disk-key\n')
             env = {'HOME': directory, 'HERMES_HOME': directory, 'TMPDIR': directory,
+                   'USERPROFILE': directory, 'TEMP': directory, 'TMP': directory,
                    'PATH': os.defpath, 'HERMES_LAUNCHD_LABEL': 'ai.hermes.gateway.test-only'}
+            # Windows needs SystemRoot to initialize Winsock/asyncio. Preserve
+            # only this OS prerequisite, never copy ambient credentials/config.
+            if os.environ.get('SystemRoot'):
+                env['SystemRoot'] = os.environ['SystemRoot']
             if inherited is not None:
                 env['MODEL_API_KEY'] = inherited
             result = subprocess.run([sys.executable, '-'], input=script, text=True,
                                     env=env, capture_output=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertNotIn('fake-', result.stdout + result.stderr)
+
+    def test_child_environment_keeps_only_runtime_prerequisites(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        # Payload capture tests the allowlist on every OS, not Windows itself.
+        temp_root = tempfile.gettempdir()
+        ambient = {'SystemRoot': r'C:\Windows', 'MODEL_API_KEY': 'fake-ambient-key',
+                   'UNRELATED_SECRET': 'fake-other-key', 'USERPROFILE': 'ambient-home',
+                   'TMPDIR': temp_root, 'TEMP': temp_root, 'TMP': temp_root}
+        with patch.dict(os.environ, ambient, clear=True), patch.object(
+                subprocess, 'run', return_value=SimpleNamespace(
+                    returncode=0, stdout='', stderr='')) as run:
+            self.child('pass')
+        env = run.call_args.kwargs['env']
+        self.assertEqual(env['SystemRoot'], ambient['SystemRoot'])
+        for name in ('USERPROFILE', 'TEMP', 'TMP', 'TMPDIR'):
+            self.assertEqual(env[name], env['HOME'])
+        self.assertNotEqual(env['HOME'], 'ambient-home')
+        self.assertNotIn('MODEL_API_KEY', env)
+        self.assertNotIn('UNRELATED_SECRET', env)
 
     @host_scope_test
     def test_fresh_start_nonempty_precedence_model_and_asr(self):
