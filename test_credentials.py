@@ -82,6 +82,20 @@ class CredentialTests(unittest.TestCase):
         return self.client.post('/credentials/meta', json={'action': 'save', 'key': key,
             'revision': revision if revision is not None else self.status()['revision']})
 
+    def test_missing_tokenizer_has_actionable_secret_free_error(self):
+        from types import SimpleNamespace
+        with patch.object(self.mod, '_scope', return_value=SimpleNamespace()):
+            response = self.client.get('/credentials/meta')
+            self.assertEqual(response.status_code, 503)
+            self.assertIn('credential_tokenizer_unavailable', response.text)
+            self.assertIn('Upgrade Hermes', response.text)
+            self.assertIn('service environment', response.text)
+            self.assertNotIn('fake-', response.text)
+            response = self.save(revision='0' * 64)
+            self.assertEqual(response.status_code, 503)
+            self.assertIn('credential_tokenizer_unavailable', response.text)
+            self.assertFalse((self.home / '.env.lock').exists())
+
     def test_save_readback_remove_preserves_other_credentials_and_never_publishes(self):
         before = '# untouched\nOTHER_KEY="fake-other-key"\nSINGLE="single line"\n'
         path = self.home / '.env'

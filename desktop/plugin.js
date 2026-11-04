@@ -22,6 +22,8 @@ export default {
       const [info, setInfo] = useState(null);
       const [working, setWorking] = useState(false);
       const [notice, setNotice] = useState('');
+      const tokenizerNotice = error => typeof error?.message === 'string' && error.message.includes('credential_tokenizer_unavailable')
+        ? 'Key settings unavailable: the Hermes host tokenizer is unavailable. The saved file is not loaded by the startup bridge. Upgrade Hermes and safely restart after active sessions finish, or ask your administrator to supply MODEL_API_KEY through the service environment. Never paste keys in chat.' : '';
       const erase = () => { if (input.current) input.current.value = ''; setHasDraft(false); };
       async function recheck() {
         if (inFlight.current) return;
@@ -30,9 +32,9 @@ export default {
           const current = await api('/credentials/meta');
           if (!current || typeof current.revision !== 'string') throw new Error('unsupported');
           setInfo(current); setNotice('');
-        } catch (_) {
+        } catch (error) {
           setInfo(null);
-          setNotice('Key settings unavailable: this connection, host, file permissions or credential syntax may be unsupported. Multiline or ambiguous files need manual host-administrator review; this editor will not repair them. Use the local Desktop owner connection.');
+          setNotice(tokenizerNotice(error) || 'Key settings unavailable: this connection, host, file permissions or credential syntax may be unsupported. Multiline or ambiguous files need manual host-administrator review; this editor will not repair them. Use the local Desktop owner connection.');
         } finally { inFlight.current = false; setWorking(false); }
       }
       useEffect(() => { recheck(); return () => { if (input.current) input.current.value = ''; }; }, []);
@@ -60,9 +62,9 @@ export default {
           }
           setInfo(current);
           setNotice(action === 'save' ? 'Saved — new scoped requests can use the key immediately; existing requests and workers may retain their loaded key. Not verified with Meta.' : 'Saved key removed — new scoped requests may fall back to an inherited key. Existing requests and workers may retain their loaded key. Removal is not revocation.');
-        } catch (_) {
+        } catch (error) {
           setInfo(null);
-          setNotice('The key change could not be confirmed. Recheck key status before trying again; another settings edit or an unsupported host may have blocked it.');
+          setNotice(tokenizerNotice(error) || 'The key change could not be confirmed. Recheck key status before trying again; another settings edit or an unsupported host may have blocked it.');
         } finally { delete body.key; inFlight.current = false; setWorking(false); }
       }
       return h('section', { style: card, 'aria-label': 'Meta API key settings' },

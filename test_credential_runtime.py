@@ -57,6 +57,32 @@ assert meta_asr.transcribe_file(path, macos_audio._model_api_key(), opener=fake_
 ''', inherited)
 
     @host_scope_test
+    def test_benign_unrelated_syntax_allows_real_startup_and_scoped_transports(self):
+        for inherited in ('', 'fake-process-key'):
+            self.child(r'''
+import os
+from pathlib import Path
+from contextlib import nullcontext
+from hermes_constants import pin_process_hermes_home
+from hermes_cli.web_server_profiles import _config_profile_scope
+home = Path(os.environ['HERMES_HOME'])
+pin_process_hermes_home(str(home))
+process = os.environ.get('MODEL_API_KEY', '').strip()
+(home / '.env').write_text('OTHER="first\nsecond"\nESCAPED="first\\nsecond"\nNORMAL=value\nMODEL_API_KEY=fake-first-key\nMODEL_API_KEY=fake-disk-key\n')
+# Reuse actual model/ASR fake transports and a real wave fixture.
+from test_credential_host_scope import HARNESS
+exec(HARNESS)
+assert os.environ['MODEL_API_KEY'] == (process or 'fake-disk-key'), 'safe startup key unavailable'
+for context, wanted in ((nullcontext(), process or 'fake-disk-key'),
+                         (_config_profile_scope('current'), 'fake-disk-key')):
+    with context:
+        check_model(model_selection.selected_completion('meta', None), wanted)
+        check_asr(macos_audio._model_api_key(), wanted)
+# Startup permission is not permission to rewrite an unsupported environment.
+assert client.get('/credentials/meta').status_code == 503
+''', inherited)
+
+    @host_scope_test
     def test_actual_launch_rejects_host_parser_disagreement(self):
         self.child(r'''
 import os
@@ -76,6 +102,36 @@ with _config_profile_scope('current'):
     assert meta_models.resolve_model_api_key() == '', 'host scope acquired an unsupported launch key'
 ''')
 
+    @host_scope_test
+    def test_hostile_target_history_never_seeds_but_host_scope_stays_authoritative(self):
+        from test_credential_env import HOSTILE_TARGETS
+        for index, prefix in enumerate(HOSTILE_TARGETS):
+            with self.subTest(case=index):
+                self.child('from pathlib import Path\nimport os\nraw = ' + repr(prefix + b'MODEL_API_KEY=fake-final-key\n') + r'''
+Path(os.environ['HERMES_HOME'], '.env').write_bytes(raw)
+from test_credential_host_scope import HARNESS
+exec(HARNESS)
+assert not os.environ.get('MODEL_API_KEY', '').strip(), 'ambiguous key seeded'
+assert meta_models.resolve_model_api_key() == ''
+assert macos_audio._model_api_key() == ''
+try:
+    model_selection.selected_completion('meta', None)
+except ValueError:
+    pass
+else:
+    raise AssertionError('ambiguous startup allowed model')
+# Host-scoped snapshots are host-owned; this bridge does not reinterpret them.
+expected = 'fake-final-key'
+assert client.get('/probe').json()['ok']
+assert client.get('/credentials/meta').status_code == 503
+before = path.stat()
+for action in ('save', 'remove'):
+    assert edit(action, credentials._revision(path, raw)).status_code == 503
+assert path.read_bytes() == raw
+assert path.stat().st_mtime_ns == before.st_mtime_ns
+assert not (home / '.env.lock').exists()
+''')
+
     def test_launch_without_host_tokenizer_fails_closed(self):
         self.child(r'''
 import os, sys
@@ -92,7 +148,41 @@ from unittest.mock import patch
 with patch.dict(sys.modules, {'agent': None}):
     import meta_models
 assert not os.environ.get('MODEL_API_KEY', '').strip(), 'standalone startup published an unvalidated key'
+try:
+    meta_models.meta_completion()
+except ValueError as error:
+    assert 'Upgrade Hermes' in str(error), 'missing actionable startup error'
+    assert 'service environment' in str(error)
+else:
+    raise AssertionError('model accepted absent credential')
 ''')
+
+    @host_scope_test
+    def test_missing_tokenizer_preserves_inherited_transport_and_scoped_keys(self):
+        for absent in (False, True):
+            self.child('absent = ' + repr(absent) + r'''
+import os, sys, io
+from unittest.mock import patch
+from agent import secret_scope
+from hermes_constants import pin_process_hermes_home
+from hermes_cli.web_server_profiles import _config_profile_scope
+pin_process_hermes_home(os.environ['HERMES_HOME'])
+context = patch.dict(sys.modules, {'agent': None}) if absent else patch.object(secret_scope, '_parse_env_text', None)
+with context:
+    import meta_models, macos_audio, meta_asr
+    assert os.environ['MODEL_API_KEY'] == 'fake-process-key'
+    def model(request, timeout):
+        assert request.get_header('Authorization') == 'Bearer fake-process-key'
+        return io.BytesIO(b'{"choices":[{"message":{"content":"synthetic answer"}}]}')
+    with patch.object(meta_models.urllib.request, 'urlopen', side_effect=model):
+        assert meta_models.meta_completion()([]) == 'synthetic answer'
+    assert meta_asr.build_handshake(macos_audio._model_api_key())['authorization']['accessToken'] == 'Bearer fake-process-key'
+# Restore actual host tokenizer for a real scoped snapshot; file beats process.
+from test_credential_host_scope import HARNESS
+exec(HARNESS)
+expected = 'fake-disk-key'
+assert client.get('/probe').json()['ok']
+''', 'fake-process-key')
 
     @host_scope_test
     def test_trusted_host_scope_foreign_missing_and_owner(self):

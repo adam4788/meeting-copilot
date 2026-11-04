@@ -30,32 +30,34 @@ def _load_dotenv_key_once():
     """Seed the launch owner's key once; never publish routed profile secrets.
 
     A genuinely nonempty service environment wins. Empty/whitespace inherited
-    placeholders do not block a saved key. Editing and startup reject multiline
-    files (last assignment wins, no expansion). This is startup/unscoped
-    precedence ONLY; a host-built request scope can prefer its saved file.
+    placeholders do not block a saved key. Startup requires agreement on every
+    target assignment (last assignment wins, no expansion); editing is stricter.
+    This is startup/unscoped precedence ONLY; a host-built request scope can prefer its saved file.
     """
     if os.environ.get('MODEL_API_KEY', '').strip():
         return
     if not os.environ.get('HERMES_LAUNCHD_LABEL', '').startswith('ai.hermes.gateway'):
         return
     try:
+        if __package__:
+            from .credential_env import startup_value, TOKENIZER_UNAVAILABLE
+        else:
+            from credential_env import startup_value, TOKENIZER_UNAVAILABLE
         scope = _secret_scope()
-        if scope is None or scope.serves_routed_profile():
+        if scope is None:
+            return TOKENIZER_UNAVAILABLE
+        if scope.serves_routed_profile():
             return
-        # Do not seed unvalidated values when an older host lacks its tokenizer.
+        # No standalone approximation: require the actual installed tokenizer.
         host_parser = getattr(scope, '_parse_env_text', None)
         if not callable(host_parser):
-            return
-        if __package__:
-            from .credential_env import bindings, saved
-        else:
-            from credential_env import bindings, saved
+            return TOKENIZER_UNAVAILABLE
         home = Path(os.environ.get('HERMES_HOME') or Path.home() / '.hermes')
         with (home / '.env').open('rb') as file:
             raw = file.read(1024 * 1024 + 1)
         if len(raw) > 1024 * 1024:
             return
-        value = saved(bindings(raw, host_parser=host_parser)).strip()
+        value = startup_value(raw, host_parser).strip()
         if value and not os.environ.get('MODEL_API_KEY', '').strip():
             os.environ['MODEL_API_KEY'] = value
     except Exception:
@@ -63,7 +65,7 @@ def _load_dotenv_key_once():
         return
 
 
-_load_dotenv_key_once()
+_startup_key_error = _load_dotenv_key_once()
 
 
 def resolve_model_api_key():
@@ -111,7 +113,7 @@ def meta_completion(model=None):
     model = validate_meta_model(model)
     key = resolve_model_api_key()
     if len(key) < 8:
-        raise ValueError('Meta Model API key is not configured')
+        raise ValueError(_startup_key_error or 'Meta Model API key is not configured')
 
     def complete(messages):
         body = json.dumps({'model': model, 'messages': messages, 'max_tokens': 600}).encode('utf-8')

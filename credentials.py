@@ -16,9 +16,11 @@ import tempfile
 from pathlib import Path
 
 if __package__:
-    from .credential_env import KEY, UnsupportedEnvFile, bindings, saved as _saved
+    from .credential_env import (KEY, UnsupportedEnvFile, HostTokenizerUnavailable,
+                                 TOKENIZER_UNAVAILABLE, require_host_parser, bindings, saved as _saved)
 else:
-    from credential_env import KEY, UnsupportedEnvFile, bindings, saved as _saved
+    from credential_env import (KEY, UnsupportedEnvFile, HostTokenizerUnavailable,
+                                TOKENIZER_UNAVAILABLE, require_host_parser, bindings, saved as _saved)
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -31,19 +33,23 @@ _UNSUPPORTED_FILE = 'Unsupported credential file syntax. No changes made. Multil
 
 
 def _scope():
-    from agent import secret_scope
+    try:
+        from agent import secret_scope
+    except ImportError:
+        raise HostTokenizerUnavailable(TOKENIZER_UNAVAILABLE) from None
     return secret_scope
 
 
 def _bindings(raw):
     # Use the installed host tokenizer on the same immutable bytes, not a
     # second file read or a copied approximation of the host's parser.
-    return bindings(raw, host_parser=_scope()._parse_env_text)
+    return bindings(raw, host_parser=require_host_parser(_scope()))
 
 
 def _host():
     # Import only on an owner-authorized request. Older/hosted/multiplexed
     # hosts fail closed, never fall back to an unscoped file or custom lock.
+    require_host_parser(_scope())
     from agent.secret_scope import serves_routed_profile
     from hermes_cli import config
     from hermes_constants import get_hermes_home
@@ -299,6 +305,8 @@ def make_router():
             _host()
             path = _path()
             return _response(_status(path, _read(path)))
+        except HostTokenizerUnavailable:
+            raise HTTPException(503, TOKENIZER_UNAVAILABLE) from None
         except UnsupportedEnvFile:
             raise HTTPException(503, _UNSUPPORTED_FILE) from None
         except Exception:  # noqa: BLE001 -- credential boundary: sanitize all failures
@@ -347,6 +355,8 @@ def make_router():
             return _response(await asyncio.to_thread(apply))
         except HTTPException:
             raise
+        except HostTokenizerUnavailable:
+            raise HTTPException(503, TOKENIZER_UNAVAILABLE) from None
         except UnsupportedEnvFile:
             raise HTTPException(503, _UNSUPPORTED_FILE) from None
         except Exception:  # noqa: BLE001 -- credential boundary: sanitize all failures

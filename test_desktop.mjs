@@ -121,6 +121,18 @@ test('Meta key form saves explicitly, clears input, reads back, and never caches
   assert.ok(!JSON.stringify(tree).includes('fake-ui-key-only'));
 });
 
+test('Meta key missing tokenizer guidance is actionable without reflecting errors', async () => {
+  const ui = pane('', true, false, '', {}, {
+    '/credentials/meta': () => { throw new Error('credential_tokenizer_unavailable fake-secret-do-not-reflect'); },
+  });
+  await nodes(ui.tree).find(n => n.type === 'button' && n.children.includes('Recheck key status')).props.onClick();
+  const text = JSON.stringify(ui.rerender());
+  assert.match(text, /Upgrade Hermes/);
+  assert.match(text, /service environment/);
+  assert.match(text, /saved file.*not loaded/i);
+  assert.doesNotMatch(text, /fake-secret/);
+});
+
 test('Meta key never claims a status source before or after a failed check', async () => {
   const ui = pane('', true, false, '', {}, {
     '/credentials/meta': () => { throw new Error('unavailable'); },

@@ -140,11 +140,27 @@ merely satisfying the manifest's minimum Hermes version.
 - The pane compares the POST revision with its subsequent GET revision, not just
   the saved flag. A different writer between those requests produces a conflict
   notice, never confirmation that this pane's key was saved.
-- Startup and editing use non-interpolating dotenv bindings; multiline files are
-  refused, not partially rewritten. Every binding must agree with the installed
-  host tokenizer before either editing or launchd startup seeding. If the host or
-  tokenizer is missing, startup does not seed from the file; a separately supplied
-  process key remains usable. Empty/whitespace inherited keys
+- Startup and editing both disable interpolation, but have different safety
+  boundaries. The startup bridge compares the **complete ordered target binding
+  history** from whole-file python-dotenv parsing with the installed host tokenizer
+  on every physical line: source offset and exact unexpanded value, including all
+  duplicates. It also checks the full-file host result. Benign unrelated multiline,
+  escaped values or quoted unrelated names no longer block a safe target. Hidden
+  target lines, quoted target names and shadowed mismatches still refuse startup
+  seeding even if both final maps agree. Invalid parsing, BOMs and invalid UTF-8
+  remain refusal cases. The editor remains stricter: any unsupported binding
+  anywhere in the file blocks GET/Save/Remove before mutation.
+- Missing host/tokenizer remains deliberately **fail-closed**; no standalone
+  tokenizer approximation is shipped. A copied parser has no proven parity across
+  installed host versions. Startup does not load the saved file in this case;
+  a separately supplied nonempty process key remains usable. The owner endpoint
+  returns `credential_tokenizer_unavailable` with fixed, actionable instructions;
+  the pane translates that code into fixed text without echoing transport errors.
+  Unconfigured Meta completion also reports the startup constraint. Upgrade Hermes
+  and safely restart only after active sessions finish, or ask the administrator
+  to supply `MODEL_API_KEY` through the service/secret-manager environment. Merely
+  re-saving the file or restarting the same incompatible host cannot fix it.
+- Empty/whitespace inherited keys
   do not block the launchd startup bridge; nonempty process keys retain precedence
   **only for that startup bridge/unscoped code**, not fresh host-scoped requests.
   Runtime Meta resolution uses Hermes' trusted `agent.secret_scope` API. Foreign
@@ -152,6 +168,10 @@ merely satisfying the manifest's minimum Hermes version.
   closed. ASR snapshots the scoped key before its thread starts and removes the
   gateway startup marker from the child environment to prevent launch-home reload.
   Owner-scoped requests retain the host's legitimate environment fallback.
+  A host-built scope remains authoritative, including for files this bridge/editor
+  refuses: this plugin does not rewrite or re-parse trusted scope snapshots during
+  model/ASR requests. Refusing startup seeding or editing is not revocation of a
+  key already supplied by the host. Manual administrator review is required.
 - Bodies are bounded, JSON-only, explicitly validated without FastAPI's default
   input-echoing 422 responses; errors are fixed messages. GET/status return only
   flags and an opaque revision, not a key, suffix, or public key hash. Successful
@@ -174,6 +194,10 @@ When Hermes is installed, a clean child process additionally uses the **real hos
 lock/writer**, simulates startup, and exercises `selected_completion('meta', …)`
 with a fake HTTP provider; Muse Voice handshake construction uses the same key.
 That integration test skips on machines without Hermes, never on this verified host.
+
+`python -m unittest test_credential_env -v` compares target histories against the
+installed tokenizer, including same-valued shadow assignments, quoted names,
+multiline targets, duplicate bindings, line endings and literal variable values.
 
 `python -m unittest test_credential_runtime -v` uses fresh child processes and
 synthetic profiles to check empty/nonempty startup precedence through fake Meta
@@ -224,3 +248,15 @@ environment containing no live credentials:
 ACLs/custom metadata and differing provenance remain explicit refusal cases, not
 silent repair. Visual browser acceptance and live provider credentials are outside
 this isolated test receipt.
+
+### Startup availability follow-up
+
+The benign unrelated-multiline model/ASR startup regression and missing-tokenizer
+API/UI guidance tests were observed failing before their fixes. The target-history
+matrix also covers hidden assignments followed by identical or different final
+values; these never seed the process key. Real host-scoped requests remain governed
+by the host's snapshot, while the editor refuses those files without creating a lock.
+
+Full isolated `npm test` after this follow-up: **599 Python tests passed (3
+Windows-only skips)**, JavaScript syntax check passed, **79 desktop tests passed**.
+No live credentials, provider calls, installs, pushes or merges were used.
