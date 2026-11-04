@@ -156,10 +156,10 @@ class GatewayTests(unittest.TestCase):
             release.set()
             capture._thread.join(2)
         self.assertEqual(capture.status()['state'], 'stopped')
-        # Teardown delivers exactly one terminal stopped summary (with the
-        # last known loss evidence); the slow spawn's late callbacks stay suppressed.
+        # A bounded stop cannot claim the slow-spawning worker has exited.
+        # Deliver stopping honestly; its late running/segment callbacks stay suppressed.
         self.assertEqual(len(segments), 1)
-        self.assertEqual(segments[0].get('state'), 'stopped')
+        self.assertEqual(segments[0].get('state'), 'stopping')
         self.assertNotIn('text', segments[0])
         self.assertIsNotNone(processes[0].poll())
         self.assertFalse(capture.status()['running'])

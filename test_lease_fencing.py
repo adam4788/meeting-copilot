@@ -37,6 +37,18 @@ class LeaseFencingTests(CheckedThreads):
         self.post('/start', dict(consent=True, backend='macos', **auth))
         self.assertTrue(self.state.listening)
 
+    def test_claim_stops_previous_capture_without_old_release_stopping_new_one(self):
+        old = self.claim()
+        self.start(pane=old, action=1)
+        new = self.claim(2)  # close cleanup is still delayed in transport
+        self.assertFalse(self.state.listening, 'claim must not inherit capture consent')
+        self.audio.stop.assert_called_once()
+        self.assertTrue(self.post('/heartbeat', {'pane': new})['accepted'])
+        self.start(pane=new, action=1)
+        self.assertFalse(self.post('/overlay/release', {'pane': old, 'action': 2})['accepted'])
+        self.assertTrue(self.state.listening)
+        self.assertEqual(self.audio.stop.call_count, 1)
+
     def test_status_and_unscoped_heartbeat_cannot_renew_claimed_capture(self):
         pane = self.claim()
         self.start(pane=pane, action=1)
@@ -98,6 +110,178 @@ class LeaseFencingTests(CheckedThreads):
             self.assertFalse(self.post('/heartbeat', body)['accepted'])
             self.assertEqual(self.state.pane_seen, before)
         self.assertEqual(self.client.post('/heartbeat', json={'typo': pane}).status_code, 422)
+
+    def test_claim_returns_live_capability_even_when_old_helper_hide_fails(self):
+        pane = self.claim()
+        self.start(pane=pane, action=1)
+        self.state.overlay = Mock()
+        self.state.overlay.hide_overlay.side_effect = RuntimeError('old helper pipe closed')
+        new = self.claim(2)
+        self.assertFalse(self.state.listening)
+        self.assertTrue(self.post('/heartbeat', {'pane': new})['accepted'])
+        self.start(pane=new, action=1)
+
+    def test_claim_stops_without_overlay_lock_and_preserves_liveness(self):
+        import threading
+        pane = self.claim()
+        self.start(pane=pane, action=1)
+        completed = threading.Event()
+        workers = []
+        def stop():
+            def callback():
+                # Models a shutdown callback needing overlay -> state locks.
+                self.state.heartbeat(server.LeaseRequest(pane=pane))
+                completed.set()
+            worker = threading.Thread(target=self.checked_callback(callback))
+            workers.append(worker)
+            worker.start()
+            self.checked_wait(completed, 1, 'claim must not join under overlay lock')
+        self.audio.stop.side_effect = stop
+        new = self.claim(2)
+        for worker in workers:
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+        self.assertFalse(self.state.listening)
+        self.assertTrue(self.post('/heartbeat', {'pane': new})['accepted'])
+        self.start(pane=new, action=1)
+
+    def test_stop_failure_is_visible_retried_and_blocks_new_capture(self):
+        pane = self.claim()
+        self.start(pane=pane, action=1)
+        self.audio.stop.side_effect = [RuntimeError('signal not sent'), None]
+        with patch.object(self.state, '_start_stop_retry_locked', create=True):
+            result = self.post('/overlay/release', {'pane': pane, 'action': 2})
+        self.assertTrue(result['accepted'])
+        self.assertFalse(result['stop_confirmed'])
+        status = self.client.get('/status').json()
+        self.assertTrue(status['stopping'])
+        self.assertEqual(status['capture']['state'], 'stopping')
+        self.assertIn('not confirmed', status['error'])
+        new = self.claim(2)
+        response = self.client.post('/start', json={'pane': new, 'action': 1, 'consent': True, 'backend': 'macos'})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(self.audio.start.call_count, 1)
+        self.state._retry_stop(self.state.stop_sequence)
+        self.assertFalse(self.client.get('/status').json()['stopping'])
+        self.start(pane=new, action=2)
+        stops = self.audio.stop.call_count
+        self.assertFalse(self.post('/overlay/release', {'pane': pane, 'action': 3})['accepted'])
+        self.state._retry_stop(self.state.stop_sequence - 1)
+        self.assertEqual(self.audio.stop.call_count, stops)
+
+    def test_stop_retries_are_bounded_and_current_owner_can_retry(self):
+        pane = self.claim()
+        self.start(pane=pane, action=1)
+        self.audio.stop.side_effect = RuntimeError('signal not sent')
+        with patch.object(self.state, '_start_stop_retry_locked', create=True):
+            result = self.post('/pause', {'pane': pane, 'action': 2})
+            self.assertFalse(result['stop_confirmed'])
+            self.state._retry_stop(self.state.stop_sequence)
+        self.assertEqual(self.audio.stop.call_count, 3)
+        status = self.client.get('/status').json()
+        self.assertTrue(status['stopping'])
+        self.assertIn('Retry', status['error'])
+        self.assertFalse(self.post('/heartbeat', {'pane': pane})['accepted'])
+        self.audio.stop.side_effect = None
+        result = self.post('/pause', {'pane': pane, 'action': 3})
+        self.assertTrue(result['stop_confirmed'])
+        self.assertFalse(self.client.get('/status').json()['stopping'])
+
+    def test_clear_cannot_replace_adapter_when_its_stop_fails(self):
+        pane = self.claim()
+        self.start(pane=pane, action=1)
+        self.audio.stop.side_effect = RuntimeError('signal not sent')
+        with patch.object(self.state, '_start_stop_retry_locked'):
+            response = self.client.post('/clear', json={'pane': pane, 'action': 2})
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()['listening'])
+        self.assertEqual(self.audio.start.call_count, 1)
+        self.assertTrue(self.client.get('/status').json()['stopping'])
+
+    def test_show_expiring_during_helper_launch_never_refreshes_capture(self):
+        pane = self.claim()
+        self.start(pane=pane, action=1)
+        seen = self.state.pane_seen
+        self.now += 29
+        display = Mock()
+        display.show_overlay.side_effect = lambda: (self.tick(2), {'shown': True})[1]
+        with patch('overlay_bridge.OverlayBridge', return_value=display):
+            self.post('/overlay/show', {'pane': pane, 'action': 2, 'scope': {}})
+        self.assertFalse(self.state.listening)
+        self.assertEqual(self.state.pane_seen, seen)
+        self.assertFalse(self.post('/heartbeat', {'pane': pane})['accepted'])
+
+    def test_watchdog_stop_failure_has_independent_retry(self):
+        pane = self.claim()
+        self.start(pane=pane, action=1)
+        self.audio.stop.side_effect = [RuntimeError('signal not sent'), None]
+        self.now += 31
+        with patch.object(self.state, '_start_stop_retry_locked', create=True) as retry:
+            server.MeetingState.watchdog(self.state, self.state.capture_generation)
+        retry.assert_called_once()
+        self.assertTrue(self.client.get('/status').json()['stopping'])
+        self.state._retry_stop(self.state.stop_sequence)
+        self.assertFalse(self.client.get('/status').json()['stopping'])
+
+    def test_expired_clear_cannot_restart_capture(self):
+        pane = self.claim()
+        self.start(pane=pane, action=1)
+        self.state.add_segment({'text': 'private'})
+        seen = self.state.pane_seen
+        self.now += 31
+        result = self.post('/clear', {'pane': pane, 'action': 2})
+        self.assertFalse(result['listening'])
+        self.assertEqual(result['segments'], [])
+        self.assertEqual(self.audio.start.call_count, 1)
+        self.audio.stop.assert_called_once()
+        self.assertEqual(self.state.pane_seen, seen)
+
+    def test_failed_show_cannot_revive_expired_capture(self):
+        pane = self.claim()
+        self.start(pane=pane, action=1)
+        seen = self.state.pane_seen
+        self.now += 31
+        display = Mock()
+        display.show_overlay.return_value = {'shown': False}
+        with patch('overlay_bridge.OverlayBridge', return_value=display):
+            result = self.client.post('/overlay/show', json={'pane': pane, 'action': 2, 'scope': {}})
+        self.assertEqual(result.status_code, 503)
+        self.assertFalse(self.state.listening)
+        self.audio.stop.assert_called_once()
+        self.assertEqual(self.state.pane_seen, seen)
+        self.assertFalse(self.post('/heartbeat', {'pane': pane})['accepted'])
+
+    def test_valid_clear_preserves_capture_deadline_not_consent(self):
+        pane = self.claim()
+        self.start(pane=pane, action=1)
+        seen = self.state.pane_seen
+        self.now += 2
+        result = self.post('/clear', {'pane': pane, 'action': 2})
+        self.assertTrue(result['listening'])
+        self.assertEqual(self.audio.start.call_count, 2)
+        self.assertEqual(self.state.pane_seen, seen, 'Clear is not fresh capture consent')
+
+    def test_clear_expiring_during_restart_preparation_cannot_start(self):
+        pane = self.claim()
+        self.start(pane=pane, action=1)
+        self.now += 29
+        real_get_audio = self.state.get_audio
+        def delayed_audio(*args, **kwargs):
+            self.now += 2
+            return real_get_audio(*args, **kwargs)
+        with patch.object(self.state, 'get_audio', side_effect=delayed_audio):
+            result = self.post('/clear', {'pane': pane, 'action': 2})
+        self.assertFalse(result['listening'])
+        self.assertEqual(self.audio.start.call_count, 1)
+
+    def test_clear_expiring_during_stop_cannot_restart_capture(self):
+        pane = self.claim()
+        self.start(pane=pane, action=1)
+        self.now += 29
+        self.audio.stop.side_effect = lambda: self.tick(2)
+        result = self.post('/clear', {'pane': pane, 'action': 2})
+        self.assertFalse(result['listening'])
+        self.assertEqual(self.audio.start.call_count, 1)
 
     def test_explicit_show_reestablishes_expired_display_lease(self):
         pane = self.claim()

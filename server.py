@@ -124,6 +124,12 @@ class MeetingState:
         self.overlay_lock = threading.RLock()
         self.overlay_lease_seq = 0
         self.capture_error = None
+        # Logical retirement is not proof of physical shutdown. Keep the exact
+        # adapter until stop succeeds; starts cannot replace it meanwhile.
+        self.pending_stop = None
+        self.stop_sequence = 0
+        self.stop_attempts = 0
+        self.stop_error = None
         self.segments = deque(maxlen=120)
         self.listening = False
         self.error = None
@@ -210,8 +216,10 @@ class MeetingState:
                                transcription_provider, asr_mode)
 
     def _start(self, consent, backend='meetily', recording_id=None, transcription_model='base.en', audio_source='microphone',
-               new_meeting=False, transcription_provider='local', asr_mode='ENDPOINTING'):
+               new_meeting=False, transcription_provider='local', asr_mode='ENDPOINTING', *, renew_lease=True):
         from fastapi import HTTPException
+        if self.pending_stop is not None:
+            raise HTTPException(409, self.stop_error or 'Capture stop is not confirmed. Retry Pause before starting.')
         if not consent:
             raise HTTPException(400, 'Confirm participant consent and audio capture before starting.')
         if backend == 'meetily' and not recording_id:
@@ -278,7 +286,10 @@ class MeetingState:
             status_session_key = self.session_key
         # Lease refresh outside self.lock: _touch_pane_seen takes overlay_lock,
         # and overlay_lock -> self.lock ordering elsewhere forbids the reverse.
-        self._touch_pane_seen()
+        if renew_lease:
+            self._touch_pane_seen()
+        elif self._expire_capture():
+            return {'listening': False}
         def segment_callback(segment):
             with self.lock:
                 if self.listening and self.capture_generation == capture_generation:
@@ -391,65 +402,77 @@ class MeetingState:
                 accepted = (body.revision == self.overlay_revision and body.epoch == self.overlay_epoch)
             else:
                 accepted = self.overlay_revision == 0
-            accepted = accepted and time.monotonic() - self.pane_seen <= 30
+            accepted = accepted and self.pending_stop is None and time.monotonic() - self.pane_seen <= 30
             if accepted:
                 self._touch_pane_seen()
             with self.lock:
                 return {'accepted': accepted, 'listening': self.listening}
+
+    def _expire_capture(self):
+        """Called with lifecycle_lock; no stop/join while holding overlay_lock."""
+        with self.overlay_lock:
+            expired = self.listening and time.monotonic() - self.pane_seen > 30
+        if expired:
+            self.pause(retain_tail=False)
+            self.overlay_hide()
+        return expired
 
     def watchdog(self, capture_generation=None):
         if capture_generation is None:
             capture_generation = self.capture_generation
         while self.listening and capture_generation == self.capture_generation:
             time.sleep(2)
-            # Entire expiry teardown runs atomically under lifecycle_lock: a
-            # restart between the expiry check and backend stop must neither
-            # pause the new capture nor stop its backend / hide its overlay.
-            # pane_seen is read under overlay_lock — the same lock heartbeat
-            # renewal takes — so a renewal cannot slip between check and teardown.
             with self.lifecycle_lock:
                 if capture_generation != self.capture_generation:
-                    break
-                with self.overlay_lock:
-                    expired = time.monotonic() - self.pane_seen > 30
-                    if expired:
-                        # Same bounded tail window as explicit pause: flushed
-                        # audio during teardown still belongs to this meeting.
-                        with self.lock:
-                            self.listening = False
-                            self.capture_generation += 1
-                            self.retiring_generations[capture_generation] = time.monotonic() + 5.0
-                        overlay = self.overlay
-                        self._invalidate_overlay_locked(overlay)
-                        self.overlay = None
-                        self.overlay_owner = None
-                    else:
-                        overlay = None
-                if not expired:
-                    continue
-                # Cancel answer work before stopping the backend (same order
-                # as explicit pause): a worker must not submit or publish
-                # while stop is in progress. Still cooperative for already
-                # blocked provider calls.
-                with self.lock:
-                    for entry in self.requests.values():
-                        if entry.get('status') in ('queued', 'streaming', 'running'):
-                            entry['cancelled'] = True
-                            entry['status'] = 'cancelled'
-                audio = self.audio if self.backend in ('native', 'macos') else self.bridge
-                if audio:
-                    try:
-                        audio.stop()
-                    except Exception:
-                        pass
-                with self.lock:
-                    self.busy = False
-                if overlay is not None:
-                    try:
-                        overlay.hide_overlay()
-                    except Exception:
-                        pass
-                break
+                    return
+                if self._expire_capture():
+                    return
+
+    def _start_stop_retry_locked(self):
+        threading.Thread(target=self._retry_stop, args=(self.stop_sequence,),
+                         name='meeting-stop-retry', daemon=True).start()
+
+    def _retry_stop(self, sequence):
+        # Separate from capture-generation watchdog: logical retirement must
+        # not kill the only worker capable of retrying a failed physical stop.
+        for _ in range(2):
+            time.sleep(2)
+            with self.lifecycle_lock:
+                if sequence != self.stop_sequence or self.pending_stop is None:
+                    return
+                if self.stop_attempts >= 3:
+                    return
+                if self._attempt_stop_locked():
+                    return
+
+    def _attempt_stop_locked(self):
+        """One adapter-bounded attempt, lifecycle lock only across stop/join."""
+        audio = self.pending_stop
+        if audio is None:
+            return True
+        self.stop_attempts += 1
+        try:
+            audio.stop()
+            # Concrete adapters report workers still running after a bounded
+            # join. A return from stop alone must not erase that uncertainty.
+            status = getattr(type(audio), 'status', None)
+            info = status(audio) if callable(status) else None
+            if getattr(audio, 'is_running', False) is True or (
+                    isinstance(info, dict) and (info.get('running') is True or info.get('state') == 'stopping')):
+                raise RuntimeError('Adapter is still stopping')
+        except Exception as exc:
+            with self.lock:
+                self.stop_error = ('Capture stop is not confirmed; audio may still be active. '
+                                   'Retry Pause / Retry stop. If it persists, quit the capture process or '
+                                   'revoke microphone/system-audio permissions and verify the OS indicator. '
+                                   f'Attempt {self.stop_attempts}/3: {type(exc).__name__}: {str(exc)[:200]}')
+                self.retiring_generations.clear()
+            return False
+        with self.lock:
+            self.pending_stop = None
+            self.stop_error = None
+            self.capture_info = {**self.capture_info, 'state': 'stopped', 'message': 'Paused / detached'}
+        return True
 
     def restart_after_clear(self, last_args, clear_generation, clear_session):
         # See the /clear route: restart the same session on a new generation
@@ -460,15 +483,20 @@ class MeetingState:
             if (self.listening and last_args
                     and self.capture_generation == clear_generation + 1
                     and self.session_key == clear_session):
-                self.pause(retain_tail=False)
+                stopped = self.pause(retain_tail=False)
+                if not stopped['stop_confirmed']:
+                    return
                 self.retiring_generations.clear()
+                with self.overlay_lock:
+                    if time.monotonic() - self.pane_seen > 30:
+                        return
                 backend, recording_id, tm, src, *rest = last_args
                 # Sessions saved before provider selection existed carry
                 # only four fields; they restart as local/ENDPOINTING.
                 provider = rest[0] if len(rest) > 0 else 'local'
                 asr_mode = rest[1] if len(rest) > 1 else 'ENDPOINTING'
-                self.start(True, backend, recording_id, tm, src,
-                           transcription_provider=provider, asr_mode=asr_mode)
+                self._start(True, backend, recording_id, tm, src,
+                            transcription_provider=provider, asr_mode=asr_mode, renew_lease=False)
 
     def pause(self, *, retain_tail=True):
         with self.lifecycle_lock:
@@ -496,8 +524,15 @@ class MeetingState:
                         entry['cancelled'] = True
                         entry['status'] = 'cancelled'
                 audio = self.audio if self.backend in ('native', 'macos') else self.bridge
-            if audio:
-                audio.stop()
+                self.busy = False
+                self.stop_sequence += 1
+                self.stop_attempts = 0
+                self.pending_stop = self.pending_stop or audio
+                if self.pending_stop is not None:
+                    self.stop_error = 'Capture stop is not confirmed; stopping audio. Do not assume the microphone is off.'
+            if self.pending_stop is not None and not self._attempt_stop_locked():
+                self._start_stop_retry_locked()
+                return {'listening': False, 'stopping': True, 'stop_confirmed': False}
             with self.lock:
                 self.busy = False
                 # A genuine capture failure survives pause — including one the
@@ -518,7 +553,7 @@ class MeetingState:
                     if previous.get(key) is not None:
                         latched[key] = previous[key]
                 self.capture_info = latched
-            return {'listening': False}
+            return {'listening': False, 'stopping': False, 'stop_confirmed': True}
 
     def get_engine(self):
         with self.lock:
@@ -981,39 +1016,49 @@ class MeetingState:
         can send ordered Show/Hide/Release actions; counters never rebind it.
         """
         import secrets
-        with self.lifecycle_lock, self.overlay_lock:
-            if client is not None:
-                # Renderer-local creation order is assigned BEFORE any lookup.
-                # Different renderers have no comparable clock: never guess an
-                # order from network arrival, wall time or random identifiers.
-                if epoch != self.overlay_epoch:
-                    return {'accepted': False, 'reason': 'backend_restarted'}
-                if self.overlay_client not in (None, client):
-                    return {'accepted': False, 'reason': 'different_renderer'}
-                if type(creation) is not int or creation <= self.overlay_creation:
-                    return {'accepted': False, 'reason': 'superseded'}
-                self.overlay_client = client
-                self.overlay_creation = creation
-            elif revision is not None and revision != self.overlay_revision:
-                # Only an immediately preceding release can be recovered. Do
-                # not issue fresh tickets on conflicts with another claimant:
-                # an old pane must never retry its way over a newer owner.
-                if self.overlay_pane is None and revision == self.overlay_revision - 1:
-                    return {'accepted': False, 'retry_revision': self.overlay_revision}
-                return {'accepted': False}
-            self.overlay_revision += 1
-            old = self.overlay
-            self._invalidate_overlay_locked(old)
-            self.overlay = None
-            self.overlay_owner = None
-            self.overlay_lease_seq += 1
-            self.overlay_pane = secrets.token_hex(16)
-            self.overlay_action = 0
-            # Claim is explicit authorization, not a passive status read.
-            self._touch_pane_seen()
-            pane = self.overlay_pane
+        with self.lifecycle_lock:
+            with self.overlay_lock:
+                if client is not None:
+                    # Renderer-local creation order is assigned BEFORE any lookup.
+                    # Different renderers have no comparable clock: never guess an
+                    # order from network arrival, wall time or random identifiers.
+                    if epoch != self.overlay_epoch:
+                        return {'accepted': False, 'reason': 'backend_restarted'}
+                    if self.overlay_client not in (None, client):
+                        return {'accepted': False, 'reason': 'different_renderer'}
+                    if type(creation) is not int or creation <= self.overlay_creation:
+                        return {'accepted': False, 'reason': 'superseded'}
+                    self.overlay_client = client
+                    self.overlay_creation = creation
+                elif revision is not None and revision != self.overlay_revision:
+                    # Only an immediately preceding release can be recovered. Do
+                    # not issue fresh tickets on conflicts with another claimant:
+                    # an old pane must never retry its way over a newer owner.
+                    if self.overlay_pane is None and revision == self.overlay_revision - 1:
+                        return {'accepted': False, 'retry_revision': self.overlay_revision}
+                    return {'accepted': False}
+            # A claim authorizes a pane, never continuation of someone else's
+            # capture. Stop before minting authority; hold lifecycle, not overlay,
+            # across adapter teardown (callbacks may need the state lock).
+            if self.listening:
+                self.pause(retain_tail=False)
+            with self.overlay_lock:
+                self.overlay_revision += 1
+                old = self.overlay
+                self._invalidate_overlay_locked(old)
+                self.overlay = None
+                self.overlay_owner = None
+                self.overlay_lease_seq += 1
+                self.overlay_pane = secrets.token_hex(16)
+                self.overlay_action = 0
+                # Claim is explicit authorization, not a passive status read.
+                self._touch_pane_seen()
+                pane = self.overlay_pane
         if old is not None:
-            old.hide_overlay()
+            try:
+                old.hide_overlay()
+            except Exception:
+                pass  # old helper is already invalidated; do not strand the new capability
         return {'pane': pane}
 
     @contextmanager
@@ -1037,6 +1082,7 @@ class MeetingState:
                     accepted = self.overlay_revision == 0
                 if not accepted:
                     raise HTTPException(409, 'Lifecycle control is stale or unscoped. Reopen the pane; API clients must read /overlay/lifecycle and send its revision and epoch explicitly.')
+            self._expire_capture()
             yield
 
     def _accept_overlay_action_locked(self, pane, action):
@@ -1059,22 +1105,33 @@ class MeetingState:
                 self.overlay = None
                 self.overlay_owner = None
                 self.overlay_lease_seq += 1
+            stopped = self.pause()
             if old is not None:
-                old.hide_overlay()
-            self.pause()
-        return {'accepted': True, 'shown': False}
+                try:
+                    old.hide_overlay()
+                except Exception:
+                    pass  # capture stop has already been attempted/queued
+        return {'accepted': True, 'shown': False, **stopped}
 
     def overlay_show(self, scope, *, pane=None, action=None):
         """Explicit pane action: backend-managed bridge owns one helper process."""
+        with self.lifecycle_lock:
+            with self.overlay_lock:
+                if pane is not None and not self._accept_overlay_action_locked(pane, action):
+                    return {'shown': self.overlay is not None, 'accepted': False}
+            self._expire_capture()
+            try:
+                return self._overlay_show(scope)
+            finally:
+                # Helper startup may outlast the lease. No overlay lock is
+                # held here, so stop/join cannot deadlock its callbacks.
+                self._expire_capture()
+
+    def _overlay_show(self, scope):
         import importlib
         import secrets
         with self.overlay_lock:
-            # Internal callers without a pane are trusted lifecycle operations;
-            # HTTP endpoints require both capability and action sequence.
-            if pane is not None and not self._accept_overlay_action_locked(pane, action):
-                return {'shown': self.overlay is not None, 'accepted': False}
             cleaned = self._clean_overlay_scope(scope)
-            self._touch_pane_seen()  # explicit, admitted Show (not status polling)
             if self.overlay is not None:
                 try:
                     alive = self.overlay.process is not None and self.overlay.process.poll() is None
@@ -1101,6 +1158,8 @@ class MeetingState:
                         self.overlay.update(self.status())
                     except Exception:
                         pass
+                    if not self.listening and self.pending_stop is None:
+                        self._touch_pane_seen()  # idle display lease only
                     self._start_overlay_lease_locked()
                     return {'shown': True, 'reused': True, 'available': True, 'owner': self.overlay_owner}
             try:
@@ -1135,6 +1194,8 @@ class MeetingState:
                 pass
             self.overlay = bridge
             self.overlay_owner = secrets.token_hex(16)
+            if not self.listening and self.pending_stop is None:
+                self._touch_pane_seen()
             self._start_overlay_lease_locked()
             if isinstance(result, dict):
                 out = dict(result)
@@ -1272,11 +1333,16 @@ class MeetingState:
             overlay_available = self._overlay_capability_available(overlay, overlay_status)
             import sys as _sys_cap
             macos_ready = _sys_cap.platform == 'darwin' and self._macos_runtime_ready()
-            return {'listening': self.listening, 'segments': list(self.segments), 'error': self.error or self.capture_error,
+            return {'listening': self.listening, 'stopping': self.pending_stop is not None,
+                    'stop_attempts': self.stop_attempts,
+                    'segments': list(self.segments), 'error': self.stop_error or self.error or self.capture_error,
                     'error_request': self.error_request,
                     'busy': self.busy, 'result': self.result, 'requests': {e['request_id']: dict(e) for e in live},
                     'recent': terminal, 'meetily_clear_error': self.meetily_clear_error,
-                    'capture': self.capture_info, 'backend': self.backend, 'last_session': last_session,
+                    'capture': ({**self.capture_info, 'state': 'stopping', 'error': self.stop_error,
+                                 'message': 'Capture stop is not confirmed; audio may still be active.'}
+                                if self.pending_stop is not None else self.capture_info),
+                    'backend': self.backend, 'last_session': last_session,
                     'generation': self.generation, 'status_seq': self.status_seq,
                     'capture_generation': self.capture_generation, 'pane_seen': self.pane_seen,
                     'overlay_shown': overlay is not None,

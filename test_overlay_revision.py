@@ -29,8 +29,8 @@ class RevisionTests(CheckedThreads):
             return {'answer': 'Safe HTTP answer'}
         engine.answer.side_effect = self.checked_callback(answer)
         state = server.MeetingState(engine_factory=lambda: engine)
-        state.listening = True
-        state.add_segment({'id': 'row', 'text': 'Who approves?'})
+        # Claim never transfers capture consent. Activate the test fixture only
+        # after its pane owns the lease (capture itself is covered in router tests).
         app = FastAPI()
         app.include_router(server.make_router(state))
         with _fake_overlay_spawn(), patch.object(state, '_start_overlay_lease_locked'), TestClient(app) as client:
@@ -43,6 +43,8 @@ class RevisionTests(CheckedThreads):
             ticket = client.get('/overlay/lifecycle').json()
             ticket.update(client='revision-test', creation=1)
             pane = post('/overlay/claim', ticket)['pane']
+            state.listening = True
+            state.add_segment({'id': 'row', 'text': 'Who approves?'})
             shown = post('/overlay/show', {'pane': pane, 'action': 1, 'scope': {'seq': 0}})
             self.assertTrue(shown['shown'])
             overlay = state.overlay
@@ -71,6 +73,8 @@ class RevisionTests(CheckedThreads):
                 new_ticket = client.get('/overlay/lifecycle').json()
                 new_ticket.update(client='revision-test', creation=2)
                 newer = post('/overlay/claim', new_ticket)['pane']
+                self.assertFalse(state.listening, 'claim cannot inherit capture')
+                state.listening = True  # unrelated new capture; stale release cannot stop it
                 self.assertFalse(post('/overlay/claim', ticket)['accepted'])
                 self.assertFalse(post('/overlay/hide', {'pane': pane, 'action': 999})['accepted'])
                 self.assertFalse(post('/overlay/release', {'pane': pane, 'action': 1000})['accepted'])

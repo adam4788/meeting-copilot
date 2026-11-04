@@ -12,7 +12,7 @@ export default {
   description: 'Live answers grounded in your projects, prior sessions, and optional web research.',
   version: '0.2.0',
   register(ctx) {
-    const api = (path, body) => ctx.rest(path, body === undefined ? {} : { method: 'POST', body });
+    const request = (path, body) => ctx.rest(path, body === undefined ? {} : { method: 'POST', body });
     // Survives plugin unregister/re-register in the SAME renderer. Neither a
     // wall clock nor HTTP arrival can establish pane creation order.
     const orderKey = Symbol.for('meeting-copilot.pane-creation.v1');
@@ -28,12 +28,19 @@ export default {
       if (life.release) return life.release;
       if (!life.pane) return Promise.resolve({ accepted: false });
       life.released = true;
-      life.release = api('/overlay/release', { pane: life.pane, action: ++life.action });
+      try { life.release = Promise.resolve(request('/overlay/release', { pane: life.pane, action: ++life.action })); }
+      catch (error) { life.release = Promise.reject(error); }
       // Observe cleanup failures too; Restart still receives the rejection.
-      life.release.catch(() => notify('warning', 'Capture pause could not be confirmed. The abandoned lease expires within 30 seconds plus the watchdog check; verify capture has stopped.'));
+      const warnStop = () => notify('warning', 'Capture stop is not confirmed. Lease expiry initiates stop but cannot guarantee physical shutdown. Reopen Meeting Copilot to check status and Retry stop; verify the OS audio indicator.');
+      life.release.then(result => { if (result?.stop_confirmed === false || result?.stopping) warnStop(); }, warnStop);
       return life.release;
     }
     function MeetingPane({ registration: paneEntry }) {
+      // Fence all outbound work, including previously captured Assist/retry
+      // callbacks. Release uses the registration-level request, never fallback.
+      const usable = () => registered() && paneEntry.active && !paneEntry.retired;
+      const api = (path, body) => (usable() || (path === '/status' && body === undefined)) ? request(path, body)
+        : Promise.reject(new Error('This pane is retired. Close and reopen it.'));
       const qc = useQueryClient();
       const SCOPE_KEY = 'meeting-copilot.scope.v2';
       const loadScope = () => {
@@ -151,6 +158,8 @@ export default {
           alive: true, syncedKey: null, released: false,
           get mounted() { return this.alive && registered() && paneEntry.active && paneRegistration === paneEntry; },
           set mounted(value) { this.alive = value; } };
+        paneEntry.retired = null;  // a genuinely new effect owns its own recovery
+        paneEntry.retire?.(null);
         paneEntry.life = life;
         lifecycles.add(life);
         return life;
@@ -349,6 +358,7 @@ export default {
         } finally { if (life.mounted) setPending(false); }
       }
       async function assistNow(extra = {}, questionOverride, scopeOverride) {
+        if (!usable() || !overlayActionAt.current.mounted) return;
         const asked = questionOverride !== undefined ? questionOverride : question;
         const scopeUsed = scopeOverride || scope;
         if (questionOverride !== undefined) setQuestion(questionOverride);
@@ -370,7 +380,7 @@ export default {
       // Exact replay: resend a stored request verbatim (question, scope,
       // transcript snapshot) instead of whatever the pane currently shows.
       async function replayRequest(req) {
-        if (!req) return;
+        if (!usable() || !overlayActionAt.current.mounted || !req) return;
         if (typeof req.question === 'string') setQuestion(req.question);
         setPending(true); setError(''); setAssistFailed(false); setLiveEntry(null); setTrackedRequest(null);
         // Remember before sending: a failed replay stays retryable as itself,
@@ -452,7 +462,7 @@ export default {
       const result = data.result;
       const transcript = data.segments || [];
       const failed = !!(data.error_request || data.error || (data.capture && (data.capture.error || /fail|error|could not/i.test(data.capture.warning || ''))));
-      const statusLabel = status.isPending ? 'Connecting…' : status.error ? 'Unavailable' : failed ? 'Needs attention' : data.listening ? 'Listening' : 'Paused';
+      const statusLabel = status.isPending ? 'Connecting…' : status.error ? 'Unavailable' : data.stopping ? 'Stopping — unconfirmed' : failed ? 'Needs attention' : data.listening ? 'Listening' : 'Paused';
         // Always-visible listening bar: the source card collapses while
         // listening, but Pause/Detach and loss evidence must never hide.
         // Native frames, worker chunks, and sub-second tails are distinct
@@ -477,6 +487,12 @@ export default {
           try { el.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); } catch (ignored) {}
         }
       }, [result?.answer, liveEntry?.answer, liveEntry?.status]);
+      const [, setRetirement] = useState('');
+      paneEntry.retire = message => { paneEntry.retired = message; setRetirement(message); };
+      if (paneEntry.retired) return h('section', { role: 'alert', style: card },
+        h('strong', null, 'Meeting Copilot pane retired — actions disabled'),
+        h('p', null, paneEntry.retired),
+        h('p', null, 'Close this pane and reopen Meeting Copilot. Check capture status and Retry stop if needed before giving fresh consent. If audio remains active, quit the capture process or revoke audio permissions and verify the OS indicator.'));
       return h('div', { style: { padding: 16, display: 'flex', flexDirection: 'column', gap: 14, height: '100%', minWidth: 0, width: '100%', boxSizing: 'border-box', overflowY: 'auto', overflowX: 'hidden', overflowWrap: 'anywhere', color: 'var(--ui-text-primary)' } },
         h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
           h('strong', { style: { fontSize: 17 } }, 'Meeting Copilot'),
@@ -486,23 +502,25 @@ export default {
         h('section', { style: { ...card, display: 'grid', gap: 10 }, 'aria-label': 'Capture session' },
           h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
             h('strong', null, 'Capture session'),
-            h('span', { style: muted, role: 'status' }, data.listening
+            h('span', { style: muted, role: 'status' }, data.stopping ? 'Stop is not confirmed — audio may still be active.' : data.listening
               ? `Listening via ${data.backend || backend}${lossText(data.capture)}${data.capture?.warning ? ' · transcript may be incomplete' : ''}`
               : ((data.segments || []).length || result || (data.recent || []).length) ? 'Paused — resume this meeting or start a fresh one.' : 'Not capturing yet.')),
           h('label', { style: { display: 'flex', gap: 8, alignItems: 'flex-start', border: '1px solid var(--ui-stroke-secondary)', borderRadius: 10, padding: '10px 12px', background: 'var(--ui-bg-card)' } },
             h('input', { type: 'checkbox', checked: consent, disabled: data.listening, onChange: e => setConsent(e.target.checked), 'aria-label': 'Capture permission' }),
             h('span', null, h('strong', null, 'Permission check. '), 'I have permission to capture/read this meeting and use its context with my configured model.')),
           backend === 'macos' && transcriptionProvider === 'meta' && h('p', { 'data-cloud-capture-disclosure': true, role: 'status', style: { ...muted, margin: 0 } }, `Cloud transcription selected: meeting audio is sent to Meta while listening. ${data.listening ? 'Pause to change' : 'Change'} the provider in Transcript source below.`),
-          !data.listening && (pending || !consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)) && h('p', { style: { ...muted, margin: 0 }, role: 'status' },
+          !data.listening && !data.stopping && (pending || !consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)) && h('p', { style: { ...muted, margin: 0 }, role: 'status' },
             pending ? 'Starting…' : !consent ? 'Confirm permission with the check above to enable Start.' : (backend === 'meetily' && !recording) ? 'Select an active Meetily recording below to enable Attach.' : 'Independent macOS transcription is unavailable here — see the source card below.'),
           h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
-            data.listening
+            data.stopping
+              ? h(Button, { variant: 'secondary', disabled: pending, onClick: () => act('/pause', {}) }, 'Retry stop')
+              : data.listening
               ? h(Button, { variant: 'secondary', onClick: () => act('/pause', {}) }, data.backend === 'meetily' ? 'Detach' : 'Pause listening')
               : h(Button, { disabled: pending || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), onClick: () => startCapture() }, ((data.segments || []).length || result || (data.recent || []).length) ? (backend === 'meetily' ? 'Resume' : 'Resume listening') : (backend === 'meetily' ? 'Attach to Meetily' : 'Start listening')),
-            !data.listening && ((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), title: 'Starts a fresh meeting; the earlier transcript, answers, and retry data are cleared', onClick: () => startCapture(true) }, 'New meeting'),
+            !data.listening && !data.stopping && ((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), title: 'Starts a fresh meeting; the earlier transcript, answers, and retry data are cleared', onClick: () => startCapture(true) }, 'New meeting'),
             ((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending, title: 'Clears past Q&A, transcript segments, and cached snippets for this meeting', onClick: async () => { if (typeof window !== 'undefined' && window.confirm && !window.confirm('Clear this meeting? Past questions, answers, and transcript segments are removed from the pane.')) return; if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } } }, 'Clear meeting'),
             h(Button, { variant: 'secondary', disabled: pending || !data.capabilities?.overlay, title: 'Show or hide the floating meeting overlay (macOS)', onClick: toggleOverlay }, overlayOn ? 'Hide overlay' : 'Show overlay')),
-          h('p', { style: { ...muted, margin: 0 } }, 'No additional audio files · copilot detaches/pauses if this pane disconnects. Resume keeps this meeting (transcript and latest answer stay); New meeting, different settings, or Clear starts fresh. Pausing can discard the last few seconds of audio.'),
+          h('p', { style: { ...muted, margin: 0 } }, 'No additional audio files · disconnect initiates detach/pause; verify stop status before assuming audio is off. Resume keeps this meeting (transcript and latest answer stay); New meeting, different settings, or Clear starts fresh. Pausing can discard the last few seconds of audio.'),
           data.capture && h('div', { style: muted }, data.capture.message || data.capture.state || ''),
           data.capture && (data.capture.warning || lossText(data.capture)) && h('div', { role: 'status', style: muted },
             ['Transcript may be incomplete',
@@ -524,14 +542,15 @@ export default {
               const backendIssue = !!status.error && !storedRetry;
               // A capture failure needs capture restarted (consent already
               // given), not a status refresh: label and wire it honestly.
-              const captureIssue = !!data.error && !storedRetry && !status.error;
+              const captureIssue = !!data.error && !storedRetry && !status.error && !data.stopping;
               // A failed forget-boundary needs Clear run again, not a
               // dismiss: the adapter keeps serving its old snapshot until
               // the boundary installs. The user already consented to
               // clearing, so the retry completes their intent.
               const clearIssue = !!data.meetily_clear_error && !storedRetry && !status.error && !data.error;
-              const label = retryReq ? 'Retry' : backendIssue ? 'Retry' : captureIssue ? (data.listening ? 'Recheck status' : 'Restart capture') : clearIssue ? 'Clear again' : 'Dismiss';
+              const label = data.stopping ? 'Recheck status' : retryReq ? 'Retry' : backendIssue ? 'Retry' : captureIssue ? (data.listening ? 'Recheck status' : 'Restart capture') : clearIssue ? 'Clear again' : 'Dismiss';
               return h(Button, { variant: 'secondary', disabled: pending || (captureIssue && !data.listening && (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription))), onClick: async () => {
+                if (data.stopping) return qc.invalidateQueries({ queryKey: [ID, 'status'] });
                 if (retryReq) { setError(''); setAssistFailed(false); return replayRequest(retryReq); }
                 if (clearIssue) { if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } return; }
                 if (captureIssue && !data.listening) return startCapture();
@@ -540,7 +559,7 @@ export default {
               } }, label);
             })())),
         persistWarning && h('p', { role: 'status', style: muted }, persistWarning),
-        !data.listening && !result && h('section', { style: card, 'aria-label': 'Getting started' },
+        !data.listening && !data.stopping && !result && h('section', { style: card, 'aria-label': 'Getting started' },
           h('strong', null, 'Getting started'),
           h('ol', { style: { ...muted, margin: '8px 0 0', paddingLeft: 20, display: 'grid', gap: 4 } },
             h('li', null, backend === 'meetily' ? 'Confirm permission above, pick your active Meetily recording below, then Attach.' : 'Confirm permission above, then Start listening.'),
@@ -589,7 +608,7 @@ export default {
               try { await api('/assist/cancel', { request_id: cancellableId }); setTrackedRequest(null); setLiveEntry(null); await qc.invalidateQueries({ queryKey: [ID, 'status'] }); }
               catch (e) { setError(String(e.message || e)); }
             } }, 'Cancel answer'),
-          h(Button, { variant: 'secondary', disabled: !result?.answer, onClick: async () => { try { await navigator.clipboard.writeText(result.answer); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch (e) { setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, copied ? 'Copied ✓' : 'Copy'),
+          h(Button, { variant: 'secondary', disabled: !result?.answer, onClick: async () => { if (!usable()) return; try { await navigator.clipboard.writeText(result.answer); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch (e) { setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, copied ? 'Copied ✓' : 'Copy'),
           question && h(Button, { variant: 'secondary', disabled: busy, onClick: () => { setQuestion(''); composerRef.current?.querySelector('textarea')?.focus(); } }, 'Clear question')),
         liveEntry && ['queued', 'streaming', 'running'].includes(liveEntry.status) && h('section', { style: card, 'aria-live': 'polite', ref: answerRef },
           h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8 } },
@@ -645,7 +664,7 @@ export default {
             (entry.sources || []).length > 0 && h('details', { style: { marginTop: 8 } }, h('summary', { style: { cursor: 'pointer', ...muted } }, `Evidence · ${entry.sources.length} sources${entry.sources.length > 6 ? ' (showing first 6)' : ''}`),
               ...(entry.sources || []).slice(0, 6).map((s, k) => h('div', { key: s.id || k, style: { ...muted, paddingTop: 6, overflowWrap: 'anywhere' } }, h('strong', null, `[${k + 1}] ${s.title || s.source || 'Source'}`)))),
             h('div', { style: { paddingTop: 8, display: 'flex', gap: 8, flexWrap: 'wrap' } },
-              entry.answer && h(Button, { variant: 'secondary', onClick: async () => { try { await navigator.clipboard.writeText(entry.answer); } catch (e) { setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, 'Copy this answer'),
+              entry.answer && h(Button, { variant: 'secondary', onClick: async () => { if (!usable()) return; try { await navigator.clipboard.writeText(entry.answer); } catch (e) { setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, 'Copy this answer'),
               entry.request && h(Button, { variant: 'secondary', onClick: () => replayRequest(entry.request) }, /partial|interrupt|unavailable|failed|error/i.test((entry.warnings || []).join(' ') + ' ' + (entry.status || '')) ? 'Retry for the complete response' : 'Ask again'))))),
         h('details', { open: setupOpen, onToggle: e => setSetupOpen(e.currentTarget.open), style: { border: '1px solid var(--ui-stroke-secondary)', borderRadius: 12, padding: '2px 14px 14px', background: 'var(--ui-bg-card)' } },
         h('summary', { style: { cursor: 'pointer', fontWeight: 700, color: 'var(--ui-text-primary)', padding: '12px 0', fontSize: 14 } }, setupOpen ? '\u25be Answer setup — scope, models, overlay, web' : '\u25b8 Answer setup — scope, models, overlay, web'),
@@ -735,6 +754,7 @@ export default {
       if (!entry) { openPane(); return; }
       if (entry.restarting) return;
       entry.restarting = true;
+      entry.retire?.('Restart in progress. Capture pause is not confirmed; all actions are disabled.');
       const life = entry.life;
       const current = () => registered() && paneRegistration === entry && removePane === remove && entry.life === life;
       try {
@@ -746,6 +766,7 @@ export default {
           if (life.pane) {
             const released = await releaseOverlayPane(life);
             if (released?.accepted !== true) throw new Error('Pane ownership changed; release was not accepted.');
+            if (released?.stop_confirmed === false || released?.stopping) throw new Error('Capture stop is not confirmed; the backend is retrying stop.');
           }
         }
         if (!current()) return;
@@ -753,7 +774,11 @@ export default {
         openPane();
         notify('info', 'Meeting Copilot pane reopened. Its owned capture was paused before reopening; Resume requires consent.');
       } catch (e) {
-        if (current()) notify('warning', `Restart was not completed: ${String(e.message || e)} Close and reopen the pane. Capture pause is not confirmed; the abandoned lease will expire.`);
+        if (current()) {
+          const message = `Restart was not completed: ${String(e.message || e)} Capture pause is not confirmed. Lease expiry initiates stop, but cannot guarantee physical shutdown.`;
+          entry.retire?.(message);
+          notify('warning', message + ' Close and reopen the pane to check status and Retry stop.');
+        }
       } finally { entry.restarting = false; }
     };
     function StatusButton() {

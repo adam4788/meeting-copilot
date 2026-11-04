@@ -169,7 +169,8 @@ test('real Restart cannot retire a newer effect lifecycle in the same registrati
   const original = p.contributions.find(c => c.area === 'panes');
   const restarting = command(p, 'Restart Meeting Copilot')();
   await entered.promise;
-  await button(p.replayEffects(), 'Start listening').props.onClick();
+  p.replayEffects(); // effects clear retirement and schedule React's next render
+  await button(p.rerender(), 'Start listening').props.onClick();
   resume.resolve(); await restarting;
   await backend.rpc({ command: 'inspect' });
   assert.equal(p.contributions.find(c => c.area === 'panes'), original);
@@ -223,6 +224,37 @@ test('real committed claim with lost reply never replays; explicit new mount rec
   newer.unmount(); await backend.rpc({ command: 'inspect' });
 });
 
+test('accepted release with unconfirmed physical stop does not reopen or claim success', async () => {
+  const p = lifecyclePane({ '/overlay/release': { accepted: true, stopping: true, stop_confirmed: false } }, { 3: true, 4: 'macos' });
+  await button(p.tree, 'Start listening').props.onClick();
+  const original = p.contributions.find(c => c.area === 'panes');
+  await command(p, 'Restart Meeting Copilot')();
+  assert.equal(p.contributions.find(c => c.area === 'panes'), original);
+  assert.ok(!nodes(p.rerender()).some(n => typeof n.props?.onClick === 'function'));
+  assert.ok(p.notices.some(n => n.kind === 'warning' && /not confirmed/.test(n.message)));
+  assert.ok(!p.notices.some(n => n.kind === 'success'));
+  p.unmount();
+  const closed = lifecyclePane({ '/overlay/release': { accepted: true, stopping: true, stop_confirmed: false } });
+  await button(closed.tree, 'Show overlay').props.onClick();
+  closed.unmount(); await new Promise(resolve => setImmediate(resolve));
+  assert.ok(closed.requests.some(r => r.path === '/overlay/release'));
+  assert.ok(closed.notices.some(n => n.kind === 'warning' && /not confirmed/.test(n.message)));
+});
+
+test('unconfirmed stop is visible and only offers stop retry, not restart capture', async () => {
+  const p = lifecyclePane({}, { 3: true, 4: 'macos' }, {
+    listening: false, stopping: true, error: 'Capture stop is not confirmed; audio may still be active.',
+    capture: { state: 'stopping' }, segments: [{ text: 'Earlier context' }],
+  });
+  const tree = p.rerender();
+  assert.match(JSON.stringify(tree), /Stopping — unconfirmed/);
+  assert.ok(!button(tree, 'Start listening') && !button(tree, 'Resume listening') && !button(tree, 'New meeting'));
+  await button(tree, 'Retry stop').props.onClick();
+  assert.ok(p.requests.some(r => r.path === '/pause' && r.body.pane));
+  assert.ok(!p.requests.some(r => r.path === '/start'));
+  p.unmount();
+});
+
 test('real failed Restart release stays closed to callbacks and expires instead of legacy fallback', { timeout: 10000 }, async t => {
   const backend = await realBackend(t);
   const p = backend.mount({}, (path, options) => {
@@ -231,8 +263,16 @@ test('real failed Restart release stays closed to callbacks and expires instead 
   });
   await button(p.tree, 'Start listening').props.onClick();
   const original = p.contributions.find(c => c.area === 'panes');
+  const staleSuggest = button(p.tree, 'Suggest answer').props.onClick;
   await command(p, 'Restart Meeting Copilot')();
   assert.equal(p.contributions.find(c => c.area === 'panes'), original);
+  const retired = p.rerender();
+  assert.ok(!nodes(retired).some(n => typeof n.props?.onClick === 'function'), 'retired pane has no interactive controls');
+  assert.match(JSON.stringify(retired), /Capture pause is not confirmed/);
+  assert.match(JSON.stringify(retired), /close.*reopen/i);
+  const before = p.requests.length;
+  await staleSuggest();
+  assert.equal(p.requests.length, before, 'captured old Assist cannot send private meeting context');
   assert.ok(!p.requests.some(r => r.path === '/pause'));
   assert.ok(p.notices.some(n => n.kind === 'warning' && /not completed/.test(n.message)), 'unconfirmed pause is visible');
   await p.heartbeat();
