@@ -602,6 +602,32 @@ test('each speaker keeps one distinct color across tiles, with a legend', async 
   assert.equal(legend.length, 2, 'legend chips name each speaker');
 });
 
+test('composer shortcut sends once without inserting a newline or interrupting composition', () => {
+  for (const modifier of ['metaKey', 'ctrlKey']) {
+    const { tree, requests } = pane('', true, false, '', { 1: 'My question' });
+    const composer = nodes(tree).find(n => n.type === 'textarea');
+    let prevented = 0;
+    const event = { key: 'Enter', [modifier]: true, preventDefault: () => { prevented++; } };
+    composer.props.onKeyDown({ ...event, nativeEvent: { isComposing: true } });
+    composer.props.onKeyDown({ ...event, repeat: true });
+    composer.props.onKeyDown({ ...event, key: 'a' });
+    composer.props.onKeyDown({ key: 'Enter', preventDefault: event.preventDefault });
+    assert.equal(requests.length, 0);
+    assert.equal(prevented, 0, 'ordinary typing and IME composition remain untouched');
+    composer.props.onKeyDown(event);
+    assert.equal(prevented, 1);
+    assert.equal(requests.filter(r => r.path === '/assist').length, 1);
+    assert.equal(requests[0].body.question, 'My question');
+  }
+  for (const [supported, status] of [[true, { busy: true }], [false, {}]]) {
+    const { tree, requests } = pane(supported ? '' : '__all_projects__', supported, false, '', {}, {}, status);
+    let prevented = false;
+    nodes(tree).find(n => n.type === 'textarea').props.onKeyDown({ key: 'Enter', metaKey: true, preventDefault: () => { prevented = true; } });
+    assert.equal(requests.length, 0, 'disabled shortcut must not send');
+    assert.equal(prevented, false);
+  }
+});
+
 test('layout order: capture session with permission comes first, transcript above history', async () => {
   const { tree } = pane('', true, true, '', {}, {}, { segments: [
     { speaker: 'Alice', text: 'hi', timestamp: 1 },
