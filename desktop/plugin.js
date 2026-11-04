@@ -517,7 +517,7 @@ export default {
         const scopeUsed = scopeOverride || scope;
         if (questionOverride !== undefined) setQuestion(questionOverride);
         setPending(true); setError(''); setAssistFailed(false); setLiveEntry(null); setTrackedRequest(null);
-        // Remember before sending: a failed attempt stays retryable.
+        // Remember for explicit partial replay, not automatic transport retry.
         setLastAsked({ question: asked, extra, scope: { ...scopeUsed } });
         // Request outcome and status refresh are separate: an accepted
         // assist whose refresh fails must not be reported as failed (and
@@ -526,7 +526,7 @@ export default {
           const res = await api('/assist', { question: asked, ...scopeUsed, ...extra });
           if (res && res.request_id) setTrackedRequest(res.request_id);
         }
-        catch (e) { setError(String(e.message || e)); setAssistFailed(true); }
+        catch (e) { setError('Answer submission was not confirmed. Check the backend connection and recheck status; the request may already be running or complete. Review the result before asking again.'); setAssistFailed(true); }
         finally { setPending(false); }
         try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }); }
         catch (e) {}
@@ -537,8 +537,7 @@ export default {
         if (!usable() || !overlayActionAt.current.mounted || !req) return;
         if (typeof req.question === 'string') setQuestion(req.question);
         setPending(true); setError(''); setAssistFailed(false); setLiveEntry(null); setTrackedRequest(null);
-        // Remember before sending: a failed replay stays retryable as itself,
-        // not as whatever request came before it.
+        // A lost replay response may still mean the backend accepted it.
         setLastAsked({ question: req.question || '', extra: { web_query: req.web_query }, scope: req });
         try {
           const body = { question: req.question || '', project: req.project ?? null,
@@ -550,7 +549,7 @@ export default {
           const res = await api('/assist', body);
           if (res && res.request_id) setTrackedRequest(res.request_id);
         }
-        catch (e) { setError(String(e.message || e)); setAssistFailed(true); }
+        catch (e) { setError('Answer submission was not confirmed. Check the backend connection and recheck status; the request may already be running or complete. Review the result before asking again.'); setAssistFailed(true); }
         finally { setPending(false); }
         // Same split as a fresh ask: a replayed request that the backend
         // accepted must not become a duplicate through a failed refresh.
@@ -593,12 +592,11 @@ export default {
             // (404: cleared by a newer session or restart) stops tracking
             // with an actionable explanation instead of stale progress.
             if (!alive) return;
-            const msg = String((e && (e.message || e)) || e);
-            if (e && (e.status === 404 || /404|not found/i.test(msg))) {
+            if (e && e.status === 404) {
               setTrackedRequest(null); setLiveEntry(null);
               setError('That answer is no longer available (new meeting or restart cleared it). Ask again.');
               try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }); } catch (ignored) {}
-            } else if (++misses >= 3) setError(`Answer progress unavailable: ${msg}. The result still lands below when it completes.`);
+            } else if (++misses >= 3) setError('Answer progress unavailable. Check the backend connection; polling will continue. Recheck status for the result before asking again.');
           } finally { inFlight = false; }
         };
         poll();
@@ -687,29 +685,33 @@ export default {
              data.capture.warning ? `: ${data.capture.warning}` : ''].join(''))),
         (error || data.error || status.error || data.meetily_clear_error) && h('div', { role: 'alert', style: card },
           h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' } },
-            h('span', null, (data.error_request ? (data.error || error) : (error || data.error || data.meetily_clear_error)) || `Backend unavailable: ${status.error?.message}. Check installation and plugin enablement.`),
+            h('span', null, (assistFailed || (typeof error === 'string' && error.startsWith('Answer progress')) ? error : data.error_request ? (data.error || error) : (error || data.error || data.meetily_clear_error)) || `Backend unavailable: ${status.error?.message}. Check installation and plugin enablement.`),
             (() => {
               // Dismiss only clears local state; it never sends anything.
               // Retry replays the exact failed answer request when one is
-              // known (async engine failure, failed assist, or the shown
+              // known (async engine failure or the shown
               // partial result) and otherwise just rechecks backend state —
               // a capture failure recovers through Pause/Start, not re-ask.
-              const storedRetry = data.error_request || null;
-              const failedRetry = (!data.error && !status.error && !!error && assistFailed && lastAsked)
-                ? { question: lastAsked.question, transcript: undefined, ...(lastAsked.scope || {}), ...(lastAsked.extra || {}) } : null;
-              const retryReq = storedRetry || failedRetry;
+              const progressIssue = typeof error === 'string' && error.startsWith('Answer progress');
+              const storedRetry = assistFailed || progressIssue ? null : (data.error_request || null);
+              const retryReq = storedRetry;
               const backendIssue = !!status.error && !storedRetry;
               // A capture failure needs capture restarted (consent already
               // given), not a status refresh: label and wire it honestly.
-              const captureIssue = !!data.error && !storedRetry && !status.error && !data.stopping;
+              const captureIssue = !assistFailed && !progressIssue && !!data.error && !storedRetry && !status.error && !data.stopping;
               // A failed forget-boundary needs Clear run again, not a
               // dismiss: the adapter keeps serving its old snapshot until
               // the boundary installs. The user already consented to
               // clearing, so the retry completes their intent.
               const clearIssue = !!data.meetily_clear_error && !storedRetry && !status.error && !data.error;
-              const label = data.stopping ? 'Recheck status' : retryReq ? 'Retry' : backendIssue ? 'Retry' : captureIssue ? (data.listening ? 'Recheck status' : 'Restart capture') : clearIssue ? 'Clear again' : 'Dismiss';
+              const label = data.stopping || assistFailed || progressIssue ? 'Recheck status' : retryReq ? 'Retry' : backendIssue ? 'Retry' : captureIssue ? (data.listening ? 'Recheck status' : 'Restart capture') : clearIssue ? 'Clear again' : 'Dismiss';
               return h(Button, { variant: 'secondary', disabled: pending || (captureIssue && !data.listening && (cloudUnavailable || overlayNeedsHide || !consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription))), onClick: async () => {
                 if (data.stopping) return qc.invalidateQueries({ queryKey: [ID, 'status'] });
+                if (assistFailed) {
+                  try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }); setError(''); setAssistFailed(false); } catch (ignored) {}
+                  return;
+                }
+                if (progressIssue) return qc.invalidateQueries({ queryKey: [ID, 'status'] });
                 if (retryReq) { setError(''); setAssistFailed(false); return replayRequest(retryReq); }
                 if (clearIssue) { if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } return; }
                 if (captureIssue && !data.listening) return startCapture();

@@ -24,7 +24,15 @@ class Audio:
     def stop(self): self.running = False
     def status(self): return {'running': self.running, 'stop_confirmed': not self.running}
 audio = Audio()
-state = server.MeetingState(macos_factory=lambda **kw: audio)
+class FakeEngine:
+    provider_failure = False
+    def answer(self, question, **kwargs):
+        if self.provider_failure:
+            return {'answer': '', 'sources': [], 'warnings': [],
+                    'provider_error': 'Provider authentication failed (HTTP 401). Check your API key.'}
+        return {'answer': 'Synthetic offline answer', 'sources': [], 'warnings': []}
+    def projects(self): return []
+state = server.MeetingState(macos_factory=lambda **kw: audio, engine_factory=FakeEngine)
 owner_allowed = True
 async def scoped():
     with _config_profile_scope('current'): yield
@@ -79,6 +87,9 @@ with ExitStack() as stack:
             assert state.pending_overlay is not None
             bridge = state.pending_overlay
             bridge.hide_overlay = type(bridge).hide_overlay.__get__(bridge)
+            result = {'code': 200, 'body': {}}
+        elif m.get('control') == 'provider-failure':
+            FakeEngine.provider_failure = True
             result = {'code': 200, 'body': {}}
         elif m.get('control') == 'segment':
             state.add_segment({'text': 'Synthetic question?'})

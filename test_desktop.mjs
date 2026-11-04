@@ -1532,13 +1532,12 @@ test('listening bar surfaces drop counts', async () => {
   assert.ok(nodes(tree).some(n => n.children && n.children.some(c => typeof c === 'string' && c.includes('1 worker chunk(s) + 2 native frame(s)'))));
 });
 
-test('retry re-asks the failed question', async () => {
+test('uncertain answer submission rechecks status without replay', async () => {
   const { tree, requests } = pane('edited', true, false, '', { 6: 'boom', 23: { question: 'original?', extra: {} }, 24: true }, {}, {});
-  const retry = nodes(tree).find(n => n.type === 'button' && n.children.includes('Retry'));
-  assert.ok(retry, 'a failed answer offers Retry');
+  const retry = nodes(tree).find(n => n.type === 'button' && n.children.includes('Recheck status'));
+  assert.ok(retry, 'uncertain submission offers status recheck');
   await retry.props.onClick();
-  const last = requests.filter(r => r.path === '/assist').at(-1);
-  assert.equal(last.body.question, 'original?');
+  assert.ok(!requests.some(r => r.path === '/assist'), 'status recheck does not replay');
 });
 
 test('dismiss never sends anything', async () => {
@@ -1550,7 +1549,7 @@ test('dismiss never sends anything', async () => {
 });
 
 test('capture errors offer an honest capture restart instead of re-asking', async () => {
-  const { tree, requests } = pane('edited', true, false, '', { 23: { question: 'original?', extra: {} }, 24: true }, {}, { error: 'capture failed' });
+  const { tree, requests } = pane('edited', true, false, '', { 23: { question: 'original?', extra: {} } }, {}, { error: 'capture failed' });
   const retry = nodes(tree).find(n => n.type === 'button' && (n.children.includes('Restart capture') || n.children.includes('Retry')));
   assert.ok(retry, 'capture errors offer recovery');
   await retry.props.onClick();
@@ -1811,7 +1810,7 @@ test('separate loss units render without a misleading total', async () => {
   assert.ok(nodes(tree).some(n => n.children && n.children.some(c => typeof c === 'string' && c.includes('1 worker chunk(s) + 2 native frame(s)'))));
 });
 
-test('failed replay stays retryable as itself', async () => {
+test('uncertain replay rechecks without sending the request again', async () => {
   let calls = 0;
   const failOnce = () => { calls++; if (calls === 1) throw new Error('down'); return { accepted: true, request_id: 'r-2' }; };
   const req = { question: 'old q?', project: null, all_projects: false, web_fallback: false };
@@ -1822,11 +1821,11 @@ test('failed replay stays retryable as itself', async () => {
   await retry.props.onClick();
   assert.equal(calls, 1);
   const tree2 = rerender();
-  const retry2 = nodes(tree2).find(n => n.type === 'button' && n.children.includes('Retry'));
-  assert.ok(retry2, 'failed replay offers Retry');
+  const retry2 = nodes(tree2).find(n => n.type === 'button' && n.children.includes('Recheck status'));
+  assert.ok(retry2, 'uncertain replay offers a status recheck');
   await retry2.props.onClick();
   const bodies = requests.filter(r => r.path === '/assist').map(r => r.body);
-  assert.equal(bodies.length, 2);
+  assert.equal(bodies.length, 1);
   assert.ok(bodies.every(b => b.question === 'old q?'));
 });
 

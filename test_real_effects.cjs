@@ -15,11 +15,15 @@ createInterface({input:child.stdout}).on('line',line=>{const r=JSON.parse(line);
 const rpc=data=>new Promise(resolve=>{waiting.set(++id,resolve);child.stdin.write(JSON.stringify({...data,id})+'\n')});
 let holdWrite=false,heldWrite=null,releaseWrite,failStatus=false;
 let holdStatus=false,heldStatus=null,releaseStatus;
+let answerFault=process.env.ANSWER_FAULT||'', pollFault=false;
+const timers=new Map();let timerId=0;
 async function rest(path,options={}){
  if(failLifecycle && path===failLifecycle)throw new Error('synthetic-sensitive-lifecycle');
  if(failReadback&&path==='/credentials/meta'&&!options.method)throw new Error('synthetic-sensitive-readback');
  if(failStatus&&path==='/status')throw new Error('synthetic-sensitive-status');
  const r=await rpc({path,...options});traffic.push({path,method:options.method||'GET',code:r.code});
+ if(['lost','replay'].includes(answerFault) && path==='/assist')throw new Error('synthetic-sensitive-answer-transport');
+ if(pollFault && path.startsWith('/assist/'))throw new Error(answerFault==='poll'?'synthetic-sensitive-poll-404 not found':'synthetic-sensitive-poll-transport');
  if(process.env.ACTION_TRANSPORT_FAULT===path)throw new Error('synthetic-sensitive-action-transport');
  if(holdWrite&&path==='/credentials/meta'&&options.method){heldWrite=r;await new Promise(resolve=>releaseWrite=resolve);}
  if(holdStatus&&path==='/status'){heldStatus=r;await new Promise(resolve=>releaseStatus=resolve);}
@@ -31,7 +35,7 @@ const ctx={rest,register:c=>{if(c.area==='panes')registered=c;return()=>{}}};
 const source=fs.readFileSync(__dirname+'/desktop/plugin.js','utf8').replace(/^import .*;\r?\n/gm,'').replace('export default','const plugin =');
 const store=new Map([['meeting-copilot.scope.v2',JSON.stringify({backend:'macos',transcriptionProvider:'meta'})]]);
 const box={...React,h:React.createElement,ctx,crypto:require('node:crypto').webcrypto,console,window:dom.window,
-Button:'button',Input:'input',Textarea:'textarea',Badge:'span',PALETTE_AREA:'palette',setInterval:()=>0,clearInterval:()=>{},setTimeout,clearTimeout,
+Button:'button',Input:'input',Textarea:'textarea',Badge:'span',PALETTE_AREA:'palette',setInterval:fn=>{timers.set(++timerId,fn);return timerId},clearInterval:id=>timers.delete(id),setTimeout,clearTimeout,
 host:{notify:()=>{},paneVisibility:()=>({get:()=>true}),revealPane:()=>{}},useValue:a=>a.get(),useQueryClient:()=>({invalidateQueries:async()=>{}}),
 useQuery:q=>({data:q.queryKey[1]==='status'?status:q.queryKey[1]==='models'?{providers:[]}:[]}),
 localStorage:{getItem:k=>store.get(k)||null,setItem:(k,v)=>store.set(k,v)}};
@@ -57,6 +61,50 @@ const reports=[];
   assert.ok(claim.pane);
  }
  await render();
+ if(process.env.ANSWER_FAULT){
+  await rpc({control:'segment'});await refresh();
+  if(answerFault==='provider')await rpc({control:'provider-failure'});
+  if(answerFault==='replay'){
+   answerFault='';await click('Suggest answer');await until(()=>traffic.some(t=>t.path.startsWith('/assist/')));await refresh();
+   answerFault='replay';await click('Ask again');
+  }else{
+   pollFault=answerFault.startsWith('poll');
+   await click('Suggest answer');
+  }
+  const initialCount=answerFault==='replay'?2:1;
+  assert.equal(traffic.filter(t=>t.path==='/assist').length,initialCount);
+  if(['lost','replay'].includes(answerFault)){
+   assert.doesNotMatch(document.body.textContent,/synthetic-sensitive/);
+   assert.match(document.body.textContent,/not confirmed/i);
+   assert.ok(button('Recheck status'));
+   await click('Recheck status');
+   assert.equal(traffic.filter(t=>t.path==='/assist').length,initialCount,'status recheck must not replay');
+   await refresh();assert.match(document.body.textContent,/Synthetic offline answer/);
+  }else if(answerFault.startsWith('poll')){
+   for(let i=0;i<3;i++)await act(async()=>{for(const fn of [...timers.values()])await fn();await ticks()});
+   assert.doesNotMatch(document.body.textContent,/synthetic-sensitive|no longer available/);
+   assert.match(document.body.textContent,/Answer progress unavailable/);
+   assert.ok(!button('Retry'),'poll failure must not replay an answer');
+   status={...status,error:'Old provider error',error_request:{question:'old question'}};await render();
+   assert.match(document.body.textContent,/Answer progress unavailable/);
+   assert.ok(button('Recheck status'));assert.ok(!button('Retry'),'stale provider request must not own progress retry');
+   await click('Recheck status');
+   assert.equal(traffic.filter(t=>t.path==='/assist').length,initialCount);
+   pollFault=false;
+   for(const fn of [...timers.values()])await act(async()=>{await fn();await ticks()});
+   await refresh();
+   assert.match(document.body.textContent,/Synthetic offline answer/);
+   assert.doesNotMatch(document.body.textContent,/Answer progress unavailable/);
+  }else if(answerFault==='provider'){
+   await until(()=>traffic.some(t=>t.path.startsWith('/assist/')));await refresh();
+   assert.match(document.body.textContent,/Provider authentication failed \(HTTP 401\).*Check your API key/);
+   assert.ok(button('Retry'),'confirmed provider failure retains its retry');
+  }else{
+   await until(()=>traffic.some(t=>t.path.startsWith('/assist/')));await refresh();
+   assert.match(document.body.textContent,/Synthetic offline answer/);
+  }
+  console.log('PASS real answer '+answerFault);return;
+ }
  if(process.env.CLAIM_CONFLICT){
   await act(async()=>document.querySelector('[aria-label="Capture permission"]').click());
   await click('Start listening');
