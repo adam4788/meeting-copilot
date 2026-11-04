@@ -43,16 +43,21 @@ export default {
         const body = { action, revision: info.revision };
         if (action === 'save') {
           const value = input.current?.value || '';
-          if (!/^[A-Za-z0-9._~+/=-]{8,4096}$/.test(value)) { setNotice('Enter the API key without spaces, quotes or line breaks.'); return; }
+          if (!/^[A-Za-z0-9._~+/=-]{8,4096}$/.test(value)) { setNotice('Enter an 8–4096 character API key using letters, digits or . _ ~ + / = - only; no spaces, quotes or line breaks.'); return; }
           body.key = value;
         }
         erase(); inFlight.current = true; setWorking(true); setNotice('');
         try {
-          await api('/credentials/meta', body);
+          const written = await api('/credentials/meta', body);
           delete body.key;
           // Read the exact target back; a successful POST is not readiness.
           const current = await api('/credentials/meta');
           if (!current || typeof current.revision !== 'string' || current.saved !== (action === 'save')) throw new Error('unconfirmed');
+          if (!written || current.revision !== written.revision) {
+            setInfo(null);
+            setNotice('Key settings changed after this write. Another settings edit may have replaced it; recheck key status before trying again.');
+            return;
+          }
           setInfo(current);
           setNotice(action === 'save' ? 'Saved — restart the gateway safely before using the new key.' : 'Saved key removed — pause capture and restart the gateway to drop loaded credentials.');
         } catch (_) {
@@ -65,7 +70,7 @@ export default {
         h('p', { style: muted, role: 'status' }, info
           ? `${info.saved ? 'Saved in this profile' : 'No saved key'} · ${info.runtime_configured ? 'Configured in running backend' : 'Not configured in running backend'} · Not verified with Meta`
           : 'Key status not checked'),
-        h('label', { style: { display: 'grid', gap: 6 } }, 'MODEL_API_KEY',
+        h('label', { style: { display: 'grid', gap: 6 } }, 'Meta API key',
           h('input', { ref: input, type: 'password', autoComplete: 'new-password', spellCheck: false,
             autoCapitalize: 'none', maxLength: 4096, 'aria-label': 'Meta API key', style: selectStyle,
             placeholder: info?.saved ? 'Enter a replacement key' : 'Paste key here — never in chat', disabled: working,

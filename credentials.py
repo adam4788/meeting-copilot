@@ -6,18 +6,23 @@ See docs/meta-api-key.md for the deliberately narrow trust/compatibility boundar
 """
 import hashlib
 import hmac
-import io
 import json
 import os
 import re
 import secrets
 import stat
+import sys
+import tempfile
 from pathlib import Path
+
+if __package__:
+    from .credential_env import KEY, bindings as _bindings, saved as _saved
+else:
+    from credential_env import KEY, bindings as _bindings, saved as _saved
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-KEY = 'MODEL_API_KEY'
 _revision_secret = secrets.token_bytes(32)
 _KEY_SHAPE = re.compile(r'[A-Za-z0-9._~+/=-]{8,4096}\Z')
 _UNAVAILABLE = 'Key settings unavailable. Use Hermes Settings → Plugins → Meeting Copilot, or check the active home permissions and host version.'
@@ -41,6 +46,117 @@ def _home():
     return Path(os.environ.get('HERMES_HOME') or Path.home() / '.hermes').absolute()
 
 
+def _check_acl(path, ancestor=False, preserve_metadata=False):
+    """Refuse ACLs before the host can create a plaintext temporary file.
+
+    chmod(0600) does not remove macOS ACLs. Do not repair them or silently
+    discard existing metadata. Ancestors may have deny-only macOS ACLs (the
+    standard home deny-delete entry); any allow entry is refused there too.
+    Unsupported platforms or failed metadata inspection fail closed.
+    """
+    if sys.platform == 'darwin':
+        import ctypes
+        import errno
+        libc = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+        libc.acl_get_file.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        libc.acl_get_file.restype = ctypes.c_void_p
+        libc.acl_valid.argtypes = [ctypes.c_void_p]
+        libc.acl_get_entry.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
+        libc.acl_get_tag_type.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+        libc.acl_free.argtypes = [ctypes.c_void_p]
+        ctypes.set_errno(0)
+        acl = libc.acl_get_file(os.fsencode(path), 0x100)  # ACL_TYPE_EXTENDED
+        if not acl and ctypes.get_errno() != errno.ENOENT:
+            raise RuntimeError('Cannot inspect credential ACL')
+        if not acl:
+            # Darwin returns ENOENT for an absent extended ACL as well as an
+            # absent file. Confirm the already-checked object still exists.
+            if stat.S_ISLNK(path.lstat().st_mode):
+                raise RuntimeError('Unsafe credential path')
+        try:
+            if acl and libc.acl_valid(acl) != 0:
+                raise RuntimeError('Invalid credential ACL')
+            entry, tag = ctypes.c_void_p(), ctypes.c_int()
+            which = 0  # ACL_FIRST_ENTRY, then ACL_NEXT_ENTRY
+            while acl:
+                ctypes.set_errno(0)
+                result = libc.acl_get_entry(acl, which, ctypes.byref(entry))
+                if result == -1 and ctypes.get_errno() == errno.EINVAL:
+                    break  # Darwin's documented end-of-entries result
+                if result != 0 or not ancestor:
+                    raise RuntimeError('Credential ACL unsupported')
+                if libc.acl_get_tag_type(entry, ctypes.byref(tag)) != 0 or tag.value != 2:
+                    raise RuntimeError('Unsafe ancestor ACL')  # allow only ACL_EXTENDED_DENY
+                which = -1
+        finally:
+            libc.acl_free(acl)
+        if preserve_metadata:
+            libc.listxattr.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+            libc.listxattr.restype = ctypes.c_ssize_t
+            size = libc.listxattr(os.fsencode(path), None, 0, 1)  # XATTR_NOFOLLOW
+            if size < 0 or size > 65536:
+                raise RuntimeError('Credential metadata unsupported')
+            names = ctypes.create_string_buffer(size)
+            if libc.listxattr(os.fsencode(path), names, size, 1) != size:
+                raise RuntimeError('Credential metadata changed')
+            if set(names.raw.split(b'\0')) - {b'', b'com.apple.provenance'}:
+                raise RuntimeError('Credential metadata unsupported')
+    elif sys.platform.startswith('linux'):
+        names = os.listxattr(path, follow_symlinks=False)
+        if (preserve_metadata and names) or any(name.startswith('system.posix_acl_') for name in names):
+            raise RuntimeError('Credential ACL or metadata unsupported')
+    else:
+        raise RuntimeError('Credential permissions unsupported on this platform')
+    if preserve_metadata and getattr(path.lstat(), 'st_flags', 0):
+        raise RuntimeError('Credential file flags unsupported')
+
+
+def _provenance(path):
+    """Read the one macOS-generated xattr we allow; never read user xattrs."""
+    if sys.platform != 'darwin':
+        return None
+    import ctypes
+    import errno
+    libc = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+    libc.getxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p,
+                             ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+    libc.getxattr.restype = ctypes.c_ssize_t
+    args = (os.fsencode(path), b'com.apple.provenance')
+    size = libc.getxattr(*args, None, 0, 0, 1)
+    if size == -1 and ctypes.get_errno() == errno.ENOATTR:
+        return None
+    if size < 0 or size > 65536:
+        raise RuntimeError('Cannot inspect credential metadata')
+    data = ctypes.create_string_buffer(size)
+    if libc.getxattr(*args, data, size, 0, 1) != size:
+        raise RuntimeError('Credential metadata changed')
+    return data.raw
+
+
+def _write_preserving_metadata(host, path, lines):
+    """Stage the host's atomic write privately; publish only verified metadata.
+
+    macOS automatically attaches provenance to new files. Permit that metadata
+    only when the replacement has exactly the original value; otherwise refuse
+    without replacing the original. Other extended metadata is refused earlier.
+    """
+    original = path.lstat() if path.exists() else None
+    provenance = _provenance(path) if original else None
+    with tempfile.TemporaryDirectory(prefix='.env-stage-', dir=path.parent) as directory:
+        staging = Path(directory)
+        _check(staging, directory=True)  # before the host opens any secret temp
+        candidate = staging / '.env'
+        host._write_env_lines(candidate, lines, preserve_mode=False)
+        _check(candidate)
+        if original:
+            if _provenance(candidate) != provenance:
+                raise RuntimeError('Credential metadata cannot be preserved')
+            os.chown(candidate, -1, original.st_gid)
+            os.chmod(candidate, stat.S_IMODE(original.st_mode))
+        _path()  # recheck target ACLs/metadata before publication
+        os.replace(candidate, path)
+
+
 def _check(path, directory=False, optional=False, confidential=True):
     try:
         info = path.lstat()
@@ -52,6 +168,7 @@ def _check(path, directory=False, optional=False, confidential=True):
             or (directory and (not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o022))
             or (not directory and (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & (0o077 if confidential else 0o022)))):
         raise RuntimeError('Unsafe credential path')
+    _check_acl(path, preserve_metadata=not directory and confidential)
 
 
 def _path():
@@ -64,6 +181,7 @@ def _path():
         if (info.st_uid not in (0, os.getuid()) or stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
                 or (info.st_mode & 0o022 and not trusted_sticky)):
             raise RuntimeError('Unsafe credential directory')
+        _check_acl(parent, ancestor=parent != home)
     _check(home, directory=True)
     path = home / '.env'
     _check(path, optional=True)
@@ -84,22 +202,6 @@ def _read(path):
     if len(raw) > 1024 * 1024:
         raise RuntimeError('Credential file too large')
     return raw
-
-
-def _bindings(raw):
-    # Parse with Hermes' dotenv dependency but never expand references, log
-    # malformed input, normalize other lines, or expose another key's value.
-    from dotenv.parser import parse_stream
-    text = raw.decode('utf-8')
-    bindings = list(parse_stream(io.StringIO(text)))
-    if any(b.error for b in bindings):
-        raise RuntimeError('Malformed credential file')
-    return bindings
-
-
-def _saved(bindings):
-    values = [b.value or '' for b in bindings if b.key == KEY]
-    return values[-1] if values else ''
 
 
 def _revision(path, raw):
@@ -124,12 +226,12 @@ def _write(host, path, raw, action, key):
         if text and not text.endswith('\n'):
             text += '\n'
         text += KEY + '=' + key + '\n'
-    # Hermes' helper uses an adjacent 0600 temp file + fsync + atomic rename.
-    # The shared .env.lock serializes with Hermes config writers.
+    # Stage Hermes' 0600 temp + fsync writer inside a checked private directory.
+    # The shared .env.lock serializes publication with Hermes config writers.
     _path()
     if _read(path) != raw:
         raise HTTPException(409, 'Settings changed. Recheck before saving again.')
-    host._write_env_lines(path, [text], preserve_mode=False)
+    _write_preserving_metadata(host, path, [text])
     _check(path)
     actual = _read(path)
     if actual != text.encode('utf-8'):

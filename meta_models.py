@@ -2,11 +2,11 @@
 
 The hackathon requires the app to actually use Meta models. This module calls
 the Meta Model API's OpenAI-compatible Chat Completions endpoint directly, so
-Meta usage never depends on Hermes provider configuration. The API key comes
-from the MODEL_API_KEY environment variable of the gateway process, falling
-back to the MODEL_API_KEY line of ~/.hermes/.env (the desktop gateway does
-not inherit shell/.env variables) -- never from request bodies -- and nothing
-here writes Hermes global configuration or credentials.
+Meta usage never depends on Hermes provider configuration. MODEL_API_KEY comes
+from Hermes' trusted secret scope, or the standalone process environment. The
+launch owner's startup bridge may seed its saved dotenv value when the process
+key is empty; routed scopes never borrow that key. No request body supplies keys
+and nothing here writes Hermes configuration or credential files.
 """
 import codecs
 import json
@@ -15,38 +15,67 @@ from pathlib import Path
 import urllib.request
 
 
+def _secret_scope():
+    """Only standalone installs without Hermes may use the plain environment."""
+    try:
+        from agent import secret_scope
+        return secret_scope
+    except ModuleNotFoundError as exc:
+        if exc.name == 'agent':
+            return None
+        raise
+
+
 def _load_dotenv_key_once():
-    """Import-time bridge: the desktop gateway does not inherit shell or
-    .env variables, so seed MODEL_API_KEY from ~/.hermes/.env (setdefault:
-    a real environment value always wins). Only inside the launchd-
-    supervised gateway process (HERMES_LAUNCHD_LABEL=ai.hermes.gateway)
-    — agent shells, CLIs, and test runs must stay hermetic (they may
-    carry HERMES_SUPERVISED_CHILD, so that alone does not qualify).
-    The value is never logged."""
+    """Seed the launch owner's key once; never publish routed profile secrets.
+
+    A genuinely nonempty service environment wins. Empty/whitespace inherited
+    placeholders do not block a saved key. Editing and startup share dotenv
+    bindings (last assignment wins, no expansion, multiline values stay whole).
+    """
     if os.environ.get('MODEL_API_KEY', '').strip():
         return
     if not os.environ.get('HERMES_LAUNCHD_LABEL', '').startswith('ai.hermes.gateway'):
         return
-    home = Path(os.environ.get('HERMES_HOME', str(Path.home() / '.hermes')))
     try:
-        for line in (home / '.env').read_text(errors='replace').splitlines():
-            line = line.strip()
-            if line.startswith('MODEL_API_KEY='):
-                value = line.split('=', 1)[1].strip().strip('"').strip("'")
-                if value:
-                    os.environ.setdefault('MODEL_API_KEY', value)
-                return
-    except OSError:
-        pass
+        scope = _secret_scope()
+        if scope is not None and scope.serves_routed_profile():
+            return
+        if __package__:
+            from .credential_env import bindings, saved
+        else:
+            from credential_env import bindings, saved
+        home = Path(os.environ.get('HERMES_HOME') or Path.home() / '.hermes')
+        with (home / '.env').open('rb') as file:
+            raw = file.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            return
+        value = saved(bindings(raw)).strip()
+        if value and not os.environ.get('MODEL_API_KEY', '').strip():
+            os.environ['MODEL_API_KEY'] = value
+    except Exception:
+        # No secret, file content or host exception may escape startup.
+        return
 
 
 _load_dotenv_key_once()
 
 
 def resolve_model_api_key():
-    """MODEL_API_KEY from the process env (see _load_dotenv_key_once)."""
-    key = os.environ.get('MODEL_API_KEY', '')
-    return key.strip() if isinstance(key, str) else ''
+    """Use Hermes' trusted context-local scope, never a foreign launch key."""
+    try:
+        scope = _secret_scope()
+        if scope is None:
+            key = os.environ.get('MODEL_API_KEY', '')
+        else:
+            # get_secret on some hosts still falls back to the launch env for
+            # an unbound home override outside multiplex mode. Close that gap.
+            if scope.serves_routed_profile() and scope.current_secret_scope() is None:
+                return ''
+            key = scope.get_secret('MODEL_API_KEY', '')
+        return key.strip() if isinstance(key, str) else ''
+    except Exception:
+        return ''
 
 META_BASE_URL = 'https://api.meta.ai/v1'
 META_MODELS = ('muse-spark-1.3', 'muse-spark-1.2', 'muse-spark-1.1')

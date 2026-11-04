@@ -88,17 +88,37 @@ merely satisfying the manifest's minimum Hermes version.
 - `.env` must be a private, owner-owned regular file with one hardlink. Symlink,
   shared-writable directory ancestry (except root/owner-owned sticky temporary
   ancestors), malformed dotenv, wrong owner and permissive
-  credential files fail closed. The editor does not silently chmod an existing
+  credential files fail closed. Native macOS extended ACLs on the home, lock or
+  `.env`, including inheritable ACLs, are refused before any secret temporary
+  file is opened. Ancestor allow ACLs are also refused; standard deny-only
+  ancestor ACLs are permitted. Linux POSIX ACL xattrs are refused. Unsupported
+  platforms and failed ACL inspection fail closed. The editor does not silently chmod an existing
   credential file or rewrite unrelated entries to repair them. Fix permissions
   through the host/administrator if needed. The `.env.lock` contains no secrets;
   owner-owned read-only sharing of that lock is allowed, write sharing is not.
 - Updates reuse Hermes' cross-process `.env.lock`, preserve unrelated bytes
-  (including multiline values/comments), and use its adjacent private temporary
-  file + fsync + atomic replacement. An opaque keyed revision covers the home and
+  (including multiline values/comments), and stage its private temporary file +
+  fsync writer inside an ACL-checked private directory beside `.env`. Only a
+  checked candidate is atomically published. Existing mode, owner and group
+  are retained. Custom extended attributes and file flags are explicitly refused,
+  not discarded. macOS-generated `com.apple.provenance` is allowed only when the
+  candidate matches the original exactly; a mismatch leaves the original intact.
+  An opaque keyed revision covers the home and
   entire file; stale writes receive 409. A final disk read confirms the write.
   Concurrent Hermes writers cooperate with this lock. Arbitrary external editors
   ignoring it are not transactional; a last pre-write comparison detects ordinary
   conflicts, but cannot eliminate an adversarial same-user race.
+- The pane compares the POST revision with its subsequent GET revision, not just
+  the saved flag. A different writer between those requests produces a conflict
+  notice, never confirmation that this pane's key was saved.
+- Startup and editing share non-interpolating dotenv bindings, including export,
+  quotes, duplicate assignments and multiline values. Empty/whitespace inherited
+  keys no longer block a saved key; actual nonempty process keys retain precedence.
+  Runtime Meta resolution uses Hermes' trusted `agent.secret_scope` API. Foreign
+  scopes cannot borrow the launch key; missing scope on a routed request fails
+  closed. ASR snapshots the scoped key before its thread starts and removes the
+  gateway startup marker from the child environment to prevent launch-home reload.
+  Owner-scoped requests retain the host's legitimate environment fallback.
 - Bodies are bounded, JSON-only, explicitly validated without FastAPI's default
   input-echoing 422 responses; errors are fixed messages. GET/status return only
   flags and an opaque revision, not a key, suffix, or public key hash. Successful
@@ -114,17 +134,45 @@ merely satisfying the manifest's minimum Hermes version.
 
 `python -m unittest test_credentials -v` exercises synthetic keys in isolated
 homes: authorization, malformed/bounded input, no reflection, failure handling,
-private modes, symlinks/hardlinks, unrelated multiline preservation, duplicate
+private modes, real macOS ACL rejection, extended-metadata preservation/refusal,
+symlinks/hardlinks, unrelated multiline preservation, actual startup post-remove, duplicate
 assignments, stale/concurrent edits, save/remove and process-env precedence.
 When Hermes is installed, a clean child process additionally uses the **real host
 lock/writer**, simulates startup, and exercises `selected_completion('meta', …)`
 with a fake HTTP provider; Muse Voice handshake construction uses the same key.
 That integration test skips on machines without Hermes, never on this verified host.
 
+`python -m unittest test_credential_runtime -v` uses fresh child processes and
+synthetic profiles to check empty/nonempty startup precedence through fake Meta
+model and ASR HTTP transports, trusted owner/foreign/unbound/multiplex scopes,
+and scope retention through the actual ASR thread and subprocess boundary.
+
 `node --test --test-name-pattern='Meta key' test_desktop.mjs` exercises the real
 uncompiled pane event handlers. One test connects them over private test-only
 stdio to the actual ASGI credential routes and a real isolated private `.env`,
-proving Save/Remove effects and readback. Only host auth/locking seams are faked
+proving Save/Remove effects, readback and an actual interleaved second writer.
+Only host auth/locking seams are faked
 there; no unauthenticated network listener or real provider is involved. The
 React/SDK stand-ins test behavior, not browser visual acceptance. No live Meta
 credential, installed plugin, user `.env` or gateway was touched.
+
+### Key-flow regression receipt
+
+The regressions were reproduced red before their fixes: native existing/inheritable
+ACLs, multiline startup resurrection, empty/whitespace precedence, foreign scope
+fallback, UI interleaving and label guidance. Follow-up red tests caught ASR scope
+loss across its thread/child boundary and first-import owner-scope compatibility.
+
+With a fresh isolated `HOME`/`HERMES_HOME`/`TMPDIR` and an allowlisted process
+environment containing no live credentials:
+
+- Targeted credential/runtime/model/ASR/macOS suite: **86 tests, passed**.
+- Full `npm test`: **584 Python tests, passed (3 Windows-only skips)**;
+  JavaScript syntax check passed; **74 desktop tests, passed**.
+- Real macOS ACL tests and the real Hermes lock/writer integration ran, not skipped.
+- Provider HTTP/ASR transports were fake. No live provider, device capture,
+  gateway restart, deployment installation, push or merge was performed.
+
+ACLs/custom metadata and differing provenance remain explicit refusal cases, not
+silent repair. Visual browser acceptance and live provider credentials are outside
+this isolated test receipt.

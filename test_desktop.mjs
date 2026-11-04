@@ -140,7 +140,25 @@ test('Meta key save errors do not echo transport secrets or claim readiness', as
   assert.match(JSON.stringify(tree), /could not be confirmed/i);
 });
 
-test('Meta key pane effects reach the isolated ASGI backend and private env file', async t => {
+test('Meta key label matches accessible name and invalid lengths explain bounds', async () => {
+  const ui = pane('', true, false, '', {}, { '/credentials/meta': () => ({ saved: false, revision: 'r'.repeat(64) }) });
+  const button = (tree, text) => nodes(tree).find(n => n.type === 'button' && n.children.includes(text));
+  await button(ui.tree, 'Recheck key status').props.onClick();
+  const field = nodes(ui.rerender()).find(n => n.props['aria-label'] === 'Meta API key');
+
+  // Rerenders create new nodes; locate the nested input by its accessible name.
+  const visibleLabel = nodes(ui.rerender()).find(n => n.type === 'label' && nodes(n).some(x => x.props['aria-label'] === 'Meta API key'));
+  assert.ok(visibleLabel.children.includes(field.props['aria-label']));
+  for (const value of ['short', 'x'.repeat(4097)]) {
+    field.props.ref.current = { value };
+    field.props.onChange({ target: field.props.ref.current });
+    await button(ui.rerender(), 'Save key').props.onClick();
+    assert.match(JSON.stringify(ui.rerender()), /8–4096/);
+    assert.equal(ui.requests.filter(r => r.method === 'POST').length, 0);
+  }
+});
+
+for (const race of [false, true]) test(`Meta key pane effects reach isolated backend (interleaving=${race})`, async t => {
   const { spawn } = await import('node:child_process');
   const { createInterface } = await import('node:readline');
   const child = spawn(process.env.PYTHON || 'python', ['-u', 'test_credentials.py', '--ui-bridge'], { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -164,7 +182,16 @@ test('Meta key pane effects reach the isolated ASGI backend and private env file
     await new Promise(resolve => { if (child.exitCode !== null) resolve(); else child.once('exit', resolve); });
     assert.ok(!stderr.includes('fake-ui-key-only'), 'stderr contains no synthetic key');
   });
-  const ui = pane('', true, false, '', {}, { '/credentials/meta': call }, {}, { window: { confirm: () => true } });
+  const routedCall = async (path, opts = {}) => {
+    const result = await call(path, opts);
+    if (race && opts.method === 'POST' && opts.body.action === 'save') {
+      // Real second writer commits between this pane's POST and GET.
+      const second = await call(path);
+      await call(path, { method: 'POST', body: { action: 'save', key: 'fake-other-writer-key', revision: second.revision } });
+    }
+    return result;
+  };
+  const ui = pane('', true, false, '', {}, { '/credentials/meta': routedCall }, {}, { window: { confirm: () => true } });
   const button = (tree, text) => nodes(tree).find(n => n.type === 'button' && n.children.includes(text));
   await button(ui.tree, 'Recheck key status').props.onClick();
   const field = nodes(ui.rerender()).find(n => n.props['aria-label'] === 'Meta API key');
@@ -172,6 +199,14 @@ test('Meta key pane effects reach the isolated ASGI backend and private env file
   field.props.onChange({ target: field.props.ref.current });
   assert.equal((await call('/test/saved-effect')).saved, false);
   await button(ui.rerender(), 'Save key').props.onClick();
+  if (race) {
+    assert.deepEqual(await call('/test/saved-effect'), { saved: false, mode_private: true, runtime_unchanged: true });
+    const rendered = JSON.stringify(ui.rerender());
+    assert.match(rendered, /changed.*after|another.*edit/i);
+    assert.doesNotMatch(rendered, /Saved — restart/);
+    assert.doesNotMatch(rendered, /fake-other-writer-key|fake-ui-key-only/);
+    return;
+  }
   assert.deepEqual(await call('/test/saved-effect'), { saved: true, mode_private: true, runtime_unchanged: true });
   assert.equal(field.props.ref.current.value, '');
   assert.match(JSON.stringify(ui.rerender()), /Not verified/);

@@ -271,6 +271,93 @@ assert client.get('/credentials/meta').json()['verified'] is False
             nested.chmod(0o777)
             self.assertEqual(self.client.get('/credentials/meta').status_code, 503)
 
+    def test_macos_acls_refused_before_secret_temp_open_and_metadata_preserved(self):
+        import subprocess
+        import sys
+        if sys.platform != 'darwin':
+            self.skipTest('native macOS ACL regression')
+        path = self.home / '.env'
+        original = b'OTHER=fake-unrelated-key\n'
+        for target, rule in ((path, 'everyone allow read'),
+                             (self.home, 'everyone allow read,file_inherit,directory_inherit')):
+            with self.subTest(target=target.name):
+                path.write_bytes(original)
+                path.chmod(0o600)
+                revision = self.status()['revision']
+                subprocess.run(['/bin/chmod', '+a', rule, str(target)], check=True, capture_output=True)
+                try:
+                    before = subprocess.check_output(['/bin/ls', '-lde', str(target)])
+                    with patch.object(self.mod._host.return_value, '_write_env_lines') as writer:
+                        response = self.save(revision=revision)
+                        self.assertEqual(response.status_code, 503)
+                        writer.assert_not_called()
+                    self.assertEqual(path.read_bytes(), original)
+                    self.assertEqual(subprocess.check_output(['/bin/ls', '-lde', str(target)]), before)
+                    self.assertNotIn('fake-', response.text)
+                finally:
+                    subprocess.run(['/bin/chmod', '-N', str(target)], check=True, capture_output=True)
+
+    def test_existing_extended_metadata_is_refused_not_discarded(self):
+        path = self.home / '.env'
+        path.write_bytes(b'OTHER=fake-unrelated-key\n')
+        path.chmod(0o600)
+        revision = self.status()['revision']
+        name = 'user.meeting_copilot_test'
+        import sys
+        import subprocess
+        if sys.platform == 'darwin':
+            subprocess.run(['/usr/bin/xattr', '-w', name, 'preserve-me', str(path)], check=True)
+        else:
+            os.setxattr(path, name, b'preserve-me')
+        with patch.object(self.mod._host.return_value, '_write_env_lines') as writer:
+            self.assertEqual(self.save(revision=revision).status_code, 503)
+            writer.assert_not_called()
+        if sys.platform == 'darwin':
+            self.assertEqual(subprocess.check_output(['/usr/bin/xattr', '-p', name, str(path)]).strip(), b'preserve-me')
+        else:
+            self.assertEqual(os.getxattr(path, name), b'preserve-me')
+        self.assertEqual(path.read_bytes(), b'OTHER=fake-unrelated-key\n')
+
+    def test_generated_metadata_preserved_or_refused_before_publication(self):
+        path = self.home / '.env'
+        original = b'OTHER=fake-unrelated-key\n'
+        path.write_bytes(original)
+        path.chmod(0o600)
+        before = path.stat()
+        provenance = self.mod._provenance(path)
+        self.assertEqual(self.save().status_code, 200)
+        self.assertEqual(self.mod._provenance(path), provenance)
+        self.assertEqual((path.stat().st_uid, path.stat().st_gid, path.stat().st_mode),
+                         (before.st_uid, before.st_gid, before.st_mode))
+        raw = path.read_bytes()
+        revision = self.status()['revision']
+        # Simulate a different native provenance value on the staged candidate.
+        with patch.object(self.mod, '_provenance', side_effect=[b'original', b'different']):
+            self.assertEqual(self.save(revision=revision).status_code, 503)
+        self.assertEqual(path.read_bytes(), raw)
+        self.assertEqual(self.mod._provenance(path), provenance)
+        self.assertFalse(list(self.home.glob('.env-stage-*')))
+
+    def test_remove_does_not_resurrect_key_from_unrelated_multiline_on_startup(self):
+        import subprocess
+        import sys
+        path = self.home / '.env'
+        unrelated = 'OTHER="first\nMODEL_API_KEY=fake-embedded-key\nlast"\n'
+        path.write_text(unrelated + 'export MODEL_API_KEY="fake-real-assignment"\n')
+        path.chmod(0o600)
+        response = self.client.post('/credentials/meta', json={'action': 'remove', 'revision': self.status()['revision']})
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()['saved'])
+        self.assertEqual(path.read_text(), unrelated)
+        from dotenv import dotenv_values
+        self.assertNotIn('MODEL_API_KEY', dotenv_values(path))
+        env = {'HOME': str(self.home), 'HERMES_HOME': str(self.home), 'PATH': os.defpath,
+               'TMPDIR': str(self.home), 'HERMES_LAUNCHD_LABEL': 'ai.hermes.gateway.test-only'}
+        result = subprocess.run([sys.executable, '-c',
+            'import meta_models; assert meta_models.resolve_model_api_key() == ""'],
+            env=env, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, 'Startup resurrected removed key (output withheld)')
+
     def test_status_is_uncacheable_and_never_claims_provider_verification(self):
         self.assertEqual(self.save().status_code, 200)
         r = self.client.get('/credentials/meta')
