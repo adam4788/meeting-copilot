@@ -159,6 +159,7 @@ export default {
       const [assistFailed, setAssistFailed] = useState(false);
       const [transcriptionProvider, setTranscriptionProvider] = useState(saved.transcriptionProvider === 'meta' ? 'meta' : 'local');
       const [asrMode, setAsrMode] = useState(['ENDPOINTING', 'DIARIZATION', 'PUSH_TO_TALK'].includes(saved.asrMode) ? saved.asrMode : 'ENDPOINTING');
+      const [setupOpen, setSetupOpen] = useState(false);
       useEffect(() => {
         try {
           if (typeof localStorage !== 'undefined') localStorage.setItem(SCOPE_KEY, JSON.stringify({ project, backend, webFallback, transcriptionModel, audioSource, answerProvider, answerModel, transcriptionProvider, asrMode }));
@@ -177,6 +178,16 @@ export default {
       function resetMeetingInputs() {
         setQuestion(''); setWeb(''); setLastAsked(null); setLiveEntry(null);
         setTrackedRequest(null); setError(''); setAssistFailed(false);
+      }
+      async function toggleOverlay() {
+        setPending(true); setOverlayMsg('');
+        overlayActionAt.current = Date.now();
+        try {
+          if (overlayOn) { await api('/overlay/hide', {}); setOverlayOn(false); }
+          else { await api('/overlay/show', { scope: { ...scope, ...overlayQuery, seq: scopeSeq.current } }); setOverlayOn(true); setScopeStale(false); setOverlayMsg('Overlay shown. It returns to click-through after ~10s — press the shortcut to interact, then tap a row for a streamed answer.'); }
+          await qc.invalidateQueries({ queryKey: [ID, 'status'] });
+        } catch (e) { setOverlayMsg(String(e.message || e)); if (!overlayOn) setOverlayOn(false); }
+        finally { setPending(false); }
       }
       async function startCapture(newMeeting = false) {
         const retained = !!((data.segments || []).length || data.result || (data.recent || []).length || data.error_request);
@@ -347,7 +358,8 @@ export default {
               ? h(Button, { variant: 'secondary', onClick: () => act('/pause', {}) }, data.backend === 'meetily' ? 'Detach' : 'Pause listening')
               : h(Button, { disabled: pending || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), onClick: () => startCapture() }, ((data.segments || []).length || result || (data.recent || []).length) ? (backend === 'meetily' ? 'Resume' : 'Resume listening') : (backend === 'meetily' ? 'Attach to Meetily' : 'Start listening')),
             !data.listening && ((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), title: 'Starts a fresh meeting; the earlier transcript, answers, and retry data are cleared', onClick: () => startCapture(true) }, 'New meeting'),
-            ((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending, title: 'Clears past Q&A, transcript segments, and cached snippets for this meeting', onClick: async () => { if (typeof window !== 'undefined' && window.confirm && !window.confirm('Clear this meeting? Past questions, answers, and transcript segments are removed from the pane.')) return; if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } } }, 'Clear meeting')),
+            ((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending, title: 'Clears past Q&A, transcript segments, and cached snippets for this meeting', onClick: async () => { if (typeof window !== 'undefined' && window.confirm && !window.confirm('Clear this meeting? Past questions, answers, and transcript segments are removed from the pane.')) return; if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } } }, 'Clear meeting'),
+            h(Button, { variant: 'secondary', disabled: pending || !data.capabilities?.overlay, title: 'Show or hide the floating meeting overlay (macOS)', onClick: toggleOverlay }, overlayOn ? 'Hide overlay' : 'Show overlay')),
           h('p', { style: { ...muted, margin: 0 } }, 'No additional audio files · copilot detaches/pauses if this pane disconnects. Resume keeps this meeting (transcript and latest answer stay); New meeting, different settings, or Clear starts fresh. Pausing can discard the last few seconds of audio.'),
           data.capture && h('div', { style: muted }, data.capture.message || data.capture.state || ''),
           data.capture && (data.capture.warning || lossText(data.capture)) && h('div', { role: 'status', style: muted },
@@ -493,7 +505,9 @@ export default {
             h('div', { style: { paddingTop: 8, display: 'flex', gap: 8, flexWrap: 'wrap' } },
               entry.answer && h(Button, { variant: 'secondary', onClick: async () => { try { await navigator.clipboard.writeText(entry.answer); } catch (e) { setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, 'Copy this answer'),
               entry.request && h(Button, { variant: 'secondary', onClick: () => replayRequest(entry.request) }, /partial|interrupt|unavailable|failed|error/i.test((entry.warnings || []).join(' ') + ' ' + (entry.status || '')) ? 'Retry for the complete response' : 'Ask again'))))),
-        h('details', { style: { display: 'flex', flexDirection: 'column', gap: 14 } }, h('summary', { style: { cursor: 'pointer', fontWeight: 700, color: 'var(--ui-text-primary)', padding: '6px 0', fontSize: 14 } }, 'Answer setup — scope, models, overlay, web'),
+        h('details', { open: setupOpen, onToggle: e => setSetupOpen(e.currentTarget.open), style: { border: '1px solid var(--ui-stroke-secondary)', borderRadius: 12, padding: '2px 14px 14px', background: 'var(--ui-bg-card)' } },
+        h('summary', { style: { cursor: 'pointer', fontWeight: 700, color: 'var(--ui-text-primary)', padding: '12px 0', fontSize: 14 } }, setupOpen ? '\u25be Answer setup — scope, models, overlay, web' : '\u25b8 Answer setup — scope, models, overlay, web'),
+        h('div', { style: { display: 'flex', flexDirection: 'column', gap: 14, paddingTop: 4 } },
         h('p', { style: { ...muted, margin: 0 } }, webFallback ? 'Your projects and past sessions first. Automatic public web fallback is ON: when local evidence is insufficient, a generic public query may be drafted (best-effort filtering, not a privacy guarantee).' : 'Your projects and past sessions first. Automatic public web fallback is OFF — answers use local evidence and your explicit web query only.'),
         h('label', { style: { display: 'grid', gap: 6 } }, h('strong', { id: 'mc-scope-label' }, 'Search scope'),
           h('select', { value: project, onChange: e => setProject(e.target.value), style: selectStyle, 'aria-labelledby': 'mc-scope-label', disabled: projects.isPending },
@@ -524,16 +538,7 @@ export default {
           overlayMsg && h('p', { role: 'status', style: { ...muted, margin: 0 } }, overlayMsg),
           !data.capabilities?.overlay && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'Overlay helper unavailable. Check the macOS helper build and restart the gateway, then try Show overlay again.'),
           h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
-            h(Button, { variant: overlayOn ? 'secondary' : undefined, disabled: pending || !data.capabilities?.overlay, onClick: async () => {
-              setPending(true); setOverlayMsg('');
-              overlayActionAt.current = Date.now();
-              try {
-                if (overlayOn) { await api('/overlay/hide', {}); setOverlayOn(false); }
-                else { await api('/overlay/show', { scope: { ...scope, ...overlayQuery, seq: scopeSeq.current } }); setOverlayOn(true); setScopeStale(false); setOverlayMsg('Overlay shown. It returns to click-through after ~10s — press the shortcut to interact, then tap a row for a streamed answer.'); }
-                await qc.invalidateQueries({ queryKey: [ID, 'status'] });
-              } catch (e) { setOverlayMsg(String(e.message || e)); if (!overlayOn) setOverlayOn(false); }
-              finally { setPending(false); }
-            } }, overlayOn ? 'Hide overlay' : 'Show overlay'),
+            h(Button, { variant: overlayOn ? 'secondary' : undefined, disabled: pending || !data.capabilities?.overlay, onClick: toggleOverlay }, overlayOn ? 'Hide overlay' : 'Show overlay'),
             h(Button, { variant: 'secondary', disabled: pending || !overlayOn, onClick: async () => {
               setPending(true); setOverlayMsg('');
               scopeSeq.current += 1;
@@ -556,7 +561,7 @@ export default {
               h(Input, { value: web, onChange: e => setWeb(e.target.value), placeholder: 'Public query — no client names or meeting details', 'aria-label': 'Specific public web query' })),
             h('span', { style: muted }, 'This explicit query overrides automatic fallback for this request. Do not include private details.'),
             h(Button, { variant: 'secondary', disabled: busy || unsupported || !web.trim(), onClick: () => assistNow({ web_query: web.trim() }) }, 'Check sources + web'))),
-        ),
+        )),
         h('p', { style: { ...muted, marginTop: 'auto' } }, 'Read-only assistance. Nothing is spoken, posted, or changed for you. Check suggestions before using them.'));
     }
     const paneId = `${ID}:pane`;

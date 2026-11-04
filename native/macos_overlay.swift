@@ -85,8 +85,18 @@ final class OverlayModel: ObservableObject {
 
 struct OverlayView: View {
     @ObservedObject var model: OverlayModel
+    // Same stable per-speaker palette as the pane: first speaker accent,
+    // then green/orange/pink/blue/purple by first appearance.
+    private var speakerColors: [String: Color] {
+        let palette: [Color] = [.accentColor, .green, .orange, .pink, .blue, .purple]
+        var map: [String: Color] = [:]
+        for line in model.state.transcript where map[line.speaker] == nil {
+            map[line.speaker] = palette[map.count % palette.count]
+        }
+        return map
+    }
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text("Meeting Copilot").font(.headline)
                 Spacer()
@@ -99,7 +109,15 @@ struct OverlayView: View {
             if let warning = model.state.shareWarning { Text(warning).font(.caption).foregroundColor(.secondary).accessibilityLabel("Privacy notice: \(warning)") }
             if model.state.truncated { Text("Long answers shortened; open the pane for full text.").font(.caption).foregroundColor(.secondary) }
             ForEach(model.state.transcript) { line in
-                Text("\(line.speaker): \(line.text)").font(.caption).lineLimit(2)
+                HStack(alignment: .top, spacing: 6) {
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(speakerColors[line.speaker] ?? .accentColor)
+                        .frame(width: 3)
+                    Text("\(line.speaker): \(line.text)").font(.caption).lineLimit(2)
+                }
+                .padding(6)
+                .background((speakerColors[line.speaker] ?? .accentColor).opacity(0.08))
+                .cornerRadius(6)
             }
             Divider()
             if model.state.questions.isEmpty {
@@ -108,7 +126,7 @@ struct OverlayView: View {
                     .accessibilityLabel(model.state.listening ? "Listening, no questions detected yet" : "Paused, resume capture in the pane")
             }
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 6) {
+                LazyVStack(alignment: .leading, spacing: 8) {
                     ForEach(model.state.questions) { row in
                         VStack(alignment: .leading, spacing: 4) {
                             Button(action: { model.click(row.id) }) {
@@ -130,7 +148,9 @@ struct OverlayView: View {
                                         Text("Sources: \(sources.joined(separator: " · "))").font(.caption).foregroundColor(.secondary)
                                             .accessibilityLabel("Sources: \(sources.joined(separator: ", "))")
                                     }
-                                }.frame(maxWidth: .infinity, alignment: .leading).padding(6)
+                                }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
+                                .background(Color.primary.opacity(0.05))
+                                .cornerRadius(8)
                             }.buttonStyle(.plain).disabled(!model.interactive || !model.state.listening || row.busy == true)
                             .accessibilityLabel("Ask: \(row.question)")
                             .accessibilityHint(model.state.listening ? "Gets an answer for this question" : "Resume capture in the pane to enable")
@@ -148,7 +168,8 @@ struct OverlayView: View {
                     }
                 }
             }
-        }.padding(12).frame(minWidth: 380, minHeight: 180).foregroundColor(.primary)
+        }.padding(14).frame(minWidth: 380, minHeight: 180).foregroundColor(.primary)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
     }
 }
 

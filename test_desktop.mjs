@@ -540,8 +540,10 @@ test('setup tiles are separated by real gaps, not touching edges', async () => {
   const setup = nodes(tree).find(n => n.type === 'details'
     && JSON.stringify(n.children).includes('Answer setup'));
   assert.ok(setup, 'answer setup renders');
-  assert.equal(setup.props.style.display, 'flex');
-  assert.ok(setup.props.style.gap >= 12, `expected gap >= 12, got ${setup.props.style.gap}`);
+  const stack = (setup.children || []).find(c => c && typeof c === 'object' && c.type === 'div'
+    && c.props.style && c.props.style.display === 'flex');
+  assert.ok(stack, 'setup content uses an inner flex stack');
+  assert.ok(stack.props.style.gap >= 12, `expected gap >= 12, got ${stack.props.style.gap}`);
 });
 
 test('transcript segments render as bounded tiles with accent edges', async () => {
@@ -563,7 +565,9 @@ test('setup rhythm: cards use grids and the web toggle is a tile', async () => {
   const { tree } = pane('', true, false, '', {}, {}, {});
   const setup = nodes(tree).find(n => n.type === 'details'
     && JSON.stringify(n.children).includes('Answer setup'));
-  assert.ok(setup.props.style.gap >= 14, `expected setup gap >= 14, got ${setup.props.style.gap}`);
+  const stack = (setup.children || []).find(c => c && typeof c === 'object' && c.type === 'div'
+    && c.props.style && c.props.style.display === 'flex');
+  assert.ok(stack && stack.props.style.gap >= 14, `expected setup gap >= 14, got ${stack && stack.props.style.gap}`);
   const modelCard = nodes(tree).find(n => n.type === 'section'
     && JSON.stringify(n.children).includes('Answer model'));
   assert.ok(modelCard, 'answer model card renders');
@@ -626,6 +630,31 @@ test('composer shortcut sends once without inserting a newline or interrupting c
     assert.equal(requests.length, 0, 'disabled shortcut must not send');
     assert.equal(prevented, false);
   }
+});
+
+test('answer setup is a bordered panel with a padded inner stack', async () => {
+  const { tree } = pane('', true, false, '', {}, {}, {});
+  const setup = nodes(tree).find(n => n.type === 'details'
+    && JSON.stringify(n.children).includes('Answer setup'));
+  assert.ok(setup, 'answer setup renders');
+  assert.ok(String(setup.props.style.border || '').includes('var(--ui-stroke-secondary)'),
+    'setup expandable has a visible panel boundary');
+  assert.ok(setup.props.style.borderRadius >= 12);
+  const wrapper = (setup.children || []).find(c => c && typeof c === 'object' && c.type === 'div'
+    && c.props.style && c.props.style.display === 'flex');
+  assert.ok(wrapper, 'setup content sits in an inner flex wrapper, not on the details element');
+  assert.ok(wrapper.props.style.gap >= 14);
+  const summary = (setup.children || []).find(c => c && c.type === 'summary');
+  assert.ok(JSON.stringify(summary.children).includes('Answer setup'), 'summary labels the panel');
+});
+
+test('capture session offers an overlay quick toggle', async () => {
+  const { tree, requests } = pane('', true, false, '', {}, {}, {});
+  const session = nodes(tree).find(n => n.type === 'section' && n.props['aria-label'] === 'Capture session');
+  const toggle = nodes(session).find(n => n.type === 'button' && n.children.includes('Show overlay'));
+  assert.ok(toggle, 'overlay can be shown from the top card without opening setup');
+  await toggle.props.onClick();
+  assert.ok(requests.some(r => r.path === '/overlay/show'), 'quick toggle shows the overlay');
 });
 
 test('layout order: capture session with permission comes first, transcript above history', async () => {
