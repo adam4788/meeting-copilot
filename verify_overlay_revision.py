@@ -8,6 +8,7 @@ import overlay_bridge as bridge
 import server
 from test_overlay_revision import RevisionTests
 from test_overlay_blockers import BlockerTests
+from test_overlay_teardown import OverlayTeardownTests
 
 
 def mutated(fn, old, new):
@@ -20,6 +21,16 @@ def mutated(fn, old, new):
 
 
 cases = [
+    ('autonomous retirement denies capture admission', server.MeetingState, '_start',
+     'self._reconcile_overlay_admission()', 'pass  # ignore autonomous bridge failure',
+     OverlayTeardownTests, 'test_autonomous_pipe_failure_blocks_start_until_confirmed_cleanup'),
+    ('confirmed exit permits fresh Show', server.MeetingState, '_reconcile_overlay_admission',
+     'if self.pending_overlay is bridge and alive is False:', 'if False:',
+     OverlayTeardownTests, 'test_confirmed_child_exit_allows_fresh_show_without_extra_hide'),
+    ('status process inspection cannot block Pause', server.MeetingState, 'status',
+     'alive = self._overlay_process_alive(overlay.process)',
+     'alive = overlay.process is not None and overlay.process.poll() is None',
+     OverlayTeardownTests, 'test_stalled_process_poll_cannot_hold_state_lock_or_block_pause'),
     ('unchanged scope must preserve authorization', server.MeetingState, '_refresh_overlay_token_locked',
      'if not force and callable(matches) and matches() is True:', 'if False:',
      RevisionTests, 'test_unchanged_scope_sync_preserves_inflight_and_completed'),
@@ -59,6 +70,7 @@ if __name__ == '__main__':
             raise AssertionError(label + ': expected assertion failure\n' + output.getvalue())
         print(label + ': RED confirmed')
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(RevisionTests)
+    suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(OverlayTeardownTests))
     suite.addTest(BlockerTests('test_hide_during_provider_preflight_prevents_provider_call'))
     if not unittest.TextTestRunner(verbosity=1).run(suite).wasSuccessful():
         raise SystemExit(1)

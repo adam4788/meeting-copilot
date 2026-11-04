@@ -133,6 +133,8 @@ class MeetingState:
         self.overlay_cleanup_error = None
         self.pending_overlay = None
         self._overlay_cleanup_job = None
+        self._overlay_probe_lock = threading.Lock()
+        self._overlay_probe_jobs = {}
         self._overlay_invalidation_error = None
         self.segments = deque(maxlen=120)
         self.listening = False
@@ -224,6 +226,7 @@ class MeetingState:
         from fastapi import HTTPException
         if self.pending_stop is not None:
             raise HTTPException(409, self.stop_error or 'Capture stop is not confirmed. Retry Pause before starting.')
+        self._reconcile_overlay_admission()
         if self.pending_overlay is not None or self.overlay_cleanup_error:
             raise HTTPException(409, self.overlay_cleanup_error or 'Overlay shutdown is not confirmed. Retry Hide / Clear.')
         if not consent:
@@ -1140,46 +1143,84 @@ class MeetingState:
                 # held here, so stop/join cannot deadlock its callbacks.
                 self._expire_capture()
 
+    def _overlay_process_alive(self, process):
+        """Tri-state inspection, with no process method on the caller thread.
+
+        A poll wrapper can hang just like a signal wrapper. Reuse its in-flight
+        probe rather than multiplying threads on status/retry. Workers acquire
+        no controller/publication locks; callers wait at most 50ms even when
+        status is nested under a publication lock. Never cache a live result
+        across completed probes (a subsequent exit must be discoverable).
+        """
+        if process is None:
+            return False
+        with self._overlay_probe_lock:
+            self._overlay_probe_jobs = {target: job for target, job in self._overlay_probe_jobs.items()
+                                        if not job['done'].is_set()}
+            job = self._overlay_probe_jobs.get(process)
+            if job is None:
+                job = {'done': threading.Event(), 'alive': None}
+                self._overlay_probe_jobs[process] = job
+                def inspect_process():
+                    try:
+                        job['alive'] = process.poll() is None
+                    except Exception:
+                        pass  # unknown is not evidence of exit
+                    finally:
+                        job['done'].set()
+                threading.Thread(target=inspect_process, name='meeting-overlay-probe', daemon=True).start()
+        job['done'].wait(.05)
+        return job['alive'] if job['done'].is_set() else None
+
+    def _reconcile_overlay_admission(self, *, for_show=False):
+        """Discover autonomous bridge retirement before Start or Show.
+
+        Caller holds lifecycle_lock. Preserve overlay -> bridge -> state order;
+        cleanup waits happen outside all publication locks. A confirmed child
+        exit can finish cleanup immediately, but an unknown/live retired child
+        remains reachable and denies admission until an explicit cleanup retry.
+        """
+        # lifecycle_lock stabilizes controller ownership. Healthy admission
+        # needs no publication lock (a tap may be waiting for state.lock while
+        # holding it); only retirement takes overlay -> bridge -> state locks.
+        bridge = self.overlay or self.pending_overlay
+        if bridge is None:
+            return
+        process = getattr(bridge, 'process', None)
+        alive = self._overlay_process_alive(process)
+        retire = self.overlay is bridge and (getattr(bridge, 'stopping', False) is True
+                 or alive is None or (alive is False and (process is not None or for_show)))
+        if retire:
+            with self.overlay_lock:
+                self._retire_overlay_locked()
+        if self.pending_overlay is bridge and alive is False:
+            self._finish_overlay_cleanup()
+
     def _overlay_show(self, scope):
         import importlib
         import secrets
+        self._reconcile_overlay_admission(for_show=True)
         with self.overlay_lock:
-            if self.overlay is not None and getattr(self.overlay, 'stopping', False) is True:
-                self._retire_overlay_locked()
             if self.pending_overlay is not None or self.overlay_cleanup_error:
                 raise _unavailable(self.overlay_cleanup_error or 'Overlay shutdown is not confirmed. Retry Hide / Clear.')
             cleaned = self._clean_overlay_scope(scope)
             if self.overlay is not None:
+                # Reconciliation confirmed a live, non-retired helper.
+                # Explicit Show establishes a fresh owner, even on reuse.
+                self.overlay_owner = secrets.token_hex(16)
+                self.overlay.scope_seq = 0
+                result = self.overlay.set_scope(cleaned)
+                if not (isinstance(result, dict) and result.get('ignored_stale')):
+                    self.overlay_scope_value = cleaned
+                    self._refresh_overlay_token_locked(force=True)
                 try:
-                    alive = self.overlay.process is not None and self.overlay.process.poll() is None
+                    self.overlay.update(self.status())
                 except Exception:
-                    self._retire_overlay_locked()
-                    raise _unavailable(self.overlay_cleanup_error)
-                if not alive:
-                    # Stopped or reaped bridge (e.g. watchdog expiry cleanup):
-                    # never report a dead helper as reused.
-                    try:
-                        self.overlay.stop()
-                    except Exception:
-                        pass
-                    self.overlay = None
-                else:
-                    # Explicit Show establishes a new owner even when the
-                    # native process is reused across pane remounts.
-                    self.overlay_owner = secrets.token_hex(16)
-                    self.overlay.scope_seq = 0
-                    result = self.overlay.set_scope(cleaned)
-                    if not (isinstance(result, dict) and result.get('ignored_stale')):
-                        self.overlay_scope_value = cleaned
-                        self._refresh_overlay_token_locked(force=True)
-                    try:
-                        self.overlay.update(self.status())
-                    except Exception:
-                        pass
-                    if not self.listening and self.pending_stop is None:
-                        self._touch_pane_seen()  # idle display lease only
-                    self._start_overlay_lease_locked()
-                    return {'shown': True, 'reused': True, 'available': True, 'owner': self.overlay_owner}
+                    pass
+                if not self.listening and self.pending_stop is None:
+                    self._touch_pane_seen()  # idle display lease only
+                self._start_overlay_lease_locked()
+                return {'shown': True, 'reused': True, 'available': True, 'owner': self.overlay_owner}
             try:
                 module = importlib.import_module(f'{__package__}.overlay_bridge' if __package__ else 'overlay_bridge')
             except ImportError:
@@ -1387,10 +1428,8 @@ class MeetingState:
                     overlay_status = overlay.helper_status()
                 except Exception:
                     overlay_status = None
-                try:
-                    alive = overlay.process is not None and overlay.process.poll() is None
-                except Exception:
-                    alive = None
+                alive = self._overlay_process_alive(overlay.process)
+                if alive is None:
                     uncertain_overlay = True
                 if alive is False:
                     overlay = None

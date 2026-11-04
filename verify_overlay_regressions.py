@@ -31,7 +31,7 @@ cases = [
      'if callable(retire):', 'if False:',
      'test_same_scope_authorization_refresh_retires_pending_tap'),
     ('D synchronous clear retirement', server.MeetingState, 'overlay_clear_boundary',
-     'bridge = self.overlay', 'bridge = None',
+     'self._retire_overlay_locked()', 'pass  # skip synchronous retirement',
      'test_clear_retires_overlay_without_waiting_for_poll'),
     ('E admission mapping fence', b.OverlayBridge, 'ask',
      '            self.row_by_request[request_id] = row_id', '            pass  # recreate unmapped admitted slot',

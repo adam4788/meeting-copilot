@@ -7,16 +7,16 @@ from contextlib import contextmanager
 from unittest.mock import patch
 
 from overlay_bridge import OverlayBridge
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 import server
 from thread_test_support import CheckedThreads
 
 
 @contextmanager
-def real_display(show=True):
+def real_display(show=True, child_code=None):
     process = subprocess.Popen(
-        [sys.executable, '-u', '-c', 'import time; print("ready", flush=True); time.sleep(60)'],
+        [sys.executable, '-u', '-c', child_code or 'import time; print("ready", flush=True); time.sleep(60)'],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         text=True, bufsize=1)
     real_kill = process.kill
@@ -36,6 +36,7 @@ def real_display(show=True):
         if process.poll() is None:
             real_kill()
         process.wait(timeout=2)
+        bridge.stop()
         for worker in bridge.threads:
             worker.join(2)
             assert not worker.is_alive(), worker.name
@@ -57,6 +58,119 @@ class OverlayTeardownTests(CheckedThreads):
         worker.join(1.5)
         self.assertFalse(worker.is_alive(), 'overlay teardown exceeded bounded deadline')
         return result[0]
+
+    def test_autonomous_pipe_failure_blocks_start_until_confirmed_cleanup(self):
+        from fastapi import HTTPException
+        from types import SimpleNamespace
+        starts = []
+        audio = SimpleNamespace(start=lambda **kw: starts.append(kw), stop=lambda: None)
+        state = server.MeetingState(audio_factory=lambda: audio)
+        with patch.object(state, 'watchdog'), real_display() as (bridge, process):
+            state.overlay = bridge
+            try:
+                with patch.object(process, 'terminate', side_effect=PermissionError('denied')), \
+                        patch.object(process, 'kill', side_effect=PermissionError('denied')), \
+                        patch.object(bridge, '_write_frame', side_effect=BrokenPipeError('closed pipe')):
+                    # The writer, not a controller Hide, discovers the failure.
+                    bridge.message = 'force a distinct pipe frame'
+                    bridge.push()
+                    deadline = time.monotonic() + 2
+                    while bridge.cleanup_error is None and time.monotonic() < deadline:
+                        time.sleep(.01)
+                    self.assertTrue(bridge.stopping)
+                    self.assertIsNotNone(bridge.cleanup_error)
+                    self.assertIsNone(state.pending_overlay)
+                    with self.assertRaises(HTTPException) as denied:
+                        state.start(True, 'native')
+                    self.assertEqual(denied.exception.status_code, 409)
+                    self.assertEqual(starts, [])
+                    self.assertIs(state.pending_overlay, bridge)
+                    self.assertIsNone(state.status(touch=False)['overlay_shown'])
+                self.assertTrue(self.bounded(bridge.hide_overlay)['stop_confirmed'])
+                self.assertTrue(state.start(True, 'native')['listening'])
+                self.assertIsNone(state.pending_overlay)
+                self.assertIsNone(state.overlay_cleanup_error)
+                self.assertEqual(len(starts), 1)
+            finally:
+                state.pause(retain_tail=False)
+
+    def test_confirmed_child_exit_allows_fresh_show_without_extra_hide(self):
+        for reaped in (False, True):
+            with self.subTest(reaped=reaped), real_display(show=False, child_code='pass') as (old, child), \
+                    real_display(show=False) as (fresh, replacement):
+                # Real orderly exit (code 0), not a fake poll result.
+                child.wait(timeout=2)
+                self.assertEqual(child.returncode, 0)
+                old.process = child
+                old.invalidate()
+                if reaped:
+                    self.assertTrue(old.stop())
+                state = server.MeetingState()
+                state.overlay = old
+                def launch():
+                    fresh.process = replacement
+                    return replacement
+                try:
+                    with patch('overlay_bridge.OverlayBridge', return_value=fresh), \
+                            patch.object(fresh, 'start_helper', side_effect=launch), \
+                            patch.object(state, '_start_overlay_lease_locked'):
+                        try:
+                            result = state.overlay_show({})
+                        except HTTPException as exc:
+                            self.fail(f'confirmed exit must allow fresh Show, got {exc}')
+                    self.assertTrue(result['shown'])
+                    self.assertFalse(result['reused'])
+                    self.assertIs(state.overlay, fresh)
+                    self.assertIsNone(state.pending_overlay)
+                    self.assertIsNone(state.overlay_cleanup_error)
+                finally:
+                    old.stop()
+                    if old._cleanup_job:
+                        old._cleanup_job['worker'].join(2)
+                    state.overlay_hide()
+
+    def test_stalled_process_poll_cannot_hold_state_lock_or_block_pause(self):
+        from types import SimpleNamespace
+        stopped = threading.Event()
+        audio = SimpleNamespace(start=lambda **kw: None, stop=stopped.set)
+        state = server.MeetingState(audio_factory=lambda: audio)
+        with patch.object(state, 'watchdog'), real_display() as (bridge, process):
+            state.start(True, 'native')
+            state.overlay = bridge
+            entered, release = threading.Event(), threading.Event()
+            real_poll = process.poll
+            def stalled_poll():
+                entered.set()
+                self.checked_wait(release, 5, 'release status process probe')
+                return real_poll()
+            status_worker = threading.Thread(target=self.checked_callback(lambda: state.status(touch=False)), daemon=True)
+            pause_worker = threading.Thread(target=self.checked_callback(lambda: state.pause(retain_tail=False)), daemon=True)
+            try:
+                with patch.object(process, 'poll', side_effect=stalled_poll) as probe:
+                    status_worker.start()
+                    self.assertTrue(entered.wait(1))
+                    pause_worker.start()
+                    pause_worker.join(.7)
+                    self.assertFalse(pause_worker.is_alive(), 'Pause blocked behind status process.poll')
+                    self.assertTrue(stopped.is_set())
+                    status_worker.join(.7)
+                    self.assertFalse(status_worker.is_alive(), 'status process inspection must be bounded')
+                    for _ in range(3):
+                        self.assertIsNone(state.status(touch=False)['overlay_shown'])
+                    self.assertEqual(probe.call_count, 1, 'reuse the in-flight process inspection')
+                    def denied_start():
+                        with self.assertRaises(HTTPException) as denied:
+                            state.start(True, 'native')
+                        return denied.exception.status_code
+                    self.assertEqual(self.bounded(denied_start), 409)
+                    self.assertIs(state.pending_overlay, bridge)
+                    self.assertEqual(probe.call_count, 1)
+            finally:
+                release.set()
+                status_worker.join(2)
+                if pause_worker.ident is not None:
+                    pause_worker.join(2)
+                state.pause(retain_tail=False)
 
     def test_clear_retains_pending_display_error_and_blocks_restart_until_retry(self):
         class Audio:
