@@ -285,13 +285,13 @@ class MeetingState:
             self.listening = True
             self.error = None
             self.error_request = None  # retry data belongs only to an active answer error
-            # New capture, new counters: restarting with identical options
-            # must not display the previous capture's loss as current.
+            # Reset capture-owned status before starting the new adapter, not
+            # after its callback: old errors/messages/loss are not evidence
+            # about this generation, even when resuming identical options.
+            # New startup failures and pending-stop evidence must survive.
             # Meeting-level history stays in segments and recent answers.
-            if isinstance(self.capture_info, dict):
-                for _loss_key in ('warning', 'dropped_chunks', 'native_dropped_chunks', 'worker_dropped_chunks',
-                                  'sub_second_dropped_chunks', 'reader_incomplete', 'partial_tail'):
-                    self.capture_info.pop(_loss_key, None)
+            self.capture_info = {}
+            self.capture_error = None
             self.capture_generation += 1
             # The newest capture owns the terminal state from birth: a late
             # terminal from an older capture can never present itself as
@@ -1192,18 +1192,21 @@ class MeetingState:
         """Tri-state inspection, with no process method on the caller thread.
 
         A poll wrapper can hang just like a signal wrapper. Reuse its in-flight
-        probe rather than multiplying threads on status/retry. Workers acquire
-        no controller/publication locks; callers wait at most 50ms even when
-        status is nested under a publication lock. Never cache a live result
+        probe rather than multiplying threads on status/retry or new children.
+        One controller-wide slot stays occupied until actual worker exit.
+        Workers acquire no controller/publication locks; callers wait at most
+        50ms even when status is nested under a publication lock. Never cache a live result
         across completed probes (a subsequent exit must be discoverable).
         """
         if process is None:
             return False
         with self._overlay_probe_lock:
             self._overlay_probe_jobs = {target: job for target, job in self._overlay_probe_jobs.items()
-                                        if not job['done'].is_set()}
+                                        if job['worker'].is_alive()}
             job = self._overlay_probe_jobs.get(process)
             if job is None:
+                if self._overlay_probe_jobs:
+                    return None  # another generation's result proves nothing
                 job = {'done': threading.Event(), 'alive': None}
                 self._overlay_probe_jobs[process] = job
                 def inspect_process():
@@ -1213,7 +1216,8 @@ class MeetingState:
                         pass  # unknown is not evidence of exit
                     finally:
                         job['done'].set()
-                threading.Thread(target=inspect_process, name='meeting-overlay-probe', daemon=True).start()
+                job['worker'] = threading.Thread(target=inspect_process, name='meeting-overlay-probe', daemon=True)
+                job['worker'].start()
         job['done'].wait(.05)
         return job['alive'] if job['done'].is_set() else None
 

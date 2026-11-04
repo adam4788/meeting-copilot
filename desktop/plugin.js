@@ -512,7 +512,7 @@ export default {
       const legacyError = !('error_source' in data) && data.error &&
         ![data.overlay_cleanup_error, data.meetily_clear_error, answerError, stopError, data.capture_error].includes(data.error)
         ? data.error : null;
-      const captureError = data.capture_error || (data.error_source === 'capture' ? data.error : null) || legacyError;
+      const captureError = data.capture_error || (data.error_source === 'capture' ? data.error : null);
       const recheckStatus = () => qc.invalidateQueries({ queryKey: [ID, 'status'] });
       const errorCard = (message, label, onClick, disabled = false) => message && h('div', { role: 'alert', style: card },
         h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' } },
@@ -566,6 +566,7 @@ export default {
         errorCard(answerError, data.error_request ? 'Retry' : 'Recheck status', () =>
           data.error_request ? replayRequest(data.error_request) : recheckStatus()),
         errorCard(stopError, 'Recheck status', recheckStatus),
+        errorCard(legacyError, 'Recheck status', recheckStatus),
         errorCard(captureError, restartCapture ? 'Restart capture' : 'Recheck status',
           restartCapture ? () => startCapture() : recheckStatus, restartCapture && captureBlocked),
         errorCard(data.meetily_clear_error, 'Clear again', async () => {

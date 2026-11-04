@@ -1,14 +1,89 @@
 """Offline error provenance regressions; no audio or provider services."""
 import threading
-import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import server
 from test_overlay_descendants import wait_until
+from thread_test_support import CheckedThreads
 
 
-class ErrorAttributionTests(unittest.TestCase):
+class ErrorAttributionTests(CheckedThreads):
+    def test_synchronous_new_startup_failure_and_pending_stop_survive_start(self):
+        from fastapi import HTTPException
+        for unconfirmed in (False, True):
+            with self.subTest(unconfirmed=unconfirmed):
+                def start(**kw):
+                    kw['on_status']({'state': 'error', 'error': 'Current startup failed',
+                                     'running': unconfirmed, 'stop_confirmed': not unconfirmed})
+                audio = SimpleNamespace(start=start, stop=lambda: None)
+                state = server.MeetingState(audio_factory=lambda: audio)
+                with patch.object(state, 'watchdog'), patch.object(state, '_start_stop_retry_locked'):
+                    try:
+                        self.assertFalse(state.start(True, backend='native')['listening'])
+                        status = state.status(touch=False)
+                        self.assertEqual(status['capture_error'], 'Current startup failed')
+                        self.assertEqual(status['stopping'], unconfirmed)
+                        self.assertEqual(status['error_source'], 'stop' if unconfirmed else 'capture')
+                        if unconfirmed:
+                            with self.assertRaises(HTTPException):
+                                state.start(True, backend='native', audio_source='system')
+                            self.assertEqual(state.status(touch=False)['capture_error'], 'Current startup failed')
+                            self.assertIs(state.pending_stop, audio)
+                    finally:
+                        state.pause()
+
+    def test_new_capture_resets_old_error_before_gated_status_callback(self):
+        for source in ('microphone', 'system'):
+            with self.subTest(source=source):
+                state, callbacks = self.make_state()
+                entered, release = threading.Event(), threading.Event()
+                workers = []
+                with patch.object(state, 'watchdog'), patch.object(state, '_start_stop_retry_locked'):
+                    try:
+                        state.start(True, backend='native', audio_source='microphone')
+                        old_status = callbacks[-1]
+                        old_status({'state': 'error', 'listening': False, 'error': 'Old microphone failed',
+                                    'message': 'Old capture message', 'warning': 'Old loss', 'dropped_chunks': 4})
+                        state.pause()
+                        state.start(True, backend='native', audio_source=source)
+                        new_status = callbacks[-1]
+
+                        def report():
+                            entered.set()
+                            self.checked_wait(release, 5, 'release new capture status')
+                            new_status({'state': 'error', 'listening': False, 'error': 'New startup failed',
+                                        'running': True, 'stop_confirmed': False})
+
+                        worker = threading.Thread(target=self.checked_callback(report))
+                        workers.append(worker)
+                        worker.start()
+                        self.assertTrue(entered.wait(1))
+                        old_status({'state': 'error', 'error': 'Late old failure'})
+                        pending = state.status(touch=False)
+                        self.assertTrue(pending['listening'])
+                        self.assertIsNone(pending['capture_error'])
+                        self.assertIsNone(pending['error'])
+                        self.assertIsNone(pending['error_source'])
+                        self.assertEqual(pending['capture'], {})
+                        self.assertEqual(pending['last_session']['audio_source'], source)
+                        release.set()
+                        worker.join(2)
+                        self.assertFalse(worker.is_alive())
+                        failed = state.status(touch=False)
+                        self.assertEqual(failed['capture_error'], 'New startup failed')
+                        self.assertEqual(failed['error_source'], 'stop')
+                        self.assertTrue(failed['stopping'])
+                        self.assertFalse(failed['stop_confirmed'])
+                        self.assertEqual(failed['capture']['state'], 'stopping')
+                        self.assertIs(state.pending_stop, state.audio)
+                    finally:
+                        release.set()
+                        for worker in workers:
+                            worker.join(2)
+                            self.assertFalse(worker.is_alive())
+                        state.pause()
+
     def make_state(self):
         callbacks = []
         audio = SimpleNamespace(start=lambda **kw: callbacks.append(kw['on_status']), stop=lambda: None)

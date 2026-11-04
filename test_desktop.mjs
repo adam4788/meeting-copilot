@@ -436,7 +436,7 @@ test('capture recovery confirms changed source before destructive restart', asyn
     const confirmations = [];
     const { tree, requests } = pane('', true, false, '',
       { 3: true, 4: 'macos', 11: 'system' }, {},
-      { error: 'capture failed', result: { answer: 'Retained answer', sources: [] },
+      { error: 'capture failed', error_source: 'capture', result: { answer: 'Retained answer', sources: [] },
         last_session: { backend: 'macos', transcription_model: 'base.en', audio_source: 'microphone' } },
       { window: { confirm: message => { confirmations.push(message); return accept; } } });
     const recovery = nodes(tree).find(n => n.type === 'button' && n.children.includes('Restart capture'));
@@ -449,7 +449,7 @@ test('capture recovery confirms changed source before destructive restart', asyn
 
 test('live capture error offers a status recheck, not a false restart label', async () => {
   const { tree, requests } = pane('', true, false, '', {}, {},
-    { listening: true, backend: 'meetily', error: 'snapshot_unavailable' });
+    { listening: true, backend: 'meetily', error: 'snapshot_unavailable', error_source: 'capture' });
   const recheck = nodes(tree).find(n => n.type === 'button' && n.children.includes('Recheck status'));
   assert.ok(recheck);
   assert.ok(!nodes(tree).some(n => n.type === 'button' && n.children.includes('Restart capture')));
@@ -562,6 +562,26 @@ function button(tree, label) { return nodes(tree).find(n => n.type === 'button' 
 function alertFor(tree, message) {
   return nodes(tree).find(n => n.props?.role === 'alert' && JSON.stringify(n.children).includes(message));
 }
+
+test('unclassified legacy errors only recheck even with prior backend and stale retry data', async () => {
+  for (const priorBackend of ['native', 'macos', 'meetily']) {
+    const status = { backend: priorBackend, listening: false,
+      error: 'Unclassified legacy failure',
+      error_request: { question: 'Old question', transcript: 'Private old transcript' } };
+    const p = lifecyclePane({}, { 3: true, 4: 'macos' }, status);
+    try {
+      const alert = alertFor(p.rerender(), status.error);
+      assert.ok(alert);
+      assert.ok(!button(alert, 'Restart capture'), 'legacy summary cannot authorize capture');
+      assert.ok(!button(alert, 'Retry'), 'retained request cannot authorize answer retry');
+      const recheck = button(alert, 'Recheck status');
+      assert.ok(recheck);
+      assert.equal(recheck.props.disabled, false);
+      await recheck.props.onClick();
+      assert.ok(!p.requests.some(r => ['/start', '/assist'].includes(r.path)));
+    } finally { p.unmount(); }
+  }
+});
 
 test('capture error never replays stale answer data after source changes', async () => {
   const status = { error: 'Answer failed', answer_error: 'Answer failed', error_source: 'answer',
@@ -1285,10 +1305,10 @@ test('unsupported setup names the reason beside the answer action', async () => 
   assert.ok(buttons.some(n => n.children.includes('Suggest answer') && n.props.disabled));
 });
 
-test('backend errors offer retry, local errors offer dismiss', async () => {
+test('classified capture errors offer restart, local errors offer dismiss', async () => {
   const { tree: local } = pane('', true, false, '', { 6: 'boom' }, {}, {});
   assert.ok(nodes(local).some(n => n.type === 'button' && n.children.includes('Dismiss')));
-  const { tree: remote } = pane('', true, false, '', {}, {}, { error: 'capture failed' });
+  const { tree: remote } = pane('', true, false, '', {}, {}, { error: 'capture failed', error_source: 'capture' });
   assert.ok(nodes(remote).some(n => n.type === 'button' && n.children.includes('Restart capture')));
 });
 
@@ -1320,9 +1340,10 @@ test('dismiss never sends anything', async () => {
 });
 
 test('capture errors offer an honest capture restart instead of re-asking', async () => {
-  const { tree, requests } = pane('edited', true, false, '', { 23: { question: 'original?', extra: {} }, 24: true }, {}, { error: 'capture failed' });
+  const { tree, requests } = pane('edited', true, false, '', { 3: true, 4: 'macos', 23: { question: 'original?', extra: {} }, 24: true }, {}, { error: 'capture failed', error_source: 'capture' });
   const retry = nodes(tree).find(n => n.type === 'button' && (n.children.includes('Restart capture') || n.children.includes('Retry')));
   assert.ok(retry, 'capture errors offer recovery');
+  assert.equal(retry.props.disabled, false);
   await retry.props.onClick();
   assert.ok(!requests.some(r => r.path === '/assist'), 'capture recovery must not re-ask an answer');
   assert.ok(requests.some(r => r.path === '/start'), 'capture recovery restarts capture');
