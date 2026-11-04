@@ -25,7 +25,7 @@ export default {
           const parsed = JSON.parse(current || '{}');
           if (!parsed || typeof parsed !== 'object') return {};
           const out = {};
-          for (const k of ['project', 'backend', 'transcriptionModel', 'audioSource', 'answerProvider', 'answerModel']) {
+          for (const k of ['project', 'backend', 'transcriptionModel', 'audioSource', 'answerProvider', 'answerModel', 'transcriptionProvider', 'asrMode']) {
             if (typeof parsed[k] === 'string') out[k] = parsed[k].slice(0, 500);
           }
           if (typeof parsed.webFallback === 'boolean') out.webFallback = parsed.webFallback;
@@ -34,7 +34,7 @@ export default {
             try {
               const oldParsed = JSON.parse(legacy);
               if (oldParsed && typeof oldParsed === 'object') {
-                for (const k of ['project', 'backend', 'transcriptionModel', 'audioSource', 'answerProvider', 'answerModel']) {
+                for (const k of ['project', 'backend', 'transcriptionModel', 'audioSource', 'answerProvider', 'answerModel', 'transcriptionProvider', 'asrMode']) {
                   if (out[k] === undefined && typeof oldParsed[k] === 'string') out[k] = oldParsed[k].slice(0, 500);
                 }
               }
@@ -157,6 +157,13 @@ export default {
       const [liveEntry, setLiveEntry] = useState(null);
       const [lastAsked, setLastAsked] = useState(null);
       const [assistFailed, setAssistFailed] = useState(false);
+      const [transcriptionProvider, setTranscriptionProvider] = useState(saved.transcriptionProvider === 'meta' ? 'meta' : 'local');
+      const [asrMode, setAsrMode] = useState(['ENDPOINTING', 'DIARIZATION', 'PUSH_TO_TALK'].includes(saved.asrMode) ? saved.asrMode : 'ENDPOINTING');
+      useEffect(() => {
+        try {
+          if (typeof localStorage !== 'undefined') localStorage.setItem(SCOPE_KEY, JSON.stringify({ project, backend, webFallback, transcriptionModel, audioSource, answerProvider, answerModel, transcriptionProvider, asrMode }));
+        } catch (e) {}
+      }, [project, backend, webFallback, transcriptionModel, audioSource, answerProvider, answerModel, transcriptionProvider, asrMode]);
       function resetMeetingInputs() {
         setQuestion(''); setWeb(''); setLastAsked(null); setLiveEntry(null);
         setTrackedRequest(null); setError(''); setAssistFailed(false);
@@ -167,13 +174,15 @@ export default {
         const changed = retained && last && (
           last.backend !== backend || (backend === 'meetily'
             ? last.recording_id !== (recording || null)
-            : last.transcription_model !== transcriptionModel || last.audio_source !== audioSource));
+            : last.transcription_model !== transcriptionModel || last.audio_source !== audioSource
+              || (last.transcription_provider || 'local') !== transcriptionProvider || (last.asr_mode || 'ENDPOINTING') !== asrMode));
         const message = newMeeting
           ? 'Start a fresh meeting? The earlier transcript, answers, and retry data are cleared.'
           : 'These settings differ from the previous session, so starting begins a fresh meeting and clears the earlier transcript, answers, and retry data. Continue?';
         if ((newMeeting || changed) && typeof window !== 'undefined' && window.confirm && !window.confirm(message)) return false;
         const ok = await act('/start', { consent, backend, recording_id: recording || null,
-          transcription_model: transcriptionModel, audio_source: audioSource, new_meeting: newMeeting });
+          transcription_model: transcriptionModel, audio_source: audioSource, new_meeting: newMeeting,
+          transcription_provider: transcriptionProvider, asr_mode: asrMode });
         if (ok && (newMeeting || changed)) resetMeetingInputs();
         return ok;
       }
@@ -375,9 +384,17 @@ export default {
           backend === 'macos' && h('div', { style: { display: 'grid', gap: 8, paddingBottom: 12 } },
             h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Audio source'), h('select', { style: selectStyle, value: audioSource, disabled: data.listening, onChange: e => setAudioSource(e.target.value), 'aria-label': 'Audio source' },
               h('option', { value: 'microphone' }, 'Microphone'), h('option', { value: 'system' }, 'System audio'), h('option', { value: 'both' }, 'Microphone + system audio'))),
-            h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Local transcription model'), h('select', { style: selectStyle, value: transcriptionModel, disabled: data.listening, onChange: e => setTranscriptionModel(e.target.value), 'aria-label': 'Local transcription model' },
+            h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Transcription provider'), h('select', { style: selectStyle, value: transcriptionProvider, disabled: data.listening, onChange: e => setTranscriptionProvider(e.target.value), 'aria-label': 'Transcription provider' },
+              h('option', { value: 'local' }, 'Local — faster-whisper on this Mac'),
+              h('option', { value: 'meta', disabled: !data.capabilities?.meta_asr, title: data.capabilities?.meta_asr ? '' : 'Set MODEL_API_KEY for the gateway, then prepare macOS capture again' }, 'Meta Muse Voice — cloud transcription'))),
+            transcriptionProvider === 'local' && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Local transcription model'), h('select', { style: selectStyle, value: transcriptionModel, disabled: data.listening, onChange: e => setTranscriptionModel(e.target.value), 'aria-label': 'Local transcription model' },
               h('option', { value: 'tiny.en' }, 'Whisper tiny.en — fastest'), h('option', { value: 'base.en' }, 'Whisper base.en — balanced'), h('option', { value: 'small.en' }, 'Whisper small.en — higher accuracy'))),
-            h('span', { style: muted }, 'Runs locally in a separate audio worker. First use may download the selected model. macOS microphone / screen-and-system-audio permissions are required. No Meetily process or recording is needed.')),
+            transcriptionProvider === 'local' && h('span', { style: muted }, 'Runs locally in a separate audio worker. First use may download the selected model. macOS microphone / screen-and-system-audio permissions are required. No Meetily process or recording is needed.'),
+            transcriptionProvider === 'meta' && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Meta ASR mode'), h('select', { style: selectStyle, value: asrMode, disabled: data.listening, onChange: e => setAsrMode(e.target.value), 'aria-label': 'Meta ASR mode' },
+              h('option', { value: 'ENDPOINTING' }, 'Endpointing — one segment per utterance'),
+              h('option', { value: 'DIARIZATION' }, 'Diarization — speaker labels per source'),
+              h('option', { value: 'PUSH_TO_TALK' }, 'Push-to-talk — single-turn finals'))),
+            transcriptionProvider === 'meta' && h('span', { role: 'status', style: muted }, 'Cloud transcription: meeting audio is sent to Meta (muse-voice-transcribe) while listening. Only final turns are kept; the API key stays on the gateway and is never shown here. Local transcription remains the default.')),
           backend === 'meetily' && h('div', { style: { display: 'grid', gap: 8, paddingBottom: 12 } },
             h('span', { style: muted }, 'Start recording in Meetily, then choose the active meeting here. Only the explicitly selected transcript is read.'),
             h('label', { style: { display: 'grid', gap: 6 } }, h('span', { id: 'mc-rec-label' }, 'Active Meetily recording'),

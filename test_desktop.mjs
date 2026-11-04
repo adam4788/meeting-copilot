@@ -149,6 +149,35 @@ test('independent transcription sends explicit local model/source and consent', 
   assert.equal(body.consent, true);
 });
 
+test('meta cloud transcription is opt-in, warns, and sends provider/mode', async () => {
+  const caps = { capabilities: { all_projects: true, automatic_web_fallback: true, independent_models: true, macos_transcription: true, meta_asr: true, overlay: true, overlay_stream: true, overlay_cancel: true } };
+  const { tree, requests } = pane('', true, false, '',
+    { 3: true, 4: 'macos', 25: 'meta', 26: 'DIARIZATION' }, {}, caps);
+  const provider = nodes(tree).find(n => n.type === 'select' && n.props['aria-label'] === 'Transcription provider');
+  assert.ok(provider, 'transcription provider select renders');
+  assert.equal(provider.props.value, 'meta');
+  const mode = nodes(tree).find(n => n.type === 'select' && n.props['aria-label'] === 'Meta ASR mode');
+  assert.ok(mode, 'ASR mode select renders for the meta provider');
+  assert.equal(mode.props.value, 'DIARIZATION');
+  assert.ok(!nodes(tree).some(n => n.type === 'select' && n.props['aria-label'] === 'Local transcription model'),
+    'local model select hides when cloud provider is selected');
+  assert.ok(JSON.stringify(tree).includes('meeting audio is sent to Meta'), 'cloud warning is explicit');
+  const start = nodes(tree).find(n => n.type === 'button' && n.children.includes('Start listening'));
+  await start.props.onClick();
+  const body = requests.find(r => r.path === '/start').body;
+  assert.equal(body.transcription_provider, 'meta');
+  assert.equal(body.asr_mode, 'DIARIZATION');
+});
+
+test('meta provider option is disabled without a configured key', async () => {
+  const { tree } = pane('', true, false, '', { 3: true, 4: 'macos' });
+  const option = nodes(tree).find(n => n.type === 'option' && n.props.value === 'meta');
+  assert.ok(option, 'meta option renders');
+  assert.equal(option.props.disabled, true);
+  const provider = nodes(tree).find(n => n.type === 'select' && n.props['aria-label'] === 'Transcription provider');
+  assert.equal(provider.props.value, 'local', 'local remains the default');
+});
+
 test('answer model selection is explicit and separate from transcription', async () => {
   const { tree, requests } = pane('', true, false, '', { 12: 'openai-codex', 13: 'gpt-test' });
   assert.ok(nodes(tree).find(n => n.type === 'option' && n.props.value === 'gpt-test'));

@@ -21,6 +21,8 @@ ERRORS = {
     'capture': 'Native audio capture failed. Check the selected source and macOS permissions.',
     'protocol': 'Invalid or oversized audio worker frame.',
     'worker': 'Audio worker exited unexpectedly.',
+    'asr_auth': 'Meta cloud transcription is not configured: set MODEL_API_KEY, then prepare macOS capture again.',
+    'asr': 'Meta cloud transcription failed. Check the network connection and MODEL_API_KEY, then restart capture.',
 }
 
 
@@ -76,15 +78,21 @@ import threading
 
 MODELS = ('tiny.en', 'base.en', 'small.en')
 SOURCES = ('microphone', 'system', 'both')
+PROVIDERS = ('local', 'meta')
+ASR_MODES = ('ENDPOINTING', 'DIARIZATION', 'PUSH_TO_TALK')
 
 
-def validate(model, source, language):
+def validate(model, source, language, provider='local', asr_mode='ENDPOINTING'):
     if model not in MODELS:
         raise ValueError('model must be tiny.en, base.en, or small.en')
     if source not in SOURCES:
         raise ValueError('source must be microphone, system, or both')
     if language != 'en':
         raise ValueError('English-only models require language=en')
+    if provider not in PROVIDERS:
+        raise ValueError('provider must be local or meta')
+    if asr_mode not in ASR_MODES:
+        raise ValueError('asr_mode must be ENDPOINTING, DIARIZATION, or PUSH_TO_TALK')
 
 
 def worker_env():
@@ -95,9 +103,11 @@ def worker_env():
 
 
 class MacOSAudioCapture:
-    def __init__(self, model_size='base.en', source='microphone', language='en'):
-        validate(model_size, source, language)
+    def __init__(self, model_size='base.en', source='microphone', language='en',
+                 provider='local', asr_mode='ENDPOINTING'):
+        validate(model_size, source, language, provider, asr_mode)
         self.model_size, self.source, self.language = model_size, source, language
+        self.provider, self.asr_mode = provider, asr_mode
         self._lock = threading.RLock()
         self._state, self._error = 'idle', None
         self._callback_error = None
@@ -111,6 +121,8 @@ class MacOSAudioCapture:
         root = Path(__file__).resolve().parent
         return {'backend': 'macos-native', 'sources': list(SOURCES),
                 'default_source': 'microphone', 'models': list(MODELS),
+                'providers': list(PROVIDERS), 'asr_modes': list(ASR_MODES),
+                'meta_asr_available': bool(os.environ.get('MODEL_API_KEY')),
                 'permissions_checked': False,
                 'helper_available': (root / 'macos_capture').is_file(),
                 'permission_requirements': {'microphone': 'Microphone',
@@ -120,7 +132,9 @@ class MacOSAudioCapture:
         with self._lock:
             return {'state': self._state, 'running': bool(self._thread and self._thread.is_alive()),
                     'error': self._error, 'callback_error': self._callback_error,
-                    'source': self.source, 'model': self.model_size}
+                    'source': self.source, 'model': self.model_size,
+                    'provider': getattr(self, 'provider', 'local'),
+                    'asr_mode': getattr(self, 'asr_mode', 'ENDPOINTING')}
 
     def _notify(self, state, code=None):
         if self._cancel.is_set():
@@ -172,7 +186,8 @@ class MacOSAudioCapture:
         try:
             root = Path(__file__).resolve().parent
             command = [worker_python(root), '-u', str(root / 'audio_worker.py'),
-                       '--model', self.model_size, '--source', self.source, '--language', self.language]
+                       '--model', self.model_size, '--source', self.source, '--language', self.language,
+                       '--provider', self.provider, '--asr-mode', self.asr_mode]
             if self._cancel.is_set():
                 return
             process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
