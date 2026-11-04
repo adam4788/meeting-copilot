@@ -169,6 +169,25 @@ test('meta cloud transcription is opt-in, warns, and sends provider/mode', async
   assert.equal(body.asr_mode, 'DIARIZATION');
 });
 
+test('capture card discloses cloud audio transmission for selected Meta transcription', () => {
+  for (const [backend, provider, expected] of [['macos', 'meta', true], ['macos', 'local', false], ['meetily', 'meta', false]]) {
+    const { tree } = pane('', true, false, '', { 4: backend, 25: provider });
+    const capture = nodes(tree).find(n => n.type === 'section' && n.props['aria-label'] === 'Capture session');
+    const disclosure = nodes(capture).find(n => n.props['data-cloud-capture-disclosure'] === true);
+    assert.equal(!!disclosure, expected, `${backend}/${provider}`);
+    if (disclosure) {
+      assert.match(JSON.stringify(disclosure), /audio.*sent to Meta/i);
+      assert.equal(disclosure.props.role, 'status');
+      assert.ok(capture.children.indexOf(disclosure) < capture.children.findIndex(n => n?.type === 'div' && nodes(n).some(x => x.type === 'button' && x.children.includes('Start listening'))));
+      const start = nodes(capture).find(n => n.type === 'button' && n.children.includes('Start listening'));
+      assert.equal(start.props.disabled, true, 'permission gate remains in effect');
+    }
+  }
+  const listening = pane('', true, false, '', { 3: true, 4: 'macos', 25: 'meta' }, {}, { listening: true });
+  const notice = nodes(listening.tree).find(n => n.props['data-cloud-capture-disclosure'] === true);
+  assert.match(JSON.stringify(notice), /Pause to change/);
+});
+
 test('meta provider option is disabled without a configured key', async () => {
   const { tree } = pane('', true, false, '', { 3: true, 4: 'macos' });
   const option = nodes(tree).find(n => n.type === 'option' && n.props.value === 'meta');
