@@ -121,10 +121,14 @@ class FileTranscribeTests(unittest.TestCase):
                 {'transcript': 'Second turn.'},
             ]})
 
-        import tempfile, os
+        import tempfile, os, wave
         with tempfile.NamedTemporaryFile('wb', suffix='.wav', delete=False) as handle:
-            handle.write(b'RIFF-fake-wav')
             path = handle.name
+        with wave.open(path, 'wb') as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(24000)
+            wav.writeframes(b'\x00\x00' * 2400)
         try:
             segments = meta_asr.transcribe_file(path, 'KEY123', opener=opener)
         finally:
@@ -135,7 +139,7 @@ class FileTranscribeTests(unittest.TestCase):
         self.assertIn(b'name="request"', body)
         self.assertIn(b'muse-voice-transcribe-1.0', body)
         self.assertIn(b'name="audio"', body)
-        self.assertIn(b'RIFF-fake-wav', body)
+        self.assertIn(b'"audioEncoding": "WAV"', body)
         self.assertEqual([s['text'] for s in segments], ['First turn.', 'Second turn.'])
         self.assertEqual(segments[0]['speaker'], 'you \u00b7 Speaker A')
 

@@ -156,12 +156,23 @@ def transcribe_file(path, api_key, model=DEFAULT_MODEL, mode='ENDPOINTING',
     .read()). The WAV must be mono 16-bit PCM at 16/24 kHz.
     """
     import urllib.request
+    import wave
     if not api_key:
         raise MetaAsrError('Meta ASR requires MODEL_API_KEY')
     with open(path, 'rb') as handle:
         audio = handle.read()
+    try:
+        with wave.open(path, 'rb') as wav:
+            rate = wav.getframerate()
+    except Exception:
+        raise MetaAsrError('Meta ASR file transcription requires a WAV file') from None
+    if rate not in (16000, 24000):
+        raise MetaAsrError('Meta ASR requires 16 kHz or 24 kHz WAV audio')
     boundary = f'mc{uuid.uuid4().hex}'
+    # The file endpoint takes the WAV container as-is: audioEncoding is
+    # 'WAV' here (PCM_16KHZ/PCM_24KHZ are realtime stream encodings).
     request_json = json.dumps({'model': model or DEFAULT_MODEL, 'mode': mode,
+                               'audioEncoding': 'WAV',
                                'languageBias': ['English']}).encode()
     body = b''.join([
         f'--{boundary}\r\nContent-Disposition: form-data; name="request"\r\n'
