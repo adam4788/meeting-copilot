@@ -395,6 +395,9 @@ class OverlayBridge:
         self.pushed = []  # headless record (helper=None); used by tests/dry-run
         self.threads = []
         self.stopping = False
+        self._lifecycle_epoch = 0
+        self._startup_cancelled = False
+        self._admission_lock = threading.RLock()
         import queue as _queue
         self._push_queue = _queue.Queue(maxsize=8)
         self._click_queue = _queue.Queue(maxsize=32)
@@ -889,15 +892,27 @@ class OverlayBridge:
         self._protocol_error = None
         if not isinstance(self.helper_path, str):
             return False
+        target = None
+        valid = False
         try:
-            result = subprocess.run(
+            # Never use run/Popen's context manager here: its __exit__ waits
+            # indefinitely if timeout-triggered kill fails. Own the probe just
+            # like a display until the bounded reaper proves termination.
+            target = subprocess.Popen(
                 [self.helper_path] + list(getattr(self, 'helper_args', None) or []) + ['--protocol-version'],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, timeout=2, text=True)
-            if result.returncode == 0 and result.stdout.strip() == 'meeting-overlay/2':
-                return True
+                stderr=subprocess.DEVNULL, text=True)
+            with self.lock:
+                self.process = target
+            output, _ = target.communicate(timeout=2)
+            valid = target.returncode == 0 and output.strip() == 'meeting-overlay/2'
         except (OSError, ValueError, subprocess.TimeoutExpired):
             pass
+        finally:
+            if target is not None:
+                valid = self._reap_locked(target) and valid
+        if valid:
+            return True
         self._protocol_error = ('Overlay helper protocol is outdated or incompatible. '
                                 'Update the plugin sources and run python prepare_macos.py '
                                 '--home <active-profile-home> to rebuild it, then Show overlay again. '
@@ -916,8 +931,10 @@ class OverlayBridge:
             self.process = None
             return None
         if not self._check_helper_protocol():
-            self.process = None
-            return None
+            return None  # retain an unconfirmed probe for Hide / Clear
+        with self.lock:
+            if self.stopping:
+                return None
         argv = [self.helper_path] + list(getattr(self, 'helper_args', None) or [])
         kwargs = dict(stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                       stderr=subprocess.DEVNULL, text=True, bufsize=1)
@@ -944,10 +961,14 @@ class OverlayBridge:
             # Reaped or exited helper: fall through to a clean relaunch.
             if not self._reap_locked(None):
                 return {'shown': None, 'stop_confirmed': False, 'error': self.cleanup_error}
-        self.stopping = False
-        self.start_helper()
-        process = self.process
         with self.lock:
+            if getattr(self, '_startup_cancelled', False):
+                return {'shown': False, 'error': 'Overlay startup was retired.'}
+            self.stopping = False
+        process = self.start_helper()
+        with self.lock:
+            if self.stopping:
+                return {'shown': False, 'error': 'Overlay startup was retired.'}
             # Fresh helper lifecycle: never suppress the first snapshot.
             self._last_emit_digest = None
         if process is None:
@@ -1387,7 +1408,9 @@ class OverlayBridge:
 
     def _retire_lifecycle_locked(self):
         """Invalidate queued taps as well as admitted slots on every exit."""
-        self.stopping = True
+        with self._admission_lock:
+            self.stopping = True
+            self._lifecycle_epoch += 1
         self._listening = self.listening = False
         self.paused_generation += 1
         for request_id in list(self.row_by_request):

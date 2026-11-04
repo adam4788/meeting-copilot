@@ -9,6 +9,7 @@ import server
 from test_overlay_revision import RevisionTests
 from test_overlay_blockers import BlockerTests
 from test_overlay_teardown import OverlayTeardownTests
+from test_overlay_startup_admission import StartupAdmissionTests
 
 
 def mutated(fn, old, new):
@@ -21,9 +22,26 @@ def mutated(fn, old, new):
 
 
 cases = [
-    ('autonomous retirement denies capture admission', server.MeetingState, '_start',
-     'self._reconcile_overlay_admission()', 'pass  # ignore autonomous bridge failure',
-     OverlayTeardownTests, 'test_autonomous_pipe_failure_blocks_start_until_confirmed_cleanup'),
+    ('retirement validation is atomic with admission', server.MeetingState, '_overlay_admission_guard',
+     'bridge, epoch = ticket or (None, 0)', 'yield; return  # ignore retirement at commit',
+     StartupAdmissionTests, 'test_retirement_between_reconcile_and_admission_denies_start_and_show'),
+    ('startup retirement is checked before Show commit', server.MeetingState, 'overlay_show',
+     "and getattr(bridge, 'stopping', False) is not True", 'and True',
+     StartupAdmissionTests, 'test_startup_retirement_before_show_commit_retains_real_child'),
+    ('in-flight spawn cannot be declared cleaned', server.MeetingState, '_finish_overlay_cleanup',
+     "if startup is not None and startup['bridge'] is bridge and not startup['done'].is_set():", 'if False:',
+     StartupAdmissionTests, 'test_delayed_spawn_cannot_block_watchdog_or_rebind_new_owner'),
+    ('protocol timeout must retain ownership when kill is denied', bridge.OverlayBridge, '_check_helper_protocol',
+     'self._protocol_error = None',
+     '''self._protocol_error = None
+    try:
+        result = subprocess.run([self.helper_path] + self.helper_args + ['--protocol-version'],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, timeout=2, text=True)
+        return result.returncode == 0 and result.stdout.strip() == 'meeting-overlay/2'
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+''', StartupAdmissionTests, 'test_protocol_timeout_retains_child_without_blocking_pause'),
     ('confirmed exit permits fresh Show', server.MeetingState, '_reconcile_overlay_admission',
      'if self.pending_overlay is bridge and alive is False:', 'if False:',
      OverlayTeardownTests, 'test_confirmed_child_exit_allows_fresh_show_without_extra_hide'),
@@ -44,7 +62,7 @@ cases = [
      'if (not pane or pane != self.overlay_pane', 'if False and (not pane or pane != self.overlay_pane',
      RevisionTests, 'test_old_pane_and_delayed_show_actions_are_fenced'),
     ('new meeting synchronous retirement', server.MeetingState, '_start',
-     'boundary = self.overlay_clear_boundary() if switching else nullcontext()', 'boundary = nullcontext()',
+     'boundary = self.overlay_clear_boundary() if switching else nullcontext()', 'boundary = nullcontext(); switching = False',
      RevisionTests, 'test_start_new_or_switched_meeting_retires_overlay_synchronously'),
     ('completed pre-cleanup capture transition', bridge.OverlayBridge, 'update',
      "if not self.answers.get(key, {}).get('completed')", 'if True',
@@ -71,6 +89,7 @@ if __name__ == '__main__':
         print(label + ': RED confirmed')
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(RevisionTests)
     suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(OverlayTeardownTests))
+    suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(StartupAdmissionTests))
     suite.addTest(BlockerTests('test_hide_during_provider_preflight_prevents_provider_call'))
     if not unittest.TextTestRunner(verbosity=1).run(suite).wasSuccessful():
         raise SystemExit(1)

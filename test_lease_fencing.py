@@ -1,4 +1,5 @@
 """Real-router lease tests: no hardware, providers or wall-clock sleeps."""
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from fastapi import FastAPI
@@ -211,10 +212,13 @@ class LeaseFencingTests(CheckedThreads):
         self.start(pane=pane, action=1)
         seen = self.state.pane_seen
         self.now += 29
-        display = Mock()
+        display = Mock(lock=threading.RLock(), stopping=False,
+                       _admission_lock=threading.RLock(), _lifecycle_epoch=0)
         display.show_overlay.side_effect = lambda: (self.tick(2), {'shown': True})[1]
         with patch('overlay_bridge.OverlayBridge', return_value=display):
-            self.post('/overlay/show', {'pane': pane, 'action': 2, 'scope': {}})
+            response = self.client.post('/overlay/show', json={'pane': pane, 'action': 2, 'scope': {}})
+        # Expiry retires the pending startup before its Show commit.
+        self.assertEqual(response.status_code, 503)
         self.assertFalse(self.state.listening)
         self.assertEqual(self.state.pane_seen, seen)
         self.assertFalse(self.post('/heartbeat', {'pane': pane})['accepted'])
@@ -249,7 +253,8 @@ class LeaseFencingTests(CheckedThreads):
         self.start(pane=pane, action=1)
         seen = self.state.pane_seen
         self.now += 31
-        display = Mock()
+        display = Mock(lock=threading.RLock(), stopping=False,
+                       _admission_lock=threading.RLock(), _lifecycle_epoch=0)
         display.show_overlay.return_value = {'shown': False}
         with patch('overlay_bridge.OverlayBridge', return_value=display):
             result = self.client.post('/overlay/show', json={'pane': pane, 'action': 2, 'scope': {}})
@@ -294,7 +299,8 @@ class LeaseFencingTests(CheckedThreads):
     def test_explicit_show_reestablishes_expired_display_lease(self):
         pane = self.claim()
         self.now += 31
-        display = Mock()
+        display = Mock(lock=threading.RLock(), stopping=False,
+                       _admission_lock=threading.RLock(), _lifecycle_epoch=0)
         display.show_overlay.return_value = {'shown': True}
         display.set_scope.return_value = {}
         with patch('overlay_bridge.OverlayBridge', return_value=display), patch.object(self.state, '_start_overlay_lease_locked'):

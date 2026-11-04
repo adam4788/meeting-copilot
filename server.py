@@ -133,6 +133,7 @@ class MeetingState:
         self.overlay_cleanup_error = None
         self.pending_overlay = None
         self._overlay_cleanup_job = None
+        self._overlay_startup_job = None
         self._overlay_probe_lock = threading.Lock()
         self._overlay_probe_jobs = {}
         self._overlay_invalidation_error = None
@@ -226,14 +227,14 @@ class MeetingState:
         from fastapi import HTTPException
         if self.pending_stop is not None:
             raise HTTPException(409, self.stop_error or 'Capture stop is not confirmed. Retry Pause before starting.')
-        self._reconcile_overlay_admission()
+        ticket = self._reconcile_overlay_admission()
         if self.pending_overlay is not None or self.overlay_cleanup_error:
             raise HTTPException(409, self.overlay_cleanup_error or 'Overlay shutdown is not confirmed. Retry Hide / Clear.')
         if not consent:
             raise HTTPException(400, 'Confirm participant consent and audio capture before starting.')
         if backend == 'meetily' and not recording_id:
             raise HTTPException(400, 'Start a recording in Meetily, then explicitly select it here.')
-        with self.lock:
+        with self._overlay_admission_guard(ticket), self.lock:
             # Check under the same lock Clear uses to record the failure, and
             # before any state mutation: a concurrent plain start must block
             # until a paused Clear publishes its outcome instead of reading a
@@ -256,7 +257,7 @@ class MeetingState:
         # Retire before publishing the new session, with lock order
         # lifecycle -> overlay -> bridge -> state, never state -> bridge.
         boundary = self.overlay_clear_boundary() if switching else nullcontext()
-        with boundary, self.lock:
+        with boundary, self._overlay_admission_guard(ticket) if not switching else nullcontext(), self.lock:
             if self.pending_stop is not None:
                 raise HTTPException(409, self.stop_error)
             # A new meeting never inherits the prior one: same-settings start
@@ -355,20 +356,22 @@ class MeetingState:
             if retry_sequence is not None:
                 self._start_stop_retry_locked(retry_sequence)
         try:
-            if backend == 'meetily':
-                bridge = self.get_bridge()
-                if new_meeting:
-                    forget = getattr(bridge, 'note_cleared', None)
-                    if callable(forget):
-                        forget(recording_id)
-                    with self.lock:
-                        self.meetily_clear_error = None
-                bridge.attach(recording_id, on_segment=segment_callback, on_status=status_callback)
-            else:
-                # A native/macOS start installs no Meetily boundary, so it
-                # must not clear a failed one: the flag stands until a
-                # Meetily Clear or new meeting actually installs it.
-                self.audio.start(on_segment=segment_callback, on_status=status_callback)
+            with self._overlay_admission_guard(None if switching else ticket):
+                if backend == 'meetily':
+                    bridge = self.get_bridge()
+                    if new_meeting:
+                        forget = getattr(bridge, 'note_cleared', None)
+                        if callable(forget):
+                            forget(recording_id)
+                        with self.lock:
+                            self.meetily_clear_error = None
+                    bridge.attach(recording_id, on_segment=segment_callback, on_status=status_callback)
+                else:
+                    # Native start must not clear a failed Meetily boundary.
+                    self.audio.start(on_segment=segment_callback, on_status=status_callback)
+        except HTTPException:
+            self.pause(retain_tail=False)
+            raise
         except Exception as exc:
             self.pause()
             raise HTTPException(503, f'Audio could not start: {type(exc).__name__}: {str(exc)[:300]}') from exc
@@ -1131,17 +1134,50 @@ class MeetingState:
 
     def overlay_show(self, scope, *, pane=None, action=None):
         """Explicit pane action: backend-managed bridge owns one helper process."""
+        import secrets
         with self.lifecycle_lock:
             with self.overlay_lock:
                 if pane is not None and not self._accept_overlay_action_locked(pane, action):
                     return {'shown': self.overlay is not None, 'accepted': False}
             self._expire_capture()
-            try:
-                return self._overlay_show(scope)
-            finally:
-                # Helper startup may outlast the lease. No overlay lock is
-                # held here, so stop/join cannot deadlock its callbacks.
-                self._expire_capture()
+            result = self._overlay_show(scope)
+        if not isinstance(result, dict) or 'startup' not in result:
+            return result
+        job = result['startup']
+        # No shutdown/publication lock is held while spawning, probing or
+        # waiting for startup. A reserved pending bridge fences new admission.
+        try:
+            job['worker'].start()
+        except RuntimeError as exc:
+            job['error'] = f'Overlay startup worker could not start: {exc}'
+            job['done'].set()
+        job['done'].wait(3)
+        with self.lifecycle_lock:
+            self._expire_capture()
+            with self.overlay_lock:
+                bridge = job['bridge']
+                current = (self._overlay_startup_job is job and self.pending_overlay is bridge
+                           and self.overlay_lease_seq == job['epoch'])
+                with getattr(bridge, 'lock', nullcontext()):
+                    shown = (job['done'].is_set() and not job['error']
+                             and bool(job['result'].get('shown'))
+                             and getattr(bridge, 'stopping', False) is not True)
+                    if current and shown:
+                        self.pending_overlay = None
+                        self.overlay_cleanup_error = None
+                        self._overlay_startup_job = None
+                        self.overlay = bridge
+                        self.overlay_owner = secrets.token_hex(16)
+                        if not job['capture_was_listening'] and not self.listening and self.pending_stop is None:
+                            self._touch_pane_seen()
+                        self._start_overlay_lease_locked()
+                        return {**job['result'], 'available': True, 'owner': self.overlay_owner}
+                if current:
+                    self._retire_overlay_locked()
+                error = job['error'] or job['result'].get('error') or 'Overlay startup was retired or timed out.'
+            if self.pending_overlay is bridge:
+                self._finish_overlay_cleanup()
+            raise _unavailable(self.overlay_cleanup_error or error)
 
     def _overlay_process_alive(self, process):
         """Tri-state inspection, with no process method on the caller thread.
@@ -1195,12 +1231,49 @@ class MeetingState:
                 self._retire_overlay_locked()
         if self.pending_overlay is bridge and alive is False:
             self._finish_overlay_cleanup()
+        bridge = self.overlay
+        return (bridge, getattr(bridge, '_lifecycle_epoch', 0))
+
+    @contextmanager
+    def _overlay_admission_guard(self, ticket, code=409):
+        # lifecycle_lock stabilizes controller ownership. The small retirement
+        # gate does NOT require bridge/publication locks: a tap may hold those
+        # while waiting for state.lock. Never acquire them with this gate held.
+        # Retirement takes bridge -> admission (marker only), releases admission,
+        # then cancels slots. Capture admission takes admission -> state only.
+        from fastapi import HTTPException
+        bridge, epoch = ticket or (None, 0)
+        publication = self.overlay_lock if code == 503 else nullcontext()
+        display = getattr(bridge, 'lock', nullcontext()) if code == 503 else nullcontext()
+        with publication, display, getattr(bridge, '_admission_lock', nullcontext()):
+            retired = bridge is not None and (
+                getattr(bridge, 'stopping', False) is True
+                or getattr(bridge, '_lifecycle_epoch', 0) != epoch)
+            if (not retired and self.overlay is bridge and self.pending_overlay is None
+                    and not self.overlay_cleanup_error):
+                yield
+                return
+        if retired and self.overlay is bridge:
+            with self.overlay_lock:
+                self._retire_overlay_locked()
+        # A clean exit in the reconciliation/commit gap is not an unconfirmed
+        # helper. Reap outside all admission/publication locks, then continue
+        # only if lifecycle ownership is still empty and cleanup is confirmed.
+        if retired and self._overlay_process_alive(bridge.process) is False:
+            if self.pending_overlay is bridge:
+                self._finish_overlay_cleanup()
+            if self.overlay is None and self.pending_overlay is None and not self.overlay_cleanup_error:
+                with self.overlay_lock if code == 503 else nullcontext():
+                    yield
+                    return
+        raise HTTPException(code, self.overlay_cleanup_error or
+                            'Overlay lifecycle changed; retry the action.')
 
     def _overlay_show(self, scope):
         import importlib
         import secrets
-        self._reconcile_overlay_admission(for_show=True)
-        with self.overlay_lock:
+        ticket = self._reconcile_overlay_admission(for_show=True)
+        with self._overlay_admission_guard(ticket, 503):
             if self.pending_overlay is not None or self.overlay_cleanup_error:
                 raise _unavailable(self.overlay_cleanup_error or 'Overlay shutdown is not confirmed. Retry Hide / Clear.')
             cleaned = self._clean_overlay_scope(scope)
@@ -1241,39 +1314,26 @@ class MeetingState:
                 bridge.update(self.status())
             except Exception:
                 pass
-            try:
-                result = bridge.show_overlay()
-            except Exception as exc:
-                bridge.invalidate()
-                error = f'Overlay startup failed: {type(exc).__name__}: {str(exc)[:200]}'
-                if bridge.process is not None:
-                    self.pending_overlay = bridge
-                    self.overlay_cleanup_error = error + '; overlay shutdown is not confirmed. Retry Hide / Clear.'
-                raise _unavailable(self.overlay_cleanup_error or error)
-            # show_overlay returns a dict; fail closed when no helper could start.
-            shown = bool(result.get('shown')) if isinstance(result, dict) else bool(result)
-            if not shown:
-                error = result.get('error') if isinstance(result, dict) else None
-                if bridge.process is not None:
-                    bridge.invalidate()
-                    self.pending_overlay = bridge
-                    self.overlay_cleanup_error = bridge.cleanup_error or error or 'Overlay shutdown is not confirmed.'
-                raise _unavailable(error or 'Overlay helper is not prepared on this backend.')
-            try:
-                bridge.update(self.status())
-            except Exception:
-                pass
-            self.overlay = bridge
-            self.overlay_owner = secrets.token_hex(16)
-            if not self.listening and self.pending_stop is None:
-                self._touch_pane_seen()
-            self._start_overlay_lease_locked()
-            if isinstance(result, dict):
-                out = dict(result)
-                out.setdefault('available', True)
-                out['owner'] = self.overlay_owner
-                return out
-            return {'shown': True, 'reused': False, 'available': True, 'owner': self.overlay_owner}
+            job = {'bridge': bridge, 'epoch': self.overlay_lease_seq,
+                   'done': threading.Event(), 'result': {}, 'error': None,
+                   'capture_was_listening': self.listening}
+            # The exact bridge is reachable even before Popen returns. Cleanup
+            # cannot prove absence while this job could still create a child.
+            self.pending_overlay = bridge
+            self.overlay_cleanup_error = 'Overlay startup is pending; shutdown is not confirmed.'
+            self._overlay_startup_job = job
+            import contextvars
+            context = contextvars.copy_context()
+            def launch():
+                try:
+                    result = context.run(bridge.show_overlay)
+                    job['result'] = result if isinstance(result, dict) else {'shown': bool(result)}
+                except Exception as exc:
+                    job['error'] = f'Overlay startup failed: {type(exc).__name__}: {str(exc)[:200]}'
+                finally:
+                    job['done'].set()
+            job['worker'] = threading.Thread(target=launch, name='meeting-overlay-startup', daemon=True)
+            return {'startup': job}
 
     @staticmethod
     def _invalidate_overlay_locked(bridge):
@@ -1287,6 +1347,9 @@ class MeetingState:
         # Keep the exact retired bridge reachable until cleanup is confirmed.
         # Publication stops immediately; a pending bridge is never reused.
         bridge = self.overlay or self.pending_overlay
+        startup = self._overlay_startup_job
+        if startup is not None and startup['bridge'] is bridge:
+            bridge._startup_cancelled = True
         self._overlay_invalidation_error = None
         try:
             self._invalidate_overlay_locked(bridge)
@@ -1306,6 +1369,10 @@ class MeetingState:
         # The worker returns evidence only; only a current caller may publish it.
         with self.overlay_lock:
             bridge = self.pending_overlay
+            startup = self._overlay_startup_job
+            if startup is not None and startup['bridge'] is bridge and not startup['done'].is_set():
+                return {'shown': None, 'overlay_stop_confirmed': False,
+                        'overlay_cleanup_error': self.overlay_cleanup_error}
             job = self._overlay_cleanup_job
             if bridge is not None and (job is None or job['bridge'] is not bridge
                                       or (job['done'].is_set() and job['error'])):
@@ -1336,6 +1403,8 @@ class MeetingState:
                 else:
                     self.pending_overlay = None
                     self._overlay_cleanup_job = None
+                    if startup is not None and startup['bridge'] is bridge:
+                        self._overlay_startup_job = None
                     self.overlay_cleanup_error = None
             confirmed = self.pending_overlay is None and self.overlay_cleanup_error is None
             return {'shown': False if confirmed else None,
