@@ -1,5 +1,8 @@
 # Verification
 
+For the combined masked-key / overlay follow-up, see the
+[integrated key / overlay verification receipt](integrated-key-overlay-verification.md).
+
 ## Independent macOS implementation checks
 
 The original Swift helper compiled and was ad-hoc signed with embedded microphone usage metadata. Its installed `--check-only` returned `capture_started=false`, microphone metadata present, sources `microphone/system/both`, and a 16 kHz PCM contract. This is not a permission grant or hardware-capture test.

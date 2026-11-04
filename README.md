@@ -19,7 +19,8 @@ python ask.py --docs ./sample-docs --list-projects
 python ask.py --docs ./sample-docs --search "unit price"
 python ask.py --question "What is the unit price?" --docs ./sample-docs --provider fake
 python ask.py --question "What is the unit price?" --docs ./sample-docs --transcript ./sample-docs/transcript.sample
-MODEL_API_KEY=YOUR_REAL_KEY python ask.py --question "..." --docs ./sample-docs --provider meta
+# With MODEL_API_KEY already provided by your approved secret manager:
+python ask.py --question "..." --docs ./sample-docs --provider meta
 ```
 
 Your own documents use one folder per project:
@@ -51,6 +52,19 @@ unavailable standalone — the CLI says so instead of failing obscurely.
 Library use: `answer_core.AnswerCore` with injected
 `completion`/`search`/`history` providers; `hermes_adapters` holds the
 host-backed factories the plugin uses by default.
+
+## Meta API key
+
+In the pane, open **Meta API key**, paste into the masked field and explicitly
+**Save key**. Never paste a credential into chat. Saved, status-request configured
+and provider-verified status are separate; saving does not verify Meta or reload
+workers. Pause capture before editing: new host-scoped requests can use the saved
+key immediately, ahead of inherited keys, while existing requests/workers retain
+their snapshots. Process-based code may need a safe gateway restart. **Remove saved
+key** can expose an inherited fallback; it is not credential revocation. Ambiguous
+or multiline `.env` files are refused without rewriting unrelated data.
+See [key setup and security boundaries](docs/meta-api-key.md), including the
+Settings → Plugins fallback for hosts without native-owner credential editing.
 
 ## Design
 
@@ -104,7 +118,7 @@ No Meetily application, recordings, or models are required for this mode. A macO
 
 1. Install this plugin as above, then run `python prepare_macos.py` on macOS with `uv` and Apple Command Line Tools installed. This prepares an isolated Python 3.12 environment, faster-whisper CPU runtime, and an original signed Swift helper; it does **not** start capture or ask for recording permissions.
 
-   For cloud transcription instead of local Whisper, set `MODEL_API_KEY` in the gateway environment before preparing, then choose **Meta Muse Voice** as the transcription provider in the pane and pick an ASR mode (Endpointing, Diarization, or Push-to-talk). Local transcription stays the default and needs no key.
+   For cloud transcription instead of local Whisper, configure `MODEL_API_KEY`, then explicitly choose **Meta Muse Voice** as the transcription provider in the pane and pick an ASR mode (Endpointing, Diarization, or Push-to-talk). Local transcription is the default even when a key is configured or capabilities load later; saved provider selections are preserved. The Capture session card discloses cloud audio transmission above Start/Resume. Local transcription needs no key.
 2. Restart an already-running gateway from a separate terminal when its other work is idle: `hermes gateway restart`. Reloading desktop plugins alone does not refresh an already-mounted Python backend.
 3. Open the pane with the bottom-right **Meeting Copilot** button or **Cmd+K → Open Meeting Copilot**. The status-bar button also hides it; hiding unmounts the pane and pauses/detaches capture.
 4. Choose **Independent macOS transcription**, then **Microphone**, **System audio**, or **Microphone + system audio**. System audio captures system playback, not a specific selected app. Select **tiny.en**, **base.en**, or **small.en**. This initial release supports English only; higher-accuracy models use more memory/CPU. First explicit use can download weights from the public faster-whisper model source into the normal Hugging Face cache.

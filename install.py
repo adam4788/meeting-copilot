@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import shutil
 
-FILES = ('server.py', 'knowledge.py', 'web_policy.py', 'audio.py', 'meetily.py',
+FILES = ('server.py', 'credentials.py', 'credential_env.py', 'knowledge.py', 'web_policy.py', 'audio.py', 'meetily.py',
          'macos_audio.py', 'audio_worker.py', 'model_selection.py', 'meta_models.py', 'meta_asr.py',
          'overlay_bridge.py', 'answer_core.py', 'hermes_adapters.py', 'ask.py', 'eval_retrieval.py',
          'demo_standalone.py',
@@ -44,6 +44,12 @@ description: Read-only live meeting answers grounded in project files and past s
 requires_hermes: ">=0.22.0"
 provides_tools: []
 provides_hooks: []
+config_schema:
+  meta_api_key:
+    type: secret
+    env: MODEL_API_KEY
+    label: Meta API key
+    description: Used for Muse Voice and Meta answers. Never paste into chat. Pause capture before editing; new scoped requests can change immediately, while existing requests and workers retain loaded keys. Process-based code may need a safe restart. Configuration is not provider verification.
 ''', encoding='utf-8')
     dashboard = target / 'dashboard'
     (dashboard / 'manifest.json').write_text(json.dumps({

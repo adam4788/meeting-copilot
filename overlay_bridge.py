@@ -15,12 +15,62 @@ strings are never chunked to fake streaming.
 """
 import argparse
 import contextvars as _contextvars
+from contextlib import nullcontext
 import hashlib
 import json
+import os
+import secrets
 import subprocess
 import sys
 import threading
 import time
+
+_POPEN_TYPE = subprocess.Popen
+
+
+def _fresh_child_observation(process):
+    """Worker-only, nonblocking OS veto of an earlier healthy poll sample.
+
+    Popen.poll() may return None when another waiter owns its waitpid lock;
+    returncode=None and signal-zero also cannot distinguish a zombie. Prefer
+    non-reaping waitid; on older POSIX Pythons use owned waitpid(WNOHANG) under
+    Popen's nonblocking reaper lock. Missing primitives/errors mean unknown.
+    Neither observation proves group/pipe cleanup or future physical liveness.
+    """
+    if isinstance(getattr(process, 'returncode', None), int):
+        return None  # contradicts the original healthy sample, not cleanup
+    if not isinstance(process, _POPEN_TYPE):
+        # Injected display adapters retain their poll-result contract. Actual
+        # launched helpers are always Popen and must supply OS evidence.
+        return True
+    try:
+        if all(getattr(os, name, None) is not None
+               for name in ('waitid', 'P_PID', 'WEXITED', 'WNOWAIT', 'WNOHANG')):
+            result = os.waitid(os.P_PID, process.pid,
+                               os.WEXITED | os.WNOWAIT | os.WNOHANG)
+            return True if result is None or result.si_pid == 0 else None
+        # No guessed libc structures/flags and no PID signals. The fallback
+        # may reap, so serialize with Popen and record status on that handle.
+        lock = getattr(process, '_waitpid_lock', None)
+        if (os.name != 'posix' or not callable(getattr(os, 'waitpid', None))
+                or not hasattr(os, 'WNOHANG') or lock is None
+                or not callable(getattr(process, '_handle_exitstatus', None))
+                or not lock.acquire(False)):
+            return None
+        try:
+            if process.returncode is not None:
+                return None
+            pid, status = os.waitpid(process.pid, os.WNOHANG)
+            if pid == 0:
+                return True
+            if pid == process.pid:
+                getattr(process, '_handle_exitstatus')(status)
+            return None
+        finally:
+            lock.release()
+    except (OSError, ValueError, TypeError, AttributeError, NotImplementedError):
+        return None
+
 
 # Marker bound to an explicit pane overlay action (show/scope). The
 # transport only runs backend answers when the context it captured carries
@@ -81,7 +131,7 @@ def suggest_questions(segments, limit=QUESTION_ROWS):
         if key in seen_text:
             continue
         seen_text.add(key)
-        explicit = str(segment_id or '').strip()
+        explicit = str(segment_id or '').strip()[:200]
         if explicit and explicit not in seen_ids:
             seen_ids.add(explicit)
             rows.append({'id': explicit[:200], 'question': text})
@@ -206,24 +256,121 @@ class BackendTransport:
         self._poll = poll
         self._poll_context = None
         self._pane_token = pane_token
+        self._compat_admission_lock = threading.RLock()
         # Capture the authorized pane/show/scope context HERE (construction
         # happens on the pane's explicit action thread, before native click
         # and answer-worker threads exist). Click/native threads never inherit
         # it, so this is the only explicit propagation path.
+        self._poll_context = self._fresh_action_context()
         try:
-            self._poll_context = _contextvars.copy_context()
+            from agent.secret_scope import current_secret_scope_home
+            self._credential_home = self._poll_context.copy().run(current_secret_scope_home)
+        except ImportError:
+            self._credential_home = None
+
+    @staticmethod
+    def _fresh_action_context(expected_home=None):
+        """Publish fresh secrets, never a request's pre-admission snapshot.
+
+        Call under overlay admission serialization. The host refresh runs inside
+        a COPY of the authenticated action context; no editor identity, global
+        environment mutation, or in-place mutation of admitted workers. An
+        unscoped standalone transport retains its existing non-host behavior.
+        """
+        def capture():
+            try:
+                from agent.secret_scope import current_secret_scope, current_secret_scope_home
+            except ModuleNotFoundError as exc:
+                # Only a genuinely absent standalone host permits fallback.
+                # An installed but incompatible/broken scope API is not proof
+                # that this authenticated request was unscoped.
+                if expected_home is not None or exc.name != 'agent':
+                    raise RuntimeError('Overlay credential scope unavailable') from None
+                return _contextvars.copy_context()
+            previous_scope = current_secret_scope()
+            if previous_scope is None:
+                if expected_home is not None or current_secret_scope_home() is not None:
+                    raise RuntimeError('Overlay credential scope unavailable')
+                return _contextvars.copy_context()
+            from hermes_constants import get_hermes_home
+            from hermes_cli.web_server_profiles import _config_profile_scope
+            home = get_hermes_home().resolve()
+            from pathlib import Path
+            bound = current_secret_scope_home()
+            if (not bound or Path(bound).resolve() != home
+                    or (expected_home is not None and Path(expected_home).resolve() != home)):
+                raise RuntimeError('Overlay credential identity mismatch')
+            with _config_profile_scope('current'):
+                fresh_home = current_secret_scope_home()
+                if (current_secret_scope() is None or current_secret_scope() is previous_scope or not fresh_home
+                        or Path(fresh_home).resolve() != home
+                        or get_hermes_home().resolve() != home):
+                    raise RuntimeError('Overlay credential scope unavailable')
+                return _contextvars.copy_context()
+        try:
+            return _contextvars.copy_context().run(capture)
         except Exception:
-            self._poll_context = None
+            # Never reflect host/credential exceptions through Show or scope.
+            from fastapi import HTTPException
+            raise HTTPException(503, 'Overlay credential scope unavailable. Reopen the pane and retry.') from None
+
+    def pane_context_matches(self):
+        """Compare the captured security context, excluding our action nonce.
+
+        The host owns its ContextVars; treat ANY other changed value as an
+        authorization change (fail closed), rather than guessing auth names.
+        """
+        if self._poll_context is None:
+            return False
+        previous = {var: self._poll_context[var] for var in self._poll_context
+                    if var is not _PANE_ACTION}
+        current = {var: value for var, value in _contextvars.copy_context().items()
+                   if var is not _PANE_ACTION}
+        try:
+            return previous == current
+        except Exception:
+            return False
 
     def refresh_pane_token(self, token):
         """Re-mint the action binding on a later explicit pane action."""
+        self._poll_context = None  # failure closes new admissions
         self._pane_token = token
-        try:
-            self._poll_context = _contextvars.copy_context()
-        except Exception:
-            self._poll_context = None
+        self._poll_context = self._fresh_action_context(self._credential_home)
 
-    def assist(self, question, scope, row_id):
+    def refresh_credentials(self):
+        """Reload secrets inside the retained pane identity, not the editor's.
+
+        Called only under the state's lifecycle/admission locks after an owner
+        credential edit. Existing answer contexts are independent snapshots.
+        Never mint a new pane capability or extend its heartbeat here.
+        """
+        from hermes_constants import get_hermes_home
+        editor_home = get_hermes_home().resolve()
+        previous = self._poll_context
+        # Any failure leaves NEW admissions closed, including partial writes.
+        self._poll_context = None
+        if previous is None or not self._pane_token or not self._credential_home:
+            raise RuntimeError('Overlay credential context unavailable')
+        def reload():
+            if (get_hermes_home().resolve() != editor_home
+                    or _PANE_ACTION.get() != self._pane_token):
+                raise RuntimeError('Overlay credential scope mismatch')
+            return self._fresh_action_context(self._credential_home)
+        self._poll_context = previous.copy().run(reload)
+
+    def admission_guard(self):
+        # Production uses the same outer lock as show/scope/hide publication.
+        # Minimal injected states may lack it; they still serialize locally.
+        lock = getattr(self._state, 'overlay_lock', None)
+        if lock is not None and hasattr(type(lock), '__enter__'):
+            return lock
+        return self._compat_admission_lock
+
+    def assist(self, question, scope, row_id, expected_generation=None, expected_capture_generation=None):
+        with self.admission_guard():
+            return self._assist_locked(question, scope, row_id, expected_generation, expected_capture_generation)
+
+    def _assist_locked(self, question, scope, row_id, expected_generation, expected_capture_generation):
         # Propagate the authorized pane/show/scope context explicitly into the
         # click-driven answer worker thread. Native click handlers run on
         # overlay threads that never inherit the pane request context, so
@@ -232,7 +379,7 @@ class BackendTransport:
         # pane-context runner.
         scope = dict(scope or {})
         authoritative = getattr(self._state, 'overlay_scope_value', None)
-        if isinstance(authoritative, dict) and authoritative:
+        if isinstance(authoritative, dict):
             scope = dict(authoritative)
         caller_context = None
         try:
@@ -270,7 +417,8 @@ class BackendTransport:
                 bool(scope.get('all_projects', False)),
                 bool(scope.get('web_fallback', False)),
                 scope.get('answer_provider'), scope.get('answer_model'),
-                row_id=row_id)
+                row_id=row_id, expected_generation=expected_generation,
+                expected_capture_generation=expected_capture_generation)
 
         caller_context.run(_call)
         result = result_holder.get('result')
@@ -347,9 +495,12 @@ class OverlayBridge:
         self.cancelled = set()
         self.listening = False  # last status truth: rows are never clickable while paused
         self.paused_generation = 0
+        self._instance_id = secrets.token_hex(16)
         self._listening = False
         self._paused = False
         self._last_generation = None
+        self._last_capture_generation = None
+        self._last_status_seq = None
         self._poller = None
         self._poller_lock = threading.Lock()
         self._poller_seq = 0
@@ -359,12 +510,41 @@ class OverlayBridge:
         self.pushed = []  # headless record (helper=None); used by tests/dry-run
         self.threads = []
         self.stopping = False
+        self._lifecycle_epoch = 0
+        self._startup_cancelled = False
+        self._admission_lock = threading.RLock()
         import queue as _queue
         self._push_queue = _queue.Queue(maxsize=8)
         self._click_queue = _queue.Queue(maxsize=32)
         self._stdin_lock = threading.Lock()
+        self._cleanup_lock = threading.Lock()
+        self._cleanup_job = None
+        self._signal_jobs = {}
+        # Only launch-created sessions are eligible for group confirmation.
+        # Never infer ownership from getpgid() of an arbitrary injected handle.
+        self._process_groups = {}
+        self.cleanup_error = None
+        self._reader = None
+        self._stdout_eof = {}
+        self._stdout_pipes = {}
+        self._stdout_readers = {}
+        self._stdout_busy = set()
+        self._reader_failed = set()
+        self._probe_lock = threading.Lock()
+        self._probe_jobs = {}
+        self._show_probe_threads = set()
 
     # -- backend truth in ------------------------------------------------
+    def retire_authorization(self):
+        """Even identical settings may carry a different pane principal."""
+        with self.lock:
+            self.paused_generation += 1
+            for request_id in list(self.row_by_request):
+                self._cancel_locked(request_id)
+            self.request_by_row.clear()
+            self.reserved_generation.clear()
+            self.answers.clear()
+
     def set_scope(self, scope):
         """Pane pushes current project/session scope; clears stale meeting data.
 
@@ -397,9 +577,13 @@ class OverlayBridge:
                 self.cancelled = {request_id for request_id in self.cancelled if request_id in live_ids}
         return self.push()
 
-    def update(self, status):
+    def update(self, status, poller_seq=None):
         if not isinstance(status, dict):
             with self.lock:
+                if self.stopping:
+                    return False
+                if poller_seq is not None and poller_seq != self._poller_seq:
+                    return False
                 self.message = getattr(self, '_sticky_error', None) or default_message(status)
                 self._listening = False
                 self._paused = False
@@ -407,7 +591,28 @@ class OverlayBridge:
         raw = status.get('segments') if isinstance(status.get('segments'), list) else []
         rows = suggest_questions(raw)
         with self.lock:
+            if self.stopping or (poller_seq is not None and poller_seq != self._poller_seq):
+                return False
+            incoming_seq = status.get('status_seq')
+            if self._last_status_seq is not None:
+                if type(incoming_seq) is not int or incoming_seq <= self._last_status_seq:
+                    return False
+            if type(incoming_seq) is int:
+                self._last_status_seq = incoming_seq
+            else:
+                # Legacy injected status sources have no within-epoch order.
+                # Never permit even those sources to rewind known epochs.
+                for incoming, previous in ((status.get('generation'), self._last_generation),
+                                           (status.get('capture_generation'), self._last_capture_generation)):
+                    if type(incoming) is int and type(previous) is int and incoming < previous:
+                        return False
+            # Completion is published before worker-map cleanup. Mapping
+            # presence alone must not turn a completed answer back into pending.
+            pending_rows = {key for key in self.request_by_row
+                            if not self.answers.get(key, {}).get('completed')}
             self.segments = list(raw)
+            capture_changed = status.get('capture_generation') != self._last_capture_generation
+            self._last_capture_generation = status.get('capture_generation')
             listening = bool(status.get('listening'))
             generation = status.get('generation')
             if generation is None:
@@ -421,26 +626,56 @@ class OverlayBridge:
                     self._cancel_locked(request_id)
                 self.request_by_row = {k: v for k, v in self.request_by_row.items() if v is True}
             elif not paused_now and self._paused:
-                # Resume: paused reservations never survived, drop any stale placeholder.
+                # Resume retires both the stale placeholder and its busy state.
+                # The old worker no longer owns this row and cannot reset it.
                 for stale in [k for k, v in self.request_by_row.items() if v is True]:
                     self.request_by_row.pop(stale, None)
                     self.reserved_generation.pop(stale, None)
+                    if stale in self.answers:
+                        self.answers[stale] = {'answer': None, 'busy': False,
+                                               'streaming': False, 'completed_only': True}
             self._listening = listening
             self._paused = paused_now
             self.listening = listening
-            if generation != self._last_generation:
+            meeting_changed = generation != self._last_generation
+            if meeting_changed or capture_changed:
                 # New meeting/session/clear revision retires in-flight rows so
                 # late events from older work cannot resurrect stale rows.
                 self._last_generation = generation
+                self.paused_generation += 1
                 for request_id in list(self.row_by_request):
                     self._cancel_locked(request_id)
-                for row_id in list(self.request_by_row):
-                    self.request_by_row.pop(row_id, None)
-                    self.reserved_generation.pop(row_id, None)
-                    if row_id in self.answers:
-                        self.answers[row_id] = {'answer': None, 'busy': False,
-                                                'streaming': False, 'completed_only': True}
-            self.questions = {row['id']: row['question'] for row in rows}
+                # Completed and cancelled/partial answers may no longer have a
+                # request mapping, so retire all answer data on this boundary.
+                if meeting_changed:
+                    self.answers.clear()
+                else:
+                    # Same-meeting capture pause/resume retires pending work,
+                    # not completed answers. Partial/queued text is not complete.
+                    for key, answer in list(self.answers.items()):
+                        if key in pending_rows or answer.get('busy') or not answer.get('completed'):
+                            self.answers.pop(key, None)
+                self.request_by_row.clear()
+                self.reserved_generation.clear()
+            next_questions = {row['id']: row['question'] for row in rows}
+            revised = {key for key, text in self.questions.items() if next_questions.get(key) != text}
+            if revised:
+                # A row id is not question identity: transcript corrections
+                # can reuse it. Advance the reservation epoch (including ABA)
+                # and release pending taps; keep unrelated admitted answers.
+                self.paused_generation += 1
+                for key in list(self.request_by_row):
+                    request_id = self.request_by_row[key]
+                    if request_id is True:
+                        self.request_by_row.pop(key, None)
+                        self.reserved_generation.pop(key, None)
+                        if key in self.answers:
+                            self.answers[key]['busy'] = False
+                    elif key in revised:
+                        self._cancel_locked(request_id)
+                for key in revised:
+                    self.answers.pop(key, None)
+            self.questions = next_questions
             live = set(self.questions)
             for row_id in [key for key in self.answers if key not in live and self.answers[key].get('busy')]:
                 request_id = self.request_by_row.get(row_id)
@@ -481,13 +716,20 @@ class OverlayBridge:
             self._prune_threads_locked()
 
     # -- clicks out -------------------------------------------------------
+    @property
+    def snapshot_id(self):
+        return f'{self._instance_id}:{self.paused_generation}'
+
     def on_click_line(self, line):
         """The single path that may request an answer: an explicit overlay click."""
         row_id = parse_click(line)
         if row_id is None:
             return False
+        queued = False
         with self.lock:
-            if not self._listening:
+            if json.loads(line).get('snapshot_id') != self.snapshot_id:
+                return False
+            if self.stopping or not self._listening:
                 return False  # paused/idle backend: never open expensive slots
             question = self.questions.get(row_id)
             if question is None:
@@ -508,14 +750,16 @@ class OverlayBridge:
             self.reserved_generation[row_id] = click_generation
             try:
                 self._click_queue.put_nowait((row_id, question, click_generation))
+                queued = True
             except Exception:
                 self.request_by_row.pop(row_id, None)
                 self.reserved_generation.pop(row_id, None)
                 state['busy'] = False
                 self.message = 'Too many pending clicks; try one row at a time.'
-                self.push()
-                return False
+        # push -> _emit takes stdin then bridge; never call it under bridge.
         self.push()
+        if not queued:
+            return False
         worker = threading.Thread(target=self._drain_clicks, daemon=True)
         with self.lock:
             self._prune_threads_locked()
@@ -537,16 +781,18 @@ class OverlayBridge:
         assert transport is not None, 'ask requires a transport'
         if click_generation is None:
             click_generation = self.paused_generation
-        # Validate AND submit atomically under the bridge lock: a scope
-        # change, pause, or session switch cannot slip between the check and
-        # transport.assist and send a stale question to a provider. The
-        # backend admission path takes only backend locks, so holding the
-        # bridge lock across it cannot deadlock.
-        with self.lock:
-            if self.request_by_row.get(row_id) is not True or click_generation != self.paused_generation:
+        # Serialize with local scope/pause updates, then bind admission to the
+        # backend generation that produced the displayed question. The backend
+        # can advance before our next poll; only its own lock can close that
+        # race. Lock order: backend overlay publication -> bridge -> state.
+        # Never acquire the publication guard while already holding bridge.lock.
+        guard = transport.admission_guard() if isinstance(transport, BackendTransport) else nullcontext()
+        with guard, self.lock:
+            if (self.stopping or not self._listening or self.request_by_row.get(row_id) is not True
+                    or click_generation != self.paused_generation):
                 owner = self.request_by_row.get(row_id)
                 own_reservation = (owner is True and self.reserved_generation.get(row_id, click_generation) == click_generation)
-                if owner is None or own_reservation:
+                if own_reservation or (owner is None and click_generation == self.paused_generation):
                     # Our own reservation (or none): release it and reset the
                     # row. A live mapping owned by another request — or a
                     # newer tap's reservation — is never touched: a stale tap
@@ -559,10 +805,23 @@ class OverlayBridge:
                     self.message = 'Meeting context changed before the tap was sent; tap again to retry.'
                 request_id = None
             else:
+                admission_error = None
                 try:
-                    request_id = transport.assist(question, dict(self.scope), row_id)
-                except Exception:
+                    if isinstance(transport, BackendTransport):
+                        if self._last_generation is None or self._last_capture_generation is None:
+                            raise RuntimeError('backend snapshot lacks admission generations')
+                        # guard is already held, including for plain Lock injections.
+                        request_id = transport._assist_locked(
+                            question, dict(self.scope), row_id,
+                            self._last_generation, self._last_capture_generation)
+                    else:
+                        request_id = transport.assist(question, dict(self.scope), row_id,
+                                                      expected_generation=self._last_generation)
+                except AssertionError:
+                    raise  # Programming/test failures are not admission rejections.
+                except Exception as exc:
                     request_id = None
+                    admission_error = type(exc).__name__
                 if not isinstance(request_id, str) or not request_id:
                     self.request_by_row.pop(row_id, None)
                     self.reserved_generation.pop(row_id, None)
@@ -570,43 +829,34 @@ class OverlayBridge:
                         self.answers[row_id] = {'answer': None, 'busy': False,
                                                 'streaming': False, 'completed_only': True}
                     self.message = 'Answer request failed: request was not accepted.'
+                    if admission_error:
+                        self.message += f' Transport error: {admission_error}.'
+                    if admission_error == 'TypeError':
+                        self.message += ' Transport must accept expected_generation; no unsafe legacy retry.'
                     request_id = None
-        if request_id is None:
-            self.push()
-            return
-        with self.lock:
-            # Reservation held since click; retire the new slot instead of
-            # leaking an expensive backend orphan when the row moved on.
-            if self.request_by_row.get(row_id) is not True or click_generation != self.paused_generation:
-                orphan = request_id
-                current = self.request_by_row.get(row_id)
-                own_slot = current is None or (current is True and self.reserved_generation.get(row_id, click_generation) == click_generation)
-                if own_slot:
-                    self.request_by_row.pop(row_id, None)
-                    self.reserved_generation.pop(row_id, None)
-                    self.row_by_request.pop(orphan, None)
-                    if row_id in self.answers:
-                        self.answers[row_id] = {'answer': None, 'busy': False,
-                                                'streaming': False, 'completed_only': True}
+                elif (self.request_by_row.get(row_id) is not True
+                      or click_generation != self.paused_generation):
+                    # Injected transports may re-enter state mutation. Never
+                    # replace a newer owner with their returned orphan slot.
+                    try:
+                        transport.cancel(request_id)
+                    except AssertionError:
+                        raise
+                    except Exception:
+                        pass
+                    request_id = None
                 else:
-                    # The row now belongs to a newer tap or request: retire
-                    # only our orphan. Resetting the row here would erase the
-                    # newer answer's partial state while its worker streams.
-                    self.row_by_request.pop(orphan, None)
-            else:
-                orphan = None
-                self.request_by_row[row_id] = request_id
-                self.reserved_generation.pop(row_id, None)
-                self.row_by_request[request_id] = row_id
-                # Drop any other row holding this id (single-slot reuse safety).
-                for other, rid in [item for item in self.request_by_row.items() if item[0] != row_id and item[1] == request_id]:
-                    self.request_by_row.pop(other, None)
-                    self.reserved_generation.pop(other, None)
-        if orphan is not None:
-            try:
-                transport.cancel(orphan)
-            except Exception:
-                pass
+                    # Publish ownership BEFORE leaving the admission guard.
+                    # Hide can now always cancel the admitted backend slot.
+                    self.request_by_row[row_id] = request_id
+                    self.reserved_generation.pop(row_id, None)
+                    self.row_by_request[request_id] = row_id
+                    # Preserve injected single-slot reuse hygiene.
+                    for other, rid in list(self.request_by_row.items()):
+                        if other != row_id and rid == request_id:
+                            self.request_by_row.pop(other, None)
+                            self.reserved_generation.pop(other, None)
+        if request_id is None:
             self.push()
             return
         deadline = time.monotonic() + self.assist_timeout
@@ -620,6 +870,8 @@ class OverlayBridge:
                         return
                 try:
                     entry = transport.assist_request(request_id)
+                except AssertionError:
+                    raise
                 except Exception:
                     time.sleep(self.poll_interval)
                     continue
@@ -628,8 +880,13 @@ class OverlayBridge:
                     continue
                 if entry.get('row_id') and entry['row_id'] != row_id:
                     with self.lock:
+                        # A poll can return after retirement and a newer answer
+                        # has completed (leaving no owner). Only the current
+                        # owner may clear the row or publish a mismatch error.
+                        if self.request_by_row.get(row_id) != request_id:
+                            return
                         self._cancel_locked(request_id)
-                        if self.request_by_row.get(row_id) is None and row_id in self.answers:
+                        if row_id in self.answers:
                             self.answers[row_id] = {'answer': None, 'busy': False,
                                                     'streaming': False, 'completed_only': True}
                         self.message = 'Answer arrived for a different row; request cancelled.'
@@ -640,7 +897,9 @@ class OverlayBridge:
                     with self.lock:
                         if self.request_by_row.get(row_id) == request_id and row_id in self.answers:
                             self.answers[row_id] = {'answer': seen or None, 'busy': False,
-                                                    'streaming': False, 'completed_only': True}
+                                                    'streaming': False, 'completed_only': False,
+                                                    'completed': False,
+                                                    'warnings': ['Answer cancelled; the text above is partial.'] if seen else []}
                     self.push()
                     return
                 if answer != seen:
@@ -663,7 +922,8 @@ class OverlayBridge:
                             self.answers[row_id] = {'answer': seen or None, 'busy': False,
                                                     'streaming': False,
                                                     'completed_only': bool(entry.get('completed_only', not streaming)),
-                                                    'warnings': warnings, 'source_titles': titles}
+                                                    'warnings': warnings, 'source_titles': titles,
+                                                    'completed': entry.get('status') == 'done'}
                             if entry.get('status') == 'error':
                                 self.message = f"Answer failed for this row: {str(entry.get('error') or 'unknown')[:160]}"
                     self.push()
@@ -739,6 +999,8 @@ class OverlayBridge:
 
     def helper_status(self):
         """Pane-facing availability: reason the overlay can or cannot show."""
+        if getattr(self, '_protocol_error', None):
+            return {'available': False, 'error': self._protocol_error}
         if self._helper_available():
             return {'available': True, 'helper': self.helper_path}
         if not self.helper_path:
@@ -750,6 +1012,52 @@ class OverlayBridge:
         return {'available': False,
                 'error': f'Overlay helper is not executable: {self.helper_path}'}
 
+    def _check_helper_protocol(self):
+        # A bounded, display-free probe: never send meeting data to an old
+        # helper that cannot echo presentation identity on native clicks.
+        self._protocol_error = None
+        if not isinstance(self.helper_path, str):
+            return False
+        target = None
+        valid = False
+        try:
+            # Never use run/Popen's context manager here: its __exit__ waits
+            # indefinitely if timeout-triggered kill fails. Own the probe just
+            # like a display until the bounded reaper proves termination.
+            target = subprocess.Popen(
+                [self.helper_path] + list(getattr(self, 'helper_args', None) or []) + ['--protocol-version'],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=False, start_new_session=True)
+            with self.lock:
+                self._process_groups[target] = target.pid
+                self._register_stdout_locked(target)
+                self._stdout_busy.add(target)
+                self.process = target
+            try:
+                output, _ = target.communicate(timeout=2)
+                # Binary communicate finishes the actual read before decoding.
+                # Text-mode communicate can close stdout then raise on invalid
+                # bytes, stranding an unset EOF obligation on a closed stream.
+                self._stdout_eof[target].set()
+                output = output.decode('utf-8', errors='strict')
+            finally:
+                with self.lock:
+                    self._stdout_busy.discard(target)
+            valid = target.returncode == 0 and output.strip() == 'meeting-overlay/2'
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+        finally:
+            if target is not None:
+                valid = self._reap_locked(target) and valid
+        if valid:
+            return True
+        self._protocol_error = ('Overlay helper protocol is outdated or incompatible. '
+                                'Update the plugin sources and run python prepare_macos.py '
+                                '--home <active-profile-home> to rebuild it, then Show overlay again. '
+                                'Snapshot identity is required; '
+                                'legacy clicks are never accepted.')
+        return False
+
     def start_helper(self):
         # Fail closed on unsupported platforms or missing preparation: never
         # report started when no process exists, and never leave an orphan.
@@ -760,32 +1068,111 @@ class OverlayBridge:
         if not self._helper_available():
             self.process = None
             return None
+        if not self._check_helper_protocol():
+            return None  # retain an unconfirmed probe for Hide / Clear
+        with self.lock:
+            if self.stopping:
+                return None
         argv = [self.helper_path] + list(getattr(self, 'helper_args', None) or [])
-        kwargs = dict(stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                      stderr=subprocess.DEVNULL, text=True, bufsize=1)
-        if sys.platform != 'win32':
-            kwargs['start_new_session'] = True
         try:
-            self.process = subprocess.Popen(argv, **kwargs)
+            target = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      stderr=subprocess.DEVNULL, text=True, bufsize=1,
+                                      encoding='utf-8', errors='strict', start_new_session=True)
+            with self.lock:
+                self._process_groups[target] = target.pid
+                self._register_stdout_locked(target)
+                self.process = target
+                self._start_stdout_reader(target)
         except (OSError, ValueError, TypeError):
             self.process = None
             return None
         return self.process
 
+    def _show_process_alive(self, process):
+        """Bound direct reuse inspection to one live probe across all children."""
+        with self._probe_lock:
+            # Completion is not thread exit. Hold the slot until the worker
+            # actually exits, even if Hide has already reaped its old child.
+            self._probe_jobs = {p: j for p, j in self._probe_jobs.items() if j['worker'].is_alive()}
+            job = self._probe_jobs.get(process)
+            if job is not None and job['done'].is_set():
+                return None  # publication is not a new observation
+            if job is None:
+                if self._probe_jobs:
+                    return None  # never apply another generation's result
+                job = {'done': threading.Event(), 'alive': None, 'joined': 0}
+                self._probe_jobs[process] = job
+
+                def inspect_process():
+                    alive = None
+                    try:
+                        alive = process.poll() is None
+                        if alive:
+                            for _ in range(8):
+                                with self._probe_lock:
+                                    joined = job['joined']
+                                alive = _fresh_child_observation(process)
+                                with self._probe_lock:
+                                    if alive is not True or joined == job['joined']:
+                                        job['alive'] = alive
+                                        job['done'].set()
+                                        return
+                            alive = None
+                    except Exception:
+                        alive = None
+                    with self._probe_lock:
+                        job['alive'] = alive
+                        job['done'].set()
+
+                worker = threading.Thread(target=inspect_process, name='overlay-show-probe', daemon=True)
+                job['worker'] = worker
+                # Only prune our own finished probes. Other registered threads
+                # may not have started yet; is_alive() would discard those.
+                with self.lock:
+                    finished = {t for t in self._show_probe_threads if not t.is_alive()}
+                    self.threads = [t for t in self.threads if t not in finished]
+                    self._show_probe_threads.difference_update(finished)
+                    self._show_probe_threads.add(worker)
+                    self.threads.append(worker)
+                    worker.start()
+            job['joined'] += 1
+        if not job['done'].wait(.05):
+            return None
+        if job['alive'] is True and isinstance(getattr(process, 'returncode', None), int):
+            return None
+        return job['alive']
+
     def show_overlay(self):
         """Explicit pane action: open the overlay window, start forwarding."""
+        if self.process in self._reader_failed:
+            return {'shown': False, 'error': 'Overlay reader failed; retry Hide before Show.'}
+        if self.stopping and self.process is not None:
+            return {'shown': None, 'stop_confirmed': False,
+                    'error': self.cleanup_error or 'Overlay shutdown is not confirmed; retry Hide.'}
         if self.process is not None:
-            try:
-                if self.process.poll() is None:
+            process = self.process
+            alive = self._show_process_alive(process)
+            with self.lock:
+                # EOF/retirement can publish while the bounded probe runs.
+                # Commit reuse only against the same healthy lifecycle.
+                if process in self._reader_failed:
+                    return {'shown': False, 'error': 'Overlay reader failed; retry Hide before Show.'}
+                if self.stopping or self.process is not process or alive is None:
+                    return {'shown': None, 'stop_confirmed': False,
+                            'error': 'Overlay health is uncertain; shutdown is not confirmed. Retry Hide.'}
+                if alive is True and not isinstance(getattr(process, 'returncode', None), int):
                     return {'shown': True, 'reused': True}
-            except Exception:
-                pass
             # Reaped or exited helper: fall through to a clean relaunch.
-            self._reap_locked(None)
-        self.stopping = False
-        self.start_helper()
-        process = self.process
+            if not self._reap_locked(None):
+                return {'shown': None, 'stop_confirmed': False, 'error': self.cleanup_error}
         with self.lock:
+            if getattr(self, '_startup_cancelled', False):
+                return {'shown': False, 'error': 'Overlay startup was retired.'}
+            self.stopping = False
+        process = self.start_helper()
+        with self.lock:
+            if self.stopping:
+                return {'shown': False, 'error': 'Overlay startup was retired.'}
             # Fresh helper lifecycle: never suppress the first snapshot.
             self._last_emit_digest = None
         if process is None:
@@ -795,20 +1182,22 @@ class OverlayBridge:
             return {'shown': False, 'available': False,
                     'error': status.get('error')}
         if process.stdout is not None:
-            reader = threading.Thread(target=self._read_clicks,
-                                      name='overlay-click-reader', daemon=True)
-            reader.start()
-            with self.lock:
-                self.threads.append(reader)
+            self._start_stdout_reader(process)
         self._start_pusher_locked()
         self._start_poller_locked()
         self.push()
+        # Cached Popen evidence only: no potentially blocking poll on caller.
+        if self.stopping or isinstance(getattr(process, 'returncode', None), int):
+            return {'shown': False, 'error': 'Overlay helper exited or was retired during startup.'}
+        if process in self._reader_failed:
+            return {'shown': False, 'error': 'Overlay reader failed during startup; retry Hide.'}
         return {'shown': True, 'reused': False}
 
     def hide_overlay(self):
         """Explicit pane action: close the window, cancel rows, reap the group."""
-        self.stop()
-        return {'shown': False}
+        confirmed = self.stop()
+        return {'shown': False if confirmed else None, 'stop_confirmed': confirmed,
+                'error': self.cleanup_error}
 
     def _start_pusher_locked(self):
         with self._poller_lock:
@@ -866,7 +1255,7 @@ class OverlayBridge:
                         self.message = f'Backend unreachable: {type(exc).__name__}'
                     self.push()
                 else:
-                    self.update(status)
+                    self.update(status, poller_seq=seq)
                 if self.stopping:
                     break
                 # Bounded: one poll per interval, interruptible on hide.
@@ -944,50 +1333,63 @@ class OverlayBridge:
         # One serialization lock across validation and delivery: sequence and
         # digest checks, the write (or headless append), and bookkeeping all
         # happen atomically, so a newer snapshot can never be followed by an
-        # older one on either path. Only brief state mutations nest self.lock
-        # inside; self.lock is never held while acquiring this lock.
-        with self._stdin_lock:
-            with self.lock:
-                if digest is not None and digest == getattr(self, '_last_emit_digest', None):
-                    return True
-                if seq is not None and seq != self._latest_seq:
-                    # Superseded by a newer push; the pump or direct call that
-                    # carries the newest sequence still delivers it.
-                    return True
+        # older one on either path. The bounded fd write nests bridge.lock;
+        # bridge.lock is never held while acquiring the stdin lock.
+        failed_process = None
+        with self._stdin_lock, self.lock:
+            if self.stopping:
+                return False
+            if snapshot.get('snapshot_id', self.snapshot_id) != self.snapshot_id:
+                return False
+            if digest is not None and digest == getattr(self, '_last_emit_digest', None):
+                return True
+            if seq is not None and seq != self._latest_seq:
+                return True
+            process = self.process
+            try:
+                if process is None or process.stdin is None:
+                    self.pushed.append(snapshot)
+                else:
+                    self._write_frame(process.stdin, data.encode('utf-8'))
+            except (OSError, ValueError, TypeError, AttributeError):
+                # Partial frames are not reusable: stop admission immediately,
+                # then reap outside bridge/stdin locks. Never flush buffered IO.
+                self._retire_lifecycle_locked()
+                failed_process = process
+            else:
                 if seq is not None:
                     self._emitted_seq = max(self._emitted_seq, seq)
-            _ = truncated
-            process = self.process
-            if process is None or process.stdin is None:
-                self.pushed.append(snapshot)
-                with self.lock:
-                    if digest is not None:
-                        self._last_emit_digest = digest
+                self._last_emit_digest = digest
                 return True
+        self._broken_pipe_shutdown(failed_process)
+        return False
+
+    @staticmethod
+    def _write_frame(stream, data):
+        """Bound every real pipe write; arbitrary file-like writers unsupported.
+
+        Never call TextIO.write/flush: either can block forever on a stalled
+        helper. Holding bridge.lock across <=100ms of nonblocking fd IO makes
+        invalidation a publication fence without holding it across teardown.
+        """
+        import os
+        import select
+        fd = stream.fileno()
+        if type(fd) is not int:
+            raise TypeError('overlay stdin requires a real pipe descriptor')
+        os.set_blocking(fd, False)
+        deadline = time.monotonic() + 0.1
+        remaining = memoryview(data)
+        while remaining:
+            if time.monotonic() >= deadline:
+                raise TimeoutError('overlay helper stopped reading')
             try:
-                process_snapshot = self.process
-                if process_snapshot is None or process_snapshot.stdin is None:
-                    self.pushed.append(snapshot)
-                    with self.lock:
-                        if digest is not None:
-                            self._last_emit_digest = digest
-                    return True
-                try:
-                    process_snapshot.stdin.write(data)
-                except (BrokenPipeError, OSError, ValueError):
-                    self._broken_pipe_shutdown(process_snapshot)
-                    return False
-                try:
-                    process_snapshot.stdin.flush()
-                except (BrokenPipeError, OSError, ValueError):
-                    self._broken_pipe_shutdown(process_snapshot)
-                    return False
-                with self.lock:
-                    if digest is not None:
-                        self._last_emit_digest = digest
-                return True
-            except (BrokenPipeError, OSError, ValueError):
-                return False
+                written = os.write(fd, remaining)
+                if not written:
+                    raise BrokenPipeError('overlay pipe closed')
+                remaining = remaining[written:]
+            except BlockingIOError:
+                select.select([], [fd], [], max(0, deadline - time.monotonic()))
 
     def _broken_pipe_shutdown(self, failed_process):
         # Broken stdin means the helper exited: stop pumps/readers and reap so
@@ -996,7 +1398,8 @@ class OverlayBridge:
         current = self.process
         if current is not None and failed_process is not None and current is not failed_process:
             return
-        self.stopping = True
+        with self.lock:
+            self._retire_lifecycle_locked()
         with self._poller_lock:
             self._poller_seq += 1
             self._poller = None
@@ -1024,6 +1427,7 @@ class OverlayBridge:
             listening = bool(self._listening)
             snapshot = build_snapshot({'segments': segments, 'busy': busy, 'listening': listening},
                                       answers, message)
+            snapshot['snapshot_id'] = self.snapshot_id
             # Preserve pinned row order so streaming rows do not jump around.
             order_index = {row_id: index for index, row_id in enumerate(self.order)}
             snapshot['questions'] = sorted(snapshot.get('questions', []),
@@ -1045,6 +1449,10 @@ class OverlayBridge:
                 self._push_queue.put_nowait((snapshot, seq))
             except Exception:
                 pass
+        # Helper IO belongs only to the writer pump, never to pane publication
+        # (which may hold overlay_lock). Headless tests remain synchronous.
+        if self.process is not None and self.process.stdin is not None:
+            return True
         return self._emit(snapshot, seq)
 
     def run(self):
@@ -1069,11 +1477,8 @@ class OverlayBridge:
         self.stopping = False
         process = self.process
         if process and process.stdout:
-            reader = threading.Thread(target=self._read_clicks,
-                                      name='overlay-click-reader', daemon=True)
-            reader.start()
-            with self.lock:
-                self.threads.append(reader)
+            self._start_stdout_reader(process)
+        self._start_pusher_locked()
         self._start_poller_locked()
         try:
             while not self.stopping:
@@ -1092,18 +1497,45 @@ class OverlayBridge:
         finally:
             self.stop()
 
-    def _read_clicks(self):
-        process = self.process
+    def _register_stdout_locked(self, process):
+        # Call under bridge.lock BEFORE publishing a newly born process. Even
+        # cancelled startup owns an unset EOF obligation for its original pipe.
+        if process.stdout is not None and process not in self._stdout_eof:
+            self._stdout_eof[process] = threading.Event()
+            self._stdout_pipes[process] = process.stdout
+            self._stdout_readers[process] = None
+
+    def _start_stdout_reader(self, process):
+        with self.lock:
+            self._register_stdout_locked(process)  # injected test launchers too
+            if (self.stopping or process is not self.process or process.stdout is None
+                    or self._stdout_readers.get(process) is not None):
+                return
+            reader = threading.Thread(target=self._read_clicks, args=(process,),
+                                      name='overlay-click-reader', daemon=True)
+            self._reader = reader
+            self._stdout_readers[process] = reader
+            self.threads.append(reader)
+            reader.start()  # registration/start atomic to cleanup's snapshot
+
+    def _read_clicks(self, process=None):
+        process = self.process if process is None else process
         if process is None or process.stdout is None:
             return
         try:
             for line in process.stdout:
+                # A retired reader never publishes errors or clicks, including
+                # a line delivered only after a failed shutdown is retried.
+                if self.stopping or process is not self.process:
+                    continue  # drain without publishing; only actual EOF is evidence
                 try:
                     import json as _json
                     event = _json.loads(line) if isinstance(line, str) else None
                     if isinstance(event, dict) and event.get('type') == 'error':
                         code = str(event.get('code') or 'overlay')
                         with self.lock:
+                            if self.stopping or process is not self.process:
+                                continue
                             if code == 'hotkey':
                                 self._sticky_error = 'Overlay shortcut unavailable — overlay stays click-through. Use the pane Show/Hide actions instead.'
                             else:
@@ -1114,51 +1546,198 @@ class OverlayBridge:
                 except Exception:
                     pass
                 self.on_click_line(line)
-                if self.stopping:
-                    break
+            else:
+                # Only normal iterator exhaustion proves EOF, never an early
+                # reader return/break or IO exception.
+                with self.lock:
+                    # EOF proves pipe retirement, but an active display can no
+                    # longer deliver clicks even if its process is still alive.
+                    # Retired readers must not taint a replacement lifecycle.
+                    if not self.stopping and process is self.process:
+                        self._fail_reader_locked(process)
+                    eof = self._stdout_eof.get(process)
+                    if eof is not None:
+                        eof.set()
         except (OSError, ValueError):
-            pass
+            with self.lock:
+                self._fail_reader_locked(process)
 
-    def _reap_locked(self, process):
-        target = process if process is not None else self.process
-        if target is None:
+    def _fail_reader_locked(self, process):
+        # Caller owns bridge.lock; use the same small fence as retirement.
+        # Publishing failure and invalidating tickets is atomic with every
+        # capture guard, without taking controller/state locks from a reader.
+        with self._admission_lock:
+            self._reader_failed.add(process)
+            if not self.stopping and process is self.process:
+                self._lifecycle_epoch += 1
+
+    def _recover_stdout_eof(self, target, reader):
+        """Cleanup-only raw drain after the original reader has exited.
+
+        The serialized reaper owns this drain; no replacement blocking reader,
+        no decoding, no publication, and no EOF inferred from errors/timeouts.
+        Retain the original pipe object so a newer helper's fd is never used.
+        """
+        import os
+        import stat
+        eof = self._stdout_eof.get(target)
+        stream = self._stdout_pipes.get(target)
+        if (eof is None or eof.is_set() or stream is None
+                or stream is not getattr(target, 'stdout', None)
+                or (reader is not None and reader.is_alive())
+                or sys.platform not in ('darwin', 'linux')):
             return
         try:
-            running = target.poll() is None
-        except Exception:
-            running = False
-        if running:
+            fd = stream.fileno()
+            if stream.closed or not stat.S_ISFIFO(os.fstat(fd).st_mode):
+                return
+            os.set_blocking(fd, False)
+            deadline = time.monotonic() + .05
+            while time.monotonic() < deadline:
+                if os.read(fd, 65536) == b'':
+                    eof.set()
+                    return
+        except (OSError, ValueError, AttributeError, TypeError):
+            pass  # includes EAGAIN: a live holder is not EOF
+
+    def _signal_bounded(self, target, name):
+        # OS signaling normally returns immediately. Faulty wrappers / OS calls
+        # need not. Keep at most one in-flight call per signal and process;
+        # a hung TERM must not prevent an independent KILL or leak retry threads.
+        key = (target, name)
+        with self._cleanup_lock:
+            worker = self._signal_jobs.get(key)
+            if worker is None or not worker.is_alive():
+                def signal_child():
+                    try:
+                        getattr(target, name)()
+                    except Exception:
+                        pass  # poll, not signal delivery, proves termination
+                worker = threading.Thread(target=signal_child, name='overlay-signal', daemon=True)
+                self._signal_jobs[key] = worker
+                worker.start()
+        worker.join(.05)
+
+    def _group_gone(self, target):
+        """Observe only our launch-created group; never signal a stale PGID.
+
+        Popen.poll/communicate may already have reaped the session leader on
+        another thread. A check-then-killpg would race PID/group reuse, so only
+        the owned Popen receives TERM/KILL. Surviving descendants deliberately
+        leave shutdown unconfirmed. A reused group also fails closed (it is
+        never signaled). ESRCH proves absence only of this process group, not
+        daemonized descendants that escaped it; helpers must not daemonize.
+        """
+        import os
+        pgid = self._process_groups.get(target)
+        if pgid is None:
+            return True  # injected non-session handle: parent + reader only
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        return False
+
+    def _reap_locked(self, process):
+        """Bounded caller wait; no buffered IO or process methods on caller.
+
+        Despite the historic name, never hold bridge.lock across this call.
+        Only the caller publishes the outcome. A late worker cannot clear a
+        newer process or resurrect an invalidated bridge.
+        """
+        with self.lock:
+            target = process if process is not None else self.process
+            reader = self._stdout_readers.get(target, self._reader)
+        if target is None:
+            self.cleanup_error = None
+            return True
+        with self._cleanup_lock:
+            job = self._cleanup_job
+            if job is None or job['target'] is not target or (job['done'].is_set() and not job['confirmed']):
+                job = {'target': target, 'done': threading.Event(), 'confirmed': False}
+                self._cleanup_job = job
+                def reap():
+                    try:
+                        for name in ('terminate', 'kill'):
+                            if target.poll() is not None:
+                                break
+                            self._signal_bounded(target, name)
+                            deadline = time.monotonic() + .15
+                            while target.poll() is None and time.monotonic() < deadline:
+                                time.sleep(.01)
+                        parent_gone = target.poll() is not None
+                        group_gone = self._group_gone(target)
+                        # An escaped/inherited pipe can outlive even the group.
+                        # Never publish success before the reader has finished,
+                        # and never strand a reaper in an unbounded reader join.
+                        if parent_gone and group_gone and reader is not None and reader is not threading.current_thread():
+                            reader.join(.05)
+                        reader_gone = (target not in self._stdout_busy
+                                       and (reader is None or not reader.is_alive()))
+                        if parent_gone and reader_gone:
+                            self._recover_stdout_eof(target, reader)
+                        eof = self._stdout_eof.get(target)
+                        pipe_eof = (getattr(target, 'stdout', None) is None
+                                    or (eof is not None and eof.is_set()))
+                        job['confirmed'] = parent_gone and group_gone and reader_gone and pipe_eof
+                        if job['confirmed']:
+                            for stream in (getattr(target, 'stdout', None), getattr(target, 'stdin', None)):
+                                if stream is not None:
+                                    stream.close()
+                    except Exception:
+                        job['confirmed'] = False
+                    finally:
+                        job['done'].set()
+                job['worker'] = threading.Thread(target=reap, name='overlay-reaper', daemon=True)
+                job['worker'].start()
+        job['done'].wait(.5)
+        confirmed = job['done'].is_set() and job['confirmed'] and job['target'] is target
+        if confirmed:
+            if self.process is target:
+                self.process = None
+            self._process_groups.pop(target, None)
+            self._stdout_eof.pop(target, None)
+            self._stdout_pipes.pop(target, None)
+            self._stdout_readers.pop(target, None)
+            self._reader_failed.discard(target)
+            self.cleanup_error = None
+        else:
+            self.cleanup_error = ('Overlay shutdown is not confirmed; the helper, its process group, '
+                                  'or pipe reader may still be alive and meeting content may remain visible. '
+                                  'Retry Hide / Clear. If it persists, quit the overlay helper and its descendants.')
+        return confirmed
+
+    def _retire_lifecycle_locked(self):
+        """Invalidate queued taps as well as admitted slots on every exit."""
+        with self._admission_lock:
+            self.stopping = True
+            self._lifecycle_epoch += 1
+        self._listening = self.listening = False
+        self.paused_generation += 1
+        for request_id in list(self.row_by_request):
+            self._cancel_locked(request_id)
+        self.request_by_row.clear()
+        self.reserved_generation.clear()
+        self.answers.clear()
+        self.questions.clear()
+        self.order.clear()
+        self.segments.clear()
+        while True:
             try:
-                target.terminate()
-            except (OSError, ProcessLookupError):
-                pass
-            try:
-                target.wait(timeout=2)
-                running = False
-            except subprocess.TimeoutExpired:
-                try:
-                    target.kill()
-                    target.wait(timeout=2)
-                except Exception:
-                    pass
-        # Close pipes only after the child is reaped: closing stdout while the
-        # reader thread is blocked is safe, and closing stdin first avoids the
-        # old stop-while-reader-blocked deadlock.
-        for stream in (getattr(target, 'stdout', None), getattr(target, 'stdin', None)):
-            if stream is not None:
-                try:
-                    stream.close()
-                except (BrokenPipeError, OSError, ValueError):
-                    pass
-        if self.process is target:
-            self.process = None
+                self._click_queue.get_nowait()
+            except Exception:
+                break
+
+    def invalidate(self):
+        """Close admission before the backend detaches us; no pipe IO/join."""
+        with self.lock:
+            self._retire_lifecycle_locked()
+            self._sticky_error = None
 
     def stop(self):
-        self.stopping = True
-        with self.lock:
-            self._sticky_error = None
-            for request_id in list(self.row_by_request):
-                self._cancel_locked(request_id)
+        self.invalidate()
         with self._poller_lock:
             self._poller_seq += 1
             self._poller = None
@@ -1168,12 +1747,7 @@ class OverlayBridge:
                 self._push_queue.get_nowait()
         except Exception:
             pass
-        process = self.process
-        if process is not None:
-            try:
-                self._reap_locked(process)
-            except OSError:
-                pass
+        return self._reap_locked(self.process)
 
 
 def main(argv=None):

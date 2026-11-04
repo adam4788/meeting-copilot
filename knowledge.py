@@ -543,9 +543,9 @@ class KnowledgeEngine:
                 import itertools
                 records = list(itertools.islice(search(terms) or [], 100))
             except Exception as exc:
-                # Provider errors are untrusted text: report the failure
-                # class, never the provider's raw message.
-                raise RuntimeError(f'History provider failed ({type(exc).__name__})') from None
+                # Exception messages and class names are both untrusted.
+                # Publish only a fixed diagnostic.
+                raise RuntimeError('History provider failed.') from None
             # Injected history gets the same treatment as the host session
             # store: redact credential-looking values and bound fields
             # before any of it can reach a completion provider or caller.
@@ -791,7 +791,7 @@ class KnowledgeEngine:
                     sources.extend(self._web(query))
                     web = {'used': True, 'mode': mode, 'query': query}
                 except Exception as exc:
-                    warnings.append(f'Web search failed ({type(exc).__name__}); using local evidence only.')
+                    warnings.append('Web search failed; using local evidence only.')
         if prepared is not None:
             sources = list(prepared.get('sources') or [])
             # Stream headers carry this as 'web_search'; accept both keys so a
@@ -847,8 +847,8 @@ class KnowledgeEngine:
             raise
         except Exception as exc:
             text = 'A model answer is unavailable. Review the retrieved sources; no actions were performed.'
-            warnings.append(f'Model request failed ({type(exc).__name__}).')
-            provider_error = f'{type(exc).__name__}: model request failed'
+            warnings.append('Model request failed.')
+            provider_error = 'Model request failed.'
         warnings.extend(meta_warnings)
         if not sources:
             warnings.append('No matching local/session evidence found; transcript alone is not independent verification.')
@@ -946,7 +946,7 @@ class KnowledgeEngine:
                 web = {'used': True, 'mode': mode, 'query': query}
                 payload['evidence'] = [{'citation': i, 'title': s['title'], 'text': s['text'][:2050]} for i, s in enumerate(sources, 1)]
             except Exception as exc:
-                warnings.append(f'Web search failed ({type(exc).__name__}); using local evidence only.')
+                warnings.append('Web search failed; using local evidence only.')
         messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)}]
         web_planned = web_planned or (query is not None)
         header = {'model_route': model_route, 'sources': sources, 'warnings': warnings, 'web_search': web,
@@ -987,7 +987,7 @@ class KnowledgeEngine:
                                           'web_planned': web_planned,
                                           'model_route': model_route})
                 raise err from exc
-            raise RuntimeError(f'Model request failed ({type(exc).__name__}).') from None
+            raise RuntimeError('Model request failed.') from None
 
         _standalone_mode = self._standalone_mode
         class _GuardedStream:
@@ -1047,7 +1047,7 @@ class KnowledgeEngine:
                             raise NotImplementedError('streaming_unsupported:default-meta-route-failed') from exc
                         if not _standalone_mode:
                             raise
-                        raise RuntimeError(f'Model request failed ({type(exc).__name__}).') from None
+                        raise RuntimeError('Model request failed.') from None
                 try:
                     chunk = next(self._iterator)
                 except StopIteration:
@@ -1068,8 +1068,8 @@ class KnowledgeEngine:
                     if not _standalone_mode:
                         raise
                     # Standalone: provider exception text can embed
-                    # credentials/endpoints — surface the failure type only.
-                    raise RuntimeError(f'Model request failed ({type(exc).__name__}).') from None
+                    # credentials/endpoints — surface a fixed diagnostic only.
+                    raise RuntimeError('Model request failed.') from None
                 self._yielded = True
                 return chunk
         return header, _GuardedStream()

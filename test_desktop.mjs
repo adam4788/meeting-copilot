@@ -2,13 +2,464 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
+import { webcrypto } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { createInterface } from 'node:readline';
+
+async function realBackend(t) {
+  const child = spawn('python', ['-B', '-u', 'lifecycle_test_backend.py'], { cwd: new URL('.', import.meta.url), stdio: ['pipe', 'pipe', 'pipe'] });
+  let id = 0, stderr = '';
+  const waiting = new Map(), errors = [], traffic = [];
+  child.stderr.on('data', data => { stderr += data; });
+  const lines = createInterface({ input: child.stdout });
+  lines.on('line', line => {
+    try {
+      const data = JSON.parse(line), pending = waiting.get(data.id);
+      assert.ok(pending, 'unexpected backend reply');
+      waiting.delete(data.id);
+      if (data.error) { errors.push(data.error); pending.reject(new Error(data.error)); }
+      else pending.resolve(data.result);
+    } catch (error) { errors.push(error); }
+  });
+  const exited = new Promise(resolve => child.on('exit', (code, signal) => {
+    for (const pending of waiting.values()) pending.reject(new Error(`backend exited: ${code}/${signal}: ${stderr}`));
+    waiting.clear(); resolve(code);
+  }));
+  t.after(async () => {
+    child.stdin.end();
+    assert.equal(await exited, 0, stderr);
+    assert.deepEqual(errors, []);
+    assert.equal(stderr, '', 'no swallowed backend/thread errors');
+    lines.close();
+  });
+  const rpc = message => new Promise((resolve, reject) => {
+    const key = ++id; waiting.set(key, { resolve, reject });
+    child.stdin.write(JSON.stringify({ ...message, id: key }) + '\n');
+  });
+  const rest = async (path, options = {}) => {
+    const reply = await rpc({ path, ...options });
+    traffic.push({ path, ...options, requestBody: options.body, ...reply });
+    if (reply.code >= 400) throw new Error(`${reply.code}: ${JSON.stringify(reply.body)}`);
+    return reply.body;
+  };
+  const mount = (globals = {}, transport = rest) => {
+    const timers = new Map(); let next = 0;
+    const status = {};
+    const p = pane('', true, false, '', { 3: true, 4: 'macos' }, transport, status, {
+      setInterval: fn => { timers.set(++next, fn); return next; },
+      clearInterval: key => timers.delete(key), ...globals,
+    }, { effects: true });
+    return { ...p,
+      async refresh() { Object.assign(status, await rest('/status')); return p.rerender(); },
+      async heartbeat() { for (const fn of timers.values()) await fn(); await rpc({ command: 'inspect' }); } };
+  };
+  return { rpc, rest, mount, traffic };
+}
+
+test('quick overlay toggle uses real host effect and discloses failed Show outside details', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t);
+  await backend.rpc({ command: 'install-show-fault' });
+  const ui = await backend.mount();
+  try {
+    const before = disclosedNodes(ui.tree);
+    assert.match(JSON.stringify(before), /Screen-share privacy/);
+    await button(ui.tree, 'Show overlay').props.onClick();
+    const visible = JSON.stringify(disclosedNodes(ui.rerender()));
+    assert.match(visible, /Overlay action not confirmed/);
+    assert.match(visible, /Retry Show \/ Hide/);
+    assert.doesNotMatch(JSON.stringify(ui.rerender()), /synthetic-private-helper-path/);
+    assert.equal(backend.traffic.find(r => r.path === '/overlay/show').code, 503);
+    const state = await backend.rest('/status');
+    assert.equal(state.overlay_shown, false, 'failed helper must not become shown');
+    await backend.rpc({ command: 'allow-show' });
+    await button(ui.rerender(), 'Show overlay').props.onClick();
+    assert.equal((await backend.rest('/status')).overlay_shown, true);
+    await button(ui.rerender(), 'Hide overlay').props.onClick();
+    assert.equal((await backend.rest('/status')).overlay_shown, false);
+  } finally { ui.unmount(); await backend.rpc({ command: 'inspect' }); }
+});
+
+test('real renderer heartbeat cannot keep abandoned capture alive after reload', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t);
+  const owner = backend.mount();
+  await button(owner.tree, 'Start listening').props.onClick();
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, true);
+  // No cleanup: the first renderer vanished. A fresh JS global has a new ID.
+  const reloaded = backend.mount();
+  await button(reloaded.tree, 'Start listening').props.onClick();
+  assert.equal(backend.traffic.filter(r => r.path === '/overlay/claim').at(-1).body.reason, 'different_renderer');
+  for (let i = 0; i < 4; i++) {
+    await reloaded.heartbeat();
+    await reloaded.pollStatus();
+    await backend.rpc({ command: 'tick', seconds: 10 });
+  }
+  const stopped = await backend.rpc({ command: 'inspect' });
+  assert.equal(stopped.running, false, 'rejected renderer must not renew abandoned capture');
+  assert.equal(stopped.stops, 1);
+  reloaded.unmount();
+});
+
+test('real current owner renews capture; superseded heartbeat and status do not', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t);
+  const globals = { globalThis: { crypto: webcrypto } };
+  const old = backend.mount(globals);
+  await button(old.tree, 'Start listening').props.onClick();
+  const stalePane = old.requests.find(r => r.path === '/start').body.pane;
+  const current = backend.mount(globals);
+  await button(current.tree, 'Start listening').props.onClick();
+  for (let i = 0; i < 5; i++) {
+    await backend.rpc({ command: 'tick', seconds: 10 });
+    await current.heartbeat();
+  }
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, true);
+  const before = (await backend.rpc({ command: 'inspect' })).seen;
+  for (let i = 0; i < 4; i++) {
+    await old.heartbeat(); await old.pollStatus();
+    // A heartbeat already queued in transport before re-registration.
+    await backend.rest('/heartbeat', { method: 'POST', body: { pane: stalePane } });
+    await backend.rpc({ command: 'tick', seconds: 10 });
+  }
+  const after = await backend.rpc({ command: 'inspect' });
+  assert.equal(after.seen, before, 'stale owner cannot extend lease');
+  assert.equal(after.running, false);
+  assert.equal(backend.traffic.filter(r => r.path === '/heartbeat').at(-1).body.accepted, false);
+  old.unmount(); current.unmount();
+  await backend.rpc({ command: 'inspect' });
+});
+
+function gate() {
+  let resolve;
+  const promise = new Promise(r => { resolve = r; });
+  return { promise, resolve };
+}
+function command(p, label) { return p.contributions.find(c => c.area === 'palette' && c.data.label === label).data.run; }
+
+test('real Restart waits for fenced release before reopening and never leaves capture active', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t), entered = gate(), resume = gate();
+  t.after(() => resume.resolve());
+  const p = backend.mount({}, async (path, options) => {
+    if (path === '/overlay/release') { entered.resolve(); await resume.promise; }
+    return backend.rest(path, options);
+  });
+  await button(p.tree, 'Start listening').props.onClick();
+  const original = p.contributions.find(c => c.area === 'panes');
+  const restarting = command(p, 'Restart Meeting Copilot')();
+  // This gate also exposes the old unscoped Pause path without hanging RED.
+  await Promise.race([entered.promise, restarting]);
+  const whilePending = p.contributions.find(c => c.area === 'panes');
+  resume.resolve(); await restarting;
+  await backend.rpc({ command: 'inspect' });
+  assert.equal(whilePending, original, 'must await release before replacing pane');
+  assert.ok(!p.requests.some(r => r.path === '/pause' && !r.body.pane));
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, false);
+  assert.notEqual(p.contributions.find(c => c.area === 'panes'), original);
+  await button(p.rerender(), 'Start listening').props.onClick();
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, true, 'replacement remains functional');
+  p.unmount(); await backend.rpc({ command: 'inspect' });
+});
+
+test('real overlapping Restart cannot remove or pause a newly opened pane', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t), entered = gate(), resume = gate();
+  t.after(() => resume.resolve());
+  const p = backend.mount({}, async (path, options) => {
+    if (path === '/overlay/release' || path === '/pause') { entered.resolve(); await resume.promise; }
+    return backend.rest(path, options);
+  });
+  await button(p.tree, 'Start listening').props.onClick();
+  command(p, 'Open Meeting Copilot')();
+  const restarting = command(p, 'Restart Meeting Copilot')();
+  await entered.promise;
+  const opener = p.contributions.find(c => c.area === 'statusBar.right');
+  nodes(opener.render()).find(n => n.type === 'button').props.onClick();
+  command(p, 'Open Meeting Copilot')();
+  const replacement = p.contributions.find(c => c.area === 'panes');
+  await button(p.rerender(), 'Start listening').props.onClick();
+  resume.resolve(); await restarting;
+  assert.equal(p.contributions.find(c => c.area === 'panes'), replacement);
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, true);
+  p.unmount(); await backend.rpc({ command: 'inspect' });
+});
+
+test('real Restart cannot retire a newer effect lifecycle in the same registration', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t), entered = gate(), resume = gate();
+  t.after(() => resume.resolve());
+  const p = backend.mount({}, async (path, options) => {
+    const result = await backend.rest(path, options);
+    if (path === '/overlay/release') { entered.resolve(); await resume.promise; }
+    return result;
+  });
+  await button(p.tree, 'Start listening').props.onClick();
+  const original = p.contributions.find(c => c.area === 'panes');
+  const restarting = command(p, 'Restart Meeting Copilot')();
+  await entered.promise;
+  p.replayEffects(); // effects clear retirement and schedule React's next render
+  await button(p.rerender(), 'Start listening').props.onClick();
+  resume.resolve(); await restarting;
+  await backend.rpc({ command: 'inspect' });
+  assert.equal(p.contributions.find(c => c.area === 'panes'), original);
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, true);
+  p.unmount(); await backend.rpc({ command: 'inspect' });
+});
+
+test('real lookup retry restores Start Pause and Clear without replaying a claim', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t);
+  let lookups = 0;
+  const p = backend.mount({}, (path, options) => {
+    if (path === '/overlay/lifecycle' && ++lookups === 1) throw new Error('transient GET');
+    return backend.rest(path, options);
+  });
+  await settle();
+  await button(p.tree, 'Start listening').props.onClick();
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, true);
+  await backend.rpc({ command: 'segment', text: 'Synthetic integration meeting' });
+  await button(await p.refresh(), 'Clear meeting').props.onClick();
+  assert.deepEqual((await backend.rest('/status')).segments, []);
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, true, 'Clear restarts the authorized capture');
+  await button(await p.refresh(), 'Pause listening').props.onClick();
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, false);
+  assert.equal(lookups, 2);
+  assert.equal(backend.traffic.filter(r => r.path === '/overlay/claim').length, 1);
+  const controls = backend.traffic.filter(r => ['/start', '/clear', '/pause'].includes(r.path));
+  assert.deepEqual(controls.map(r => r.code), [200, 200, 200]);
+  assert.ok(controls.every(r => r.requestBody.pane && r.requestBody.action > 0));
+  assert.ok(controls[0].requestBody.action < controls[1].requestBody.action);
+  assert.ok(controls[1].requestBody.action < controls[2].requestBody.action);
+  p.unmount(); await backend.rpc({ command: 'inspect' });
+});
+
+test('real committed claim with lost reply never replays; explicit new mount recovers', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t), committed = gate();
+  const globals = { globalThis: { crypto: webcrypto } };
+  const old = backend.mount(globals, async (path, options) => {
+    const result = await backend.rest(path, options);
+    if (path === '/overlay/claim') { committed.resolve(); throw new Error('claim committed, response lost'); }
+    return result;
+  });
+  await committed.promise;
+  for (let i = 0; i < 2; i++) await button(old.tree, 'Start listening').props.onClick();
+  await old.heartbeat();
+  assert.equal(backend.traffic.filter(r => r.path === '/overlay/claim').length, 1);
+  assert.ok(!backend.traffic.some(r => ['/start', '/heartbeat'].includes(r.path)));
+  old.unmount();
+  const newer = backend.mount(globals);
+  await button(newer.tree, 'Start listening').props.onClick();
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, true);
+  newer.unmount(); await backend.rpc({ command: 'inspect' });
+});
+
+test('actual macOS parser cleanup failure renders unconfirmed and scoped Retry stop recovers', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t);
+  await backend.rpc({ command: 'install-macos-fault' });
+  const p = backend.mount();
+  await button(p.tree, 'Start listening').props.onClick();
+  const failure = await backend.rpc({ command: 'wait-macos-error' });
+  assert.equal(failure.running, true, 'failed signals leave the synthetic worker alive');
+  assert.equal(failure.status.listening, false);
+  assert.equal(failure.status.stop_confirmed, false);
+  const tree = await p.refresh();
+  assert.match(JSON.stringify(tree), /Stopping — unconfirmed/);
+  assert.ok(!button(tree, 'Start listening') && !button(tree, 'Resume listening') && !button(tree, 'New meeting'));
+  await backend.rpc({ command: 'allow-stop' });
+  await button(tree, 'Retry stop').props.onClick();
+  const stopped = await backend.rest('/status');
+  assert.equal(stopped.stopping, false);
+  assert.equal(stopped.stop_confirmed, true);
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, false);
+  const pauses = backend.traffic.filter(r => r.path === '/pause');
+  assert.equal(pauses.length, 1);
+  assert.ok(pauses[0].requestBody.pane && pauses[0].requestBody.action > 0);
+  assert.equal(backend.traffic.filter(r => r.path === '/start').length, 1);
+  assert.ok(!button(await p.refresh(), 'Retry stop'));
+  p.unmount(); await backend.rpc({ command: 'inspect' });
+});
+
+test('real denied overlay cleanup stays visible across Clear and failed Hide; retry confirms shutdown', {
+  timeout: 10000,
+  skip: !['darwin', 'linux'].includes(process.platform), // real POSIX pipe/select helper
+}, async t => {
+  const backend = await realBackend(t);
+  const p = backend.mount();
+  await button(p.tree, 'Start listening').props.onClick();
+  await backend.rpc({ command: 'install-overlay-fault' });
+  await backend.rpc({ command: 'segment', text: 'Question before Clear?' });
+  await button(await p.refresh(), 'Clear meeting').props.onClick();
+  let tree = await p.refresh();
+  assert.match(JSON.stringify(tree), /Overlay shutdown is not confirmed/);
+  assert.ok(button(tree, 'Retry hide overlay'), 'Clear must retain an explicit cleanup retry');
+  assert.equal(button(tree, 'Start listening').props.disabled, true);
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, false);
+  await button(tree, 'Retry hide overlay').props.onClick();
+  tree = await p.refresh();
+  assert.ok(button(tree, 'Retry hide overlay'), 'denied retry is not hidden');
+  await button(tree, 'Clear meeting').props.onClick();
+  tree = await p.refresh();
+  assert.match(JSON.stringify(tree), /Overlay shutdown is not confirmed/);
+  assert.equal((await backend.rpc({ command: 'inspect-overlay' })).alive, true);
+  await backend.rpc({ command: 'allow-overlay-stop' });
+  await button(tree, 'Retry hide overlay').props.onClick();
+  tree = await p.refresh();
+  const final = await backend.rpc({ command: 'inspect-overlay' });
+  assert.equal(final.alive, false);
+  assert.equal(final.pending, false);
+  assert.equal(final.status.overlay_stop_confirmed, true);
+  assert.equal(final.status.overlay_cleanup_error, null);
+  assert.equal(final.status.listening, false);
+  assert.doesNotMatch(JSON.stringify(tree), /Overlay shutdown is not confirmed/);
+  assert.ok(button(tree, 'Show overlay'));
+});
+
+test('live helper EOF immediately replaces shown success with actionable cleanup warning', {
+  timeout: 10000, skip: !['darwin', 'linux'].includes(process.platform),
+}, async t => {
+  const backend = await realBackend(t);
+  const p = backend.mount();
+  await button(p.tree, 'Start listening').props.onClick(); // claim using fake audio only
+  await button(await p.refresh(), 'Pause listening').props.onClick();
+  nodes(p.rerender()).find(n => n.props?.['aria-labelledby'] === 'mc-backend-label').props.onChange({ target: { value: 'native' } });
+  await backend.rpc({ command: 'install-overlay-channel-fault' });
+  await button(await p.refresh(), 'Show overlay').props.onClick();
+  assert.ok(JSON.stringify(p.rerender()).includes('Overlay shown'), JSON.stringify(backend.traffic.slice(-3)));
+  await backend.rpc({ command: 'close-overlay-stdout' });
+  let tree = await p.refresh();
+  const status = (await backend.rpc({ command: 'inspect-overlay' })).status;
+  assert.equal(status.overlay_shown, null);
+  assert.equal(status.overlay_stop_confirmed, false);
+  assert.match(JSON.stringify(tree), /click channel failed/);
+  assert.match(JSON.stringify(tree), /shutdown is not confirmed/);
+  assert.doesNotMatch(JSON.stringify(tree), /Overlay shown/);
+  assert.ok(!button(tree, 'Restart capture'), 'overlay fault must not suggest audio restart');
+  assert.equal(button(tree, 'Start listening').props.disabled, true);
+  await button(tree, 'Retry hide overlay').props.onClick();
+  tree = await p.refresh();
+  assert.ok(button(tree, 'Retry hide overlay'));
+  assert.equal((await backend.rpc({ command: 'inspect-overlay' })).alive, true);
+  await backend.rpc({ command: 'allow-overlay-stop' });
+  await button(tree, 'Retry hide overlay').props.onClick();
+  tree = await p.refresh();
+  assert.equal((await backend.rpc({ command: 'inspect-overlay' })).status.overlay_stop_confirmed, true);
+  assert.ok(!button(tree, 'Retry hide overlay'));
+  assert.equal(button(tree, 'Start listening').props.disabled, false);
+});
+
+test('accepted release with unconfirmed physical stop does not reopen or claim success', async () => {
+  const p = lifecyclePane({ '/overlay/release': { accepted: true, stopping: true, stop_confirmed: false } }, { 3: true, 4: 'macos' });
+  await button(p.tree, 'Start listening').props.onClick();
+  const original = p.contributions.find(c => c.area === 'panes');
+  await command(p, 'Restart Meeting Copilot')();
+  assert.equal(p.contributions.find(c => c.area === 'panes'), original);
+  assert.ok(!nodes(p.rerender()).some(n => typeof n.props?.onClick === 'function'));
+  assert.ok(p.notices.some(n => n.kind === 'warning' && /not confirmed/.test(n.message)));
+  assert.ok(!p.notices.some(n => n.kind === 'success'));
+  p.unmount();
+  const closed = lifecyclePane({ '/overlay/release': { accepted: true, stopping: true, stop_confirmed: false } });
+  await button(closed.tree, 'Show overlay').props.onClick();
+  closed.unmount(); await new Promise(resolve => setImmediate(resolve));
+  assert.ok(closed.requests.some(r => r.path === '/overlay/release'));
+  assert.ok(closed.notices.some(n => n.kind === 'warning' && /not confirmed/.test(n.message)));
+});
+
+test('overlay release failure blocks Restart and warns on unmount independently of audio stop', async () => {
+  const reply = { accepted: true, stop_confirmed: true, stopping: false, overlay_stop_confirmed: false,
+    overlay_cleanup_error: 'Overlay shutdown is not confirmed. Retry Hide / Clear.' };
+  const p = lifecyclePane({ '/overlay/release': reply });
+  await button(p.tree, 'Show overlay').props.onClick();
+  const original = p.contributions.find(c => c.area === 'panes');
+  await command(p, 'Restart Meeting Copilot')();
+  assert.equal(p.contributions.find(c => c.area === 'panes'), original);
+  assert.ok(p.notices.some(n => n.kind === 'warning' && /Overlay shutdown is not confirmed/.test(n.message)));
+  assert.ok(!p.notices.some(n => /pane reopened/.test(n.message)));
+  const closed = lifecyclePane({ '/overlay/release': reply });
+  await button(closed.tree, 'Show overlay').props.onClick();
+  closed.unmount(); await new Promise(resolve => setImmediate(resolve));
+  assert.ok(closed.notices.some(n => n.kind === 'warning' && /Overlay shutdown is not confirmed/.test(n.message)));
+});
+
+test('unconfirmed stop is visible and only offers stop retry, not restart capture', async () => {
+  const p = lifecyclePane({}, { 3: true, 4: 'macos' }, {
+    listening: false, stopping: true, error: 'Capture stop is not confirmed; audio may still be active.',
+    capture: { state: 'stopping' }, segments: [{ text: 'Earlier context' }],
+  });
+  const tree = p.rerender();
+  assert.match(JSON.stringify(tree), /Stopping — unconfirmed/);
+  assert.ok(!button(tree, 'Start listening') && !button(tree, 'Resume listening') && !button(tree, 'New meeting'));
+  await button(tree, 'Retry stop').props.onClick();
+  assert.ok(p.requests.some(r => r.path === '/pause' && r.body.pane));
+  assert.ok(!p.requests.some(r => r.path === '/start'));
+  p.unmount();
+});
+
+test('real failed Restart release stays closed to callbacks and expires instead of legacy fallback', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t);
+  const p = backend.mount({}, (path, options) => {
+    if (path === '/overlay/release') throw new Error('release transport lost');
+    return backend.rest(path, options);
+  });
+  await button(p.tree, 'Start listening').props.onClick();
+  const original = p.contributions.find(c => c.area === 'panes');
+  const staleSuggest = button(p.tree, 'Suggest answer').props.onClick;
+  await command(p, 'Restart Meeting Copilot')();
+  assert.equal(p.contributions.find(c => c.area === 'panes'), original);
+  const retired = p.rerender();
+  assert.ok(!nodes(retired).some(n => typeof n.props?.onClick === 'function'), 'retired pane has no interactive controls');
+  assert.match(JSON.stringify(retired), /Capture pause is not confirmed/);
+  assert.match(JSON.stringify(retired), /close.*reopen/i);
+  const before = p.requests.length;
+  await staleSuggest();
+  assert.equal(p.requests.length, before, 'captured old Assist cannot send private meeting context');
+  assert.ok(!p.requests.some(r => r.path === '/pause'));
+  assert.ok(p.notices.some(n => n.kind === 'warning' && /not completed/.test(n.message)), 'unconfirmed pause is visible');
+  await p.heartbeat();
+  assert.equal((await backend.rpc({ command: 'tick', seconds: 32 })).running, false);
+  p.unmount();
+  assert.equal(p.requests.filter(r => r.path === '/overlay/release').length, 1, 'uncertain release is not replayed');
+});
+
+test('superseded registration callbacks cannot restart open or heartbeat a newer pane', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t);
+  const globals = { globalThis: { crypto: webcrypto } };
+  const old = backend.mount(globals);
+  await button(old.tree, 'Start listening').props.onClick();
+  const restart = command(old, 'Restart Meeting Copilot'), open = command(old, 'Open Meeting Copilot');
+  const current = backend.mount(globals);
+  await button(current.tree, 'Start listening').props.onClick();
+  const requests = old.requests.length;
+  await restart(); open(); await old.heartbeat();
+  assert.equal(old.requests.length, requests);
+  assert.equal(old.revealed.length, 0);
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, true);
+  old.unregister();
+  await backend.rpc({ command: 'inspect' });
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, true);
+  current.unmount(); await backend.rpc({ command: 'inspect' });
+});
+
+test('transient lifecycle GET retries but uncertain claim never replays', async () => {
+  let lookups = 0;
+  const p = lifecyclePane({ '/overlay/lifecycle': () => {
+    if (++lookups === 1) throw new Error('temporary lookup failure');
+    return { revision: 0, epoch: 'backend-epoch' };
+  } }, { 3: true, 4: 'macos' });
+  await settle();
+  await button(p.tree, 'Start listening').props.onClick();
+  assert.equal(lookups, 2);
+  assert.equal(p.requests.filter(r => r.path === '/overlay/claim').length, 1);
+  assert.equal(p.requests.filter(r => r.path === '/start').length, 1);
+  p.unmount();
+  let claims = 0;
+  const uncertain = lifecyclePane({ '/overlay/claim': () => { claims++; throw new Error('response lost after commit'); } }, { 3: true, 4: 'macos' });
+  await settle();
+  for (let i = 0; i < 2; i++) await button(uncertain.tree, 'Start listening').props.onClick();
+  assert.equal(claims, 1);
+  assert.ok(!uncertain.requests.some(r => r.path === '/start'));
+  uncertain.unmount();
+});
 
 test('capture recovery confirms changed source before destructive restart', async () => {
   for (const accept of [false, true]) {
     const confirmations = [];
     const { tree, requests } = pane('', true, false, '',
       { 3: true, 4: 'macos', 11: 'system' }, {},
-      { error: 'capture failed', result: { answer: 'Retained answer', sources: [] },
+      { error: 'capture failed', error_source: 'capture', result: { answer: 'Retained answer', sources: [] },
         last_session: { backend: 'macos', transcription_model: 'base.en', audio_source: 'microphone' } },
       { window: { confirm: message => { confirmations.push(message); return accept; } } });
     const recovery = nodes(tree).find(n => n.type === 'button' && n.children.includes('Restart capture'));
@@ -21,7 +472,7 @@ test('capture recovery confirms changed source before destructive restart', asyn
 
 test('live capture error offers a status recheck, not a false restart label', async () => {
   const { tree, requests } = pane('', true, false, '', {}, {},
-    { listening: true, backend: 'meetily', error: 'snapshot_unavailable' });
+    { listening: true, backend: 'meetily', error: 'snapshot_unavailable', error_source: 'capture' });
   const recheck = nodes(tree).find(n => n.type === 'button' && n.children.includes('Recheck status'));
   assert.ok(recheck);
   assert.ok(!nodes(tree).some(n => n.type === 'button' && n.children.includes('Restart capture')));
@@ -38,26 +489,42 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
   const requests = [];
   const contributions = [];
   const revealed = [];
+  const notices = [];
+  const effects = [];
+  let effectIndex = 0;
+  let pendingEffects = [];
+  let statusQuery;
   let visible = false;
   const visibility = { get: () => visible };
   const ctx = {
     rest: async (path, options = {}) => {
       requests.push({ path, ...options });
-      const r = respond[path];
+      const defaults = { '/overlay/lifecycle': { revision: 0, epoch: 'backend-epoch' }, '/overlay/claim': { pane: 'test-pane' }, '/overlay/show': { shown: true, owner: 'test-owner' }, '/overlay/release': { accepted: true } };
+      if (typeof respond === 'function') return respond(path, options);
+      const r = respond[path] || defaults[path];
       return typeof r === 'function' ? r(path, options) : (r || {});
     },
     register: item => {
       contributions.push(item);
       if (item.area === 'panes') registered = item;
-      return () => { contributions.splice(contributions.indexOf(item), 1); if (item.area === 'panes') visible = false; };
+      return () => {
+        const index = contributions.indexOf(item);
+        if (index < 0) return;
+        contributions.splice(index, 1);
+        if (item.area === 'panes') {
+          visible = false;
+          for (const effect of effects) effect?.cleanup?.();
+          effects.length = 0; values.length = 0;
+        }
+      };
     },
   };
   const h = (type, props, ...children) => typeof type === 'function'
     ? type(props || {}) : { type, props: props || {}, children: children.flat(Infinity) };
   const source = readFileSync(new URL('./desktop/plugin.js', import.meta.url), 'utf8')
     .replace(/^import .*;\r?\n/gm, '').replace('export default', 'const plugin =');
-  vm.runInNewContext(source + '\nplugin.register(ctx);', {
-    ctx, h,
+  const unregister = vm.runInNewContext(source + '\nplugin.register(ctx);', {
+    ctx, h, crypto: webcrypto,
     useState: initial => {
       const i = stateIndex++;
       if (!(i in values)) {
@@ -71,19 +538,785 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
       if (!(i in values)) values[i] = { current: initial };
       return values[i];
     },
-    useEffect: () => {},
+    useEffect: (fn, deps) => {
+      if (!qcBehavior.effects) return;
+      const i = effectIndex++;
+      const old = effects[i];
+      if (!old || !deps || deps.some((value, j) => !Object.is(value, old.deps?.[j]))) {
+        pendingEffects.push(() => { old?.cleanup?.(); effects[i] = { deps, cleanup: fn() }; });
+      }
+    },
     useQueryClient: () => ({ invalidateQueries: qcBehavior.failInvalidate ? async () => { throw new Error('invalidate failed'); } : async () => {} }),
-    useQuery: options => ({ data: options.queryKey[1] === 'status'
+    useQuery: options => { if (options.queryKey[1] === 'status') statusQuery = options; return ({ error: options.queryKey[1] === 'status' ? qcBehavior.statusError : null, data: options.queryKey[1] === 'status'
       ? { capabilities: supported ? { all_projects: true, automatic_web_fallback: true, independent_models: true, macos_transcription: true, overlay: true, overlay_stream: true, overlay_cancel: true } : undefined, ...statusExtra }
       : options.queryKey[1] === 'projects' ? [{ name: 'alpha', path: '/projects/alpha' }]
-      : options.queryKey[1] === 'models' ? { providers: [{ id: 'openai-codex', label: 'Codex', models: [{ id: 'gpt-test', label: 'Test model' }] }] } : [] }),
+      : options.queryKey[1] === 'models' ? { providers: [{ id: 'openai-codex', label: 'Codex', models: [{ id: 'gpt-test', label: 'Test model' }] }] } : [] }); },
     useValue: atom => atom.get(),
-    host: { paneVisibility: () => visibility, revealPane: id => { revealed.push(id); visible = true; } }, Button: 'button', Input: 'input', Textarea: 'textarea', Badge: 'badge', PALETTE_AREA: 'palette',
+    host: { notify: notice => notices.push(notice), paneVisibility: () => visibility, revealPane: id => { revealed.push(id); visible = true; } }, Button: 'button', Input: 'input', Textarea: 'textarea', Badge: 'badge', PALETTE_AREA: 'palette',
     ...browserGlobals,
   });
-  const render = () => { stateIndex = 0; return registered.render(); };
-  return { tree: render(), rerender: render, requests, contributions, revealed };
+  const render = () => {
+    stateIndex = 0; effectIndex = 0; pendingEffects = [];
+    const tree = registered.render();
+    for (const effect of pendingEffects) effect();
+    return tree;
+  };
+  return { tree: render(), rerender: render, requests, contributions, revealed, notices, unregister,
+    pollStatus: () => statusQuery.queryFn(),
+    unmount: () => { for (const effect of effects) effect?.cleanup?.(); },
+    replayEffects: () => { for (const effect of effects) effect?.cleanup?.(); effects.length = 0; return render(); } };
 }
+test('legacy automatic Meta preference migrates to local without proof', async () => {
+  const store = new Map([['meeting-copilot.scope.v2', JSON.stringify({ backend: 'macos', transcriptionProvider: 'meta' })]]);
+  const ui = pane('', true, false, '', {}, {}, { capabilities: { macos_transcription: true, meta_asr: true } }, { localStorage: { getItem: k => store.get(k), setItem: (k,v) => store.set(k,v) } });
+  assert.equal(nodes(ui.tree).find(n => n.props['aria-label'] === 'Transcription provider').props.value, 'local');
+});
+
+test('saved explicit unavailable Meta disables capture with actionable guidance', async () => {
+  const store = new Map([['meeting-copilot.scope.v2', JSON.stringify({ backend: 'macos', transcriptionProvider: 'meta', transcriptionChoiceVersion: 1 })]]);
+  const ui = pane('', true, false, '', { 3: true }, {}, { capabilities: { macos_transcription: true, meta_asr: false } }, { localStorage: { getItem: k => store.get(k), setItem: (k,v) => store.set(k,v) } });
+  assert.equal(button(ui.tree, 'Start listening').props.disabled, true);
+  assert.match(JSON.stringify(ui.tree), /Meta.*unavailable.*local.*key/i);
+  await button(ui.tree, 'Start listening').props.onClick();
+  assert.equal(ui.requests.some(r => r.path === '/start'), false, 'stale callback is also guarded');
+});
+
+for (const path of ['/overlay/lifecycle', '/overlay/claim']) test(`initial lifecycle failure never reflects raw sensitive transport text (${path})`, async () => {
+  const ui = pane('', true, false, '', {}, { [path]: () => { throw new Error('fake-sensitive-initial-error'); } }, {}, { setInterval: () => 0, clearInterval: () => {} }, { effects: true });
+  await settle();
+  assert.doesNotMatch(JSON.stringify(ui.rerender()), /fake-sensitive/);
+  assert.match(JSON.stringify(ui.rerender()), /reopen.*pane/i);
+  ui.unregister();
+});
+
+for (const confirmed of [true, false]) test(`retirement survives failed key readback and updates quick control (${confirmed})`, async () => {
+  let written = false;
+  const ui = pane('', true, false, '', {}, { '/credentials/meta': (_path, opts) => {
+    if (opts.method === 'POST') { written = true; return { saved: true, revision: 'r'.repeat(64), overlay_credentials: 'retired', overlay_stop_confirmed: confirmed }; }
+    if (written) throw new Error('fake-sensitive-readback');
+    return { saved: false, revision: 'r'.repeat(64) };
+  }});
+  await button(ui.tree, 'Show overlay').props.onClick();
+  await button(ui.rerender(), 'Recheck key status').props.onClick();
+  const field = nodes(ui.rerender()).find(n => n.props['aria-label'] === 'Meta API key');
+  field.props.ref.current = { value: 'fake-ui-key-only' }; field.props.onChange({ target: field.props.ref.current });
+  await button(ui.rerender(), 'Save key').props.onClick();
+  const tree = ui.rerender();
+  assert.ok(button(tree, confirmed ? 'Show overlay' : 'Retry hide overlay'));
+  assert.match(JSON.stringify(tree), confirmed ? /overlay was closed/i : /shutdown is not confirmed/i);
+  assert.match(JSON.stringify(tree), /could not be confirmed/);
+  assert.doesNotMatch(JSON.stringify(tree), /fake-sensitive/);
+  if (!confirmed) {
+    await button(tree, 'Retry hide overlay').props.onClick();
+    assert.ok(button(ui.rerender(), 'Show overlay'));
+    assert.doesNotMatch(JSON.stringify(ui.rerender()), /shutdown is not confirmed/);
+  }
+});
+
+test('Meta key form saves explicitly, clears input, reads back, and never caches secrets', async () => {
+  let saved = false;
+  const info = () => ({ saved, request_configured: false, verified: false, activation: 'host-scoped', revision: 'r'.repeat(64) });
+  const ui = pane('', true, false, '', {}, {
+    '/credentials/meta': (_path, opts) => {
+      if (opts.method === 'POST') {
+        assert.equal(opts.body.action, 'save');
+        assert.equal(opts.body.key, 'fake-ui-key-only');
+        saved = true;
+      }
+      return info();
+    },
+  });
+  const button = (tree, text) => nodes(tree).find(n => n.type === 'button' && n.children.includes(text));
+  let tree = ui.tree;
+  const field = nodes(tree).find(n => n.props['aria-label'] === 'Meta API key');
+  assert.ok(field, 'masked key field exists inside the pane');
+  assert.equal(field.props.type, 'password');
+  assert.equal(field.props.autoComplete, 'new-password');
+  assert.equal(button(tree, 'Save key').props.disabled, true, 'unknown status cannot overwrite');
+  await button(tree, 'Recheck key status').props.onClick();
+  tree = ui.rerender();
+  const input = nodes(tree).find(n => n.props['aria-label'] === 'Meta API key');
+  input.props.ref.current = { value: 'fake-ui-key-only' };
+  input.props.onChange({ target: input.props.ref.current });
+  assert.equal(ui.requests.filter(r => r.method === 'POST').length, 0, 'typing never saves');
+  tree = ui.rerender();
+  await button(tree, 'Save key').props.onClick();
+  assert.equal(input.props.ref.current.value, '', 'erase draft immediately after submission');
+  tree = ui.rerender();
+  assert.ok(saved, 'save changed the backend fixture');
+  assert.equal(ui.requests.at(-1).method, undefined, 'separate exact-target readback');
+  assert.match(JSON.stringify(tree), /Saved — new scoped requests can use the key immediately/i);
+  assert.match(JSON.stringify(tree), /Not verified/i);
+  assert.ok(!JSON.stringify(tree).includes('fake-ui-key-only'));
+});
+
+for (const retirement of ['unmount', 'unregister', 'supersede', 'effect-remount', 'failed-restart']) test(`retired Meta key callbacks cannot read or write credentials (${retirement})`, async () => {
+  const globals = { globalThis: { crypto: webcrypto }, setInterval: () => 0, clearInterval: () => {} };
+  let saved = false;
+  const ui = pane('', true, false, '', {}, {
+    '/credentials/meta': (_path, options) => {
+      if (options.method === 'POST') saved = true;
+      return { saved, revision: 'r'.repeat(64) };
+    },
+    '/overlay/release': () => { throw new Error('synthetic release failure'); },
+  }, {}, globals, { effects: true });
+  await settle();
+  let tree = ui.rerender();
+  const field = nodes(tree).find(n => n.props['aria-label'] === 'Meta API key');
+  field.props.ref.current = { value: 'fake-retired-key-only' };
+  field.props.onChange({ target: field.props.ref.current });
+  tree = ui.rerender();
+  const save = button(tree, 'Save key').props.onClick;
+  const recheck = button(tree, 'Recheck key status').props.onClick;
+  let newer;
+  if (retirement === 'unmount') ui.unmount();
+  if (retirement === 'unregister') ui.unregister();
+  if (retirement === 'supersede') newer = pane('', true, false, '', {}, {}, {}, globals);
+  if (retirement === 'effect-remount') ui.replayEffects();
+  if (retirement === 'failed-restart') await command(ui, 'Restart Meeting Copilot')();
+  await settle();
+  // Supply a synthetic stale DOM value so validation cannot mask a missing fence.
+  field.props.ref.current.value = 'fake-retired-key-only';
+  const before = ui.requests.length;
+  await save();
+  await recheck();
+  assert.equal(ui.requests.length, before, 'retired key callbacks must never reach ctx.rest');
+  assert.equal(field.props.ref.current.value, '', 'attempted stale submission erases the secret');
+  assert.equal(saved, false);
+  if (retirement === 'effect-remount') {
+    await button(ui.rerender(), 'Recheck key status').props.onClick();
+    const current = nodes(ui.rerender()).find(n => n.props['aria-label'] === 'Meta API key');
+    current.props.ref.current = { value: 'fake-current-key-only' };
+    current.props.onChange({ target: current.props.ref.current });
+    await button(ui.rerender(), 'Save key').props.onClick();
+    assert.equal(saved, true, 'fresh lifecycle remains authorized');
+    assert.match(JSON.stringify(ui.rerender()), /Saved — new scoped requests/);
+  }
+  ui.unregister(); newer?.unregister();
+  await settle();
+});
+
+for (const confirmed of [true, false]) test(`key write reports overlay rebind failure honestly (closed=${confirmed})`, async () => {
+  let saved = false;
+  const ui = pane('', true, false, '', {}, {
+    '/credentials/meta': (_path, opts) => {
+      if (opts.method === 'POST') {
+        saved = true;
+        return { saved, revision: 'r'.repeat(64), overlay_credentials: 'retired', overlay_stop_confirmed: confirmed };
+      }
+      return { saved, revision: 'r'.repeat(64) };
+    },
+  });
+  await button(ui.tree, 'Recheck key status').props.onClick();
+  const field = nodes(ui.rerender()).find(n => n.props['aria-label'] === 'Meta API key');
+  field.props.ref.current = { value: 'fake-ui-key-only' };
+  field.props.onChange({ target: field.props.ref.current });
+  await button(ui.rerender(), 'Save key').props.onClick();
+  const text = JSON.stringify(ui.rerender());
+  assert.match(text, /Saved —/);
+  assert.match(text, /Overlay.*credential.*refresh.*failed/i);
+  assert.match(text, confirmed ? /Show overlay to reopen/ : /shutdown.*not confirmed.*Retry hide/i);
+});
+
+test('Meta key missing tokenizer guidance is actionable without reflecting errors', async () => {
+  const ui = pane('', true, false, '', {}, {
+    '/credentials/meta': () => { throw new Error('credential_tokenizer_unavailable fake-secret-do-not-reflect'); },
+  });
+  await nodes(ui.tree).find(n => n.type === 'button' && n.children.includes('Recheck key status')).props.onClick();
+  const text = JSON.stringify(ui.rerender());
+  assert.match(text, /Upgrade Hermes/);
+  assert.match(text, /service environment/);
+  assert.match(text, /saved file.*not loaded/i);
+  assert.doesNotMatch(text, /fake-secret/);
+});
+
+test('Meta key never claims a status source before or after a failed check', async () => {
+  const ui = pane('', true, false, '', {}, {
+    '/credentials/meta': () => { throw new Error('unavailable'); },
+  });
+  const verifyUnknown = tree => {
+    const text = JSON.stringify(tree);
+    assert.match(text, /Key status not checked/);
+    assert.doesNotMatch(text, /This status used/);
+  };
+  verifyUnknown(ui.tree);
+  await nodes(ui.tree).find(n => n.type === 'button' && n.children.includes('Recheck key status')).props.onClick();
+  const after = ui.rerender();
+  verifyUnknown(after);
+  assert.match(JSON.stringify(after), /Key settings unavailable/);
+});
+
+test('Meta key explains scoped activation, process fallback and snapshot limits', async () => {
+  for (const activation of ['host-scoped', 'process']) {
+    const ui = pane('', true, false, '', {}, { '/credentials/meta': () => ({
+      saved: true, request_configured: true, process_configured: true,
+      process_differs_from_saved: true, activation, verified: false, revision: 'r'.repeat(64),
+    }) });
+    await nodes(ui.tree).find(n => n.type === 'button' && n.children.includes('Recheck key status')).props.onClick();
+    const text = JSON.stringify(ui.rerender());
+    assert.match(text, /Configured for this status request/);
+    assert.match(text, activation === 'host-scoped' ? /This status used a host-scoped credential snapshot/ : /This status used the process environment/);
+    assert.match(text, /new scoped requests.*immediately/i);
+    assert.match(text, /saved file.*precedence.*inherited/i);
+    assert.match(text, /existing requests.*workers.*retain/i);
+    assert.match(text, /process.environment.*fallback/i);
+    assert.match(text, /Not verified with Meta/);
+    assert.doesNotMatch(text, /does not override it|before using the new key|Configured in running backend/);
+  }
+});
+
+test('Meta key save errors do not echo transport secrets or claim readiness', async () => {
+  const ui = pane('', true, false, '', {}, {
+    '/credentials/meta': (_path, opts) => {
+      if (opts.method === 'POST') throw new Error('fake-ui-key-only');
+      return { saved: false, request_configured: false, verified: false, revision: 'r'.repeat(64) };
+    },
+  });
+  const button = (tree, text) => nodes(tree).find(n => n.type === 'button' && n.children.includes(text));
+  await button(ui.tree, 'Recheck key status').props.onClick();
+  const input = nodes(ui.rerender()).find(n => n.props['aria-label'] === 'Meta API key');
+  input.props.ref.current = { value: 'fake-ui-key-only' };
+  input.props.onChange({ target: input.props.ref.current });
+  await button(ui.rerender(), 'Save key').props.onClick();
+  const tree = ui.rerender();
+  assert.equal(input.props.ref.current.value, '');
+  assert.ok(!JSON.stringify(tree).includes('fake-ui-key-only'));
+  assert.match(JSON.stringify(tree), /could not be confirmed/i);
+});
+
+test('Meta key label matches accessible name and invalid lengths explain bounds', async () => {
+  const ui = pane('', true, false, '', {}, { '/credentials/meta': () => ({ saved: false, revision: 'r'.repeat(64) }) });
+  const button = (tree, text) => nodes(tree).find(n => n.type === 'button' && n.children.includes(text));
+  await button(ui.tree, 'Recheck key status').props.onClick();
+  const field = nodes(ui.rerender()).find(n => n.props['aria-label'] === 'Meta API key');
+
+  // Rerenders create new nodes; locate the nested input by its accessible name.
+  const visibleLabel = nodes(ui.rerender()).find(n => n.type === 'label' && nodes(n).some(x => x.props['aria-label'] === 'Meta API key'));
+  assert.ok(visibleLabel.children.includes(field.props['aria-label']));
+  for (const value of ['short', 'x'.repeat(4097)]) {
+    field.props.ref.current = { value };
+    field.props.onChange({ target: field.props.ref.current });
+    await button(ui.rerender(), 'Save key').props.onClick();
+    assert.match(JSON.stringify(ui.rerender()), /8–4096/);
+    assert.equal(ui.requests.filter(r => r.method === 'POST').length, 0);
+  }
+});
+
+for (const realHost of [false, true]) for (const race of [false, true]) test(`Meta key pane effects reach isolated backend (host=${realHost}, interleaving=${race})`, {
+  // Real credential writes require production POSIX permission/ACL inspection.
+  // Mocked pane authorization/validation/error tests above still run everywhere.
+  skip: !['darwin', 'linux'].includes(process.platform),
+}, async t => {
+  const { spawn, spawnSync } = await import('node:child_process');
+  if (realHost && spawnSync(process.env.PYTHON || 'python', ['-c', "import agent.secret_scope, hermes_cli.web_server_profiles"]).status !== 0) {
+    t.skip('Installed Hermes host unavailable'); return;
+  }
+  const { createInterface } = await import('node:readline');
+  const child = spawn(process.env.PYTHON || 'python', ['-u', realHost ? 'test_credential_host_scope.py' : 'test_credentials.py', '--ui-bridge'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const lines = createInterface({ input: child.stdout });
+  const pending = [];
+  let stderr = '';
+  child.stderr.on('data', chunk => { stderr += chunk.toString(); });
+  lines.on('line', line => {
+    const slot = pending.shift();
+    const response = JSON.parse(line);
+    if (response.status >= 400) slot.reject(new Error('Backend refused request'));
+    else slot.resolve(response.body);
+  });
+  child.on('exit', () => { for (const slot of pending.splice(0)) slot.reject(new Error('Backend exited')); });
+  const call = (path, opts = {}) => new Promise((resolve, reject) => {
+    pending.push({ resolve, reject });
+    child.stdin.write(JSON.stringify({ path, opts }) + '\n');
+  });
+  t.after(async () => {
+    child.stdin.end();
+    await new Promise(resolve => { if (child.exitCode !== null) resolve(); else child.once('exit', resolve); });
+    assert.ok(!stderr.includes('fake-ui-key-only'), 'stderr contains no synthetic key');
+  });
+  const routedCall = async (path, opts = {}) => {
+    const result = await call(path, opts);
+    if (race && opts.method === 'POST' && opts.body.action === 'save') {
+      // Real second writer commits between this pane's POST and GET.
+      const second = await call(path);
+      await call(path, { method: 'POST', body: { action: 'save', key: 'fake-other-writer-key', revision: second.revision } });
+    }
+    return result;
+  };
+  const ui = pane('', true, false, '', {}, { '/credentials/meta': routedCall }, {}, { window: { confirm: () => true } });
+  const button = (tree, text) => nodes(tree).find(n => n.type === 'button' && n.children.includes(text));
+  await button(ui.tree, 'Recheck key status').props.onClick();
+  const field = nodes(ui.rerender()).find(n => n.props['aria-label'] === 'Meta API key');
+  field.props.ref.current = { value: 'fake-ui-key-only' };
+  field.props.onChange({ target: field.props.ref.current });
+  assert.equal((await call('/test/saved-effect')).saved, false);
+  await button(ui.rerender(), 'Save key').props.onClick();
+  if (race) {
+    assert.deepEqual(await call('/test/saved-effect'), { saved: false, mode_private: true, runtime_unchanged: true });
+    const rendered = JSON.stringify(ui.rerender());
+    assert.match(rendered, /changed.*after|another.*edit/i);
+    assert.doesNotMatch(rendered, /Saved — new scoped requests can use the key immediately/);
+    assert.doesNotMatch(rendered, /fake-other-writer-key|fake-ui-key-only/);
+    return;
+  }
+  assert.deepEqual(await call('/test/saved-effect'), { saved: true, mode_private: true, runtime_unchanged: true });
+  assert.equal(field.props.ref.current.value, '');
+  assert.match(JSON.stringify(ui.rerender()), /Not verified/);
+  await button(ui.rerender(), 'Remove saved key').props.onClick();
+  assert.deepEqual(await call('/test/saved-effect'), { saved: false, mode_private: true, runtime_unchanged: true });
+  assert.match(JSON.stringify(ui.rerender()), /No saved key/);
+});
+
+// Effect-capable lifecycle tests use deterministic timers (no React package).
+function lifecyclePane(respond = {}, settings = {}, statusExtra = {}) {
+  const timers = new Map(); let next = 0;
+  const p = pane('alpha', true, false, '', settings, {
+    '/overlay/lifecycle': { revision: 0, epoch: 'backend-epoch' },
+    '/overlay/claim': { pane: 'pane-capability' },
+    '/overlay/show': { shown: true, owner: 'show-owner' }, ...respond,
+  }, statusExtra, {
+    setInterval: () => 0, clearInterval: () => {},
+    setTimeout: fn => { timers.set(++next, fn); return next; },
+    clearTimeout: id => timers.delete(id),
+  }, { effects: true });
+  return { ...p, async flushTimers() { const work = [...timers.values()]; timers.clear(); for (const fn of work) await fn(); } };
+}
+function button(tree, label) { return nodes(tree).find(n => n.type === 'button' && n.children.includes(label)); }
+
+function alertFor(tree, message) {
+  return nodes(tree).find(n => n.props?.role === 'alert' && JSON.stringify(n.children).includes(message));
+}
+
+test('unclassified legacy errors only recheck even with prior backend and stale retry data', async () => {
+  for (const priorBackend of ['native', 'macos', 'meetily']) {
+    const status = { backend: priorBackend, listening: false,
+      error: 'Unclassified legacy failure',
+      error_request: { question: 'Old question', transcript: 'Private old transcript' } };
+    const p = lifecyclePane({}, { 3: true, 4: 'macos' }, status);
+    try {
+      const alert = alertFor(p.rerender(), 'Answer failed. Check answer setup');
+      assert.ok(alert);
+      assert.doesNotMatch(JSON.stringify(p.rerender()), /Unclassified legacy failure/);
+      assert.ok(!button(alert, 'Restart capture'), 'legacy summary cannot authorize capture');
+      assert.ok(!button(alert, 'Retry'), 'retained request cannot authorize answer retry');
+      const recheck = button(alert, 'Recheck status');
+      assert.ok(recheck);
+      assert.equal(recheck.props.disabled, false);
+      await recheck.props.onClick();
+      assert.ok(!p.requests.some(r => ['/start', '/assist'].includes(r.path)));
+    } finally { p.unmount(); }
+  }
+});
+
+test('capture error never replays stale answer data after source changes', async () => {
+  const status = { error: 'Answer failed', answer_error: 'Answer failed', error_source: 'answer',
+    error_request: { question: 'Old question', transcript: 'Private old transcript' }, backend: 'macos' };
+  const p = lifecyclePane({}, { 3: true, 4: 'macos' }, status);
+  assert.ok(button(alertFor(p.rerender(), 'Answer failed'), 'Retry'));
+  Object.assign(status, { error: 'Microphone failed', answer_error: null, error_source: 'capture',
+    capture_error: 'Microphone failed', listening: false });
+  let tree = p.rerender();
+  const capture = alertFor(tree, 'Microphone failed');
+  assert.ok(button(capture, 'Restart capture'));
+  assert.ok(!button(capture, 'Retry'));
+  await button(capture, 'Restart capture').props.onClick();
+  assert.ok(p.requests.some(r => r.path === '/start'));
+  assert.ok(!p.requests.some(r => r.path === '/assist'));
+  Object.assign(status, { error: 'System capture failed', capture_error: 'System capture failed', listening: true });
+  tree = p.rerender();
+  await button(alertFor(tree, 'System capture failed'), 'Recheck status').props.onClick();
+  assert.ok(!p.requests.some(r => r.path === '/assist'));
+  p.unmount();
+});
+
+test('progress overlay and forget boundary errors keep their own messages and actions', async () => {
+  const overlay = 'Overlay shutdown is not confirmed; retry Hide.';
+  const boundary = 'Could not install the Meetily forget boundary: retry Clear.';
+  const progress = 'Answer progress unavailable: network.';
+  const status = { error: overlay, overlay_cleanup_error: overlay, meetily_clear_error: boundary,
+    error_request: { question: 'Stale question', transcript: 'Private stale transcript' }, listening: false };
+  const p = lifecyclePane({}, { 6: progress }, status);
+  let tree = p.rerender();
+  assert.ok(button(alertFor(tree, boundary), 'Clear again'));
+  assert.ok(button(alertFor(tree, overlay), 'Retry hide overlay'));
+  await button(alertFor(tree, progress), 'Recheck status').props.onClick();
+  tree = p.rerender();
+  assert.ok(alertFor(tree, progress), 'rechecking is not evidence progress recovered');
+  assert.ok(button(alertFor(tree, boundary), 'Clear again'));
+  assert.ok(button(alertFor(tree, overlay), 'Retry hide overlay'));
+  assert.doesNotMatch(JSON.stringify(tree), /Backend unavailable: undefined/);
+  await button(alertFor(tree, boundary), 'Clear again').props.onClick();
+  assert.ok(p.requests.some(r => r.path === '/clear'));
+  assert.ok(!p.requests.some(r => r.path === '/assist'));
+  assert.ok(alertFor(p.rerender(), overlay));
+  p.unmount();
+});
+
+test('simultaneous answer capture stop boundary and backend errors stay independently actionable', async () => {
+  const messages = { answer_error: 'Answer provider failed', capture_error: 'Microphone failed',
+    stop_error: 'Capture shutdown unconfirmed', overlay_cleanup_error: 'Overlay cleanup denied',
+    meetily_clear_error: 'Meetily forget boundary failed' };
+  const stored = { question: 'Actual failed question', transcript: 'Exact failed transcript' };
+  const p = pane('', true, false, '', {}, {}, { ...messages, error: messages.stop_error,
+    error_source: 'stop', stopping: true, error_request: stored }, {},
+    { statusError: new Error('Connection lost') });
+  for (const [key, message] of Object.entries(messages)) {
+    const label = key === 'answer_error' ? 'Retry' : key === 'meetily_clear_error' ? 'Clear again'
+      : key === 'overlay_cleanup_error' ? 'Retry hide overlay' : 'Recheck status';
+    assert.ok(button(alertFor(p.tree, key === 'answer_error' ? 'Answer failed. Check answer setup' : message), label), `${key} must pair its own action`);
+  }
+  assert.ok(button(alertFor(p.tree, 'Backend unavailable. Check the backend connection'), 'Retry'));
+  assert.doesNotMatch(JSON.stringify(p.tree), /Answer provider failed|Connection lost/);
+  await button(alertFor(p.tree, 'Answer failed. Check answer setup'), 'Retry').props.onClick();
+  const assist = p.requests.find(r => r.path === '/assist');
+  assert.equal(assist.body.question, stored.question);
+  assert.equal(assist.body.transcript, stored.transcript);
+});
+
+test('legacy answer diagnostics are private without granting stale retry authority', async () => {
+  const p = pane('', true, false, '', {}, {}, {
+    error: 'synthetic-sensitive-legacy-provider-error',
+    error_request: { question: 'Old question', transcript: 'Old private context' },
+  });
+  const alert = alertFor(p.tree, 'Answer failed. Check answer setup');
+  assert.ok(alert);
+  assert.doesNotMatch(JSON.stringify(p.tree), /synthetic-sensitive-legacy-provider-error/);
+  assert.ok(!button(alert, 'Retry'));
+  await button(alert, 'Recheck status').props.onClick();
+  assert.ok(!p.requests.some(r => r.path === '/assist'));
+});
+
+test('non-answer local error replaces failed assist without retaining its retry', async () => {
+  const p = pane('', true, false, '', { 1: 'Old question', 3: true, 4: 'macos' }, {
+    '/assist': () => { throw new Error('Answer submission failed'); },
+    '/start': () => { throw new Error('Microphone could not start'); },
+  });
+  await button(p.tree, 'Suggest answer').props.onClick();
+  let tree = p.rerender();
+  assert.ok(button(alertFor(tree, 'Answer submission was not confirmed'), 'Recheck status'));
+  assert.doesNotMatch(JSON.stringify(tree), /Answer submission failed/);
+  await button(tree, 'Start listening').props.onClick();
+  tree = p.rerender();
+  const capture = alertFor(tree, 'Start was not confirmed');
+  assert.doesNotMatch(JSON.stringify(tree), /Microphone could not start/);
+  assert.ok(button(capture, 'Dismiss'));
+  assert.ok(!button(capture, 'Retry'));
+  await button(capture, 'Dismiss').props.onClick();
+  assert.equal(p.requests.filter(r => r.path === '/assist').length, 1);
+});
+
+test('local progress error and overlay cleanup have independent paired actions', async () => {
+  const warning = 'Overlay shutdown is not confirmed; retry Hide.';
+  const progress = 'Answer progress unavailable: network. The result still lands below when it completes.';
+  const p = lifecyclePane({}, { 3: true, 4: 'macos', 6: progress }, {
+    error: warning, overlay_cleanup_error: warning, overlay_stop_confirmed: false,
+    listening: false, backend: 'macos',
+  });
+  let tree = p.rerender();
+  const alerts = nodes(tree).filter(n => n.props?.role === 'alert');
+  const local = alerts.find(n => JSON.stringify(n).includes(progress));
+  const overlay = alerts.find(n => JSON.stringify(n).includes(warning));
+  assert.ok(local && overlay && local !== overlay);
+  assert.ok(button(local, 'Recheck status'));
+  assert.ok(!button(local, 'Retry hide overlay'));
+  assert.ok(button(overlay, 'Retry hide overlay'));
+  assert.ok(nodes(tree).some(n => n.props?.role === 'status' && JSON.stringify(n).includes(warning)));
+  assert.equal(button(tree, 'Start listening').props.disabled, true);
+  await button(local, 'Recheck status').props.onClick();
+  tree = p.rerender();
+  assert.match(JSON.stringify(tree), /Answer progress unavailable/);
+  assert.ok(!p.requests.some(r => r.path === '/assist'), 'progress recheck never replays');
+  assert.match(JSON.stringify(tree), /Overlay shutdown is not confirmed/);
+  assert.ok(!p.requests.some(r => r.path === '/overlay/hide'));
+  await button(nodes(tree).find(n => n.props?.role === 'alert' && JSON.stringify(n).includes(warning)), 'Retry hide overlay').props.onClick();
+  assert.equal(p.requests.filter(r => r.path === '/overlay/hide').length, 1);
+  p.unmount();
+});
+
+test('attributed capture restart preserves cloud availability and overlay safety gates', async () => {
+  for (const overlayUncertain of [false, true]) {
+    const store = new Map([['meeting-copilot.scope.v2', JSON.stringify({ backend: 'macos', transcriptionProvider: overlayUncertain ? 'local' : 'meta', transcriptionChoiceVersion: 1 })]]);
+    const ui = pane('', true, false, '', { 3: true }, {}, {
+      error_source: 'capture', capture_error: 'Microphone failed',
+      ...(overlayUncertain ? { overlay_cleanup_error: 'Overlay shutdown is not confirmed' } : {}),
+      capabilities: { macos_transcription: true, meta_asr: false },
+    }, { localStorage: { getItem: k => store.get(k), setItem: (k, v) => store.set(k, v) } });
+    const restart = button(alertFor(ui.tree, 'Microphone failed'), 'Restart capture');
+    assert.ok(restart);
+    assert.equal(restart.props.disabled, true);
+    await restart.props.onClick();
+    assert.ok(!ui.requests.some(r => r.path === '/start'), 'handler must also refuse blocked capture');
+    assert.ok(!ui.requests.some(r => r.path === '/assist'));
+  }
+});
+
+test('pane Pause and Clear carry lifecycle authorization; unregister only releases', async () => {
+  const p = lifecyclePane({}, {}, { listening: true, backend: 'macos', segments: [{ text: 'Meeting' }] });
+  await button(p.tree, 'Pause listening').props.onClick();
+  await button(p.rerender(), 'Clear meeting').props.onClick();
+  p.unregister();
+  await Promise.resolve();
+  const pause = p.requests.find(r => r.path === '/pause');
+  const clear = p.requests.find(r => r.path === '/clear');
+  assert.equal(pause.body.pane, 'pane-capability');
+  assert.equal(clear.body.pane, pause.body.pane);
+  assert.ok(clear.body.action > pause.body.action);
+  assert.equal(p.requests.filter(r => r.path === '/pause').length, 1);
+  const release = p.requests.find(r => r.path === '/overlay/release');
+  assert.equal(release.body.pane, pause.body.pane);
+  assert.ok(release.body.action > clear.body.action);
+  p.unmount();
+  assert.equal(p.requests.filter(r => r.path === '/overlay/release').length, 1);
+});
+
+for (const failedPath of ['/overlay/lifecycle', '/overlay/claim']) test(`failed lifecycle lookup/claim shows reopen guidance (${failedPath})`, async () => {
+  const p = lifecyclePane({ [failedPath]: () => { throw new Error('network unavailable'); } });
+  await button(p.tree, 'Show overlay').props.onClick();
+  const text = JSON.stringify(p.rerender());
+  assert.doesNotMatch(text, /network unavailable/, 'transport details stay private');
+  assert.match(text, /Overlay action not confirmed/);
+  assert.match(text, /[Rr]eopen|[Cc]lose and reopen/);
+  await button(p.rerender(), 'Show overlay').props.onClick();
+  const expected = failedPath === '/overlay/lifecycle' ? 2 : 1;
+  assert.equal(p.requests.filter(r => r.path === '/overlay/lifecycle').length, expected);
+  assert.equal(p.requests.filter(r => r.path === failedPath).length, expected);
+  assert.ok(!p.requests.some(r => r.path === '/overlay/show'));
+  p.unmount();
+});
+
+test('empty-session source switch immediately retires local overlay', async () => {
+  const p = lifecyclePane({}, { 3: true, 4: 'macos', 11: 'system' }, {
+    last_session: { backend: 'macos', transcription_model: 'base.en', audio_source: 'microphone' },
+  });
+  await button(p.tree, 'Show overlay').props.onClick();
+  assert.ok(button(p.rerender(), 'Hide overlay'));
+  await button(p.rerender(), 'Start listening').props.onClick();
+  assert.ok(button(p.rerender(), 'Show overlay'));
+  assert.ok(!button(p.rerender(), 'Hide overlay'));
+  p.unmount();
+});
+
+test('real effects do not auto-sync unchanged Show scope', async () => {
+  const p = lifecyclePane();
+  await button(p.tree, 'Show overlay').props.onClick();
+  p.rerender();
+  await p.flushTimers();
+  assert.equal(p.requests.filter(r => r.path === '/overlay/scope').length, 0);
+  p.unmount();
+});
+
+test('real effects still synchronize changed scope with its owner', async () => {
+  const p = lifecyclePane({ '/overlay/scope': { accepted: true } });
+  await button(p.tree, 'Show overlay').props.onClick();
+  let tree = p.rerender();
+  nodes(tree).find(n => n.type === 'select' && n.props.value === 'alpha').props.onChange({ target: { value: '' } });
+  tree = p.rerender();
+  await p.flushTimers();
+  const syncs = p.requests.filter(r => r.path === '/overlay/scope');
+  assert.equal(syncs.length, 1);
+  assert.equal(syncs[0].body.scope.owner, 'show-owner');
+  assert.equal(syncs[0].body.scope.project, null);
+  assert.equal(syncs[0].body.scope.all_projects, false);
+  assert.ok(syncs[0].body.scope.seq > 0);
+  p.unmount();
+});
+
+test('unmount fences a delayed Show and never sends global hide/pause', async () => {
+  let resolve;
+  const p = lifecyclePane({ '/overlay/show': () => new Promise(r => { resolve = r; }) });
+  const pending = button(p.tree, 'Show overlay').props.onClick();
+  await settle();
+  assert.ok(resolve, 'Show must have reached backend before cleanup');
+  p.unmount();
+  resolve({ shown: true, owner: 'old-show-owner' });
+  await pending;
+  const show = p.requests.find(r => r.path === '/overlay/show');
+  const releases = p.requests.filter(r => r.path === '/overlay/release');
+  assert.ok(releases.length, 'cleanup sends ordered release even before Show responds');
+  assert.equal(releases[0].body.pane, show.body.pane);
+  assert.ok(releases[0].body.action > show.body.action);
+  assert.ok(!p.requests.some(r => r.path === '/pause' || (r.path === '/overlay/hide' && !r.body.pane)));
+});
+
+test('unmount while claiming ownership cleans exact capability without showing', async () => {
+  let resolve;
+  const p = lifecyclePane({ '/overlay/claim': () => new Promise(r => { resolve = r; }) });
+  const pending = button(p.tree, 'Show overlay').props.onClick();
+  for (let i = 0; i < 12 && !resolve; i++) await Promise.resolve();
+  assert.ok(resolve, 'ownership request is pending');
+  p.unmount();
+  resolve({ pane: 'late-capability' });
+  await pending;
+  assert.ok(!p.requests.some(r => r.path === '/overlay/show'));
+  assert.equal(p.requests.find(r => r.path === '/overlay/release')?.body.pane, 'late-capability');
+});
+
+test('effect remount gets a fresh capability; old cleanup never releases the new one', async () => {
+  let claims = 0;
+  const p = lifecyclePane({ '/overlay/claim': () => ({ pane: `pane-${++claims}` }) });
+  for (let i = 0; i < 12; i++) await Promise.resolve();
+  const tree = p.replayEffects();
+  await button(tree, 'Show overlay').props.onClick();
+  assert.equal(claims, 2);
+  assert.equal(p.requests.find(r => r.path === '/overlay/show').body.pane, 'pane-2');
+  assert.deepEqual(p.requests.filter(r => r.path === '/overlay/release').map(r => r.body.pane), ['pane-1']);
+  p.unmount();
+  assert.deepEqual(p.requests.filter(r => r.path === '/overlay/release').map(r => r.body.pane), ['pane-1', 'pane-2']);
+});
+
+async function settle() { for (let i = 0; i < 30; i++) await Promise.resolve(); }
+function changeProject(p, value) {
+  const tree = p.rerender();
+  nodes(tree).find(n => n.type === 'select' && n.props['aria-labelledby'] === 'mc-scope-label').props.onChange({ target: { value } });
+  return p.rerender();
+}
+
+test('pending lifecycle cannot start capture after pane closes', async () => {
+  let resolve;
+  const p = lifecyclePane({ '/overlay/lifecycle': () => new Promise(r => { resolve = r; }) }, { 3: true, 4: 'macos' });
+  const pending = button(p.tree, 'Start listening').props.onClick();
+  await settle();
+  const earlyStarts = p.requests.filter(r => r.path === '/start');
+  p.unmount();
+  resolve({ revision: 0 });
+  await pending;
+  assert.equal(earlyStarts.length, 0, 'capture waits for an owner capable of safe cleanup');
+  assert.ok(!p.requests.some(r => ['/start', '/pause', '/overlay/claim'].includes(r.path)));
+});
+
+test('started capture carries the capability and cleanup supersedes it', async () => {
+  const p = lifecyclePane({}, { 3: true, 4: 'macos' });
+  await button(p.tree, 'Start listening').props.onClick();
+  p.unmount();
+  const start = p.requests.find(r => r.path === '/start');
+  const release = p.requests.find(r => r.path === '/overlay/release');
+  assert.equal(start.body.pane, 'pane-capability');
+  assert.ok(release.body.action > start.body.action);
+});
+
+test('superseded plugin registration cannot commit its delayed lifecycle lookup', async () => {
+  const shared = { crypto: webcrypto };
+  const globals = { globalThis: shared, setInterval: () => 0, clearInterval: () => {} };
+  let deliverOld;
+  const older = pane('', true, false, '', {}, {
+    '/overlay/lifecycle': () => new Promise(resolve => { deliverOld = resolve; }),
+  }, {}, globals, { effects: true });
+  await settle();
+  assert.equal(typeof deliverOld, 'function');
+  const newer = pane('', true, false, '', {}, {}, {}, globals, { effects: true });
+  await button(newer.tree, 'Show overlay').props.onClick();
+  // The newer pane has claimed before the old GET is even handled.
+  deliverOld({ revision: 1, epoch: 'backend-epoch' });
+  await settle();
+  assert.ok(!older.requests.some(r => r.path === '/overlay/claim'), 'retired registration cannot commit');
+  const newClaim = newer.requests.find(r => r.path === '/overlay/claim').body;
+  assert.equal(newClaim.creation, 2, 'creation identity is assigned before either GET finishes');
+  assert.equal(newClaim.epoch, 'backend-epoch');
+  older.rerender();
+  older.rerender();
+  older.unregister();
+  newer.unregister();
+  assert.ok(!older.requests.some(r => r.path === '/pause'));
+  assert.ok(!newer.requests.some(r => r.path === '/pause'));
+});
+
+test('legacy retry tickets never trigger a new lifecycle claim', async () => {
+  const p = lifecyclePane({ '/overlay/claim': { accepted: false, retry_revision: 1 } });
+  await button(p.tree, 'Show overlay').props.onClick();
+  assert.equal(p.requests.filter(r => r.path === '/overlay/claim').length, 1);
+  assert.equal(p.requests.filter(r => r.path === '/overlay/lifecycle').length, 1);
+  assert.ok(!p.requests.some(r => r.path === '/overlay/show'));
+  p.unmount();
+});
+
+test('claim conflict with a newer owner never retries or starts capture', async () => {
+  const p = lifecyclePane({ '/overlay/claim': { accepted: false } }, { 3: true, 4: 'macos' });
+  await button(p.tree, 'Start listening').props.onClick();
+  assert.equal(p.requests.filter(r => r.path === '/overlay/claim').length, 1);
+  assert.ok(!p.requests.some(r => r.path === '/start'));
+  p.unmount();
+});
+
+for (const manual of [false, true]) test(`restoring narrow scope supersedes intervening broad request (manual=${manual})`, async () => {
+  const resolveBroad = []; let backendScope = { project: 'alpha', seq: 0 };
+  const p = lifecyclePane({ '/overlay/scope': (_, { body }) => {
+    const scope = body.scope;
+    if (scope.seq >= backendScope.seq) backendScope = scope;
+    if (scope.all_projects) return new Promise(r => { resolveBroad.push(r); });
+    return { accepted: true };
+  } });
+  await button(p.tree, 'Show overlay').props.onClick();
+  let tree = changeProject(p, '__all_projects__');
+  let broad;
+  if (manual) broad = button(tree, 'Sync scope').props.onClick();
+  else broad = p.flushTimers();
+  await settle();
+  assert.ok(resolveBroad.length);
+  changeProject(p, 'alpha');
+  await p.flushTimers();
+  for (const resolve of resolveBroad) resolve({ accepted: true });
+  await broad;
+  assert.equal(backendScope.project, 'alpha');
+  assert.equal(backendScope.all_projects, false);
+  assert.equal(p.requests.filter(r => r.path === '/overlay/scope').at(-1).body.scope.project, 'alpha');
+  p.unmount();
+});
+
+for (const manual of [false, true]) test(`acknowledged broad scope can return to original narrow scope (manual=${manual})`, async () => {
+  let backendScope;
+  const p = lifecyclePane({ '/overlay/scope': (_, { body }) => {
+    backendScope = body.scope;
+    return { accepted: true };
+  } });
+  await button(p.tree, 'Show overlay').props.onClick();
+  changeProject(p, '__all_projects__');
+  await settle();
+  if (manual) await button(p.rerender(), 'Sync scope').props.onClick();
+  assert.equal(backendScope.all_projects, true);
+  changeProject(p, 'alpha');
+  await settle();
+  assert.equal(backendScope.project, 'alpha');
+  assert.equal(backendScope.all_projects, false);
+  assert.ok(!JSON.stringify(p.rerender()).includes('Settings changed — syncing'));
+  p.unmount();
+});
+
+test('effect-capable Show then first Start retains coherent Hide UI', async () => {
+  const p = lifecyclePane({}, { 3: true, 4: 'macos' });
+  await button(p.tree, 'Show overlay').props.onClick();
+  await button(p.rerender(), 'Start listening').props.onClick();
+  await settle();
+  assert.ok(button(p.rerender(), 'Hide overlay'));
+  const shown = p.requests.find(r => r.path === '/overlay/show');
+  const started = p.requests.find(r => r.path === '/start');
+  assert.equal(started.body.pane, shown.body.pane);
+  assert.ok(started.body.action > shown.body.action);
+  assert.ok(!p.requests.some(r => ['/overlay/scope', '/overlay/hide', '/overlay/release'].includes(r.path)));
+  p.unmount();
+});
+
+test('scope failure retires overlay rather than retaining broader permissions', async () => {
+  const p = lifecyclePane({ '/overlay/scope': () => { throw new Error('sync failed'); } });
+  await button(p.tree, 'Show overlay').props.onClick();
+  changeProject(p, '__all_projects__');
+  await p.flushTimers();
+  await settle();
+  assert.ok(p.requests.some(r => r.path === '/overlay/hide' && r.body.pane === 'pane-capability'));
+  assert.ok(button(p.rerender(), 'Show overlay'));
+  p.unmount();
+});
+
+test('Clear retires local Hide state and permits immediate Show', async () => {
+  const p = lifecyclePane({}, {}, { segments: [{ text: 'Who approves?' }] });
+  await button(p.tree, 'Show overlay').props.onClick();
+  await button(p.rerender(), 'Clear meeting').props.onClick();
+  const reopen = button(p.rerender(), 'Show overlay');
+  assert.ok(reopen, 'Clear already retired the overlay, without an eight-second grace');
+  await reopen.props.onClick();
+  assert.equal(p.requests.filter(r => r.path === '/overlay/show').length, 2);
+  assert.equal(p.requests.filter(r => r.path === '/overlay/hide').length, 0);
+  p.unmount();
+});
+
 function nodes(tree) {
   return tree && typeof tree === 'object' ? [tree, ...(tree.children || []).flatMap(nodes)] : [];
 }
@@ -126,12 +1359,14 @@ test('status bar toggles open, hide, and reopen without capture changes', () => 
   assert.equal(requests.length, 0);
 });
 
-test('restart command pauses capture and reopens exactly one pane', async () => {
-  const { contributions, revealed, requests } = pane('');
+test('restart command releases owned capture and reopens exactly one pane', async () => {
+  const { contributions, revealed, requests } = lifecyclePane();
+  await settle();
   const restart = contributions.find(c => c.area === 'palette' && c.data.label === 'Restart Meeting Copilot');
   assert.ok(restart, 'A restart command must be discoverable in Cmd+K');
   await restart.data.run();
-  assert.ok(requests.some(r => r.path === '/pause'), 'Restart must pause capture first');
+  assert.ok(requests.some(r => r.path === '/overlay/release' && r.body.pane), 'Restart must release owned capture first');
+  assert.ok(!requests.some(r => r.path === '/pause'), 'never fall back to legacy Pause');
   assert.equal(contributions.filter(c => c.area === 'panes').length, 1, 'Restart must leave exactly one pane registration');
   assert.deepEqual(revealed, ['meeting-copilot-live:pane']);
 });
@@ -186,6 +1421,64 @@ test('capture card discloses cloud audio transmission for selected Meta transcri
   const listening = pane('', true, false, '', { 3: true, 4: 'macos', 25: 'meta' }, {}, { listening: true });
   const notice = nodes(listening.tree).find(n => n.props['data-cloud-capture-disclosure'] === true);
   assert.match(JSON.stringify(notice), /Pause to change/);
+});
+
+function disclosedNodes(node) {
+  if (!node || typeof node !== 'object') return [];
+  return [{ ...node, children: (node.children || []).filter(child => typeof child !== 'object') },
+    ...(node.type === 'details' && !node.props.open ? [] : (node.children || []).flatMap(disclosedNodes))];
+}
+
+for (const timing of ['cached', 'delayed']) test(`local capture default is independent of capability timing (${timing})`, async () => {
+  const store = new Map();
+  const status = { capabilities: { macos_transcription: true, meta_asr: timing === 'cached' } };
+  const ui = pane('', true, false, '', { 3: true, 4: 'macos' }, {}, status, {
+    localStorage: { getItem: key => store.get(key) || null, setItem: (key, value) => store.set(key, value) },
+    setInterval: () => 0, clearInterval: () => {},
+  }, { effects: true });
+  await settle(); ui.rerender();
+  status.capabilities.meta_asr = true;
+  ui.rerender(); await settle();
+  const tree = ui.rerender();
+  assert.equal(nodes(tree).find(n => n.props['aria-label'] === 'Transcription provider').props.value, 'local');
+  await button(tree, 'Start listening').props.onClick();
+  assert.equal(ui.requests.find(r => r.path === '/start').body.transcription_provider, 'local');
+  ui.unmount();
+});
+
+test('explicit persisted cloud preference survives unrelated preference edits and discloses at Start', async () => {
+  const store = new Map([['meeting-copilot.scope.v2', JSON.stringify({ transcriptionProvider: 'meta', transcriptionChoiceVersion: 1 })]]);
+  const ui = pane('', true, false, '', { 3: true, 4: 'macos' }, {}, { capabilities: { macos_transcription: true, meta_asr: true } }, {
+    localStorage: { getItem: key => store.get(key) || null, setItem: (key, value) => store.set(key, value) },
+    setInterval: () => 0, clearInterval: () => {},
+  }, { effects: true });
+  await settle();
+  let tree = ui.rerender();
+  const fallback = nodes(tree).find(n => n.type === 'input' && n.props['aria-label'] === 'Allow automatic web fallback');
+  if (fallback) fallback.props.onChange({ target: { checked: true } });
+  // Change a real common preference, not the provider itself.
+  nodes(tree).find(n => n.props['aria-label'] === 'Audio source').props.onChange({ target: { value: 'system' } });
+  tree = ui.rerender();
+  assert.equal(JSON.parse(store.get('meeting-copilot.scope.v2')).transcriptionProvider, 'meta');
+  assert.match(JSON.stringify(disclosedNodes(tree)), /meeting audio is sent to Meta/);
+  assert.doesNotMatch(JSON.stringify(tree), /Transcription remains local/);
+  await button(tree, 'Start listening').props.onClick();
+  assert.equal(ui.requests.find(r => r.path === '/start').body.transcription_provider, 'meta');
+  ui.unmount();
+});
+
+test('quick overlay failure and screen-share privacy warning are disclosed without opening details', async () => {
+  const ui = pane('', true, false, '', {}, {
+    '/overlay/show': () => { throw new Error('fake-sensitive-transport-detail'); },
+  });
+  await button(ui.tree, 'Show overlay').props.onClick();
+  const capture = nodes(ui.rerender()).find(n => n.props['aria-label'] === 'Capture session');
+  const text = JSON.stringify(disclosedNodes(capture));
+  assert.match(text, /screen.shar/i);
+  assert.match(text, /overlay.*not confirmed/i);
+  assert.match(text, /Retry|reopen/i);
+  assert.doesNotMatch(JSON.stringify(ui.rerender()), /fake-sensitive-transport-detail/);
+  assert.equal(ui.requests.filter(r => r.path === '/overlay/show').length, 1);
 });
 
 test('meta provider option is disabled without a configured key', async () => {
@@ -329,7 +1622,7 @@ test('react import parser tolerates CRLF checkouts', () => {
   assert.ok(![...imported].some(s => s.includes('react')), 'no `} from \'react\'` fragments as names');
 });
 
-test('rejected scope sync keeps the stale warning actionable', async () => {
+test('rejected scope sync closes the overlay with an actionable warning', async () => {
   const { rerender } = pane('alpha', true, false, '', {}, { '/overlay/scope': { accepted: false } });
   const findButton = (tree, label) => nodes(tree).filter(n => n.type === 'button')
     .find(n => (Array.isArray(n.children) ? n.children.join('') : String(n.children || '')) === label);
@@ -338,7 +1631,19 @@ test('rejected scope sync keeps the stale warning actionable', async () => {
   tree = rerender();
   await findButton(tree, 'Sync scope').props.onClick();
   tree = rerender();
-  assert.ok(JSON.stringify(tree).includes('stale sync was ignored'), 'rejection must stay visible, not clear the stale state');
+  assert.ok(JSON.stringify(tree).includes('Overlay closed because scope synchronization failed'), 'rejection must stay visible, not pretend synchronization succeeded');
+  assert.ok(findButton(tree, 'Show overlay'), 'reopen must apply the visible scope');
+});
+
+test('scope sync carries the owner minted by show', async () => {
+  const { rerender, requests } = pane('alpha', true, false, '', {}, {
+    '/overlay/show': { shown: true, owner: 'owner-A' },
+    '/overlay/scope': { accepted: true },
+  });
+  const button = (label) => nodes(rerender()).find(n => n.type === 'button' && n.children.includes(label));
+  await button('Show overlay').props.onClick();
+  await button('Sync scope').props.onClick();
+  assert.equal(requests.find(r => r.path === '/overlay/scope').body.scope.owner, 'owner-A');
 });
 
 test('accepted scope sync clears the stale indicator', async () => {
@@ -417,10 +1722,10 @@ test('unsupported setup names the reason beside the answer action', async () => 
   assert.ok(buttons.some(n => n.children.includes('Suggest answer') && n.props.disabled));
 });
 
-test('backend errors offer retry, local errors offer dismiss', async () => {
+test('classified capture errors offer restart, local errors offer dismiss', async () => {
   const { tree: local } = pane('', true, false, '', { 6: 'boom' }, {}, {});
   assert.ok(nodes(local).some(n => n.type === 'button' && n.children.includes('Dismiss')));
-  const { tree: remote } = pane('', true, false, '', {}, {}, { error: 'capture failed' });
+  const { tree: remote } = pane('', true, false, '', {}, {}, { error: 'capture failed', error_source: 'capture' });
   assert.ok(nodes(remote).some(n => n.type === 'button' && n.children.includes('Restart capture')));
 });
 
@@ -434,13 +1739,12 @@ test('listening bar surfaces drop counts', async () => {
   assert.ok(nodes(tree).some(n => n.children && n.children.some(c => typeof c === 'string' && c.includes('1 worker chunk(s) + 2 native frame(s)'))));
 });
 
-test('retry re-asks the failed question', async () => {
+test('uncertain answer submission rechecks status without replay', async () => {
   const { tree, requests } = pane('edited', true, false, '', { 6: 'boom', 23: { question: 'original?', extra: {} }, 24: true }, {}, {});
-  const retry = nodes(tree).find(n => n.type === 'button' && n.children.includes('Retry'));
-  assert.ok(retry, 'a failed answer offers Retry');
+  const retry = nodes(tree).find(n => n.type === 'button' && n.children.includes('Recheck status'));
+  assert.ok(retry, 'uncertain submission offers status recheck');
   await retry.props.onClick();
-  const last = requests.filter(r => r.path === '/assist').at(-1);
-  assert.equal(last.body.question, 'original?');
+  assert.ok(!requests.some(r => r.path === '/assist'), 'status recheck does not replay');
 });
 
 test('dismiss never sends anything', async () => {
@@ -452,9 +1756,10 @@ test('dismiss never sends anything', async () => {
 });
 
 test('capture errors offer an honest capture restart instead of re-asking', async () => {
-  const { tree, requests } = pane('edited', true, false, '', { 23: { question: 'original?', extra: {} }, 24: true }, {}, { error: 'capture failed' });
+  const { tree, requests } = pane('edited', true, false, '', { 3: true, 4: 'macos', 23: { question: 'original?', extra: {} } }, {}, { error: 'capture failed', error_source: 'capture' });
   const retry = nodes(tree).find(n => n.type === 'button' && (n.children.includes('Restart capture') || n.children.includes('Retry')));
   assert.ok(retry, 'capture errors offer recovery');
+  assert.equal(retry.props.disabled, false);
   await retry.props.onClick();
   assert.ok(!requests.some(r => r.path === '/assist'), 'capture recovery must not re-ask an answer');
   assert.ok(requests.some(r => r.path === '/start'), 'capture recovery restarts capture');
@@ -472,7 +1777,7 @@ test('partial answers carry a retry for the complete response', async () => {
 
 test('async failure retry replays the stored original request', async () => {
   const stored = { question: 'orig q?', project: '/p', all_projects: false, web_fallback: false, transcript: 'you: hi' };
-  const { tree, requests } = pane('', true, false, '', {}, {}, { error_request: stored, error: 'RuntimeError: down' });
+  const { tree, requests } = pane('', true, false, '', {}, {}, { error_request: stored, error: 'RuntimeError: down', answer_error: 'RuntimeError: down', error_source: 'answer' });
   const retry = nodes(tree).find(n => n.type === 'button' && n.children.includes('Retry'));
   assert.ok(retry);
   await retry.props.onClick();
@@ -519,7 +1824,7 @@ test('recent entries retry their own stored request', async () => {
 
 test('stored backend errors pair text with retry', async () => {
   const stored = { question: 'orig q?', project: null, all_projects: false, web_fallback: false, transcript: 'you: hi' };
-  const { tree } = pane('', true, false, '', { 6: 'local hiccup' }, {}, { error: 'RuntimeError: down', error_request: stored });
+  const { tree } = pane('', true, false, '', { 6: 'local hiccup' }, {}, { error: 'RuntimeError: down', error_request: stored, answer_error: 'RuntimeError: down', error_source: 'answer' });
   assert.ok(nodes(tree).some(n => n.type === 'button' && n.children.includes('Retry')));
 });
 
@@ -713,7 +2018,7 @@ test('separate loss units render without a misleading total', async () => {
   assert.ok(nodes(tree).some(n => n.children && n.children.some(c => typeof c === 'string' && c.includes('1 worker chunk(s) + 2 native frame(s)'))));
 });
 
-test('failed replay stays retryable as itself', async () => {
+test('uncertain replay rechecks without sending the request again', async () => {
   let calls = 0;
   const failOnce = () => { calls++; if (calls === 1) throw new Error('down'); return { accepted: true, request_id: 'r-2' }; };
   const req = { question: 'old q?', project: null, all_projects: false, web_fallback: false };
@@ -724,11 +2029,11 @@ test('failed replay stays retryable as itself', async () => {
   await retry.props.onClick();
   assert.equal(calls, 1);
   const tree2 = rerender();
-  const retry2 = nodes(tree2).find(n => n.type === 'button' && n.children.includes('Retry'));
-  assert.ok(retry2, 'failed replay offers Retry');
+  const retry2 = nodes(tree2).find(n => n.type === 'button' && n.children.includes('Recheck status'));
+  assert.ok(retry2, 'uncertain replay offers a status recheck');
   await retry2.props.onClick();
   const bodies = requests.filter(r => r.path === '/assist').map(r => r.body);
-  assert.equal(bodies.length, 2);
+  assert.equal(bodies.length, 1);
   assert.ok(bodies.every(b => b.question === 'old q?'));
 });
 

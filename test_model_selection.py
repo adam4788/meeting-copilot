@@ -182,7 +182,7 @@ class KnowledgeSelectionTests(unittest.TestCase):
         with patch('model_selection.selected_completion', return_value=Mock(side_effect=RuntimeError('sanitized'))):
             result = engine.answer('public', answer_provider='openai-codex', answer_model='gpt-public')
         self.assertIn('unavailable', result['answer'])
-        self.assertTrue(any('Model request failed (RuntimeError)' in w for w in result['warnings']))
+        self.assertTrue(any(w == 'Model request failed.' for w in result['warnings']))
         engine._complete.assert_not_called()
 
 

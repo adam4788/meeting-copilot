@@ -1,12 +1,13 @@
 """Overlay bridge tests; stdlib only, no GUI, network, devices, or permissions."""
 import json
 import unittest
+from thread_test_support import CheckedThreads
 from contextlib import contextmanager
 
 import overlay_bridge as bridge
 
 
-class ActiveWebNoticeTests(unittest.TestCase):
+class ActiveWebNoticeTests(CheckedThreads):
     def test_native_snapshot_discloses_active_query_and_clears_it(self):
         overlay = bridge.OverlayBridge(scope={'web_query': 'public docs'})
         overlay.push()
@@ -56,7 +57,7 @@ def _fake_overlay_spawn():
         yield
 
 
-class SnapshotTests(unittest.TestCase):
+class SnapshotTests(CheckedThreads):
     def test_question_id_is_stable_as_transcript_window_rolls(self):
         question = {'speaker': 'remote', 'text': 'Who approves?'}
         before = bridge.suggest_questions([{'text': 'earlier'}, question])[0]['id']
@@ -93,7 +94,7 @@ class SnapshotTests(unittest.TestCase):
         self.assertNotIn('stream', message.lower())
 
 
-class ClickTests(unittest.TestCase):
+class ClickTests(CheckedThreads):
     def test_click_line_parsing_ignores_garbage(self):
         self.assertIsNone(bridge.parse_click('not json'))
         self.assertIsNone(bridge.parse_click('{"type":"snapshot"}'))
@@ -110,7 +111,7 @@ class ClickTests(unittest.TestCase):
         delay = 0.05
 
         class SlotTransport:
-            def assist(self, question, scope, row_id):
+            def assist(self, question, scope, row_id, expected_generation=None):
                 with lock:
                     calls.append({'question': question, 'scope': dict(scope), 'row_id': row_id})
                     seq[0] += 1
@@ -152,9 +153,9 @@ class ClickTests(unittest.TestCase):
         overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}],
                         'listening': True, 'generation': 0, 'capture_generation': 0})
         row_id = next(iter(overlay.questions))
-        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
-        self.assertFalse(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))  # busy
-        self.assertFalse(overlay.on_click_line(json.dumps({'type': 'click', 'id': 'unknown'})))
+        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
+        self.assertFalse(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))  # busy
+        self.assertFalse(overlay.on_click_line(json.dumps({'type': 'click', 'id': 'unknown', 'snapshot_id': overlay.snapshot_id})))
         for _thread in list(overlay.threads):
             _thread.join(timeout=10)
         self.assertEqual(len(calls), 1)
@@ -172,7 +173,7 @@ class ClickTests(unittest.TestCase):
         slots, seq, calls = {}, [0], []
 
         class SlotTransport:
-            def assist(self, question, scope, row_id):
+            def assist(self, question, scope, row_id, expected_generation=None):
                 with lock:
                     seq[0] += 1
                     request_id = f'r-{seq[0]}'
@@ -202,7 +203,7 @@ class ClickTests(unittest.TestCase):
         rows = list(overlay.questions)
         self.assertEqual(len(rows), 2)
         for row_id in rows:
-            self.assertTrue(overlay.on_click_line(__import__('json').dumps({'type': 'click', 'id': row_id})))
+            self.assertTrue(overlay.on_click_line(__import__('json').dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
         for thread in list(overlay.threads):
             thread.join(timeout=10)
         got = sorted(overlay.answers[row_id]['answer'] for row_id in rows)
@@ -217,7 +218,7 @@ class ClickTests(unittest.TestCase):
         row_id = next(iter(overlay.questions))
 
         class CrossWired:
-            def assist(self, question, scope, rid):
+            def assist(self, question, scope, rid, expected_generation=None):
                 return 'r-x'
             def assist_request(self, request_id):
                 return {'request_id': request_id, 'row_id': 'some-other-row',
@@ -226,7 +227,7 @@ class ClickTests(unittest.TestCase):
                 calls.append({'cancelled': request_id})
 
         overlay.transport = CrossWired()
-        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
+        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
         for _thread in list(overlay.threads):
             _thread.join(timeout=10)
         self.assertNotIn('WRONG', str(overlay.answers[row_id].get('answer')))
@@ -235,7 +236,7 @@ class ClickTests(unittest.TestCase):
 
     def test_assist_rejection_marks_row_idle_without_raise(self):
         class FailingTransport:
-            def assist(self, question, scope, row_id):
+            def assist(self, question, scope, row_id, expected_generation=None):
                 raise RuntimeError('down')
             def assist_request(self, request_id):
                 raise AssertionError('must not poll after rejection')
@@ -247,7 +248,7 @@ class ClickTests(unittest.TestCase):
         overlay = bridge.OverlayBridge(transport=FailingTransport())
         overlay.update({'segments': [{'speaker': 'm', 'text': 'Ready?'}], 'listening': True, 'generation': 0, 'capture_generation': 0})
         row_id = next(iter(overlay.questions))
-        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
+        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
         for _thread in list(overlay.threads):
             _thread.join(timeout=10)
         self.assertFalse(overlay.answers[row_id]['busy'])
@@ -255,37 +256,59 @@ class ClickTests(unittest.TestCase):
 
     def test_scope_push_uses_current_pane_settings_and_cancels_stale_rows(self):
         calls = []
+        cancellations = []
         entered, release = __import__('threading').Event(), __import__('threading').Event()
         import threading as _threading
         import time as _time
 
+        checked_wait = self.checked_wait
         class HangingTransport:
-            def assist(self, question, scope, row_id):
+            def assist(self, question, scope, row_id, expected_generation=None):
                 calls.append(dict(scope))
                 entered.set()
-                release.wait(5)
+                checked_wait(release, 2, 'scope admission gate')
                 return 'r-hang'
             def assist_request(self, request_id):
                 _time.sleep(0.01)
                 return {'request_id': request_id, 'row_id': 'row', 'status': 'streaming',
                         'answer': '', 'streaming': True, 'completed_only': False}
             def cancel(self, request_id):
-                pass
+                cancellations.append(request_id)
             def poll_status(self):
                 raise AssertionError('no global polling')
 
-        overlay = bridge.OverlayBridge(transport=HangingTransport(), scope={'project': 'old'})
+        transport = HangingTransport()
+        for method in ('assist', 'assist_request', 'cancel', 'poll_status'):
+            setattr(transport, method, self.checked_callback(getattr(transport, method)))
+        overlay = bridge.OverlayBridge(transport=transport, scope={'project': 'old'})
         overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}], 'listening': True, 'generation': 0, 'capture_generation': 0})
         row_id = next(iter(overlay.questions))
-        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
+        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
         self.assertTrue(entered.wait(5))
-        overlay.set_scope({'project': 'new', 'answer_provider': 'meta', 'answer_model': 'muse-spark-1.3'})
-        release.set()
-        for _thread in list(overlay.threads):
-            _thread.join(timeout=10)
+        attempted, synced = _threading.Event(), _threading.Event()
+        def sync():
+            attempted.set()
+            overlay.set_scope({'project': 'new', 'answer_provider': 'meta', 'answer_model': 'muse-spark-1.3'})
+            synced.set()
+        updater = _threading.Thread(target=sync, daemon=True)
+        updater.start()
+        try:
+            self.assertTrue(attempted.wait(2))
+        finally:
+            # Admission holds bridge.lock. Release it before waiting for scope;
+            # the old synchronous test advanced only when its gate timed out.
+            release.set()
+            updater.join(2)
+            for worker in list(overlay.threads):
+                worker.join(2)
+                self.assertFalse(worker.is_alive())
+        self.assertFalse(updater.is_alive())
+        self.assertTrue(synced.is_set())
         self.assertEqual(overlay.scope['project'], 'new')
         self.assertFalse(overlay.answers.get(row_id, {}).get('busy'))
         self.assertEqual(calls[0].get('project'), 'old')
+        self.assertEqual(cancellations, ['r-hang'])
+        self.assertEqual(self.worker_errors, [], 'even caught callback errors must fail on the test thread')
 
     def test_cancel_row_stops_its_worker_and_keeps_other_rows(self):
         import threading
@@ -293,7 +316,7 @@ class ClickTests(unittest.TestCase):
         started = threading.Event()
 
         class SlowTransport:
-            def assist(self, question, scope, row_id):
+            def assist(self, question, scope, row_id, expected_generation=None):
                 started.set()
                 return 'r-slow'
             def assist_request(self, request_id):
@@ -308,7 +331,7 @@ class ClickTests(unittest.TestCase):
         overlay = bridge.OverlayBridge(transport=SlowTransport(), poll_interval=0.01)
         overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}], 'listening': True, 'generation': 0, 'capture_generation': 0})
         row_id = next(iter(overlay.questions))
-        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
+        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
         self.assertTrue(started.wait(5))
         self.assertTrue(overlay.cancel_row(row_id))
         for _thread in list(overlay.threads):
@@ -321,7 +344,7 @@ class ClickTests(unittest.TestCase):
         cancelled_seen = []
 
         class CancellingTransport:
-            def assist(self, question, scope, row_id):
+            def assist(self, question, scope, row_id, expected_generation=None):
                 return 'r-prune'
             def assist_request(self, request_id):
                 cancelled_seen.append(request_id)
@@ -336,7 +359,7 @@ class ClickTests(unittest.TestCase):
         overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}],
                         'listening': True, 'generation': 0, 'capture_generation': 0})
         row_id = next(iter(overlay.questions))
-        self.assertTrue(overlay.on_click_line(_json.dumps({'type': 'click', 'id': row_id})))
+        self.assertTrue(overlay.on_click_line(_json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
         for _thread in list(overlay.threads):
             _thread.join(timeout=10)
         # Worker exited on the cancelled slot: no id may be retained.
@@ -349,7 +372,7 @@ class ClickTests(unittest.TestCase):
 
     def test_headless_run_without_poll_capability_returns(self):
         class ClickOnly:
-            def assist(self, question, scope, row_id):
+            def assist(self, question, scope, row_id, expected_generation=None):
                 raise AssertionError('no clicks in this test')
             def assist_request(self, request_id):
                 raise AssertionError('no slots in this test')
@@ -382,12 +405,14 @@ class ClickTests(unittest.TestCase):
         self.assertLessEqual(overlay._push_queue.qsize(), 8)
 
     def test_helper_exit_is_reaped_without_leaked_process(self):
+        if bridge.sys.platform not in ('darwin', 'linux'):
+            self.skipTest('real overlay helper launch requires macOS or Linux')
         import subprocess
         overlay = bridge.OverlayBridge(transport=self._slot_transport([]))
         import sys as _sys
         overlay.helper_path = _sys.executable
-        overlay.helper_args = ['-c', 'pass']
-        overlay.show_overlay()
+        overlay.helper_args = ['-c', 'import sys; print("meeting-overlay/2") if "--protocol-version" in sys.argv else None']
+        self.assertTrue(overlay.show_overlay()['shown'])
         deadline = __import__('time').monotonic() + 10
         while overlay.process is not None and overlay.process.poll() is None and __import__('time').monotonic() < deadline:
             __import__('time').sleep(0.01)
@@ -514,14 +539,14 @@ class BridgeLifecycleTests(ClickTests):
         # Pause: rows retire, clicks rejected, no request reserved.
         overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}],
                         'listening': False, 'generation': 0, 'capture_generation': 1})
-        self.assertFalse(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
+        self.assertFalse(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
         self.assertEqual(overlay.request_by_row.get(row_id), None)
         # Resume on a new meeting revision: stale rows stay retired until the
         # new revision renders them.
         overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves still?'}],
                         'listening': True, 'generation': 2, 'capture_generation': 2})
         row_id = next(iter(overlay.questions))
-        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
+        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
         overlay.set_scope({'project': 'other'})
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
@@ -535,17 +560,19 @@ class BridgeLifecycleTests(ClickTests):
         self.assertFalse(any(s.get('busy') for s in overlay.answers.values()))
         overlay.stop()
 
-    def test_stale_scope_reservation_cancels_new_request_without_orphan(self):
-        import time
+    def test_scope_change_during_slot_poll_cancels_request_without_orphan(self):
+        import threading
         cancels = []
+        entered, release = threading.Event(), threading.Event()
+        checked_wait = self.checked_wait
 
         class SlowScope:
-            def assist(self, question, scope, row_id):
-                time.sleep(0.05)
+            def assist(self, question, scope, row_id, expected_generation=None):
                 return 'r-stale'
 
             def assist_request(self, request_id):
-                time.sleep(0.5)
+                entered.set()
+                checked_wait(release, 3, 'stale scope polling gate')
                 return {'request_id': request_id, 'status': 'streaming', 'answer': ''}
 
             def cancel(self, request_id):
@@ -555,21 +582,26 @@ class BridgeLifecycleTests(ClickTests):
         overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}],
                         'listening': True, 'generation': 0, 'capture_generation': 0})
         row_id = next(iter(overlay.questions))
-        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
-        time.sleep(0.02)  # let the worker pass transport.assist, then switch scope
-        overlay.set_scope({'project': 'switched'})
-        for thread in list(overlay.threads):
-            thread.join(timeout=10)
-        self.assertEqual(cancels, ['r-stale'])
-        self.assertFalse(overlay.answers.get(row_id, {}).get('busy'))
-        overlay.stop()
+        try:
+            self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
+            self.assertTrue(entered.wait(3), 'request must be mapped before changing scope')
+            overlay.set_scope({'project': 'switched'})
+            release.set()
+            for thread in list(overlay.threads):
+                thread.join(timeout=3)
+                self.assertFalse(thread.is_alive())
+            self.assertEqual(cancels, ['r-stale'])
+            self.assertFalse(overlay.answers.get(row_id, {}).get('busy'))
+        finally:
+            release.set()
+            overlay.stop()
 
     def test_late_answer_events_cannot_resurrect_retired_rows(self):
         import time
         late = {'fire': False}
 
         class LateTransport:
-            def assist(self, question, scope, row_id):
+            def assist(self, question, scope, row_id, expected_generation=None):
                 return 'r-late'
 
             def assist_request(self, request_id):
@@ -587,7 +619,7 @@ class BridgeLifecycleTests(ClickTests):
         overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}],
                         'listening': True, 'generation': 0, 'capture_generation': 0})
         row_id = next(iter(overlay.questions))
-        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
+        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
         overlay.set_scope({'project': 'next-meeting'})
         late['fire'] = True
         for thread in list(overlay.threads):
@@ -622,7 +654,7 @@ class BridgeLifecycleTests(ClickTests):
             overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}],
                             'listening': True, 'generation': 0, 'capture_generation': 0})
             row_id = next(iter(overlay.questions))
-            self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
+            self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
             for thread in list(overlay.threads):
                 thread.join(timeout=10)
             self.assertEqual(seen.get('ctx'), 'pane-secret-value')
@@ -643,7 +675,7 @@ class BridgeLifecycleTests(ClickTests):
         slots, seq = {}, [0]
 
         class FakeStreamingTransport:
-            def assist(self, question, scope, row_id):
+            def assist(self, question, scope, row_id, expected_generation=None):
                 with lock:
                     seq[0] += 1
                     request_id = f'r-{seq[0]}'
@@ -665,7 +697,9 @@ class BridgeLifecycleTests(ClickTests):
             def poll_status(self):
                 raise AssertionError('streaming rows poll their own slot')
 
-        overlay = bridge.OverlayBridge(transport=FakeStreamingTransport(), poll_interval=0.01)
+        transport = FakeStreamingTransport()
+        transport.poll_status = self.checked_callback(transport.poll_status)
+        overlay = bridge.OverlayBridge(transport=transport, poll_interval=0.01)
         overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}], 'listening': True, 'generation': 0, 'capture_generation': 0})
         row_id = next(iter(overlay.questions))
         seen_streaming = []
@@ -676,8 +710,8 @@ class BridgeLifecycleTests(ClickTests):
             if state.get('streaming') or (state.get('answer') and state.get('busy')):
                 seen_streaming.append(state.get('answer'))
             return original_push()
-        overlay.push = spy_push
-        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
+        overlay.push = self.checked_callback(spy_push)
+        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
         for thread in list(overlay.threads):
             thread.join(timeout=10)
         overlay.push = original_push
@@ -694,7 +728,7 @@ class BridgeLifecycleTests(ClickTests):
         real_row = [None]
 
         class CompletedOnly:
-            def assist(self, question, scope, row_id):
+            def assist(self, question, scope, row_id, expected_generation=None):
                 real_row[0] = row_id
                 return 'r-1'
             def assist_request(self, request_id):
@@ -705,10 +739,12 @@ class BridgeLifecycleTests(ClickTests):
             def poll_status(self):
                 raise AssertionError('no global polling')
 
-        overlay = bridge.OverlayBridge(transport=CompletedOnly(), poll_interval=0.01)
+        transport = CompletedOnly()
+        transport.poll_status = self.checked_callback(transport.poll_status)
+        overlay = bridge.OverlayBridge(transport=transport, poll_interval=0.01)
         overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}], 'listening': True, 'generation': 0, 'capture_generation': 0})
         row_id = next(iter(overlay.questions))
-        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
+        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
         for thread in list(overlay.threads):
             thread.join(timeout=10)
         self.assertEqual(overlay.answers[row_id]['answer'], 'Final answer.')
@@ -762,12 +798,12 @@ class BridgeLifecycleTests(ClickTests):
         row_id = next(iter(overlay.questions))
         current_scope = {'project': 'demo', 'answer_provider': 'meta',
                          'answer_model': 'muse-spark-1.3', 'web_fallback': True}
-        state.overlay_scope(current_scope)
+        state.overlay_scope(dict(current_scope, owner=state.overlay_owner))
         row_deadline = time.monotonic() + 10
         clicked = False
         while time.monotonic() < row_deadline:
             try:
-                clicked = overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id}))
+                clicked = overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id}))
             except AssertionError:
                 raise
             except Exception:
@@ -788,18 +824,12 @@ class BridgeLifecycleTests(ClickTests):
         self.assertIsNone(state.overlay)
 
     def test_first_partial_row_answer_visible_before_provider_finishes(self):
-        """End-to-end barrier: the row shows its first partial before release.
-
-        Uses the real MeetingState + BackendTransport with a gated fake
-        provider stream (no models, no network): the engine's first chunk
-        arrives and the row answer becomes visible while the provider is
-        still blocked on an event; only then is the provider released and
-        the stream completes. Cancelling never revives a stale row.
-        """
+        """Real backend/bridge with gated publication; no providers or GUI."""
         import threading
-        import time
+        from unittest.mock import patch
         import server as real_server
-        release = threading.Event()
+        release, partial, complete = (threading.Event() for _ in range(3))
+        checked_wait = self.checked_wait
 
         class FakeGatedEngine:
             def answer_stream(self, question, **kwargs):
@@ -807,59 +837,64 @@ class BridgeLifecycleTests(ClickTests):
                           'web_search': {'used': False}}
                 def gated():
                     yield 'Two '
-                    release.wait(10)  # stay unfinished until row proves arrival
+                    checked_wait(release, 3, 'first partial provider gate')
                     yield 'reviewers.'
                 return header, gated()
             def answer(self, question, **kwargs):
                 raise AssertionError('streaming engine must use answer_stream')
 
-        state = real_server.MeetingState(engine_factory=lambda: FakeGatedEngine())
+        engine = FakeGatedEngine()
+        engine.answer = self.checked_callback(engine.answer)
+        state = real_server.MeetingState(engine_factory=lambda: engine)
         state.add_segment({'speaker': 'remote', 'text': 'Who approves?'})
         state.listening = True
-        real_helper_path = state._overlay_helper_path
-        state._overlay_helper_path = lambda: '/fake/macos_overlay_for_test'
-        try:
-            with _fake_overlay_spawn():
-                shown = state.overlay_show({'project': 'demo'})
-        finally:
-            state._overlay_helper_path = real_helper_path
+        with _fake_overlay_spawn(), patch.object(state, '_overlay_helper_path', return_value='/fake/macos_overlay_for_test'):
+            shown = state.overlay_show({'project': 'demo'})
         self.assertTrue(shown['shown'])
-        transport = bridge.BackendTransport(state)
         overlay = state.overlay
         self.assertIsNotNone(overlay)
         assert overlay is not None
         overlay.update(state.status())
         row_id = next(iter(overlay.questions))
-        state.overlay_scope({'project': 'demo'})
-        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
-        # First partial row answer must be visible before release.
-        visible = ''
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            with state.lock:
+        state.overlay_scope({'owner': state.overlay_owner, 'project': 'demo'})
+        original_push = overlay.push
+
+        def push():
+            result = original_push()
+            # Observe only under bridge.lock, never state.lock -> bridge.lock.
+            with overlay.lock:
+                row = overlay.answers.get(row_id, {})
+                if row.get('answer') == 'Two ':
+                    partial.set()
+                if row.get('completed'):
+                    complete.set()
+            return result
+
+        try:
+            with patch.object(overlay, 'push', self.checked_callback(push)):
+                self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
+                self.assertTrue(partial.wait(3), 'partial must be published while provider is gated')
+                self.assertFalse(release.is_set())
+                release.set()
+                self.assertTrue(complete.wait(3))
                 with overlay.lock:
-                    visible = overlay.answers.get(row_id, {}).get('answer', '')
-            if visible == 'Two ':
-                break
-            time.sleep(0.01)
-        self.assertEqual(visible, 'Two ')
-        self.assertFalse(release.is_set(), 'provider must still be gated')
-        release.set()
-        for thread in list(overlay.threads):
-            thread.join(timeout=10)
-        with overlay.lock:
-            final = overlay.answers[row_id]['answer']
-            completed = overlay.answers[row_id]['completed_only']
-        self.assertEqual(final, 'Two reviewers.')
-        self.assertFalse(completed)
-        state.overlay_hide()
+                    self.assertEqual(overlay.answers[row_id]['answer'], 'Two reviewers.')
+                    self.assertFalse(overlay.answers[row_id]['completed_only'])
+        finally:
+            release.set()
+            # Pusher/status threads are intentionally long-lived. Stop them
+            # BEFORE joining instead of silently spending two 10s join budgets.
+            state.overlay_hide()
+            for thread in list(overlay.threads):
+                thread.join(3)
+                self.assertFalse(thread.is_alive(), thread.name)
         self.assertIsNone(state.overlay)
 
     def test_timeout_cancels_slot_and_reports_retry(self):
         import time
 
         class Never:
-            def assist(self, question, scope, row_id):
+            def assist(self, question, scope, row_id, expected_generation=None):
                 return 'r-1'
             def assist_request(self, request_id):
                 time.sleep(0.02)
@@ -876,7 +911,7 @@ class BridgeLifecycleTests(ClickTests):
         overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}], 'listening': True, 'generation': 0, 'capture_generation': 0})
         row_id = next(iter(overlay.questions))
         real_row[0] = row_id
-        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id})))
+        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
         for thread in list(overlay.threads):
             thread.join(timeout=10)
         self.assertEqual(cancelled, ['r-1'])
@@ -887,7 +922,327 @@ class BridgeLifecycleTests(ClickTests):
                         'timeout must persist a row-level partial warning, not just a transient message')
 
 
-class SnapshotTruthTests(unittest.TestCase):
+class GenerationIsolationTests(CheckedThreads):
+    def test_late_mismatched_row_cannot_erase_completed_new_answer(self):
+        import threading
+        from unittest.mock import Mock
+        entered = threading.Event()
+        release = threading.Event()
+        transport = Mock()
+        transport.assist.side_effect = ['old', 'new']
+        overlay = bridge.OverlayBridge(transport=transport, poll_interval=0.001)
+        status = {'segments': [{'text': 'Who approves?'}], 'listening': True, 'generation': 1}
+        overlay.update(status)
+        row_id = next(iter(overlay.questions))
+        click = json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})
+
+        def poll(request_id):
+            if request_id == 'old':
+                entered.set()
+                if not release.wait(5):
+                    raise AssertionError('late-response gate was not released')
+                return {'row_id': 'different-row', 'status': 'done', 'answer': 'Old answer'}
+            return {'row_id': row_id, 'status': 'done', 'answer': 'New answer',
+                    'warnings': ['New warning'], 'sources': [{'title': 'New source'}]}
+
+        transport.assist_request.side_effect = self.checked_callback(poll)
+        workers = []
+        try:
+            self.assertTrue(overlay.on_click_line(json.dumps(dict(json.loads(click), snapshot_id=overlay.snapshot_id))))
+            workers.extend(overlay.threads)
+            self.assertTrue(entered.wait(5))
+            overlay.update(dict(status, generation=2))
+            self.assertTrue(overlay.on_click_line(json.dumps(dict(json.loads(click), snapshot_id=overlay.snapshot_id))))
+            workers.extend(t for t in overlay.threads if t not in workers)
+            workers[1].join(5)
+            self.assertFalse(workers[1].is_alive())
+            self.assertNotIn(row_id, overlay.request_by_row)
+            expected = dict(overlay.answers[row_id])
+            expected_message = overlay.message
+            self.assertEqual(expected['answer'], 'New answer')
+            release.set()
+            workers[0].join(5)
+            self.assertFalse(workers[0].is_alive())
+            self.assertEqual(overlay.answers[row_id], expected)
+            self.assertEqual(overlay.message, expected_message)
+            self.assertEqual(overlay.pushed[-1]['questions'][0]['answer'], 'New answer')
+            self.assertEqual(overlay.row_by_request, {})
+        finally:
+            release.set()
+            for worker in workers:
+                worker.join(5)
+
+    def test_resume_retires_pending_click_and_allows_retry_without_old_worker_reset(self):
+        import threading
+        from unittest.mock import Mock, patch
+        entered = [threading.Event(), threading.Event()]
+        release = [threading.Event(), threading.Event()]
+        transport = Mock()
+        transport.assist.return_value = 'retry'
+        overlay = bridge.OverlayBridge(transport=transport)
+        status = {'segments': [{'text': 'Who approves?'}], 'listening': True, 'generation': 1}
+        overlay.update(status)
+        row_id = next(iter(overlay.questions))
+        transport.assist_request.return_value = {'row_id': row_id, 'status': 'done', 'answer': 'Retry answer'}
+        click = json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})
+        real_ask = overlay.ask
+        old_generation = overlay.paused_generation
+
+        def gated_ask(row_id, question, click_generation):
+            index = 0 if click_generation == old_generation else 1
+            entered[index].set()
+            if not release[index].wait(5):
+                raise AssertionError('click gate was not released')
+            return real_ask(row_id, question, click_generation)
+
+        workers = []
+        try:
+            with patch.object(overlay, 'ask', side_effect=gated_ask):
+                self.assertTrue(overlay.on_click_line(json.dumps(dict(json.loads(click), snapshot_id=overlay.snapshot_id))))
+                workers.extend(overlay.threads)
+                self.assertTrue(entered[0].wait(5))
+                self.assertTrue(overlay.answers[row_id]['busy'])
+                overlay.update(dict(status, listening=False))
+                overlay.update(status)  # Resume the SAME backend generation.
+                self.assertNotIn(row_id, overlay.request_by_row)
+                self.assertFalse(overlay.answers[row_id]['busy'])
+                self.assertTrue(overlay.on_click_line(json.dumps(dict(json.loads(click), snapshot_id=overlay.snapshot_id))))
+                workers.extend(t for t in overlay.threads if t not in workers)
+                self.assertTrue(entered[1].wait(5))
+                release[0].set()
+                workers[0].join(5)
+                self.assertFalse(workers[0].is_alive())
+                transport.assist.assert_not_called()
+                self.assertIs(overlay.request_by_row[row_id], True)
+                self.assertTrue(overlay.answers[row_id]['busy'])
+                release[1].set()
+                workers[1].join(5)
+                self.assertFalse(workers[1].is_alive())
+                self.assertEqual(overlay.answers[row_id]['answer'], 'Retry answer')
+                self.assertFalse(overlay.answers[row_id]['busy'])
+                self.assertNotIn(row_id, overlay.request_by_row)
+                transport.assist.assert_called_once()
+        finally:
+            for event in release:
+                event.set()
+            for worker in workers:
+                worker.join(5)
+
+    def test_completed_answer_is_cleared_for_identical_question_in_new_generation(self):
+        class Transport:
+            def assist(self, question, scope, row_id, expected_generation=None):
+                self.row_id = row_id
+                return 'request'
+
+            def assist_request(self, request_id):
+                return {'row_id': self.row_id, 'status': 'done', 'answer': 'Old answer',
+                        'warnings': ['Old warning'], 'sources': [{'title': 'Old source'}]}
+
+            def cancel(self, request_id):
+                pass
+
+        overlay = bridge.OverlayBridge(transport=Transport())
+        status = {'segments': [{'text': 'Who approves?'}], 'listening': True, 'generation': 1}
+        overlay.update(status)
+        row_id = next(iter(overlay.questions))
+        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
+        for thread in list(overlay.threads):
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(overlay.answers[row_id]['answer'], 'Old answer')
+        self.assertNotIn(row_id, overlay.request_by_row)
+        overlay.update(dict(status, generation=2))
+        row = overlay.pushed[-1]['questions'][0]
+        self.assertEqual(row['id'], row_id)
+        self.assertIsNone(row['answer'])
+        self.assertFalse(row['busy'])
+        self.assertEqual(row['warnings'], [])
+        self.assertEqual(row['sources'], [])
+
+    def test_running_partial_is_cancelled_and_late_result_cannot_overwrite_new_answer(self):
+        import threading
+        import time
+        waiting = threading.Event()
+        late_poll_entered = threading.Event()
+        release = threading.Event()
+        cancelled = []
+        checked_wait = self.checked_wait
+
+        class Transport:
+            def __init__(self):
+                self.count = 0
+                self.row_id = None
+
+            def assist(self, question, scope, row_id, expected_generation=None):
+                self.count += 1
+                self.row_id = row_id
+                return f'request-{self.count}'
+
+            def assist_request(self, request_id):
+                if request_id == 'request-1':
+                    if not waiting.is_set():
+                        waiting.set()
+                        return {'row_id': self.row_id, 'status': 'streaming',
+                                'answer': 'Old partial', 'streaming': True}
+                    late_poll_entered.set()
+                    checked_wait(release, 5, 'late poll gate')
+                    return {'row_id': self.row_id, 'status': 'done', 'answer': 'Old late'}
+                return {'row_id': self.row_id, 'status': 'done', 'answer': 'New answer'}
+
+            def cancel(self, request_id):
+                cancelled.append(request_id)
+
+        overlay = bridge.OverlayBridge(transport=Transport(), poll_interval=0.001)
+        status = {'segments': [{'text': 'Who approves?'}], 'listening': True, 'generation': 1}
+        overlay.update(status)
+        row_id = next(iter(overlay.questions))
+        try:
+            self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with overlay.lock:
+                    if overlay.answers[row_id]['answer'] == 'Old partial':
+                        break
+                time.sleep(0.001)
+            self.assertEqual(overlay.answers[row_id]['answer'], 'Old partial')
+            self.assertTrue(late_poll_entered.wait(5))
+            overlay.update(dict(status, generation=2))
+            row = overlay.pushed[-1]['questions'][0]
+            self.assertIsNone(row['answer'])
+            self.assertFalse(row['busy'])
+            self.assertIn('request-1', cancelled)
+            self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with overlay.lock:
+                    if overlay.answers[row_id]['answer'] == 'New answer':
+                        break
+                time.sleep(0.001)
+            self.assertEqual(overlay.answers[row_id]['answer'], 'New answer')
+            release.set()
+            for thread in list(overlay.threads):
+                thread.join(timeout=5)
+                self.assertFalse(thread.is_alive())
+            self.assertEqual(overlay.answers[row_id]['answer'], 'New answer')
+        finally:
+            release.set()
+            for thread in list(overlay.threads):
+                thread.join(timeout=5)
+
+    def test_stale_queued_click_cannot_clear_new_completed_answer(self):
+        from unittest.mock import Mock
+        transport = Mock()
+        overlay = bridge.OverlayBridge(transport=transport)
+        status = {'segments': [{'text': 'Who approves?'}], 'listening': True, 'generation': 1}
+        overlay.update(status)
+        row_id = next(iter(overlay.questions))
+        old_generation = overlay.paused_generation
+        overlay.update(dict(status, generation=2))
+        overlay.answers[row_id] = {'answer': 'New answer', 'busy': False,
+                                   'streaming': False, 'completed_only': True}
+        overlay.ask(row_id, 'Who approves?', click_generation=old_generation)
+        transport.assist.assert_not_called()
+        self.assertEqual(overlay.answers[row_id]['answer'], 'New answer')
+
+    def test_old_queued_click_cannot_claim_new_generation_reservation(self):
+        from unittest.mock import Mock
+        transport = Mock()
+        overlay = bridge.OverlayBridge(transport=transport)
+        status = {'segments': [{'text': 'Who approves?'}], 'listening': True, 'generation': 1}
+        overlay.update(status)
+        row_id = next(iter(overlay.questions))
+        old_generation = overlay.paused_generation
+        overlay.request_by_row[row_id] = True
+        overlay.reserved_generation[row_id] = old_generation
+        overlay.update(dict(status, generation=2))
+        overlay.request_by_row[row_id] = True
+        overlay.reserved_generation[row_id] = overlay.paused_generation
+        overlay.answers[row_id]['busy'] = True
+        overlay.ask(row_id, 'Who approves?', click_generation=old_generation)
+        transport.assist.assert_not_called()
+        self.assertIs(overlay.request_by_row[row_id], True)
+        self.assertTrue(overlay.answers[row_id]['busy'])
+
+
+class BackendGenerationAdmissionTests(CheckedThreads):
+    def test_stale_snapshot_click_is_rejected_before_next_overlay_poll(self):
+        self._exercise_admission('before_click')
+
+    def test_generation_is_checked_inside_backend_admission_lock(self):
+        self._exercise_admission('at_lock')
+
+    def test_matching_generation_is_admitted_and_completed(self):
+        self._exercise_admission(None)
+
+    def _exercise_admission(self, change_when):
+        # Test the backend boundary directly: a bridge tap holds overlay_lock,
+        # so waiting for Clear in that tap's admission gate deadlocks the test.
+        from fastapi import HTTPException
+        from unittest.mock import Mock
+        import server
+        import threading
+        import time
+        entered, release = threading.Event(), threading.Event()
+        state = server.MeetingState(engine_factory=lambda: engine)
+        engine = Mock()
+        engine.supports_streaming.return_value = False
+        engine.answer.return_value = {'answer': 'Current answer'}
+        state.listening = True
+        state.add_segment({'id': 'row', 'speaker': 'remote', 'text': 'Who approves?'})
+        generation, capture = state.generation, state.capture_generation
+        lock = state.lock
+        caller = None
+        errors, results = [], []
+        class Gate:
+            def __enter__(self):
+                if threading.current_thread() is caller and not entered.is_set():
+                    entered.set()
+                    if not release.wait(2):
+                        raise AssertionError('admission gate timed out')
+                return lock.__enter__()
+            def __exit__(self, *args):
+                return lock.__exit__(*args)
+        state.lock = Gate()
+        clear = next(r.endpoint for r in server.make_router(state).routes if getattr(r, 'path', None) == '/clear')
+        def submit():
+            try:
+                results.append(state.assist('Who approves?', row_id='row',
+                                            expected_generation=generation,
+                                            expected_capture_generation=capture))
+            except BaseException as exc:
+                errors.append(exc)
+        if change_when == 'before_click':
+            clear()
+        caller = threading.Thread(target=submit, daemon=True)
+        caller.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            if change_when == 'at_lock':
+                clear()
+        finally:
+            release.set()
+            caller.join(2)
+        self.assertFalse(caller.is_alive())
+        if change_when:
+            self.assertEqual(results, [])
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], HTTPException)
+            self.assertEqual(errors[0].status_code, 409)
+            self.assertEqual(state.requests, {})
+            self.assertEqual(state.request_seq, 0)
+            engine.answer.assert_not_called()
+        else:
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 1)
+            deadline = time.monotonic() + 2
+            while state.live_workers and time.monotonic() < deadline:
+                time.sleep(0.001)
+            self.assertEqual(state.live_workers, 0)
+            self.assertEqual(state.assist_request(results[0]['request_id'])['answer'], 'Current answer')
+            engine.answer.assert_called_once()
+
+
+class SnapshotTruthTests(CheckedThreads):
     def test_snapshot_carries_listening_and_share_warning(self):
         status = {'segments': [], 'listening': True}
         snapshot = bridge.build_snapshot(status)
@@ -934,7 +1289,7 @@ class SnapshotTruthTests(unittest.TestCase):
         self.assertIn('shortcut', (b.message or '').lower())
 
 
-class ScopeOrderingTests(unittest.TestCase):
+class ScopeOrderingTests(CheckedThreads):
     def test_older_scope_sequence_is_ignored(self):
         b = bridge.OverlayBridge(transport=None)
         b.set_scope({'project': 'beta', 'seq': 5})
@@ -960,7 +1315,7 @@ class ScopeOrderingTests(unittest.TestCase):
         self.assertEqual(rendered['sources'], ['01_quote.txt'])
 
 
-class WarningPriorityTests(unittest.TestCase):
+class WarningPriorityTests(CheckedThreads):
     def test_interruption_warning_survives_cap(self):
         warnings = ['Selected snippets may be sent.', 'All-project scope searches up to 100 folders.',
                     'Single-project scope still includes prior sessions.',
@@ -974,7 +1329,7 @@ class WarningPriorityTests(unittest.TestCase):
         self.assertTrue(any('more warning' in w for w in prioritized))
 
 
-class ConcurrentAssistTests(unittest.TestCase):
+class ConcurrentAssistTests(CheckedThreads):
     def test_overlapping_assists_do_not_share_context(self):
         import threading
         import time
@@ -1024,7 +1379,7 @@ class ConcurrentAssistTests(unittest.TestCase):
         self.assertIn('tap again', (overlay.message or '').lower())
 
 
-class OrderedDeliveryTests(unittest.TestCase):
+class OrderedDeliveryTests(CheckedThreads):
     def test_stale_sequence_never_reaches_helper(self):
         b = bridge.OverlayBridge(transport=None)
         with b.lock:
@@ -1050,7 +1405,7 @@ class OrderedDeliveryTests(unittest.TestCase):
         self.assertEqual(len(b.pushed), before)
 
 
-class PushAtomicityTests(unittest.TestCase):
+class PushAtomicityTests(CheckedThreads):
     def test_concurrent_pushes_serialize_with_exact_sequences(self):
         import threading
         b = bridge.OverlayBridge(transport=None)
@@ -1068,7 +1423,7 @@ class PushAtomicityTests(unittest.TestCase):
         self.assertEqual(b._latest_seq, 16)
 
 
-class StaleWriteRaceTests(unittest.TestCase):
+class StaleWriteRaceTests(CheckedThreads):
     def test_older_write_loses_after_newer_observed(self):
         # An older emission validated before a newer push must not overwrite
         # the newer snapshot: validation and delivery are atomic.
@@ -1105,7 +1460,7 @@ class StaleWriteRaceTests(unittest.TestCase):
         self.assertEqual(b.pushed[0].get('marker'), 'seq-32')
 
 
-class TakeoverTests(unittest.TestCase):
+class TakeoverTests(CheckedThreads):
     def test_late_worker_never_writes_into_takeover_row(self):
         import threading
         import time
@@ -1115,7 +1470,7 @@ class TakeoverTests(unittest.TestCase):
         slots, seq = {}, [0]
 
         class GateTransport:
-            def assist(self, question, scope, row_id):
+            def assist(self, question, scope, row_id, expected_generation=None):
                 with lock:
                     seq[0] += 1
                     request_id = f'r-{seq[0]}'
@@ -1151,7 +1506,7 @@ class TakeoverTests(unittest.TestCase):
         overlay.update({'segments': [{'speaker': 'm', 'text': 'first?'}],
                         'listening': True, 'generation': 0, 'capture_generation': 0})
         row_id = next(iter(overlay.questions))
-        self.assertTrue(overlay.on_click_line(__import__('json').dumps({'type': 'click', 'id': row_id})))
+        self.assertTrue(overlay.on_click_line(__import__('json').dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
         # Let the old worker pass its pre-poll ownership check, then retire
         # the scope and re-ask the same row before it writes.
         deadline = time.monotonic() + 5
@@ -1166,7 +1521,7 @@ class TakeoverTests(unittest.TestCase):
         overlay.update({'segments': [{'speaker': 'm', 'text': 'second?'}],
                         'listening': True, 'generation': 1, 'capture_generation': 0})
         row_id2 = next(iter(overlay.questions))
-        self.assertTrue(overlay.on_click_line(__import__('json').dumps({'type': 'click', 'id': row_id2})))
+        self.assertTrue(overlay.on_click_line(__import__('json').dumps({'type': 'click', 'id': row_id2, 'snapshot_id': overlay.snapshot_id})))
         release_old.set()
         for _thread in list(overlay.threads):
             _thread.join(timeout=10)
@@ -1179,7 +1534,7 @@ class TakeoverTests(unittest.TestCase):
             self.assertNotIn('r-1', overlay.row_by_request)
 
 
-class PaneTokenGateTests(unittest.TestCase):
+class PaneTokenGateTests(CheckedThreads):
     def test_off_path_transport_construction_fails_closed(self):
         import contextvars
         from unittest.mock import Mock
@@ -1206,7 +1561,7 @@ class PaneTokenGateTests(unittest.TestCase):
         state.assist.assert_called_once()
 
 
-class StaleAskTests(unittest.TestCase):
+class StaleAskTests(CheckedThreads):
     def test_stale_tap_never_evicts_newer_row_reservation(self):
         from unittest.mock import Mock
         state = Mock()
@@ -1233,7 +1588,7 @@ class StaleAskTests(unittest.TestCase):
         transport.assist.assert_not_called()
 
 
-class StaleAskReservationTests(unittest.TestCase):
+class StaleAskReservationTests(CheckedThreads):
     def test_stale_tap_never_evicts_newer_pending_reservation(self):
         from unittest.mock import Mock
         state = Mock()
@@ -1280,7 +1635,7 @@ class StaleAskReservationTests(unittest.TestCase):
         transport.assist.assert_not_called()
 
 
-class StaleOrphanTests(unittest.TestCase):
+class StaleOrphanTests(CheckedThreads):
     def test_stale_orphan_never_resets_newer_answer_state(self):
         from unittest.mock import Mock
         state = Mock()
@@ -1293,7 +1648,7 @@ class StaleOrphanTests(unittest.TestCase):
         own_generation = overlay.paused_generation
         overlay.request_by_row[row_id] = True
         overlay.reserved_generation[row_id] = own_generation
-        def assist_with_takeover(question, scope, rid):
+        def assist_with_takeover(question, scope, rid, expected_generation=None):
             # Another thread's scope change + newer tap lands while our
             # assist call is in flight; the post-assist re-check observes it.
             overlay.paused_generation += 1
@@ -1312,7 +1667,7 @@ class StaleOrphanTests(unittest.TestCase):
         transport.cancel.assert_called_once_with('r-old')
 
 
-class ReservationTagHygieneTests(unittest.TestCase):
+class ReservationTagHygieneTests(CheckedThreads):
     def test_generation_cleanup_drops_tags_with_reservations(self):
         from unittest.mock import Mock
         state = Mock()

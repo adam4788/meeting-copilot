@@ -67,12 +67,12 @@ def terminate_group(process, timeout=1.0):
     # A child may ignore TERM even if its parent already exited.
     try:
         _signal_group(process, _SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError, AttributeError):
-        pass
+    except ProcessLookupError:
+        pass  # the group has already exited; other signal failures are unsafe
     try:
         process.wait(timeout=.2)
-    except subprocess.TimeoutExpired:
-        pass
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError('Audio worker termination is not confirmed') from exc
 from pathlib import Path
 import threading
 
@@ -109,17 +109,27 @@ def validate(model, source, language, provider='local', asr_mode='ENDPOINTING'):
 
 def _model_api_key():
     try:
-        import meta_models
+        if __package__:
+            from . import meta_models
+        else:
+            import meta_models
         return meta_models.resolve_model_api_key()
     except Exception:
-        return os.environ.get('MODEL_API_KEY', '')
+        return ''  # never bypass a failed profile-scope resolver
 
 
 def worker_env():
     """Hermetic env for the isolated worker: never inherit the launcher's
     PYTHONPATH/PYTHONHOME (e.g. Hermes's own 3.14 site-packages), which would
     shadow the audio-runtime's 3.12 packages and break model loading."""
-    return {k: v for k, v in os.environ.items() if k not in ('PYTHONPATH', 'PYTHONHOME')}
+    env = {k: v for k, v in os.environ.items()
+           if k not in ('PYTHONPATH', 'PYTHONHOME', 'MODEL_API_KEY', 'HERMES_LAUNCHD_LABEL')}
+    # Snapshot the trusted request key, not the launch profile's environment.
+    # The child is not a gateway and must never reseed from the launch .env.
+    key = _model_api_key()
+    if key:
+        env['MODEL_API_KEY'] = key
+    return env
 
 
 class MacOSAudioCapture:
@@ -129,6 +139,8 @@ class MacOSAudioCapture:
         self.model_size, self.source, self.language = model_size, source, language
         self.provider, self.asr_mode = provider, asr_mode
         self._lock = threading.RLock()
+        self._termination_lock = threading.Lock()
+        self._cleanup_confirmed = True
         self._state, self._error = 'idle', None
         self._callback_error = None
         self._process = None
@@ -150,7 +162,10 @@ class MacOSAudioCapture:
 
     def status(self):
         with self._lock:
-            return {'state': self._state, 'running': bool(self._thread and self._thread.is_alive()),
+            running = bool((self._thread and self._thread.is_alive())
+                           or (self._process and self._process.poll() is None))
+            return {'state': self._state, 'running': running,
+                    'stop_confirmed': self._cleanup_confirmed and not running,
                     'error': self._error, 'callback_error': self._callback_error,
                     'source': self.source, 'model': self.model_size,
                     'provider': getattr(self, 'provider', 'local'),
@@ -174,7 +189,7 @@ class MacOSAudioCapture:
             # Terminal capture states are always delivered: final loss
             # counts and errors must reach the pane even during teardown.
             state = value.get('state') if isinstance(value, dict) else None
-            if state not in ('stopped', 'error'):
+            if state not in ('stopped', 'stopping', 'error'):
                 return
         try:
             callback(value)
@@ -189,8 +204,9 @@ class MacOSAudioCapture:
         if not callable(on_segment) or (on_status is not None and not callable(on_status)):
             raise TypeError('on_segment and on_status must be callable')
         with self._lock:
-            if self._thread and self._thread.is_alive():
-                raise RuntimeError('Audio capture is already active or stopping')
+            if not self.status()['stop_confirmed']:
+                raise RuntimeError('Audio capture is active or its cleanup is unconfirmed')
+            self._cleanup_confirmed = False
             self._cancel = threading.Event()
             self._stopping = threading.Event()
             self._on_segment = on_segment
@@ -198,10 +214,11 @@ class MacOSAudioCapture:
             self._state, self._error, self._callback_error = 'starting', None, None
             self._last_loss = {}
             self._process = None
-            self._thread = threading.Thread(target=self._run, daemon=True, name='macos-audio-worker')
+            self._thread = threading.Thread(target=self._run, args=(worker_env(),),
+                                            daemon=True, name='macos-audio-worker')
             self._thread.start()
 
-    def _run(self):
+    def _run(self, environment):
         process = None
         try:
             root = Path(__file__).resolve().parent
@@ -212,7 +229,7 @@ class MacOSAudioCapture:
                 return
             process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                        stderr=subprocess.DEVNULL, start_new_session=True,
-                                       env=worker_env())
+                                       env=environment)
             with self._lock:
                 self._process = process
             assert process.stdout is not None
@@ -264,11 +281,29 @@ class MacOSAudioCapture:
             self._notify('error', 'worker')
         finally:
             if process:
-                terminate_group(process, .2)
+                try:
+                    self._terminate(process, .2)
+                except Exception:
+                    self._notify('error', 'worker')
                 process.stdout.close()
+            else:
+                with self._lock:
+                    self._cleanup_confirmed = True
             with self._lock:
                 if self._cancel.is_set() and self._state != 'error':
                     self._state = 'stopped'
+
+    def _terminate(self, process, timeout):
+        # Reader cleanup and explicit stop may overlap. Serialize signals,
+        # never callbacks or joins; a failed cleanup retains the exact handle.
+        with self._termination_lock:
+            with self._lock:
+                if self._cleanup_confirmed and process.poll() is not None:
+                    return  # do not signal a reaped/reusable process-group ID
+                self._cleanup_confirmed = False
+            terminate_group(process, timeout)
+            with self._lock:
+                self._cleanup_confirmed = True
 
     def stop(self, timeout=3.0):
         """Bounded graceful shutdown: SIGTERM first so the worker flushes its
@@ -281,6 +316,8 @@ class MacOSAudioCapture:
         self._stopping.set()
         force_needed = False
         with self._lock:
+            if self._state != 'error':
+                self._state = 'stopping'
             process, thread = self._process, self._thread
         if process:
             # Graceful window: the worker stops its helper, flushes trailing
@@ -305,7 +342,7 @@ class MacOSAudioCapture:
         with self._lock:
             process, thread = self._process, self._thread
         if process:
-            terminate_group(process, min(.5, timeout))
+            self._terminate(process, min(.5, timeout))
         if thread and thread is not threading.current_thread():
             thread.join(max(0, deadline - time.monotonic()))
         with self._lock:
@@ -315,16 +352,13 @@ class MacOSAudioCapture:
             forced = force_needed or bool(thread and thread.is_alive())
         # Deliver the terminal state with the last known loss evidence: the
         # worker may have been terminated before its own summary arrived.
-        # The process group is dead at this point, so 'stopping' is settled
-        # to 'stopped' for delivery. A forced shutdown is marked explicitly:
-        # trailing audio may never have been reported.
+        # A worker still alive after the bounded join remains visibly stopping.
+        # A forced shutdown is marked explicitly: trailing audio may be lost.
         if forced:
             prior = final_loss.get('warning') or ''
             final_loss['warning'] = (prior + ' Forced shutdown before the worker exited; trailing audio may be incomplete.').strip()
         try:
             final = self.status()
-            if final.get('state') == 'stopping':
-                final['state'] = 'stopped'
             final.update(final_loss)
             self._callback(self._on_status, final)
         except Exception:
