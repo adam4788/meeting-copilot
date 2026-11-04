@@ -107,6 +107,14 @@ def validate(model, source, language, provider='local', asr_mode='ENDPOINTING'):
         raise ValueError('asr_mode must be ENDPOINTING, DIARIZATION, or PUSH_TO_TALK')
 
 
+def _model_api_key():
+    try:
+        import meta_models
+        return meta_models.resolve_model_api_key()
+    except Exception:
+        return os.environ.get('MODEL_API_KEY', '')
+
+
 def worker_env():
     """Hermetic env for the isolated worker: never inherit the launcher's
     PYTHONPATH/PYTHONHOME (e.g. Hermes's own 3.14 site-packages), which would
@@ -134,7 +142,7 @@ class MacOSAudioCapture:
         return {'backend': 'macos-native', 'sources': list(SOURCES),
                 'default_source': 'microphone', 'models': list(MODELS),
                 'providers': list(PROVIDERS), 'asr_modes': list(ASR_MODES),
-                'meta_asr_available': bool(os.environ.get('MODEL_API_KEY')),
+                'meta_asr_available': bool(_model_api_key()),
                 'permissions_checked': False,
                 'helper_available': (root / 'macos_capture').is_file(),
                 'permission_requirements': {'microphone': 'Microphone',

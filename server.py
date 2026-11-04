@@ -54,6 +54,16 @@ class CaptureRequest(BaseModel):
     new_meeting: bool = False
 
 
+def _meta_key_present():
+    try:
+        import importlib
+        module = importlib.import_module(f'{__package__}.meta_models' if __package__ else 'meta_models')
+        return module.api_key_present()
+    except Exception:
+        import os
+        return bool(os.environ.get('MODEL_API_KEY'))
+
+
 class MeetingState:
     def __init__(self, engine_factory=None, audio_factory=None, bridge_factory=None, macos_factory=None):
         self.macos_factory = macos_factory
@@ -1039,7 +1049,7 @@ class MeetingState:
                     'capture_generation': self.capture_generation, 'pane_seen': self.pane_seen,
                     'overlay_shown': overlay is not None,
                     'capabilities': {'all_projects': True, 'automatic_web_fallback': True, 'independent_models': True,
-                                     'meta_asr': bool(__import__('os').environ.get('MODEL_API_KEY')),
+                                     'meta_asr': _meta_key_present(),
                                      'macos_transcription': bool(macos_ready),
                                      'overlay': overlay_available, 'overlay_stream': True, 'overlay_cancel': True,
                                      'macos_detail': self._macos_capability_detail(macos_ready)}}

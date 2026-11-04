@@ -59,7 +59,8 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(command[command.index('--asr-mode') + 1], 'DIARIZATION')
         with patch.dict(os.environ, {'MODEL_API_KEY': 'k'}, clear=False):
             self.assertTrue(module.MacOSAudioCapture().devices()['meta_asr_available'])
-        with patch.dict(os.environ, {}, clear=True):
+        import tempfile
+        with patch.dict(os.environ, {'HERMES_HOME': tempfile.mkdtemp(prefix='mc-no-key-')}, clear=True):
             self.assertFalse(module.MacOSAudioCapture().devices()['meta_asr_available'])
 
     def test_diarized_meta_segments_survive_the_adapter(self):

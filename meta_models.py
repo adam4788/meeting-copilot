@@ -3,14 +3,50 @@
 The hackathon requires the app to actually use Meta models. This module calls
 the Meta Model API's OpenAI-compatible Chat Completions endpoint directly, so
 Meta usage never depends on Hermes provider configuration. The API key comes
-only from the MODEL_API_KEY environment variable of the gateway process --
-never from request bodies -- and nothing here reads or writes Hermes global
-configuration or credentials.
+from the MODEL_API_KEY environment variable of the gateway process, falling
+back to the MODEL_API_KEY line of ~/.hermes/.env (the desktop gateway does
+not inherit shell/.env variables) -- never from request bodies -- and nothing
+here writes Hermes global configuration or credentials.
 """
 import codecs
 import json
 import os
+from pathlib import Path
 import urllib.request
+
+
+def _load_dotenv_key_once():
+    """Import-time bridge: the desktop gateway does not inherit shell or
+    .env variables, so seed MODEL_API_KEY from ~/.hermes/.env (setdefault:
+    a real environment value always wins). Only inside the launchd-
+    supervised gateway process (HERMES_LAUNCHD_LABEL=ai.hermes.gateway)
+    — agent shells, CLIs, and test runs must stay hermetic (they may
+    carry HERMES_SUPERVISED_CHILD, so that alone does not qualify).
+    The value is never logged."""
+    if os.environ.get('MODEL_API_KEY', '').strip():
+        return
+    if not os.environ.get('HERMES_LAUNCHD_LABEL', '').startswith('ai.hermes.gateway'):
+        return
+    home = Path(os.environ.get('HERMES_HOME', str(Path.home() / '.hermes')))
+    try:
+        for line in (home / '.env').read_text(errors='replace').splitlines():
+            line = line.strip()
+            if line.startswith('MODEL_API_KEY='):
+                value = line.split('=', 1)[1].strip().strip('"').strip("'")
+                if value:
+                    os.environ.setdefault('MODEL_API_KEY', value)
+                return
+    except OSError:
+        pass
+
+
+_load_dotenv_key_once()
+
+
+def resolve_model_api_key():
+    """MODEL_API_KEY from the process env (see _load_dotenv_key_once)."""
+    key = os.environ.get('MODEL_API_KEY', '')
+    return key.strip() if isinstance(key, str) else ''
 
 META_BASE_URL = 'https://api.meta.ai/v1'
 META_MODELS = ('muse-spark-1.3', 'muse-spark-1.2', 'muse-spark-1.1')
@@ -19,8 +55,7 @@ META_PROVIDER_ID = 'meta'
 
 
 def api_key_present():
-    key = os.environ.get('MODEL_API_KEY', '')
-    return isinstance(key, str) and len(key.strip()) >= 8
+    return len(resolve_model_api_key()) >= 8
 
 
 def validate_meta_model(model):
@@ -35,8 +70,8 @@ def validate_meta_model(model):
 def meta_completion(model=None):
     """Request-local completion closure over the Meta Model API."""
     model = validate_meta_model(model)
-    key = os.environ.get('MODEL_API_KEY', '')
-    if not isinstance(key, str) or len(key.strip()) < 8:
+    key = resolve_model_api_key()
+    if len(key) < 8:
         raise ValueError('Meta Model API key is not configured')
 
     def complete(messages):

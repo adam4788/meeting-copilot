@@ -445,7 +445,11 @@ def main(argv=None):
     if args.provider == 'meta':
         import os
         import meta_asr
-        api_key = os.environ.get('MODEL_API_KEY', '')
+        try:
+            import meta_models
+            api_key = meta_models.resolve_model_api_key()
+        except Exception:
+            api_key = os.environ.get('MODEL_API_KEY', '')
         if not api_key:
             emit({'type': 'error', 'code': 'asr_auth', 'message': error_message('asr_auth')})
             return 1

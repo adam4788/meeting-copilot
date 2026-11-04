@@ -148,6 +148,30 @@ class FileTranscribeTests(unittest.TestCase):
             meta_asr.transcribe_file('/nonexistent.wav', '')
 
 
+class KeyResolutionTests(unittest.TestCase):
+    def test_dotenv_seeds_env_once_and_env_wins(self):
+        import os
+        import tempfile
+        import unittest.mock
+        import meta_models
+        with tempfile.TemporaryDirectory() as home:
+            with open(os.path.join(home, '.env'), 'w') as handle:
+                handle.write('OTHER=1\nMODEL_API_KEY="filekey123456"\n')
+            with unittest.mock.patch.dict(os.environ, {'HERMES_HOME': home, 'HERMES_LAUNCHD_LABEL': 'ai.hermes.gateway'}, clear=False):
+                os.environ.pop('MODEL_API_KEY', None)
+                meta_models._load_dotenv_key_once()
+                self.assertEqual(meta_models.resolve_model_api_key(), 'filekey123456')
+                self.assertTrue(meta_models.api_key_present())
+                os.environ['MODEL_API_KEY'] = 'envkey999'
+                meta_models._load_dotenv_key_once()
+                self.assertEqual(meta_models.resolve_model_api_key(), 'envkey999',
+                                 'a real environment value always wins over .env')
+            with unittest.mock.patch.dict(os.environ, {'HERMES_HOME': home + '-missing'}, clear=False):
+                os.environ.pop('MODEL_API_KEY', None)
+                meta_models._load_dotenv_key_once()
+                self.assertEqual(meta_models.resolve_model_api_key(), '')
+
+
 class WorkerProviderTests(unittest.TestCase):
     def test_worker_meta_without_key_fails_cleanly(self):
         import os
@@ -165,6 +189,7 @@ class WorkerProviderTests(unittest.TestCase):
                 wav.setframerate(24000)
                 wav.writeframes(b'\x00\x00' * 2400)
             env = {k: v for k, v in os.environ.items() if k != 'MODEL_API_KEY'}
+            env['HERMES_HOME'] = tempfile.mkdtemp(prefix='mc-no-key-')
             result = subprocess.run(
                 [sys.executable, os.path.join(root, 'audio_worker.py'),
                  '--file', path, '--provider', 'meta'],
