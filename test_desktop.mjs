@@ -509,15 +509,34 @@ test('transcript segments render as bounded tiles with accent edges', async () =
     { speaker: 'Bob', text: 'general kenobi', timestamp: 2 },
   ] });
   const tiles = nodes(tree).filter(n => n.type === 'p'
-    && n.props.style && String(n.props.style.borderLeft || '').includes('var(--ui-accent)'));
+    && n.props.style && String(n.props.style.borderLeft || '').includes('3px solid'));
   assert.equal(tiles.length, 2);
   for (const tile of tiles) {
     assert.ok(String(tile.props.style.border || '').includes('var(--ui-stroke-secondary)'));
     assert.ok(String(tile.props.style.background || '').includes('color-mix'));
     assert.ok(tile.props.style.borderRadius >= 8);
   }
-  const speakers = tiles.map(t => t.children[0]);
-  assert.ok(speakers.every(s => s && s.props.style && s.props.style.color === 'var(--ui-accent)'));
+});
+
+test('each speaker keeps one distinct color across tiles, with a legend', async () => {
+  const { tree } = pane('', true, true, '', {}, {}, { segments: [
+    { speaker: 'Alice', text: 'first', timestamp: 1 },
+    { speaker: 'Bob', text: 'second', timestamp: 2 },
+    { speaker: 'Alice', text: 'third', timestamp: 3 },
+  ] });
+  const tiles = nodes(tree).filter(n => n.type === 'p'
+    && n.props.style && String(n.props.style.borderLeft || '').includes('3px solid'));
+  assert.equal(tiles.length, 3);
+  const colors = tiles.map(t => t.props.style.borderLeft);
+  assert.equal(colors[0], colors[2], 'same speaker, same color');
+  assert.notEqual(colors[0], colors[1], 'different speakers, different colors');
+  const speakerNames = tiles.map(t => t.children[0]);
+  assert.ok(speakerNames.every((s, i) => s && s.props.style
+    && s.props.style.color === colors[i].replace('3px solid ', '')),
+    'speaker name uses the tile color');
+  const legend = nodes(tree).filter(n => n.type === 'span'
+    && (n.children || []).some(c => typeof c === 'string' && (c === 'Alice' || c === 'Bob')));
+  assert.equal(legend.length, 2, 'legend chips name each speaker');
 });
 
 test('idle pane keeps a prominent start action above the fold', async () => {

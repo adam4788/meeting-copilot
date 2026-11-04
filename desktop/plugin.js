@@ -442,10 +442,27 @@ export default {
               entry.request && h(Button, { variant: 'secondary', onClick: () => replayRequest(entry.request) }, /partial|interrupt|unavailable|failed|error/i.test((entry.warnings || []).join(' ') + ' ' + (entry.status || '')) ? 'Retry for the complete response' : 'Ask again'))))),
         h('details', { open: showTranscript, onToggle: e => setShowTranscript(e.currentTarget.open) },
           h('summary', { style: { cursor: 'pointer', ...muted } }, `Live transcript · ${transcript.length} segments`),
+          ...(() => {
+            const palette = ['var(--ui-accent)', '#16a34a', '#ea8600', '#db2777', '#0284c7', '#9333ea'];
+            const assigned = {};
+            for (const seg of transcript) {
+              const name = String(seg.speaker || 'Speaker');
+              if (!(name in assigned)) assigned[name] = palette[Object.keys(assigned).length % palette.length];
+            }
+            return Object.keys(assigned).length > 1 ? [h('div', { key: 'speakers', style: { display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 } },
+              ...Object.entries(assigned).map(([name, color]) => h('span', { key: name, style: { border: '1px solid var(--ui-stroke-secondary)', borderRadius: 999, padding: '2px 9px', fontSize: 12 } },
+                h('span', { style: { color } }, '\u25cf '), name)))] : [];
+          })(),
           h('div', { style: { maxHeight: 280, overflowY: 'auto', marginTop: 8, padding: 10, display: 'flex', flexDirection: 'column', gap: 8, border: '1px solid var(--ui-stroke-secondary)', borderRadius: 10, background: 'var(--ui-bg-card)' } },
-            ...(transcript.length ? transcript.slice(-30).map((s, i) => h('p', { key: `${i}-${s.timestamp}`, style: { margin: 0, padding: '8px 10px', borderRadius: 8, border: '1px solid var(--ui-stroke-secondary)', borderLeft: '3px solid var(--ui-accent)', background: 'color-mix(in srgb, var(--ui-accent) 6%, transparent)', lineHeight: 1.5 } },
-              h('strong', { style: { color: 'var(--ui-accent)' } }, `${s.speaker}: `), s.text,
-              s.partial_tail && h('span', { title: 'Transcribed from trailing audio captured during shutdown' }, ' \u00b7 trailing audio')))
+            ...(transcript.length ? transcript.slice(-30).map((s, i) => {
+              const palette = ['var(--ui-accent)', '#16a34a', '#ea8600', '#db2777', '#0284c7', '#9333ea'];
+              const order = [];
+              for (const seg of transcript) { const n = String(seg.speaker || 'Speaker'); if (!order.includes(n)) order.push(n); }
+              const color = palette[Math.max(0, order.indexOf(String(s.speaker || 'Speaker'))) % palette.length];
+              return h('p', { key: `${i}-${s.timestamp}`, style: { margin: 0, padding: '8px 10px', borderRadius: 8, border: '1px solid var(--ui-stroke-secondary)', borderLeft: `3px solid ${color}`, background: `color-mix(in srgb, ${color} 7%, transparent)`, lineHeight: 1.5 } },
+              h('strong', { style: { color } }, `${s.speaker}: `), s.text,
+              s.partial_tail && h('span', { title: 'Transcribed from trailing audio captured during shutdown' }, ' \u00b7 trailing audio'));
+            })
               : [h('p', { key: 'empty', style: { ...muted, margin: 0 } }, 'No transcript segments yet — attach or start listening, then speak.')]))),
         h('details', { style: { display: 'flex', flexDirection: 'column', gap: 12 } }, h('summary', { style: { cursor: 'pointer', ...muted } }, 'Answer setup — scope, models, overlay, web'),
         h('label', { style: { display: 'grid', gap: 6 } }, h('strong', { id: 'mc-scope-label' }, 'Search scope'),
