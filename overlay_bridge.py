@@ -18,11 +18,59 @@ import contextvars as _contextvars
 from contextlib import nullcontext
 import hashlib
 import json
+import os
 import secrets
 import subprocess
 import sys
 import threading
 import time
+
+_POPEN_TYPE = subprocess.Popen
+
+
+def _fresh_child_observation(process):
+    """Worker-only, nonblocking OS veto of an earlier healthy poll sample.
+
+    Popen.poll() may return None when another waiter owns its waitpid lock;
+    returncode=None and signal-zero also cannot distinguish a zombie. Prefer
+    non-reaping waitid; on older POSIX Pythons use owned waitpid(WNOHANG) under
+    Popen's nonblocking reaper lock. Missing primitives/errors mean unknown.
+    Neither observation proves group/pipe cleanup or future physical liveness.
+    """
+    if isinstance(getattr(process, 'returncode', None), int):
+        return None  # contradicts the original healthy sample, not cleanup
+    if not isinstance(process, _POPEN_TYPE):
+        # Injected display adapters retain their poll-result contract. Actual
+        # launched helpers are always Popen and must supply OS evidence.
+        return True
+    try:
+        if all(getattr(os, name, None) is not None
+               for name in ('waitid', 'P_PID', 'WEXITED', 'WNOWAIT', 'WNOHANG')):
+            result = os.waitid(os.P_PID, process.pid,
+                               os.WEXITED | os.WNOWAIT | os.WNOHANG)
+            return True if result is None or result.si_pid == 0 else None
+        # No guessed libc structures/flags and no PID signals. The fallback
+        # may reap, so serialize with Popen and record status on that handle.
+        lock = getattr(process, '_waitpid_lock', None)
+        if (os.name != 'posix' or not callable(getattr(os, 'waitpid', None))
+                or not hasattr(os, 'WNOHANG') or lock is None
+                or not callable(getattr(process, '_handle_exitstatus', None))
+                or not lock.acquire(False)):
+            return None
+        try:
+            if process.returncode is not None:
+                return None
+            pid, status = os.waitpid(process.pid, os.WNOHANG)
+            if pid == 0:
+                return True
+            if pid == process.pid:
+                getattr(process, '_handle_exitstatus')(status)
+            return None
+        finally:
+            lock.release()
+    except (OSError, ValueError, TypeError, AttributeError, NotImplementedError):
+        return None
+
 
 # Marker bound to an explicit pane overlay action (show/scope). The
 # transport only runs backend answers when the context it captured carries
@@ -980,18 +1028,33 @@ class OverlayBridge:
             # actually exits, even if Hide has already reaped its old child.
             self._probe_jobs = {p: j for p, j in self._probe_jobs.items() if j['worker'].is_alive()}
             job = self._probe_jobs.get(process)
+            if job is not None and job['done'].is_set():
+                return None  # publication is not a new observation
             if job is None:
                 if self._probe_jobs:
                     return None  # never apply another generation's result
-                job = {'done': threading.Event(), 'alive': None}
+                job = {'done': threading.Event(), 'alive': None, 'joined': 0}
                 self._probe_jobs[process] = job
 
                 def inspect_process():
+                    alive = None
                     try:
-                        job['alive'] = process.poll() is None
+                        alive = process.poll() is None
+                        if alive:
+                            for _ in range(8):
+                                with self._probe_lock:
+                                    joined = job['joined']
+                                alive = _fresh_child_observation(process)
+                                with self._probe_lock:
+                                    if alive is not True or joined == job['joined']:
+                                        job['alive'] = alive
+                                        job['done'].set()
+                                        return
+                            alive = None
                     except Exception:
-                        pass  # unknown is neither healthy nor confirmed shutdown
-                    finally:
+                        alive = None
+                    with self._probe_lock:
+                        job['alive'] = alive
                         job['done'].set()
 
                 worker = threading.Thread(target=inspect_process, name='overlay-show-probe', daemon=True)
@@ -1005,8 +1068,12 @@ class OverlayBridge:
                     self._show_probe_threads.add(worker)
                     self.threads.append(worker)
                     worker.start()
-        job['done'].wait(.05)
-        return job['alive'] if job['done'].is_set() else None
+            job['joined'] += 1
+        if not job['done'].wait(.05):
+            return None
+        if job['alive'] is True and isinstance(getattr(process, 'returncode', None), int):
+            return None
+        return job['alive']
 
     def show_overlay(self):
         """Explicit pane action: open the overlay window, start forwarding."""

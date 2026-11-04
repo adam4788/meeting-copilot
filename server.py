@@ -1195,11 +1195,12 @@ class MeetingState:
         slot stays occupied until actual worker exit, including after done is
         signaled. Same-process callers may join only before completion is
         published; callers arriving afterward get unknown until worker exit.
-        Publication is not a fresh OS sample: every waiter vetoes healthy
-        evidence contradicted by that handle's known returncode at consumption.
-        Poll runs without control/publication locks; each caller waits at most
-        50ms (subject to scheduling). This is an observation, not a guarantee
-        that the child cannot exit after the last check.
+        Publication is not a fresh OS sample: healthy polls are validated on
+        the worker using nonblocking OS child evidence after every caller has
+        joined. Late joins during validation require another observation.
+        Poll/OS calls run without control/publication locks; callers wait at
+        most 50ms (subject to scheduling). No observation promises the child
+        cannot exit after the last check.
         """
         if process is None:
             return False
@@ -1211,21 +1212,37 @@ class MeetingState:
                 if target is not process or job['done'].is_set():
                     return None
             else:
-                job = {'done': threading.Event(), 'alive': None}
+                job = {'done': threading.Event(), 'alive': None, 'joined': 0}
                 self._overlay_probe_jobs[process] = job
                 def inspect_process():
                     alive = None
                     try:
                         alive = process.poll() is None
+                        if alive:
+                            import importlib
+                            module = importlib.import_module(
+                                f'{__package__}.overlay_bridge' if __package__ else 'overlay_bridge')
+                            # Bound refresh work under a stream of late joins;
+                            # a delayed observation must still allow a fresh
+                            # sample for callers that joined during the delay.
+                            for _ in range(8):
+                                with self._overlay_probe_lock:
+                                    joined = job['joined']
+                                alive = module._fresh_child_observation(process)
+                                with self._overlay_probe_lock:
+                                    if alive is not True or joined == job['joined']:
+                                        job['alive'] = alive
+                                        job['done'].set()
+                                        return
+                            alive = None
                     except Exception:
-                        pass  # unknown is not evidence of exit
-                    # Admission and completion share this lock: a caller either
-                    # joins before publication or cannot consume this result.
+                        alive = None  # unknown is not evidence of exit
                     with self._overlay_probe_lock:
                         job['alive'] = alive
                         job['done'].set()
                 job['worker'] = threading.Thread(target=inspect_process, name='meeting-overlay-probe', daemon=True)
                 job['worker'].start()
+            job['joined'] += 1
         if not job['done'].wait(.05):
             return None
         # Publication can lag the OS sample (including inside a poll wrapper).

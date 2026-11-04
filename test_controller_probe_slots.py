@@ -1,4 +1,5 @@
 """Controller probe lifetime regressions with inert children and fakes."""
+import os
 import subprocess
 import sys
 import threading
@@ -49,7 +50,14 @@ class ControllerProbeSlotTests(CheckedThreads):
                 with self.subTest(action=action, exited=exited):
                     self._check_sampled_alive(action, exited)
 
-    def _check_sampled_alive(self, action, exited):
+    def test_exited_unreaped_child_cannot_supply_prejoin_sample(self):
+        if not all(hasattr(os, name) for name in ('waitid', 'P_PID', 'WEXITED', 'WNOWAIT')):
+            self.skipTest('non-reaping waitid observation unavailable')
+        for action in ('status', 'start', 'show', 'waiters'):
+            with self.subTest(action=action):
+                self._check_sampled_alive(action, True, unreaped=True)
+
+    def _check_sampled_alive(self, action, exited, unreaped=False):
         starts, results, workers = [], {}, []
         state = server.MeetingState(audio_factory=lambda: SimpleNamespace(
             start=lambda **kwargs: starts.append(True), stop=lambda: None))
@@ -115,8 +123,21 @@ class ControllerProbeSlotTests(CheckedThreads):
                 self.assertFalse(job['done'].is_set())
                 if exited:
                     stdin.close()
-                    self.assertEqual(child.wait(timeout=3), 0)
-                    self.assertEqual(child.returncode, 0)
+                    if unreaped:
+                        deadline = time.monotonic() + 3
+                        while time.monotonic() < deadline:
+                            observed = os.waitid(os.P_PID, child.pid,
+                                                 os.WEXITED | os.WNOWAIT | os.WNOHANG)
+                            if observed is not None and observed.si_pid == child.pid:
+                                break
+                            time.sleep(.001)
+                        else:
+                            self.fail('owned child did not exit within observation deadline')
+                        self.assertEqual(observed.si_status, 0)
+                        self.assertIsNone(child.returncode, 'exit must remain unreaped')
+                    else:
+                        self.assertEqual(child.wait(timeout=3), 0)
+                        self.assertEqual(child.returncode, 0)
                 for caller in callers:
                     caller.start()
                 self.assertTrue(joined.wait(1), 'late callers must join before publication')
