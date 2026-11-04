@@ -149,6 +149,35 @@ test('independent transcription sends explicit local model/source and consent', 
   assert.equal(body.consent, true);
 });
 
+test('meta cloud transcription is opt-in, warns, and sends provider/mode', async () => {
+  const caps = { capabilities: { all_projects: true, automatic_web_fallback: true, independent_models: true, macos_transcription: true, meta_asr: true, overlay: true, overlay_stream: true, overlay_cancel: true } };
+  const { tree, requests } = pane('', true, false, '',
+    { 3: true, 4: 'macos', 25: 'meta', 26: 'DIARIZATION' }, {}, caps);
+  const provider = nodes(tree).find(n => n.type === 'select' && n.props['aria-label'] === 'Transcription provider');
+  assert.ok(provider, 'transcription provider select renders');
+  assert.equal(provider.props.value, 'meta');
+  const mode = nodes(tree).find(n => n.type === 'select' && n.props['aria-label'] === 'Meta ASR mode');
+  assert.ok(mode, 'ASR mode select renders for the meta provider');
+  assert.equal(mode.props.value, 'DIARIZATION');
+  assert.ok(!nodes(tree).some(n => n.type === 'select' && n.props['aria-label'] === 'Local transcription model'),
+    'local model select hides when cloud provider is selected');
+  assert.ok(JSON.stringify(tree).includes('meeting audio is sent to Meta'), 'cloud warning is explicit');
+  const start = nodes(tree).find(n => n.type === 'button' && n.children.includes('Start listening'));
+  await start.props.onClick();
+  const body = requests.find(r => r.path === '/start').body;
+  assert.equal(body.transcription_provider, 'meta');
+  assert.equal(body.asr_mode, 'DIARIZATION');
+});
+
+test('meta provider option is disabled without a configured key', async () => {
+  const { tree } = pane('', true, false, '', { 3: true, 4: 'macos' });
+  const option = nodes(tree).find(n => n.type === 'option' && n.props.value === 'meta');
+  assert.ok(option, 'meta option renders');
+  assert.equal(option.props.disabled, true);
+  const provider = nodes(tree).find(n => n.type === 'select' && n.props['aria-label'] === 'Transcription provider');
+  assert.equal(provider.props.value, 'local', 'local remains the default');
+});
+
 test('answer model selection is explicit and separate from transcription', async () => {
   const { tree, requests } = pane('', true, false, '', { 12: 'openai-codex', 13: 'gpt-test' });
   assert.ok(nodes(tree).find(n => n.type === 'option' && n.props.value === 'gpt-test'));
@@ -249,11 +278,19 @@ test('pane uses only approved theme vars and no resurrected scope controls', () 
   assert.match(source, /\/overlay\/scope/);
 });
 
+function reactImports(src) {
+  // Checkouts may use CRLF: `/\}.*$/` cannot cross a trailing `\r`
+  // (`.` excludes it and `$` will not match mid-string), so normalize
+  // line endings before parsing or `useRef } from 'react';` counts as a name.
+  const text = src.replace(/\r\n?/g, '\n');
+  const importLine = text.split('\n').find(l => l.startsWith('import {') && l.includes('react'));
+  assert.ok(importLine, 'expected a react import line');
+  return new Set(importLine.replace(/^import \{/, '').replace(/\}.*$/, '').split(',').map(s => s.trim()));
+}
+
 test('pane imports every React hook it calls (no undeclared globals)', () => {
   const src = readFileSync(new URL('./desktop/plugin.js', import.meta.url), 'utf8');
-  const importLine = src.split('\n').find(l => l.startsWith('import {') && l.includes('react'));
-  assert.ok(importLine, 'expected a react import line');
-  const imported = new Set(importLine.replace(/^import \{/, '').replace(/\}.*$/, '').split(',').map(s => s.trim()));
+  const imported = reactImports(src);
   const called = new Set([...src.matchAll(/(?<![A-Za-z0-9_.])use[A-Z]\w*(?=\()/g)].map(m => m[0]));
   const provided = new Set(['useState', 'useRef', 'useEffect', 'useQueryClient', 'useQuery', 'useValue']);
   for (const hook of called) {
@@ -263,6 +300,14 @@ test('pane imports every React hook it calls (no undeclared globals)', () => {
     }
   }
   assert.ok(imported.has('useRef'), 'useRef must be imported from react');
+});
+
+test('react import parser tolerates CRLF checkouts', () => {
+  const src = readFileSync(new URL('./desktop/plugin.js', import.meta.url), 'utf8');
+  const crlf = src.replace(/\n/g, '\r\n');
+  const imported = reactImports(crlf);
+  assert.ok(imported.has('useRef'), 'CRLF must not fuse the import tail into a name');
+  assert.ok(![...imported].some(s => s.includes('react')), 'no `} from \'react\'` fragments as names');
 });
 
 test('rejected scope sync keeps the stale warning actionable', async () => {
@@ -457,6 +502,104 @@ test('stored backend errors pair text with retry', async () => {
   const stored = { question: 'orig q?', project: null, all_projects: false, web_fallback: false, transcript: 'you: hi' };
   const { tree } = pane('', true, false, '', { 6: 'local hiccup' }, {}, { error: 'RuntimeError: down', error_request: stored });
   assert.ok(nodes(tree).some(n => n.type === 'button' && n.children.includes('Retry')));
+});
+
+test('answer region carries a scroll ref so new answers find the user', async () => {
+  const { tree } = pane('', true, false, '', {}, {},
+    { result: { answer: 'Ship it Monday.', sources: [], elapsed_seconds: 1 } });
+  const section = nodes(tree).find(n => n.type === 'section'
+    && JSON.stringify(n.children).includes('Suggested answer'));
+  assert.ok(section, 'result section renders');
+  assert.ok(section.props.ref && typeof section.props.ref === 'object',
+    'result section is attached to the answer scroll ref');
+});
+
+test('clear question empties the composer', async () => {
+  const { tree, rerender } = pane('', true, false, '', { 1: 'Why is the sky blue?' }, {}, {});
+  const clear = nodes(tree).find(n => n.type === 'button' && n.children.includes('Clear question'));
+  assert.ok(clear, 'clear button shows when a question is typed');
+  await clear.props.onClick();
+  assert.ok(!nodes(rerender()).some(n => n.type === 'button' && n.children.includes('Clear question')),
+    'clear button hides once the question is empty');
+});
+
+test('clearing a question returns focus to the composer without sending', () => {
+  const { tree, rerender, requests } = pane('', true, false, '', { 1: 'Draft question' });
+  const label = nodes(tree).find(n => n.type === 'label' && nodes(n).some(c => c.type === 'textarea'));
+  assert.ok(label.props.ref, 'composer wrapper exposes its DOM ref');
+  let focused = 0;
+  label.props.ref.current = { querySelector: selector => selector === 'textarea' ? { focus: () => { focused++; } } : null };
+  nodes(tree).find(n => n.type === 'button' && n.children.includes('Clear question')).props.onClick();
+  assert.equal(focused, 1, 'focus returns to the question field');
+  assert.equal(nodes(rerender()).find(n => n.type === 'textarea').props.value, '');
+  assert.equal(requests.length, 0, 'clearing does not send a request');
+});
+
+test('setup tiles are separated by real gaps, not touching edges', async () => {
+  const { tree } = pane('', true, false, '', {}, {}, {});
+  const setup = nodes(tree).find(n => n.type === 'details'
+    && JSON.stringify(n.children).includes('Answer setup'));
+  assert.ok(setup, 'answer setup renders');
+  assert.equal(setup.props.style.display, 'flex');
+  assert.ok(setup.props.style.gap >= 12, `expected gap >= 12, got ${setup.props.style.gap}`);
+});
+
+test('transcript segments render as bounded tiles with accent edges', async () => {
+  const { tree } = pane('', true, true, '', {}, {}, { segments: [
+    { speaker: 'Alice', text: 'hello there', timestamp: 1 },
+    { speaker: 'Bob', text: 'general kenobi', timestamp: 2 },
+  ] });
+  const tiles = nodes(tree).filter(n => n.type === 'p'
+    && n.props.style && String(n.props.style.borderLeft || '').includes('3px solid'));
+  assert.equal(tiles.length, 2);
+  for (const tile of tiles) {
+    assert.ok(String(tile.props.style.border || '').includes('var(--ui-stroke-secondary)'));
+    assert.ok(String(tile.props.style.background || '').includes('color-mix'));
+    assert.ok(tile.props.style.borderRadius >= 8);
+  }
+});
+
+test('setup rhythm: cards use grids and the web toggle is a tile', async () => {
+  const { tree } = pane('', true, false, '', {}, {}, {});
+  const setup = nodes(tree).find(n => n.type === 'details'
+    && JSON.stringify(n.children).includes('Answer setup'));
+  assert.ok(setup.props.style.gap >= 14, `expected setup gap >= 14, got ${setup.props.style.gap}`);
+  const modelCard = nodes(tree).find(n => n.type === 'section'
+    && JSON.stringify(n.children).includes('Answer model'));
+  assert.ok(modelCard, 'answer model card renders');
+  assert.equal(modelCard.props.style.display, 'grid');
+  assert.ok(modelCard.props.style.gap >= 10);
+  const overlayCard = nodes(tree).find(n => n.type === 'section'
+    && JSON.stringify(n.children).includes('Meeting overlay'));
+  assert.ok(overlayCard, 'overlay card renders');
+  assert.equal(overlayCard.props.style.display, 'grid');
+  const toggle = nodes(tree).find(n => n.type === 'label'
+    && n.props.style && String(n.props.style.border || '').includes('var(--ui-stroke-secondary)')
+    && JSON.stringify(n.children).includes('Automatic web fallback'));
+  assert.ok(toggle, 'web fallback toggle renders as a bordered tile');
+  assert.ok(toggle.props.style.borderRadius >= 10);
+  assert.ok(toggle.props.style.padding.includes('12px'));
+});
+
+test('each speaker keeps one distinct color across tiles, with a legend', async () => {
+  const { tree } = pane('', true, true, '', {}, {}, { segments: [
+    { speaker: 'Alice', text: 'first', timestamp: 1 },
+    { speaker: 'Bob', text: 'second', timestamp: 2 },
+    { speaker: 'Alice', text: 'third', timestamp: 3 },
+  ] });
+  const tiles = nodes(tree).filter(n => n.type === 'p'
+    && n.props.style && String(n.props.style.borderLeft || '').includes('3px solid'));
+  assert.equal(tiles.length, 3);
+  const colors = tiles.map(t => t.props.style.borderLeft);
+  assert.equal(colors[0], colors[2], 'same speaker, same color');
+  assert.notEqual(colors[0], colors[1], 'different speakers, different colors');
+  const speakerNames = tiles.map(t => t.children[0]);
+  assert.ok(speakerNames.every((s, i) => s && s.props.style
+    && s.props.style.color === colors[i].replace('3px solid ', '')),
+    'speaker name uses the tile color');
+  const legend = nodes(tree).filter(n => n.type === 'span'
+    && (n.children || []).some(c => typeof c === 'string' && (c === 'Alice' || c === 'Bob')));
+  assert.equal(legend.length, 2, 'legend chips name each speaker');
 });
 
 test('idle pane keeps a prominent start action above the fold', async () => {

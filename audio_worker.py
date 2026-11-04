@@ -332,14 +332,106 @@ def run_capture(model, source, language, helper=None, stop=None):
                 break
 
 
+def run_capture_meta(source, mode, api_key, model_id, helper=None, stop=None):
+    """Stream helper PCM to Meta Muse Voice (opt-in cloud ASR).
+
+    One realtime session per active source, so microphone audio keeps
+    the 'you' label and system audio keeps 'remote'; DIARIZATION may
+    refine speakers within a source. Only final turns are emitted.
+    """
+    import asyncio
+    import os
+    import meta_asr
+    stop = stop or threading.Event()
+    helper = helper or Path(__file__).resolve().with_name('macos_capture')
+    process = subprocess.Popen([str(helper), '--start', '--source', source],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL)
+    emit({'type': 'status', 'state': 'running'})
+    loop = asyncio.new_event_loop()
+    sources = {'microphone': 'you', 'system': 'remote'}
+    active = sources if source == 'both' else {source: sources[source]}
+    queues = {name: asyncio.Queue(maxsize=64) for name in active}
+    native_lost = {'count': 0}
+
+    def reader():
+        try:
+            for line in process.stdout:
+                try:
+                    speaker, samples, stamp, drops = decode_frame(line)
+                except Exception:
+                    continue
+                native_lost['count'] += drops
+                name = 'microphone' if speaker == 'you' else 'system'
+                if name not in queues:
+                    continue
+                frame = meta_asr.resample_to_24k(samples)
+                loop.call_soon_threadsafe(_offer, queues[name], frame)
+        except Exception:
+            pass
+        finally:
+            loop.call_soon_threadsafe(_end_queues, queues)
+
+    def _offer(target, frame):
+        if target.full():
+            try:
+                target.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        target.put_nowait(frame)
+
+    def _end_queues(targets):
+        for target in targets.values():
+            target.put_nowait(None)
+
+    def watcher():
+        stop.wait()
+        try:
+            if process.poll() is None:
+                process.terminate()
+        except Exception:
+            pass
+
+    threading.Thread(target=reader, daemon=True).start()
+    threading.Thread(target=watcher, daemon=True).start()
+
+    async def main_async():
+        tasks = [asyncio.ensure_future(meta_asr.run_session(
+            queues[name], emit, api_key, model_id, mode, label))
+            for name, label in active.items()]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, meta_asr.MetaAsrError):
+                raise result
+
+    try:
+        loop.run_until_complete(main_async())
+    finally:
+        try:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=.5)
+        except Exception:
+            pass
+        loop.close()
+    if native_lost['count']:
+        emit({'type': 'status', 'state': 'stopped', 'dropped_chunks': native_lost['count'],
+              'native_dropped_chunks': native_lost['count'],
+              'warning': f"Stopped with native {native_lost['count']} dropped frame(s); some words may be missing."})
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Explicit local CPU int8 transcription; starting may download model weights.')
     parser.add_argument('--model', choices=MODELS, default='base.en')
     parser.add_argument('--source', choices=SOURCES, default='microphone')
     parser.add_argument('--language', choices=['en'], default='en')
     parser.add_argument('--file', type=Path, help='Read an existing synthetic/offline WAV instead of opening audio devices')
+    parser.add_argument('--provider', choices=['local', 'meta'], default='local',
+                        help='Transcription provider: local faster-whisper (default) or Meta Muse Voice cloud ASR')
+    parser.add_argument('--asr-mode', choices=['ENDPOINTING', 'DIARIZATION', 'PUSH_TO_TALK'], default='ENDPOINTING')
+    parser.add_argument('--asr-model', default=None, help='Meta ASR model id (default: ASR_MODEL or muse-voice-transcribe-1.0)')
     args = parser.parse_args(argv)
-    validate(args.model, args.source, args.language)
+    validate(args.model, args.source, args.language, args.provider, args.asr_mode)
     if args.file and (args.file.suffix.lower() != '.wav' or not args.file.is_file()):
         parser.error('--file must be an existing WAV')
     helper = Path(__file__).resolve().with_name('macos_capture')
@@ -350,6 +442,29 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     emit({'type': 'status', 'state': 'loading'})
+    if args.provider == 'meta':
+        import os
+        import meta_asr
+        api_key = os.environ.get('MODEL_API_KEY', '')
+        if not api_key:
+            emit({'type': 'error', 'code': 'asr_auth', 'message': error_message('asr_auth')})
+            return 1
+        model_id = args.asr_model or meta_asr.DEFAULT_MODEL
+        try:
+            if args.file:
+                for segment in meta_asr.transcribe_file(str(args.file), api_key, model_id, args.asr_mode):
+                    segment['timestamp'] = time.time()
+                    if not stop.is_set():
+                        emit(segment)
+            elif not stop.is_set():
+                run_capture_meta(args.source, args.asr_mode, api_key, model_id, stop=stop)
+        except meta_asr.MetaAsrError:
+            emit({'type': 'error', 'code': 'asr', 'message': error_message('asr')})
+            return 1
+        except Exception:
+            emit({'type': 'error', 'code': 'capture', 'message': error_message('capture')})
+            return 1
+        return 0
     try:
         model = load_model(args.model)
     except Exception:

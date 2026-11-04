@@ -145,7 +145,10 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
             return noErr
         }
         engine.attach(sink)
-        do { try engine.connectNode(input, to: sink, format: format) } catch { fail("capture") }
+        // connect(_:to:format:) is current through the macOS 26 SDK and only
+        // deprecated (renamed to connectNode) in macOS 27: keep the portable
+        // spelling so the helper builds on both toolchains.
+        do { try engine.connect(input, to: sink, format: format) } catch { fail("capture") }
         micSink = sink
         do { try engine.start() } catch { fail("capture") }
     }

@@ -362,6 +362,74 @@ class IncrementalRetrievalTests(KnowledgeTests):
         self.assertEqual(short[0]['text'], 'doc 0 orchid')
         self.assertEqual(KnowledgeEngine._preselect(docs, ['missing'], 6), [])
 
+    def test_preselect_matches_tokens_not_substrings(self):
+        # "renewal" contains the substring "new" but not the token: it must
+        # not crowd the document that actually contains "new" out of the
+        # shortlist before FTS ranking runs.
+        docs = [{'text': f'renewal paperwork {i}'} for i in range(6)]
+        docs.append({'text': 'brand new rollout'})
+        short = KnowledgeEngine._preselect(docs, ['new'], 6)
+        self.assertEqual([d['text'] for d in short], ['brand new rollout'])
+        hits = self.engine._rank(short, ['new'], 6)
+        self.assertEqual([h['text'] for h in hits], ['brand new rollout'])
+
+    def test_preselect_mirrors_fts_tokenization_and_frequency(self):
+        # FTS5 folds accents and splits on underscores; preselection must
+        # not discard documents the ranker itself would match.
+        docs = [{'text': 'café menu'}, {'text': 'alpha_beta launch'}]
+        self.assertEqual([d['text'] for d in KnowledgeEngine._preselect(docs, ['cafe'], 6)],
+                         ['café menu'])
+        self.assertEqual([d['text'] for d in KnowledgeEngine._preselect(docs, ['alpha'], 6)],
+                         ['alpha_beta launch'])
+        # Same distinct coverage: higher term frequency wins the shortlist
+        # slot over mere file order, so BM25 sees the stronger document.
+        docs = [{'text': f'alpha once {i}'} for i in range(6)]
+        docs.append({'text': 'alpha ' * 30})
+        short = KnowledgeEngine._preselect(docs, ['alpha'], 6)
+        self.assertIn('alpha ' * 30, [d['text'] for d in short])
+
+    def test_preselect_does_not_invent_ligature_tokens(self):
+        # FTS5 unicode61 does not compatibility-decompose the ﬂ ligature,
+        # so preselection must not treat "ﬂower" as the token "flower".
+        docs = [{'text': 'ﬂower ﬂower'}, {'text': 'flower'}]
+        short = KnowledgeEngine._preselect(docs, ['flower'], 1)
+        self.assertEqual([d['text'] for d in short], ['flower'])
+
+    def test_phrase_query_survives_all_project_candidates(self):
+        # FTS treats "alpha_beta" as the phrase alpha<->beta: decoys with
+        # words between the terms must not crowd out the only phrase match.
+        for i in range(30):
+            (self.project / f'decoy{i}.md').write_text(f'alpha middle beta note {i}', encoding='utf-8')
+        (self.project / 'target.md').write_text(
+            'alpha beta ' + ('surrounding prose about schedules and budgets ' * 20), encoding='utf-8')
+        single = self.engine.search('alpha_beta', project='alpha', limit=6)
+        combined = self.engine.search('alpha_beta', all_projects=True, limit=6)
+        self.assertTrue(any('alpha beta' in h['text'] for h in single))
+        self.assertEqual([h['text'] for h in combined], [h['text'] for h in single])
+
+    def test_all_project_ranking_matches_single_project(self):
+        for i in range(6):
+            (self.project / f'short{i}.md').write_text(f'alpha short note {i}', encoding='utf-8')
+        (self.project / 'long.md').write_text(
+            'alpha alpha ' + ('filler prose about schedules and budgets ' * 40), encoding='utf-8')
+        single = self.engine.search('alpha', project='alpha', limit=1)
+        combined = self.engine.search('alpha', all_projects=True, limit=1)
+        self.assertEqual([h['text'] for h in combined], [h['text'] for h in single])
+
+    def test_preselect_bm25_prefers_short_strong_match(self):
+        docs = [{'text': f'alpha short note {i}'} for i in range(6)]
+        docs.append({'text': 'alpha alpha ' + ('filler prose about schedules and budgets ' * 40)})
+        short = KnowledgeEngine._preselect(docs, ['alpha'], 1)
+        self.assertTrue(short[0]['text'].startswith('alpha short note'))
+
+    def test_preselect_preserves_greek_accent_distinction(self):
+        # FTS5 only folds Latin diacritics: unaccented Greek must not
+        # crowd out the exact accented token.
+        docs = [{'text': 'αθηνα αθηνα αθηνα'} for _ in range(6)]
+        docs.append({'text': 'αθήνα'})
+        short = KnowledgeEngine._preselect(docs, ['αθήνα'], 6)
+        self.assertEqual([d['text'] for d in short], ['αθήνα'])
+
 
 class LargeCorpusBoundTests(KnowledgeTests):
     def test_unchanged_large_project_skips_rereads_after_expiry(self):

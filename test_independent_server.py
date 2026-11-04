@@ -95,7 +95,7 @@ class IndependentServerTests(unittest.TestCase):
             self.assertEqual(client.post('/start', json=body).status_code, 400)
             self.assertEqual(made, [])
             self.assertEqual(client.post('/start', json={**body, 'consent': True}).status_code, 200)
-            self.assertEqual(made, [{'model_size': 'tiny.en', 'source': 'microphone'}])
+            self.assertEqual(made, [{'model_size': 'tiny.en', 'source': 'microphone', 'provider': 'local', 'asr_mode': 'ENDPOINTING'}])
             self.assertTrue(state.audio.active)
             self.assertEqual(client.get('/status').json()['segments'][0]['text'], 'Synthetic test')
             self.assertEqual(client.post('/pause').status_code, 200)

@@ -1002,6 +1002,26 @@ class ErrorRequestHygieneTests(unittest.TestCase):
         state.start(True, backend='macos', transcription_model='base.en')
         self.assertIsNone(state.error_request)
 
+    def test_start_threads_meta_provider_and_records_last_session(self):
+        import server
+        recorded = {}
+        class FakeMacOSCapture:
+            def __init__(self, **options):
+                recorded.update(options)
+            def start(self, on_segment, on_status=None):
+                pass
+            def stop(self, timeout=3.0):
+                pass
+        state = server.MeetingState(engine_factory=lambda: None)
+        state.macos_factory = FakeMacOSCapture
+        state.start(True, backend='macos', transcription_provider='meta', asr_mode='DIARIZATION')
+        self.assertEqual(recorded['provider'], 'meta')
+        self.assertEqual(recorded['asr_mode'], 'DIARIZATION')
+        last = state.status()['last_session']
+        self.assertEqual(last['transcription_provider'], 'meta')
+        self.assertEqual(last['asr_mode'], 'DIARIZATION')
+        state.pause()
+
     def test_clear_route_purges_failed_request_from_status(self):
         import server
         import time
@@ -1387,7 +1407,7 @@ class RestartAfterClearTests(unittest.TestCase):
         state.restart_after_clear(stale_args, stale_gen, stale_session)
         # The newer capture keeps running on its own session; nothing stopped.
         self.assertTrue(state.listening)
-        self.assertEqual(state.session_key, ('native', ('small.en', 'microphone')))
+        self.assertEqual(state.session_key, ('native', ('small.en', 'microphone', 'local', 'ENDPOINTING')))
         self.assertEqual(stopped, [])
 
     def test_current_restart_proceeds_on_same_session(self):

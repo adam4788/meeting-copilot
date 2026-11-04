@@ -49,6 +49,8 @@ class CaptureRequest(BaseModel):
     recording_id: str | None = Field(default=None, max_length=500)
     transcription_model: Literal['tiny.en', 'base.en', 'small.en'] = 'base.en'
     audio_source: Literal['microphone', 'system', 'both'] = 'microphone'
+    transcription_provider: Literal['local', 'meta'] = 'local'
+    asr_mode: Literal['ENDPOINTING', 'DIARIZATION', 'PUSH_TO_TALK'] = 'ENDPOINTING'
     new_meeting: bool = False
 
 
@@ -120,9 +122,10 @@ class MeetingState:
                     self.bridge = module.MeetilyBridge()
             return self.bridge
 
-    def get_audio(self, backend='native', transcription_model='base.en', audio_source='microphone'):
+    def get_audio(self, backend='native', transcription_model='base.en', audio_source='microphone',
+                  transcription_provider='local', asr_mode='ENDPOINTING'):
         with self.lock:
-            options = (backend, transcription_model, audio_source)
+            options = (backend, transcription_model, audio_source, transcription_provider, asr_mode)
             if self.audio is None or self.audio_options != options:
                 if backend == 'macos':
                     if self.macos_factory:
@@ -131,7 +134,8 @@ class MeetingState:
                         import importlib
                         module = importlib.import_module(f'{__package__}.macos_audio' if __package__ else 'macos_audio')
                         factory = module.MacOSAudioCapture
-                    self.audio = factory(model_size=transcription_model, source=audio_source)
+                    self.audio = factory(model_size=transcription_model, source=audio_source,
+                                         provider=transcription_provider, asr_mode=asr_mode)
                 elif self.audio_factory:
                     self.audio = self.audio_factory()
                 else:
@@ -142,14 +146,15 @@ class MeetingState:
             return self.audio
 
     def start(self, consent, backend='meetily', recording_id=None, transcription_model='base.en', audio_source='microphone',
-              new_meeting=False):
+              new_meeting=False, transcription_provider='local', asr_mode='ENDPOINTING'):
         # Serialize the actual backend operation, not merely the UI state transition.
         # Status/segment callbacks take only self.lock, so stop/join cannot deadlock them.
         with self.lifecycle_lock:
-            return self._start(consent, backend, recording_id, transcription_model, audio_source, new_meeting)
+            return self._start(consent, backend, recording_id, transcription_model, audio_source, new_meeting,
+                               transcription_provider, asr_mode)
 
     def _start(self, consent, backend='meetily', recording_id=None, transcription_model='base.en', audio_source='microphone',
-               new_meeting=False):
+               new_meeting=False, transcription_provider='local', asr_mode='ENDPOINTING'):
         from fastapi import HTTPException
         if not consent:
             raise HTTPException(400, 'Confirm participant consent and audio capture before starting.')
@@ -167,9 +172,10 @@ class MeetingState:
             if self.listening:
                 return {'listening': True}
             if backend in ('native', 'macos'):
-                self.get_audio(backend, transcription_model, audio_source)
+                self.get_audio(backend, transcription_model, audio_source, transcription_provider, asr_mode)
             self.last_start_args = (backend, recording_id, transcription_model, audio_source)
-            session_key = (backend, recording_id if backend == 'meetily' else (transcription_model, audio_source))
+            session_key = (backend, recording_id if backend == 'meetily'
+                           else (transcription_model, audio_source, transcription_provider, asr_mode))
             # A new meeting never inherits the prior one: same-settings start
             # defaults to resume (keeps transcript, results, retry data), while
             # an explicit new_meeting — or a different session — clears them.
@@ -1009,9 +1015,10 @@ class MeetingState:
                         last_session = {'backend': 'meetily', 'recording_id': key[1]}
                     else:
                         pair = key[1] if isinstance(key[1], (tuple, list)) else (None, None)
-                        pair = list(pair) + [None, None]
+                        pair = list(pair) + [None, None, None, None]
                         last_session = {'backend': key[0], 'transcription_model': pair[0],
-                                        'audio_source': pair[1]}
+                                        'audio_source': pair[1], 'transcription_provider': pair[2] or 'local',
+                                        'asr_mode': pair[3] or 'ENDPOINTING'}
             except Exception:
                 last_session = None
             overlay_available = self._overlay_capability_available(overlay, overlay_status)
@@ -1026,6 +1033,7 @@ class MeetingState:
                     'capture_generation': self.capture_generation, 'pane_seen': self.pane_seen,
                     'overlay_shown': overlay is not None,
                     'capabilities': {'all_projects': True, 'automatic_web_fallback': True, 'independent_models': True,
+                                     'meta_asr': bool(__import__('os').environ.get('MODEL_API_KEY')),
                                      'macos_transcription': bool(macos_ready),
                                      'overlay': overlay_available, 'overlay_stream': True, 'overlay_cancel': True,
                                      'macos_detail': self._macos_capability_detail(macos_ready)}}
@@ -1094,7 +1102,8 @@ def make_router(state):
     @router.post('/start')
     def start(body: CaptureRequest):
         return state.start(body.consent, body.backend, body.recording_id, body.transcription_model, body.audio_source,
-                           new_meeting=body.new_meeting)
+                           new_meeting=body.new_meeting, transcription_provider=body.transcription_provider,
+                           asr_mode=body.asr_mode)
 
     @router.get('/recordings')
     def recordings():

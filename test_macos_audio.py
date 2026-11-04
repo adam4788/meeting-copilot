@@ -28,6 +28,40 @@ class GatewayTests(unittest.TestCase):
             capture.stop()
             self.assertEqual(capture.status()['state'], 'stopped')
 
+    def test_meta_provider_validation_command_and_availability(self):
+        module = importlib.import_module('macos_audio')
+        for kw in ({'provider': 'cloud'}, {'provider': 'meta', 'asr_mode': 'STREAM'},
+                   {'provider': 'meta', 'asr_mode': 'endpointing'}):
+            with self.subTest(kw=kw), self.assertRaises(ValueError):
+                module.MacOSAudioCapture(**kw)
+        import subprocess
+        import sys
+        import threading
+        real_popen = subprocess.Popen
+        calls = []
+        script = "import time; time.sleep(60)"
+        def factory(command, **kwargs):
+            calls.append(command)
+            return real_popen([sys.executable, '-u', '-c', script], **kwargs)
+        capture = module.MacOSAudioCapture(provider='meta', asr_mode='DIARIZATION')
+        self.assertEqual(capture.status()['provider'], 'meta')
+        self.assertEqual(capture.status()['asr_mode'], 'DIARIZATION')
+        with patch.dict(os.environ, {'MEETING_COPILOT_AUDIO_PYTHON': sys.executable}), patch('subprocess.Popen', factory):
+            capture.start(lambda s: None)
+            import time as _time
+            deadline = _time.time() + 3
+            while not calls and _time.time() < deadline:
+                _time.sleep(0.02)
+            capture.stop(timeout=1)
+        self.assertTrue(calls, 'worker was never spawned')
+        command = calls[0]
+        self.assertEqual(command[command.index('--provider') + 1], 'meta')
+        self.assertEqual(command[command.index('--asr-mode') + 1], 'DIARIZATION')
+        with patch.dict(os.environ, {'MODEL_API_KEY': 'k'}, clear=False):
+            self.assertTrue(module.MacOSAudioCapture().devices()['meta_asr_available'])
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(module.MacOSAudioCapture().devices()['meta_asr_available'])
+
     def test_explicit_start_streams_segments_and_stop_kills_process_group(self):
         import json
         import subprocess
@@ -289,9 +323,14 @@ class WorkerTests(unittest.TestCase):
             info = Path(temp) / 'Info.plist'
             info.write_bytes(plistlib.dumps({'CFBundleIdentifier': 'ai.nous.meeting-copilot.audio',
                                             'NSMicrophoneUsageDescription': 'Transcribe microphone audio only when you start meeting capture.'}))
-            subprocess.run(['/usr/bin/swiftc', '-parse-as-library', str(root / 'native/macos_capture.swift'),
+            # AVAudioSinkNode requires the macOS 26 SDK (workflow pins macos-26):
+            # never swallow the compiler output, or the next toolchain skew
+            # fails with only an exit status again.
+            proc = subprocess.run(['/usr/bin/swiftc', '-parse-as-library', str(root / 'native/macos_capture.swift'),
                             '-Xlinker', '-sectcreate', '-Xlinker', '__TEXT', '-Xlinker', '__info_plist', '-Xlinker', str(info),
-                            '-o', str(binary)], check=True, capture_output=True, timeout=120)
+                            '-o', str(binary)], check=False, capture_output=True, timeout=120, text=True)
+            self.assertEqual(proc.returncode, 0,
+                             f'swiftc failed (exit {proc.returncode}):\n--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}')
             result = subprocess.run([str(binary), '--check-only'], check=True, capture_output=True, timeout=5)
             self.assertIn(b'"capture_started":false', result.stdout)
             self.assertTrue(json.loads(result.stdout)['microphone_usage_description'])

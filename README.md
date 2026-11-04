@@ -6,10 +6,56 @@ Get short, speakable answer suggestions during Teams or Zoom calls, grounded in 
 
 > **Early development.** Not a finished replacement for Meetily or Cluely. Hardware compatibility, transcription quality, and answer latency must be checked on your machine. No meeting bots, automatic speaking, or message sending.
 
+## Standalone use (no Hermes required)
+
+The answer core runs without Hermes installed, without a Hermes home, and
+without network access unless you opt into a provider:
+
+```sh
+python demo_standalone.py            # offline fixture demo, exits nonzero on failure
+python eval_retrieval.py             # synthetic recall@k + latency percentiles (not production accuracy)
+python ask.py --docs ./sample-docs --doctor          # first-run check: layout, searchable chunks, provider
+python ask.py --docs ./sample-docs --list-projects
+python ask.py --docs ./sample-docs --search "unit price"
+python ask.py --question "What is the unit price?" --docs ./sample-docs --provider fake
+python ask.py --question "What is the unit price?" --docs ./sample-docs --transcript ./sample-docs/transcript.sample
+MODEL_API_KEY=YOUR_REAL_KEY python ask.py --question "..." --docs ./sample-docs --provider meta
+```
+
+Your own documents use one folder per project:
+
+```sh
+mkdir -p my-docs/acme
+printf 'Acme renewal is in September.\n' > my-docs/acme/renewal.md
+python ask.py --docs ./my-docs --search "renewal"
+python ask.py --docs ./my-docs --question "When is the Acme renewal?"
+```
+
+`--doctor --json` reports setup failures in its `problems` array, including
+missing project folders and how to arrange the documents; it exits `2` when
+not ready. For `--provider meta`, this offline check only checks that
+`MODEL_API_KEY` has at least 8 characters after trimming surrounding whitespace;
+it does not validate the credential, network, or model.
+JSON's `provider.ready` reflects that local check, while
+`provider.connection_verified` is `false`.
+
+`ask.py` has three job-shaped modes: `--list-projects` shows what can be
+searched, `--search` returns evidence only (no model call), and `--question`
+answers with numbered citations. It reads a docs folder
+(`<docs>/<project>/*.md|txt|rst`) plus an optional transcript
+(`--transcript meeting.json`, or `-` for stdin), prints sources, warnings,
+and timing, or `--json` for machine output. Provider failures exit `2`.
+Providers: `fake` (deterministic offline, the default) and `meta`
+(Meta Model API via `MODEL_API_KEY`). Web research and session history are
+unavailable standalone — the CLI says so instead of failing obscurely.
+Library use: `answer_core.AnswerCore` with injected
+`completion`/`search`/`history` providers; `hermes_adapters` holds the
+host-backed factories the plugin uses by default.
+
 ## Design
 
 - Explicit start, pause, and consent controls. Capture never starts at import or installation.
-- Independent macOS microphone/system-audio transcription with selectable local Whisper models; optionally attach to an explicitly selected Meetily recording. Native Windows capture remains experimental.
+- Independent macOS microphone/system-audio transcription with selectable local Whisper models, or opt-in Meta Muse Voice cloud transcription (`MODEL_API_KEY`; audio leaves the device only in that mode); optionally attach to an explicitly selected Meetily recording. Native Windows capture remains experimental.
 - Local transcription; this project writes no additional raw audio recordings. Meetily retains its own recording behavior.
 - Select one project, **All projects + sessions**, or sessions only, with visible evidence. All-project scope covers up to 100 eligible project folders, not your whole computer.
 - **Automatic web fallback is off by default.** When local evidence is insufficient and you opt in, the configured model can draft a filtered generic public query. Filtering is best effort, not a privacy guarantee. A query you enter explicitly always overrides automatic planning.
@@ -57,6 +103,8 @@ Current file retrieval supports Markdown/plain text/reStructuredText, not PDF, D
 No Meetily application, recordings, or models are required for this mode. A macOS audio worker plus a small signed Swift capture helper are built during preparation (see step 1); they only run after you click Start listening.
 
 1. Install this plugin as above, then run `python prepare_macos.py` on macOS with `uv` and Apple Command Line Tools installed. This prepares an isolated Python 3.12 environment, faster-whisper CPU runtime, and an original signed Swift helper; it does **not** start capture or ask for recording permissions.
+
+   For cloud transcription instead of local Whisper, set `MODEL_API_KEY` in the gateway environment before preparing, then choose **Meta Muse Voice** as the transcription provider in the pane and pick an ASR mode (Endpointing, Diarization, or Push-to-talk). Local transcription stays the default and needs no key.
 2. Restart an already-running gateway from a separate terminal when its other work is idle: `hermes gateway restart`. Reloading desktop plugins alone does not refresh an already-mounted Python backend.
 3. Open the pane with the bottom-right **Meeting Copilot** button or **Cmd+K → Open Meeting Copilot**. The status-bar button also hides it; hiding unmounts the pane and pauses/detaches capture.
 4. Choose **Independent macOS transcription**, then **Microphone**, **System audio**, or **Microphone + system audio**. System audio captures system playback, not a specific selected app. Select **tiny.en**, **base.en**, or **small.en**. This initial release supports English only; higher-accuracy models use more memory/CPU. First explicit use can download weights from the public faster-whisper model source into the normal Hugging Face cache.
