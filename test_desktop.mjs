@@ -602,6 +602,33 @@ test('each speaker keeps one distinct color across tiles, with a legend', async 
   assert.equal(legend.length, 2, 'legend chips name each speaker');
 });
 
+test('layout order: capture session with permission comes first, transcript above history', async () => {
+  const { tree } = pane('', true, true, '', {}, {}, { segments: [
+    { speaker: 'Alice', text: 'hi', timestamp: 1 },
+  ], recent: [{ request_id: 'r1', question: 'q?', answer: 'a', status: 'done', sources: [] }] });
+  const flat = nodes(tree);
+  const sessionAt = flat.findIndex(n => n.type === 'section' && n.props['aria-label'] === 'Capture session');
+  const sourceAt = flat.findIndex(n => (n.type === 'section' || n.type === 'details')
+    && JSON.stringify(n.children).includes('Transcript source'));
+  assert.ok(sessionAt > -1 && sourceAt > sessionAt, 'session card precedes source card');
+  const session = flat[sessionAt];
+  const sessionNodes = nodes(session);
+  assert.ok(sessionNodes.some(n => n.type === 'input' && n.props.type === 'checkbox'
+    && n.props['aria-label'] === 'Capture permission'), 'permission check lives in the top card');
+  assert.ok(sessionNodes.some(n => n.type === 'button'
+    && (n.children.includes('Start listening') || n.children.includes('Attach to Meetily')
+      || n.children.includes('Resume') || n.children.includes('Resume listening'))),
+    'primary start lives in the top card');
+  const source = flat[sourceAt];
+  assert.ok(!nodes(source).some(n => n.type === 'input' && n.props['aria-label'] === 'Capture permission'),
+    'no duplicate permission check in the source card');
+  const transcriptAt = flat.findIndex(n => n.type === 'details'
+    && JSON.stringify(n.children).includes('Live transcript'));
+  const recentAt = flat.findIndex(n => n.type === 'details'
+    && JSON.stringify(n.children).includes('Recent answers'));
+  assert.ok(transcriptAt > -1 && recentAt > transcriptAt, 'live transcript above recent answers');
+});
+
 test('idle pane keeps a prominent start action above the fold', async () => {
   const { tree } = pane('', true, false, '', {}, {}, {});
   assert.ok(nodes(tree).some(n => n.type === 'button' && (n.children.includes('Attach to Meetily') || n.children.includes('Start listening'))));
