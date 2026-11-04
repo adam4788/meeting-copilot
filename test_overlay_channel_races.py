@@ -145,10 +145,10 @@ time.sleep(20)
                         self.assertIsNone(bridge.show_overlay()['shown'])
                         self.assertLess(time.monotonic() - started, .3)
                     self.assertEqual(len(calls), 1, 'retry must reuse a stuck worker')
-                    # Pruning while this probe is in flight must retain it,
-                    # even when a different child's probe completes.
+                    # A different child cannot allocate a second probe while
+                    # this one is unresolved; its health stays unknown.
                     other = type('OtherProcess', (), {'poll': lambda self: None})()
-                    self.assertTrue(bridge._show_process_alive(other))
+                    self.assertIsNone(bridge._show_process_alive(other))
                     with bridge.lock:
                         self.assertIn(calls[0], bridge.threads)
                         self.assertIn(calls[0], bridge._show_probe_threads)
@@ -163,6 +163,55 @@ time.sleep(20)
                             self.assertFalse(worker.is_alive())
                     self.assertFalse(caller.is_alive())
             self.assertTrue(bridge.show_overlay()['reused'])
+
+    def test_direct_reuse_caps_stalled_probes_across_five_generations(self):
+        with closing_display() as (bridge, children, close_stdout):
+            release, entered = threading.Event(), threading.Event()
+            workers, targets = [], []
+
+            def stalled_poll():
+                workers.append(threading.current_thread())
+                entered.set()
+                self.checked_wait(release, 15, 'release cross-generation probe')
+                return None  # stale healthy result, even after the child exits
+
+            try:
+                for cycle in range(5):
+                    self.assertTrue(bridge.show_overlay()['shown'])
+                    target = bridge.process
+                    targets.append(target)
+                    with patch.object(target, 'poll', self.checked_callback(stalled_poll)):
+                        started = time.monotonic()
+                        result = bridge.show_overlay()
+                        self.assertIsNone(result['shown'])
+                        self.assertFalse(result['stop_confirmed'])
+                        self.assertLess(time.monotonic() - started, .3)
+                    self.assertTrue(entered.wait(1))
+                    self.assertEqual(len(workers), 1, 'one unresolved probe per bridge, not per generation')
+                    self.assertEqual(len(bridge._probe_jobs), 1)
+                    self.assertTrue(bridge.hide_overlay()['stop_confirmed'])
+                self.assertEqual(len(set(targets)), 5)
+                self.assertTrue(bridge.show_overlay()['shown'])
+                current = bridge.process
+                self.assertNotIn(current, targets)
+                release.set()
+                workers[0].join(3)
+                self.assertFalse(workers[0].is_alive())
+                # A completed old healthy result must not approve a new child.
+                with patch.object(current, 'poll', return_value=1) as current_poll, \
+                        patch.object(bridge, '_reap_locked', return_value=False):
+                    self.assertIsNone(bridge.show_overlay()['shown'])
+                    current_poll.assert_called_once()
+                self.assertTrue(bridge.show_overlay()['reused'], 'healthy current probes recover')
+            finally:
+                release.set()
+                for worker in workers:
+                    worker.join(3)
+                    self.assertFalse(worker.is_alive())
+                self.assertTrue(bridge.hide_overlay()['stop_confirmed'])
+                for worker in bridge._show_probe_threads:
+                    worker.join(3)
+                    self.assertFalse(worker.is_alive())
 
     def test_direct_reuse_prunes_completed_probes_without_losing_other_workers(self):
         with closing_display() as (bridge, children, close_stdout):

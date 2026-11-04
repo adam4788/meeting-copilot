@@ -974,11 +974,15 @@ class OverlayBridge:
         return self.process
 
     def _show_process_alive(self, process):
-        """Bound direct reuse inspection; retain only one stuck probe per child."""
+        """Bound direct reuse inspection to one live probe across all children."""
         with self._probe_lock:
-            self._probe_jobs = {p: j for p, j in self._probe_jobs.items() if not j['done'].is_set()}
+            # Completion is not thread exit. Hold the slot until the worker
+            # actually exits, even if Hide has already reaped its old child.
+            self._probe_jobs = {p: j for p, j in self._probe_jobs.items() if j['worker'].is_alive()}
             job = self._probe_jobs.get(process)
             if job is None:
+                if self._probe_jobs:
+                    return None  # never apply another generation's result
                 job = {'done': threading.Event(), 'alive': None}
                 self._probe_jobs[process] = job
 
@@ -991,6 +995,7 @@ class OverlayBridge:
                         job['done'].set()
 
                 worker = threading.Thread(target=inspect_process, name='overlay-show-probe', daemon=True)
+                job['worker'] = worker
                 # Only prune our own finished probes. Other registered threads
                 # may not have started yet; is_alive() would discard those.
                 with self.lock:

@@ -284,6 +284,7 @@ class MeetingState:
             self.backend = backend
             self.listening = True
             self.error = None
+            self.error_request = None  # retry data belongs only to an active answer error
             # New capture, new counters: restarting with identical options
             # must not display the previous capture's loss as current.
             # Meeting-level history stays in segments and recent answers.
@@ -1557,7 +1558,12 @@ class MeetingState:
                     'overlay_cleanup_error': cleanup_error,
                     'overlay_stop_confirmed': not uncertain_overlay and overlay is None and cleanup_error is None,
                     'segments': list(self.segments), 'error': self.stop_error or cleanup_error or self.error or self.capture_error,
-                    'error_request': self.error_request,
+                    # Keep the legacy summary, but never infer retry authority
+                    # from it: independent failures can coexist behind it.
+                    'error_source': ('stop' if self.stop_error else 'overlay' if cleanup_error else
+                                     'answer' if self.error else 'capture' if self.capture_error else None),
+                    'stop_error': self.stop_error, 'answer_error': self.error, 'capture_error': self.capture_error,
+                    'error_request': self.error_request if self.error else None,
                     'busy': self.busy, 'result': self.result, 'requests': {e['request_id']: dict(e) for e in live},
                     'recent': terminal, 'meetily_clear_error': self.meetily_clear_error,
                     'capture': ({**self.capture_info, 'state': 'stopping', 'error': self.stop_error,

@@ -80,7 +80,14 @@ export default {
       const [consent, setConsent] = useState(false);
       const [backend, setBackend] = useState(saved.backend || 'meetily');
       const [recording, setRecording] = useState('');
-      const [error, setError] = useState('');
+      const [error, setErrorValue] = useState('');
+      function setError(value) {
+        setErrorValue(value);
+        // A new local message retires the previous message's retry authority.
+        // Answer submission catches explicitly opt back in; progress-only
+        // functional clears leave unrelated error provenance unchanged.
+        if (typeof value !== 'function') setAssistFailed(false);
+      }
       const [pending, setPending] = useState(false);
       const [showTranscript, setShowTranscript] = useState(false);
       const [webFallback, setWebFallback] = useState(saved.webFallback !== undefined ? saved.webFallback : false);
@@ -498,7 +505,23 @@ export default {
         h('strong', null, 'Meeting Copilot pane retired — actions disabled'),
         h('p', null, paneEntry.retired),
         h('p', null, 'Close this pane and reopen Meeting Copilot. Check capture status and Retry stop if needed before giving fresh consent. If audio remains active, quit the capture process or revoke audio permissions and verify the OS indicator.'));
-      const paneDataError = data.error === data.overlay_cleanup_error ? null : data.error;
+      // Each message owns its action. A legacy summary or a retained request
+      // alone is never evidence that the displayed error came from an answer.
+      const answerError = data.answer_error || (data.error_source === 'answer' ? data.error : null);
+      const stopError = data.stop_error || (data.error_source === 'stop' ? data.error : null);
+      const legacyError = !('error_source' in data) && data.error &&
+        ![data.overlay_cleanup_error, data.meetily_clear_error, answerError, stopError, data.capture_error].includes(data.error)
+        ? data.error : null;
+      const captureError = data.capture_error || (data.error_source === 'capture' ? data.error : null) || legacyError;
+      const recheckStatus = () => qc.invalidateQueries({ queryKey: [ID, 'status'] });
+      const errorCard = (message, label, onClick, disabled = false) => message && h('div', { role: 'alert', style: card },
+        h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' } },
+          h('span', null, message), h(Button, { variant: 'secondary', disabled: pending || disabled, onClick }, label)));
+      const localRetry = error && assistFailed && lastAsked
+        ? { question: lastAsked.question, transcript: undefined, ...(lastAsked.scope || {}), ...(lastAsked.extra || {}) } : null;
+      const restartCapture = !data.listening && !data.stopping;
+      const captureBlocked = !!data.overlay_cleanup_error || !consent || (backend === 'meetily' && !recording)
+        || (backend === 'macos' && !data.capabilities?.macos_transcription);
       return h('div', { style: { padding: 16, display: 'flex', flexDirection: 'column', gap: 14, height: '100%', minWidth: 0, width: '100%', boxSizing: 'border-box', overflowY: 'auto', overflowX: 'hidden', overflowWrap: 'anywhere', color: 'var(--ui-text-primary)' } },
         h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
           h('strong', { style: { fontSize: 17 } }, 'Meeting Copilot'),
@@ -536,40 +559,20 @@ export default {
           h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' } },
             h('span', null, data.overlay_cleanup_error),
             h(Button, { variant: 'secondary', disabled: pending, onClick: toggleOverlay }, 'Retry hide overlay'))),
-        (error || paneDataError || status.error || data.meetily_clear_error) && h('div', { role: 'alert', style: card },
-          h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' } },
-            h('span', null, (data.error_request ? (paneDataError || error) : (error || paneDataError || data.meetily_clear_error)) || `Backend unavailable: ${status.error?.message}. Check installation and plugin enablement.`),
-            (() => {
-              // Dismiss only clears local state; it never sends anything.
-              // Retry replays the exact failed answer request when one is
-              // known (async engine failure, failed assist, or the shown
-              // partial result) and otherwise just rechecks backend state —
-              // a capture failure recovers through Pause/Start, not re-ask.
-              const storedRetry = paneDataError ? data.error_request || null : null;
-              const localIssue = !!error && !storedRetry;
-              const failedRetry = (!paneDataError && !status.error && localIssue && assistFailed && lastAsked)
-                ? { question: lastAsked.question, transcript: undefined, ...(lastAsked.scope || {}), ...(lastAsked.extra || {}) } : null;
-              const retryReq = storedRetry || failedRetry;
-              const backendIssue = !!status.error && !storedRetry && !localIssue && !paneDataError && !data.meetily_clear_error;
-              // A capture failure needs capture restarted (consent already
-              // given), not a status refresh: label and wire it honestly.
-              const captureIssue = !!paneDataError && !localIssue && !storedRetry && !data.stopping;
-              // A failed forget-boundary needs Clear run again, not a
-              // dismiss: the adapter keeps serving its old snapshot until
-              // the boundary installs. The user already consented to
-              // clearing, so the retry completes their intent.
-              const clearIssue = !!data.meetily_clear_error && !localIssue && !storedRetry && !paneDataError;
-              const stopIssue = data.stopping && !localIssue && !!paneDataError;
-              const label = stopIssue ? 'Recheck status' : retryReq ? 'Retry' : backendIssue ? 'Retry' : captureIssue ? (data.listening ? 'Recheck status' : 'Restart capture') : clearIssue ? 'Clear again' : 'Dismiss';
-              return h(Button, { variant: 'secondary', disabled: pending || (captureIssue && !data.listening && (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription))), onClick: async () => {
-                if (stopIssue) return qc.invalidateQueries({ queryKey: [ID, 'status'] });
-                if (retryReq) { setError(''); setAssistFailed(false); return replayRequest(retryReq); }
-                if (clearIssue) { if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } return; }
-                if (captureIssue && !data.listening) return startCapture();
-                if (label === 'Dismiss') { setError(''); setAssistFailed(false); return; }
-                return qc.invalidateQueries({ queryKey: [ID, 'status'] });
-              } }, label);
-            })())),
+        errorCard(error, localRetry ? 'Retry' : 'Dismiss', () => {
+          setError('');
+          if (localRetry) return replayRequest(localRetry);
+        }),
+        errorCard(answerError, data.error_request ? 'Retry' : 'Recheck status', () =>
+          data.error_request ? replayRequest(data.error_request) : recheckStatus()),
+        errorCard(stopError, 'Recheck status', recheckStatus),
+        errorCard(captureError, restartCapture ? 'Restart capture' : 'Recheck status',
+          restartCapture ? () => startCapture() : recheckStatus, restartCapture && captureBlocked),
+        errorCard(data.meetily_clear_error, 'Clear again', async () => {
+          if (await act('/clear')) resetMeetingInputs();
+        }),
+        status.error && errorCard(`Backend unavailable: ${String(status.error.message || status.error)}. Check installation and plugin enablement.`,
+          'Retry', recheckStatus),
         persistWarning && h('p', { role: 'status', style: muted }, persistWarning),
         !data.listening && !data.stopping && !result && h('section', { style: card, 'aria-label': 'Getting started' },
           h('strong', null, 'Getting started'),
