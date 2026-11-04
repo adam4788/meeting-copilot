@@ -56,6 +56,29 @@ async function realBackend(t) {
   return { rpc, rest, mount, traffic };
 }
 
+test('quick overlay toggle uses real host effect and discloses failed Show outside details', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t);
+  await backend.rpc({ command: 'install-show-fault' });
+  const ui = await backend.mount();
+  try {
+    const before = disclosedNodes(ui.tree);
+    assert.match(JSON.stringify(before), /Screen-share privacy/);
+    await button(ui.tree, 'Show overlay').props.onClick();
+    const visible = JSON.stringify(disclosedNodes(ui.rerender()));
+    assert.match(visible, /Overlay action not confirmed/);
+    assert.match(visible, /Retry Show \/ Hide/);
+    assert.doesNotMatch(JSON.stringify(ui.rerender()), /synthetic-private-helper-path/);
+    assert.equal(backend.traffic.find(r => r.path === '/overlay/show').code, 503);
+    const state = await backend.rest('/status');
+    assert.equal(state.overlay_shown, false, 'failed helper must not become shown');
+    await backend.rpc({ command: 'allow-show' });
+    await button(ui.rerender(), 'Show overlay').props.onClick();
+    assert.equal((await backend.rest('/status')).overlay_shown, true);
+    await button(ui.rerender(), 'Hide overlay').props.onClick();
+    assert.equal((await backend.rest('/status')).overlay_shown, false);
+  } finally { ui.unmount(); await backend.rpc({ command: 'inspect' }); }
+});
+
 test('real renderer heartbeat cannot keep abandoned capture alive after reload', { timeout: 10000 }, async t => {
   const backend = await realBackend(t);
   const owner = backend.mount();
@@ -590,6 +613,28 @@ for (const retirement of ['unmount', 'unregister', 'supersede', 'effect-remount'
   await settle();
 });
 
+for (const confirmed of [true, false]) test(`key write reports overlay rebind failure honestly (closed=${confirmed})`, async () => {
+  let saved = false;
+  const ui = pane('', true, false, '', {}, {
+    '/credentials/meta': (_path, opts) => {
+      if (opts.method === 'POST') {
+        saved = true;
+        return { saved, revision: 'r'.repeat(64), overlay_credentials: 'retired', overlay_stop_confirmed: confirmed };
+      }
+      return { saved, revision: 'r'.repeat(64) };
+    },
+  });
+  await button(ui.tree, 'Recheck key status').props.onClick();
+  const field = nodes(ui.rerender()).find(n => n.props['aria-label'] === 'Meta API key');
+  field.props.ref.current = { value: 'fake-ui-key-only' };
+  field.props.onChange({ target: field.props.ref.current });
+  await button(ui.rerender(), 'Save key').props.onClick();
+  const text = JSON.stringify(ui.rerender());
+  assert.match(text, /Saved —/);
+  assert.match(text, /Overlay.*credential.*refresh.*failed/i);
+  assert.match(text, confirmed ? /Show overlay to reopen/ : /shutdown.*not confirmed.*Retry hide/i);
+});
+
 test('Meta key missing tokenizer guidance is actionable without reflecting errors', async () => {
   const ui = pane('', true, false, '', {}, {
     '/credentials/meta': () => { throw new Error('credential_tokenizer_unavailable fake-secret-do-not-reflect'); },
@@ -773,7 +818,8 @@ for (const failedPath of ['/overlay/lifecycle', '/overlay/claim']) test(`failed 
   const p = lifecyclePane({ [failedPath]: () => { throw new Error('network unavailable'); } });
   await button(p.tree, 'Show overlay').props.onClick();
   const text = JSON.stringify(p.rerender());
-  assert.match(text, /network unavailable/);
+  assert.doesNotMatch(text, /network unavailable/, 'transport details stay private');
+  assert.match(text, /Overlay action not confirmed/);
   assert.match(text, /[Rr]eopen|[Cc]lose and reopen/);
   await button(p.rerender(), 'Show overlay').props.onClick();
   const expected = failedPath === '/overlay/lifecycle' ? 2 : 1;
@@ -1121,6 +1167,64 @@ test('capture card discloses cloud audio transmission for selected Meta transcri
   const listening = pane('', true, false, '', { 3: true, 4: 'macos', 25: 'meta' }, {}, { listening: true });
   const notice = nodes(listening.tree).find(n => n.props['data-cloud-capture-disclosure'] === true);
   assert.match(JSON.stringify(notice), /Pause to change/);
+});
+
+function disclosedNodes(node) {
+  if (!node || typeof node !== 'object') return [];
+  return [{ ...node, children: (node.children || []).filter(child => typeof child !== 'object') },
+    ...(node.type === 'details' && !node.props.open ? [] : (node.children || []).flatMap(disclosedNodes))];
+}
+
+for (const timing of ['cached', 'delayed']) test(`local capture default is independent of capability timing (${timing})`, async () => {
+  const store = new Map();
+  const status = { capabilities: { macos_transcription: true, meta_asr: timing === 'cached' } };
+  const ui = pane('', true, false, '', { 3: true, 4: 'macos' }, {}, status, {
+    localStorage: { getItem: key => store.get(key) || null, setItem: (key, value) => store.set(key, value) },
+    setInterval: () => 0, clearInterval: () => {},
+  }, { effects: true });
+  await settle(); ui.rerender();
+  status.capabilities.meta_asr = true;
+  ui.rerender(); await settle();
+  const tree = ui.rerender();
+  assert.equal(nodes(tree).find(n => n.props['aria-label'] === 'Transcription provider').props.value, 'local');
+  await button(tree, 'Start listening').props.onClick();
+  assert.equal(ui.requests.find(r => r.path === '/start').body.transcription_provider, 'local');
+  ui.unmount();
+});
+
+test('explicit persisted cloud preference survives unrelated preference edits and discloses at Start', async () => {
+  const store = new Map([['meeting-copilot.scope.v2', JSON.stringify({ transcriptionProvider: 'meta' })]]);
+  const ui = pane('', true, false, '', { 3: true, 4: 'macos' }, {}, { capabilities: { macos_transcription: true, meta_asr: true } }, {
+    localStorage: { getItem: key => store.get(key) || null, setItem: (key, value) => store.set(key, value) },
+    setInterval: () => 0, clearInterval: () => {},
+  }, { effects: true });
+  await settle();
+  let tree = ui.rerender();
+  const fallback = nodes(tree).find(n => n.type === 'input' && n.props['aria-label'] === 'Allow automatic web fallback');
+  if (fallback) fallback.props.onChange({ target: { checked: true } });
+  // Change a real common preference, not the provider itself.
+  nodes(tree).find(n => n.props['aria-label'] === 'Audio source').props.onChange({ target: { value: 'system' } });
+  tree = ui.rerender();
+  assert.equal(JSON.parse(store.get('meeting-copilot.scope.v2')).transcriptionProvider, 'meta');
+  assert.match(JSON.stringify(disclosedNodes(tree)), /meeting audio is sent to Meta/);
+  assert.doesNotMatch(JSON.stringify(tree), /Transcription remains local/);
+  await button(tree, 'Start listening').props.onClick();
+  assert.equal(ui.requests.find(r => r.path === '/start').body.transcription_provider, 'meta');
+  ui.unmount();
+});
+
+test('quick overlay failure and screen-share privacy warning are disclosed without opening details', async () => {
+  const ui = pane('', true, false, '', {}, {
+    '/overlay/show': () => { throw new Error('fake-sensitive-transport-detail'); },
+  });
+  await button(ui.tree, 'Show overlay').props.onClick();
+  const capture = nodes(ui.rerender()).find(n => n.props['aria-label'] === 'Capture session');
+  const text = JSON.stringify(disclosedNodes(capture));
+  assert.match(text, /screen.shar/i);
+  assert.match(text, /overlay.*not confirmed/i);
+  assert.match(text, /Retry|reopen/i);
+  assert.doesNotMatch(JSON.stringify(ui.rerender()), /fake-sensitive-transport-detail/);
+  assert.equal(ui.requests.filter(r => r.path === '/overlay/show').length, 1);
 });
 
 test('meta provider option is disabled without a configured key', async () => {

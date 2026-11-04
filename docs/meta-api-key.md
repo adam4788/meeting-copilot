@@ -25,16 +25,25 @@ settings edit invalidates the pane's revision rather than being overwritten.
 
 ## Safely apply changes
 
-The editor writes **only disk**, but that does **not** mean restart-only activation:
+The editor persists **only to disk**, but that does **not** mean restart-only activation:
 
 | Consumer | Effect of saving/removing the file |
 | --- | --- |
 | New requests under the supported single-profile Hermes `_config_profile_scope` | The host reads a fresh scope; the saved file takes precedence over inherited process keys immediately. Removal can expose the inherited fallback. Host external/managed secret sources can override the file. |
 | Existing scoped requests, Meta completion closures, running ASR workers | Keep their previously captured key. They are not hot-reloaded or revoked. |
+| Fresh questions in an already shown overlay after a pane-editor save/remove | Reload the host credential scope inside the existing authenticated pane context, even when search/model settings are unchanged. Already-admitted answers retain their snapshots. No pane ownership, action sequence, or heartbeat is renewed. |
 | Unscoped owner/process-based code | Continues using its process environment. A safe restart may be needed to load file changes; a nonempty inherited service key can still win at startup. |
 | Foreign/multiplexed profiles | Never borrow the launch owner's key. Editing is unavailable in these scopes. Their host-owned precedence is not changed by this editor. |
 
 No shared `os.environ` mutation, automatic restart or provider check occurs on edit.
+Overlay admissions and lifecycle changes serialize with the edit. If the host
+cannot reload the overlay's credential context, the overlay is retired rather
+than accepting new questions with stale credentials. The editor distinguishes a
+successful file write from that failure, and reports whether helper shutdown was
+confirmed. Retry Hide and verify the old window is gone when shutdown is uncertain.
+The same rebind/retirement runs after an uncertain partial write. Edits through
+other host settings or external editors do not run this callback: Hide/Show the
+overlay after those edits to obtain a new context.
 **Removal is not revocation.** A previously loaded file key may also remain in the
 process environment, even if it did not originate in a service secret manager.
 
@@ -211,6 +220,14 @@ successful removal, actual scoped Meta and ASR transports before/after save/remo
 with empty/nonempty inherited environments, retained closures/worker snapshots,
 and real foreign-profile scopes. Only provider transports and the owner principal
 (normally supplied by authenticated host middleware) are synthetic.
+
+`python -m unittest test_overlay_credentials -v` drives the actual merged router,
+installed host scopes, `BackendTransport`, native-click admission and fake Meta
+HTTP authorization. A gated existing answer keeps A; fresh overlay questions use
+B after replacement, and after removal use only a legitimate inherited key or
+make no provider call. Rebind failure closes admission, retains cleanup ownership,
+and reports confirmed/unconfirmed shutdown. Partial-write failure also refreshes
+the committed credentials without claiming the write succeeded.
 
 `node --test --test-name-pattern='Meta key' test_desktop.mjs` exercises the real
 uncompiled pane event handlers. One test connects them over private test-only

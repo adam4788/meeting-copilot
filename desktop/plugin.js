@@ -64,7 +64,12 @@ export default {
             return;
           }
           setInfo(current);
-          setNotice(action === 'save' ? 'Saved — new scoped requests can use the key immediately; existing requests and workers may retain their loaded key. Not verified with Meta.' : 'Saved key removed — new scoped requests may fall back to an inherited key. Existing requests and workers may retain their loaded key. Removal is not revocation.');
+          const overlayNotice = written.overlay_credentials === 'retired'
+            ? (written.overlay_stop_confirmed === true
+              ? ' Overlay credential refresh failed; the overlay was closed. Show overlay to reopen with current credentials.'
+              : ' Overlay credential refresh failed; new overlay questions are disabled but shutdown is not confirmed. Retry hide overlay and verify the old window is gone before sharing.')
+            : written.overlay_credentials === 'refreshed' ? ' New overlay questions use a fresh credential snapshot.' : '';
+          setNotice((action === 'save' ? 'Saved — new scoped requests can use the key immediately; existing requests and workers may retain their loaded key. Not verified with Meta.' : 'Saved key removed — new scoped requests may fall back to an inherited key. Existing requests and workers may retain their loaded key. Removal is not revocation.') + overlayNotice);
         } catch (error) {
           setInfo(null);
           setNotice(tokenizerNotice(error) || 'The key change could not be confirmed. Recheck key status before trying again; another settings edit or an unsupported host may have blocked it.');
@@ -175,11 +180,7 @@ export default {
       const [overlayMsg, setOverlayMsg] = useState('');
       const [copied, setCopied] = useState(false);
       const [persistWarning, setPersistWarning] = useState('');
-      useEffect(() => {
-        try {
-          if (typeof localStorage !== 'undefined') localStorage.setItem(SCOPE_KEY, JSON.stringify({ project, backend, webFallback, transcriptionModel, audioSource, answerProvider, answerModel }));
-        } catch (e) { setPersistWarning('Preferences could not be saved in this browser (storage unavailable). Settings still apply for this session.'); }
-      }, [project, backend, webFallback, transcriptionModel, audioSource, answerProvider, answerModel]);
+
       const status = useQuery({ queryKey: [ID, 'status'], queryFn: () => api('/status'), refetchInterval: 2500, retry: 1 });
       // Keep the overlay lease alive while the pane is visible; overlay helper
       // polls use touch=false so only this heartbeat extends the 30s watchdog.
@@ -369,18 +370,10 @@ export default {
       useEffect(() => {
         try {
           if (typeof localStorage !== 'undefined') localStorage.setItem(SCOPE_KEY, JSON.stringify({ project, backend, webFallback, transcriptionModel, audioSource, answerProvider, answerModel, transcriptionProvider, asrMode }));
-        } catch (e) {}
+        } catch (e) { setPersistWarning('Preferences could not be saved in this browser (storage unavailable). Settings still apply for this session.'); }
       }, [project, backend, webFallback, transcriptionModel, audioSource, answerProvider, answerModel, transcriptionProvider, asrMode]);
-      const providerTouched = useRef(false);
-      useEffect(() => {
-        // All-Meta default: with a Meta key configured and no saved
-        // provider choice, prefer Muse Voice transcription so a fresh
-        // pane demos on Meta models without a settings hunt. An explicit
-        // user choice (touched) or saved preference always wins.
-        if (!providerTouched.current && !saved.transcriptionProvider && data.capabilities?.meta_asr) {
-          setTranscriptionProvider('meta');
-        }
-      }, [data.capabilities?.meta_asr]);
+      // Capability discovery never opts a meeting into cloud audio. Only an
+      // explicit selection or persisted provider choice may select Meta.
       function resetMeetingInputs() {
         setQuestion(''); setWeb(''); setLastAsked(null); setLiveEntry(null);
         setTrackedRequest(null); setError(''); setAssistFailed(false);
@@ -415,7 +408,10 @@ export default {
             setOverlayMsg('Overlay shown. It returns to click-through after ~10s — press the shortcut to interact, then tap a row for a streamed answer.');
           }
           await qc.invalidateQueries({ queryKey: [ID, 'status'] });
-        } catch (e) { if (life.mounted) { setOverlayMsg(String(e.message || e)); if (!overlayOn) setOverlayOn(false); } }
+        } catch (e) { if (life.mounted) {
+          setOverlayMsg('Overlay action not confirmed. Retry Show / Hide overlay; if it still fails, close and reopen this pane. Check the macOS helper and backend connection. A window may still be visible: verify before screen-sharing.');
+          if (!overlayOn) setOverlayOn(false);
+        } }
         finally { if (life.mounted) setPending(false); }
       }
       async function startCapture(newMeeting = false) {
@@ -608,6 +604,10 @@ export default {
             !data.listening && !data.stopping && ((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending || !!data.overlay_cleanup_error || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), title: 'Starts a fresh meeting; the earlier transcript, answers, and retry data are cleared', onClick: () => startCapture(true) }, 'New meeting'),
             (data.overlay_cleanup_error || (data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending, title: 'Clears past Q&A, transcript segments, and cached snippets for this meeting', onClick: async () => { if (typeof window !== 'undefined' && window.confirm && !window.confirm('Clear this meeting? Past questions, answers, and transcript segments are removed from the pane.')) return; if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } } }, 'Clear meeting'),
             h(Button, { variant: 'secondary', disabled: pending || (!data.capabilities?.overlay && !data.overlay_cleanup_error), title: 'Show or hide the floating meeting overlay (macOS)', onClick: toggleOverlay }, data.overlay_cleanup_error ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay')),
+          h('p', { style: { ...muted, margin: 0 } }, 'Screen-share privacy: the overlay may be visible in screenshots or screen sharing. Hide it before sharing; capture exclusion is best-effort, not a guarantee.'),
+          overlayMsg && h('p', { role: 'status', style: { ...muted, margin: 0 } }, overlayMsg),
+          data.overlay_cleanup_error && h('p', { role: 'alert', style: { ...muted, margin: 0 } }, 'Overlay shutdown is not confirmed. Retry hide overlay and verify the window is gone before screen-sharing.'),
+          !data.capabilities?.overlay && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'Overlay helper unavailable. Check the macOS helper build and restart the gateway when other sessions are idle.'),
           h('p', { style: { ...muted, margin: 0 } }, 'No additional audio files · disconnect initiates detach/pause; verify stop status before assuming audio is off. Resume keeps this meeting (transcript and latest answer stay); New meeting, different settings, or Clear starts fresh. Pausing can discard the last few seconds of audio.'),
           data.capture && h('div', { style: muted }, data.capture.message || data.capture.state || ''),
           data.capture && (data.capture.warning || lossText(data.capture)) && h('div', { role: 'status', style: muted },
@@ -668,7 +668,7 @@ export default {
           backend === 'macos' && h('div', { style: { display: 'grid', gap: 8, paddingBottom: 12 } },
             h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Audio source'), h('select', { style: selectStyle, value: audioSource, disabled: data.listening, onChange: e => setAudioSource(e.target.value), 'aria-label': 'Audio source' },
               h('option', { value: 'microphone' }, 'Microphone'), h('option', { value: 'system' }, 'System audio'), h('option', { value: 'both' }, 'Microphone + system audio'))),
-            h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Transcription provider'), h('select', { style: selectStyle, value: transcriptionProvider, disabled: data.listening, onChange: e => { providerTouched.current = true; setTranscriptionProvider(e.target.value); }, 'aria-label': 'Transcription provider' },
+            h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Transcription provider'), h('select', { style: selectStyle, value: transcriptionProvider, disabled: data.listening, onChange: e => setTranscriptionProvider(e.target.value), 'aria-label': 'Transcription provider' },
               h('option', { value: 'local' }, 'Local — faster-whisper on this Mac'),
               h('option', { value: 'meta', disabled: !data.capabilities?.meta_asr, title: data.capabilities?.meta_asr ? '' : 'Set MODEL_API_KEY for the gateway, then prepare macOS capture again' }, 'Meta Muse Voice — cloud transcription'))),
             transcriptionProvider === 'local' && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Local transcription model'), h('select', { style: selectStyle, value: transcriptionModel, disabled: data.listening, onChange: e => setTranscriptionModel(e.target.value), 'aria-label': 'Local transcription model' },
@@ -776,7 +776,7 @@ export default {
               h('select', { style: selectStyle, value: answerModel, disabled: busy, onChange: e => setAnswerModel(e.target.value), 'aria-label': 'Answer model' },
                 h('option', { value: '' }, 'Choose answer model…'), ...answerModels.map(m => h('option', { value: m.id, key: m.id }, m.label || m.id))))),
           modelCatalog.error && h('p', { role: 'alert', style: { ...muted, margin: 0 } }, 'Model catalog unavailable. Use the configured model or check provider setup.'),
-          h('p', { style: { ...muted, margin: 0 } }, 'Answer selection applies only to this copilot request; it does not change your chat model. Transcription remains local.')),
+          h('p', { style: { ...muted, margin: 0 } }, 'Answer selection applies only to this copilot request; it does not change your chat model or transcription provider.')),
         h('label', { style: { ...muted, display: 'flex', gap: 8, alignItems: 'flex-start', border: '1px solid var(--ui-stroke-secondary)', borderRadius: 10, padding: '10px 12px', background: 'var(--ui-bg-card)', cursor: 'pointer' } },
           h('input', { type: 'checkbox', checked: webFallback, onChange: e => setWebFallback(e.target.checked), 'aria-label': 'Automatic web fallback' }),
           h('span', null, webFallback ? 'Automatic web fallback is ON — a generic public query may be drafted when local evidence is insufficient. Turn off for sensitive calls.' : 'Automatic web fallback is OFF — answers use local evidence and your explicit web query only.')),

@@ -295,7 +295,7 @@ def _response(value):
     return JSONResponse(value, headers={'Cache-Control': 'no-store'})
 
 
-def make_router():
+def make_router(change_boundary=None):
     router = APIRouter()
 
     @router.get('/credentials/meta')
@@ -350,8 +350,12 @@ def make_router():
                     raw = _read(path)
                     if not hmac.compare_digest(revision, _revision(path, raw)):
                         raise HTTPException(409, 'Settings changed. Recheck before saving again.')
-                    updated = _write(host, path, raw, action, key)
-                    return _status(path, updated)
+                    from contextlib import nullcontext
+                    boundary = change_boundary() if change_boundary else nullcontext({})
+                    with boundary as transition:
+                        updated = _write(host, path, raw, action, key)
+                        status = _status(path, updated)
+                    return {**status, **transition}
             return _response(await asyncio.to_thread(apply))
         except HTTPException:
             raise

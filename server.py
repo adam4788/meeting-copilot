@@ -1433,6 +1433,45 @@ class MeetingState:
         finally:
             self._finish_overlay_cleanup()
 
+    @contextmanager
+    def credential_change_boundary(self):
+        """Serialize owner edits with pane lifecycle and new click admission.
+
+        Re-read host secrets even if a writer fails after committing. The edit
+        request's pre-write snapshot must never become the overlay snapshot.
+        No pane/owner/action/lease is minted or renewed by a credential edit.
+        """
+        transition = {'overlay_credentials': 'not_shown'}
+        with self.lifecycle_lock:
+            retired = False
+            try:
+                with self.overlay_lock:
+                    try:
+                        yield transition
+                    finally:
+                        bridge = self.overlay
+                        if bridge is None and self.pending_overlay is not None:
+                            # A Show can be outside lifecycle_lock awaiting
+                            # startup. It captured pre-edit secrets but has not
+                            # admitted answers: retire its exact reserved handle
+                            # so late startup cannot publish the stale context.
+                            self._retire_overlay_locked()
+                            retired = True
+                            transition['overlay_credentials'] = 'retired'
+                        elif bridge is not None:
+                            try:
+                                bridge.transport.refresh_credentials()
+                                transition['overlay_credentials'] = 'refreshed'
+                            except Exception:
+                                # Never reflect credential/transport exceptions.
+                                self._retire_overlay_locked()
+                                retired = True
+                                transition['overlay_credentials'] = 'retired'
+            finally:
+                if retired:
+                    result = self._finish_overlay_cleanup()
+                    transition['overlay_stop_confirmed'] = result['overlay_stop_confirmed']
+
     def overlay_scope(self, scope):
         # Atomic under overlay_lock: bridge acceptance and authoritative
         # publication cannot interleave with a concurrent update.
@@ -1602,7 +1641,7 @@ def make_router(state):
     router = APIRouter()
     import importlib
     credentials = importlib.import_module(f'{__package__}.credentials' if __package__ else 'credentials')
-    router.include_router(credentials.make_router())
+    router.include_router(credentials.make_router(state.credential_change_boundary))
 
     @router.get('/status')
     def status():

@@ -57,11 +57,27 @@ fault_process = None
 capture = None
 overlay_signals = []
 overlay_process = None
+show_fault = None
 with ExitStack() as faults, TestClient(app) as client:
     for line in sys.stdin:
         message = json.loads(line)
         try:
-            if message.get('command') == 'install-overlay-fault':
+            if message.get('command') == 'install-show-fault':
+                import overlay_bridge
+                from test_overlay_bridge import _fake_overlay_spawn
+                faults.enter_context(_fake_overlay_spawn())
+                faults.enter_context(patch.object(state, '_overlay_capability_available', return_value=True))
+                faults.enter_context(patch.object(state, '_start_overlay_lease_locked'))
+                show_fault = patch.object(overlay_bridge.OverlayBridge, 'start_helper',
+                                          side_effect=RuntimeError('synthetic-private-helper-path'))
+                show_fault.start()
+                faults.callback(show_fault.stop)
+                result = {'installed': True}
+            elif message.get('command') == 'allow-show':
+                assert show_fault is not None
+                show_fault.stop()
+                result = {'allowed': True}
+            elif message.get('command') == 'install-overlay-fault':
                 from test_overlay_teardown import real_display
                 display, overlay_process = faults.enter_context(real_display())
                 state.overlay = display

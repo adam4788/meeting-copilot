@@ -14,10 +14,11 @@ Verified live on 2026-11-03 (macOS, real Meta API):
 
 1. `MODEL_API_KEY` must be in the gateway environment (`~/.hermes/.env`);
    restart the gateway after adding it so the pane sees the capability.
-2. Open the Meeting Copilot pane once and confirm the **Transcription
-   provider** shows **Meta Muse Voice** (it auto-selects when a key is
-   configured and no provider was saved). Answer provider stays on
-   "Use Meta Muse Spark (default)".
+2. Open **Transcript source → Transcription provider** and explicitly choose
+   **Meta Muse Voice** for this cloud demo. Fresh panes default to **Local**,
+   even with a configured key; a saved provider choice is preserved. Check
+   the cloud-audio disclosure above **Start listening** before starting.
+   Answer provider stays on "Use Meta Muse Spark (default)" independently.
 3. Pick **Independent macOS transcription**, audio source **Microphone**
    (or **Microphone + system audio** for the GPT Live demo below).
 4. Tick the **Permission check** in the Capture session card at the top.

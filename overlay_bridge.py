@@ -243,6 +243,32 @@ class BackendTransport:
         except Exception:
             self._poll_context = None
 
+    def refresh_credentials(self):
+        """Reload secrets inside the retained pane identity, not the editor's.
+
+        Called only under the state's lifecycle/admission locks after an owner
+        credential edit. Existing answer contexts are independent snapshots.
+        Never mint a new pane capability or extend its heartbeat here.
+        """
+        from hermes_constants import get_hermes_home
+        from hermes_cli.web_server_profiles import _config_profile_scope
+        from agent.secret_scope import current_secret_scope
+        editor_home = get_hermes_home().resolve()
+        previous = self._poll_context
+        # Any failure leaves NEW admissions closed, including partial writes.
+        self._poll_context = None
+        if previous is None or not self._pane_token:
+            raise RuntimeError('Overlay credential context unavailable')
+        def reload():
+            if (get_hermes_home().resolve() != editor_home
+                    or _PANE_ACTION.get() != self._pane_token):
+                raise RuntimeError('Overlay credential scope mismatch')
+            with _config_profile_scope('current'):
+                if current_secret_scope() is None:
+                    raise RuntimeError('Overlay credential scope unavailable')
+                return _contextvars.copy_context()
+        self._poll_context = previous.copy().run(reload)
+
     def admission_guard(self):
         # Production uses the same outer lock as show/scope/hide publication.
         # Minimal injected states may lack it; they still serialize locally.
