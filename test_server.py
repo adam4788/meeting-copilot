@@ -1,6 +1,7 @@
 import unittest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from thread_test_support import CheckedThreads
 
 
 class ServerTests(unittest.TestCase):
@@ -1742,7 +1743,7 @@ class ClearBoundaryFailureRestartTests(unittest.TestCase):
             self.assertTrue(stopped)
 
 
-class ClearBoundaryStartGateTests(unittest.TestCase):
+class ClearBoundaryStartGateTests(CheckedThreads):
     def _client(self):
         import server
         from fastapi import FastAPI
@@ -1804,45 +1805,67 @@ class ClearBoundaryStartGateTests(unittest.TestCase):
         self.assertIsNone(client.get('/status').json()['meetily_clear_error'])
 
     def test_stale_failure_pause_never_stops_newer_capture(self):
+        import threading
+        from unittest.mock import patch
         client, state = self._client()
+        entered, release, attempting, started = (threading.Event() for _ in range(4))
+        responses = {}
         stopped = []
+        checked_wait = self.checked_wait
+
         class FailingBridge:
             def note_cleared(self):
+                entered.set()
+                checked_wait(release, 3, 'failed Clear boundary')
                 raise RuntimeError('snapshot locked')
             def stop(self):
                 stopped.append(True)
+
+        class Capture:
+            def start(self, on_segment, on_status):
+                started.set()
+            def stop(self):
+                pass
+
         state.bridge = FailingBridge()
+        state.audio_factory = Capture
         state.backend = 'meetily'
         state.listening = True
         state.last_start_args = ('meetily', 'rec', 'tiny.en', 'microphone')
-        # A newer capture starts after Clear releases the state lock but
-        # before the stale failure path runs: gate the lifecycle lock to
-        # install it on first entry (the failure path's own acquisition).
-        real_lifecycle = state.lifecycle_lock
-        entries = []
-        class GateLock:
-            def __enter__(self):
-                # Inject on the SECOND acquisition: the purge section (first)
-                # must capture the true pre-clear generation. The race window
-                # is between the purge releasing the lock and the failure
-                # path re-acquiring it for its gated pause.
-                entries.append(True)
-                if len(entries) == 2:
-                    state.capture_generation += 5
-                    state.session_key = ('meetily', 'new-rec')
-                    state.listening = True
-                return real_lifecycle.__enter__()
-            def __exit__(self, *exc):
-                return real_lifecycle.__exit__(*exc)
-        state.lifecycle_lock = GateLock()
-        try:
-            self.assertEqual(client.post('/clear').status_code, 200)
-        finally:
-            state.lifecycle_lock = real_lifecycle
-        status = client.get('/status').json()
-        self.assertIn('snapshot locked', status['meetily_clear_error'])
-        self.assertTrue(status['listening'])
-        self.assertEqual(stopped, [])
+        # The whole HTTP Clear is now a lifecycle boundary; a newer start
+        # cannot slip between purge and failed-boundary pause. Exercise the
+        # actual contention instead of injecting state on lock-entry counts.
+        def clear():
+            responses['clear'] = client.post('/clear')
+        def start():
+            attempting.set()
+            responses['start'] = client.post('/start', json={'consent': True, 'backend': 'native'})
+        clearer = threading.Thread(target=self.checked_callback(clear))
+        starter = threading.Thread(target=self.checked_callback(start))
+        with patch.object(state, 'watchdog'):
+            try:
+                clearer.start()
+                self.assertTrue(entered.wait(3))
+                starter.start()
+                self.assertTrue(attempting.wait(3))
+                self.assertFalse(started.wait(0.05), 'start must wait for all of Clear')
+                release.set()
+                clearer.join(3)
+                starter.join(3)
+                self.assertFalse(clearer.is_alive())
+                self.assertFalse(starter.is_alive())
+                self.assertEqual(responses['clear'].status_code, 200)
+                self.assertEqual(responses['start'].status_code, 200)
+                self.assertTrue(state.listening)
+                self.assertEqual(state.backend, 'native')
+                self.assertTrue(started.is_set())
+                self.assertTrue(stopped)
+            finally:
+                release.set()
+                clearer.join(3)
+                if starter.ident is not None:
+                    starter.join(3)
+                state.pause()
 
 
 class ClearStartAtomicityTests(unittest.TestCase):

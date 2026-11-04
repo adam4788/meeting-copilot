@@ -45,7 +45,11 @@ class OverlayScopeRequest(BaseModel):
 
 
 class OverlayClaimRequest(BaseModel):
+    model_config = {'extra': 'forbid'}
     revision: int = Field(ge=0, strict=True)
+    client: str | None = Field(default=None, min_length=1, max_length=100)
+    creation: int | None = Field(default=None, ge=1, le=9007199254740991, strict=True)
+    epoch: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 class OverlayActionRequest(OverlayScopeRequest):
@@ -53,9 +57,16 @@ class OverlayActionRequest(OverlayScopeRequest):
     action: int = Field(ge=1, strict=True)
 
 
-class CaptureRequest(BaseModel):
+class LifecycleControlRequest(BaseModel):
+    # No ignored/typoed authorization may fall back to legacy admission.
+    model_config = {'extra': 'forbid'}
     pane: str | None = Field(default=None, min_length=1, max_length=100)
     action: int | None = Field(default=None, ge=1, strict=True)
+    revision: int | None = Field(default=None, ge=0, strict=True)
+    epoch: str | None = Field(default=None, min_length=1, max_length=100)
+
+
+class CaptureRequest(LifecycleControlRequest):
     consent: bool = False
     backend: Literal['meetily', 'native', 'macos'] = 'meetily'
     recording_id: str | None = Field(default=None, max_length=500)
@@ -120,6 +131,10 @@ class MeetingState:
         self.overlay_pane = None
         self.overlay_action = 0
         self.overlay_revision = 0
+        import secrets
+        self.overlay_epoch = secrets.token_hex(16)
+        self.overlay_client = None
+        self.overlay_creation = 0
 
     def add_segment(self, segment):
         text = str(segment.get('text', '')).strip()[:4000]
@@ -938,7 +953,7 @@ class MeetingState:
         except Exception:
             pass
 
-    def overlay_claim(self, revision=None):
+    def overlay_claim(self, revision=None, *, client=None, creation=None, epoch=None):
         """Claim once per mounted pane, never once per Show retry.
 
         A later pane revokes the old capability. Only the current capability
@@ -946,7 +961,19 @@ class MeetingState:
         """
         import secrets
         with self.lifecycle_lock, self.overlay_lock:
-            if revision is not None and revision != self.overlay_revision:
+            if client is not None:
+                # Renderer-local creation order is assigned BEFORE any lookup.
+                # Different renderers have no comparable clock: never guess an
+                # order from network arrival, wall time or random identifiers.
+                if epoch != self.overlay_epoch:
+                    return {'accepted': False, 'reason': 'backend_restarted'}
+                if self.overlay_client not in (None, client):
+                    return {'accepted': False, 'reason': 'different_renderer'}
+                if type(creation) is not int or creation <= self.overlay_creation:
+                    return {'accepted': False, 'reason': 'superseded'}
+                self.overlay_client = client
+                self.overlay_creation = creation
+            elif revision is not None and revision != self.overlay_revision:
                 # Only an immediately preceding release can be recovered. Do
                 # not issue fresh tickets on conflicts with another claimant:
                 # an old pane must never retry its way over a newer owner.
@@ -965,6 +992,29 @@ class MeetingState:
         if old is not None:
             old.hide_overlay()
         return {'pane': pane}
+
+    @contextmanager
+    def control_boundary(self, body):
+        """Fence HTTP controls for their entire operation, including Clear restart.
+
+        Internal watchdog/teardown calls remain trusted and use pause/start
+        directly. Legacy HTTP clients work until the first pane claims; after
+        that they must explicitly echo a current lifecycle revision.
+        """
+        from fastapi import HTTPException
+        body = body or LifecycleControlRequest()
+        with self.lifecycle_lock:
+            with self.overlay_lock:
+                if body.pane is not None or body.action is not None:
+                    accepted = (body.revision is None and body.epoch is None
+                                and self._accept_overlay_action_locked(body.pane, body.action))
+                elif body.revision is not None or body.epoch is not None:
+                    accepted = (body.revision == self.overlay_revision and body.epoch == self.overlay_epoch)
+                else:
+                    accepted = self.overlay_revision == 0
+                if not accepted:
+                    raise HTTPException(409, 'Lifecycle control is stale or unscoped. Reopen the pane; API clients must read /overlay/lifecycle and send its revision and epoch explicitly.')
+            yield
 
     def _accept_overlay_action_locked(self, pane, action):
         if (not pane or pane != self.overlay_pane or type(action) is not int
@@ -1273,17 +1323,19 @@ def make_router(state):
 
     @router.post('/start')
     def start(body: CaptureRequest):
-        return state.start(body.consent, body.backend, body.recording_id, body.transcription_model, body.audio_source,
-                           new_meeting=body.new_meeting, transcription_provider=body.transcription_provider,
-                           asr_mode=body.asr_mode, pane=body.pane, action=body.action)
+        with state.control_boundary(body):
+            return state.start(body.consent, body.backend, body.recording_id, body.transcription_model, body.audio_source,
+                               new_meeting=body.new_meeting, transcription_provider=body.transcription_provider,
+                               asr_mode=body.asr_mode)
 
     @router.get('/recordings')
     def recordings():
         return state.get_bridge().recordings()
 
     @router.post('/pause')
-    def pause():
-        return state.pause()
+    def pause(body: LifecycleControlRequest | None = None):
+        with state.control_boundary(body):
+            return state.pause()
 
     @router.get('/models')
     def models():
@@ -1318,11 +1370,13 @@ def make_router(state):
     @router.get('/overlay/lifecycle')
     def overlay_lifecycle():
         with state.overlay_lock:
-            return {'revision': state.overlay_revision}
+            return {'revision': state.overlay_revision, 'epoch': state.overlay_epoch}
 
     @router.post('/overlay/claim')
     def overlay_claim(body: OverlayClaimRequest):
-        return state.overlay_claim(body.revision)
+        if body.client is None or body.creation is None or body.epoch is None:
+            return {'accepted': False, 'reason': 'creation_order_required'}
+        return state.overlay_claim(body.revision, client=body.client, creation=body.creation, epoch=body.epoch)
 
     @router.post('/overlay/show')
     def overlay_show(body: OverlayActionRequest):
@@ -1345,7 +1399,11 @@ def make_router(state):
         return state.get_engine().projects()
 
     @router.post('/clear')
-    def clear():
+    def clear(body: LifecycleControlRequest | None = None):
+        with state.control_boundary(body):
+            return clear_authorized()
+
+    def clear_authorized():
         # Serialize with backend start/stop, which hold lifecycle_lock
         # across their whole operation: a start racing Clear either
         # publishes its bridge first (then Clear forgets via it) or waits

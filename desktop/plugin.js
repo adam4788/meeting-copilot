@@ -13,6 +13,17 @@ export default {
   version: '0.2.0',
   register(ctx) {
     const api = (path, body) => ctx.rest(path, body === undefined ? {} : { method: 'POST', body });
+    // Survives plugin unregister/re-register in the SAME renderer. Neither a
+    // wall clock nor HTTP arrival can establish pane creation order.
+    const orderKey = Symbol.for('meeting-copilot.pane-creation.v1');
+    const order = globalThis[orderKey] ||= { client: globalThis.crypto?.randomUUID?.(), next: 0 };
+    const lifecycles = new Set();
+    function releaseOverlayPane(life) {
+      lifecycles.delete(life);
+      if (!life.pane || life.released) return;
+      life.released = true;
+      api('/overlay/release', { pane: life.pane, action: ++life.action }).catch(() => {});
+    }
     function MeetingPane() {
       const qc = useQueryClient();
       const SCOPE_KEY = 'meeting-copilot.scope.v2';
@@ -115,31 +126,35 @@ export default {
       const scopeSeq = useRef(0);
       // Owner is minted by Show, not a pane-local counter that resets on remount.
       function newOverlayLifecycle() {
-        return { at: 0, owner: null, pane: null, claim: null, action: 0,
+        const life = { at: 0, owner: null, pane: null, claim: null, action: 0,
+          creation: ++order.next,
           mounted: true, syncedKey: null, released: false };
+        lifecycles.add(life);
+        return life;
       }
-      const overlayActionAt = useRef(newOverlayLifecycle());
-      function releaseOverlayPane(life) {
-        if (!life.pane || life.released) return;
-        life.released = true;
-        api('/overlay/release', { pane: life.pane, action: ++life.action }).catch(() => {});
-      }
+      const overlayActionAt = useRef(null);
+      if (!overlayActionAt.current) overlayActionAt.current = newOverlayLifecycle();
       async function claimOverlayPane(life) {
-        if (!life.claim) life.claim = api('/overlay/lifecycle').then(async ticket => {
+        if (!life.claim) life.claim = Promise.resolve().then(() => {
+          if (!order.client || !Number.isSafeInteger(life.creation)) throw new Error('Pane creation ordering is unavailable.');
+          return api('/overlay/lifecycle');
+        }).then(async ticket => {
           if (!life.mounted) return null;
-          const result = await api('/overlay/claim', { revision: ticket.revision });
-          // Retry only the release-only CAS ticket, never a fresh owner ticket.
-          if (life.mounted && result?.accepted === false && Number.isInteger(result.retry_revision)) {
-            return api('/overlay/claim', { revision: result.retry_revision });
-          }
-          return result;
+          if (!ticket.epoch) throw new Error('Update/restart the backend for pane creation ordering.');
+          return api('/overlay/claim', { revision: ticket.revision, epoch: ticket.epoch,
+            client: order.client, creation: life.creation });
         }).then(result => {
           if (!result && !life.mounted) return null;
+          if (result?.reason === 'different_renderer') throw new Error('Another desktop renderer owns this backend. Return to that window, or close all Meeting Copilot panes and restart the backend when other sessions are idle.');
           if (result?.accepted === false) throw new Error('Another pane owns the overlay. Close and reopen this pane to take ownership.');
           if (!result?.pane) throw new Error('Overlay lifecycle protocol unavailable. Update/restart the backend and reopen the pane.');
           life.pane = result.pane;
           if (!life.mounted) releaseOverlayPane(life);
           return result.pane;
+        }).catch(e => {
+          // A lost claim response may already have committed. Do not mint a
+          // new creation ID on retry: reopening is an explicit new lifecycle.
+          throw new Error(`${String(e.message || e)} Close and reopen this pane to retry lifecycle authorization.`);
         });
         return life.claim;
       }
@@ -197,6 +212,12 @@ export default {
       async function act(path, body = {}) {
         setPending(true); setError('');
         try {
+          if (path === '/pause' || path === '/clear') {
+            const life = overlayActionAt.current;
+            const pane = await claimOverlayPane(life);
+            if (!life.mounted) return false;
+            body = { ...body, pane, action: ++life.action };
+          }
           await api(path, body);
           if (path === '/clear') retireLocalOverlay();
         }
@@ -271,7 +292,7 @@ export default {
       async function startCapture(newMeeting = false) {
         const retained = !!((data.segments || []).length || data.result || (data.recent || []).length || data.error_request);
         const last = data.last_session;
-        const changed = retained && last && (
+        const sourceChanged = last && (
           last.backend !== backend || (backend === 'meetily'
             ? last.recording_id !== (recording || null)
             : last.transcription_model !== transcriptionModel || last.audio_source !== audioSource
@@ -279,7 +300,7 @@ export default {
         const message = newMeeting
           ? 'Start a fresh meeting? The earlier transcript, answers, and retry data are cleared.'
           : 'These settings differ from the previous session, so starting begins a fresh meeting and clears the earlier transcript, answers, and retry data. Continue?';
-        if ((newMeeting || changed) && typeof window !== 'undefined' && window.confirm && !window.confirm(message)) return false;
+        if ((newMeeting || (retained && sourceChanged)) && typeof window !== 'undefined' && window.confirm && !window.confirm(message)) return false;
         const life = overlayActionAt.current;
         setPending(true);
         try {
@@ -288,7 +309,7 @@ export default {
           const ok = await act('/start', { pane, action: ++life.action, consent, backend, recording_id: recording || null,
             transcription_model: transcriptionModel, audio_source: audioSource, new_meeting: newMeeting,
             transcription_provider: transcriptionProvider, asr_mode: asrMode });
-          if (life.mounted && ok && (newMeeting || changed)) { resetMeetingInputs(); retireLocalOverlay(); }
+          if (life.mounted && ok && (newMeeting || sourceChanged)) { resetMeetingInputs(); retireLocalOverlay(); }
           return ok;
         } catch (e) {
           if (life.mounted) setError(String(e.message || e));
@@ -707,6 +728,11 @@ export default {
     ctx.register({ id: 'open', area: PALETTE_AREA, data: { id: `${ID}.open`, label: 'Open Meeting Copilot', keywords: ['meeting', 'copilot', 'show', 'restore'], run: openPane } });
     ctx.register({ id: 'restart', area: PALETTE_AREA, data: { id: `${ID}.restart`, label: 'Restart Meeting Copilot', keywords: ['meeting', 'copilot', 'restart', 'reload'], run: restartPlugin } });
     ctx.register({ id: 'meeting-help', area: PALETTE_AREA, data: { label: 'Meeting Copilot: usage', run: () => host.notify({ kind: 'info', message: 'Open Meeting Copilot. Choose one project, All projects + sessions, or sessions only. Web fallback is off by default and can be enabled. Confirm consent and attach your recording, then Suggest answer.' }) } });
-    return () => { api('/pause', {}).catch(() => {}); };
+    return () => {
+      for (const life of lifecycles) {
+        life.mounted = false;
+        releaseOverlayPane(life);
+      }
+    };
   },
 };

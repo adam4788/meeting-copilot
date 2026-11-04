@@ -9,14 +9,28 @@ from unittest.mock import patch
 import overlay_bridge as bridge
 import server
 from test_overlay_followup import FollowupTests
-from test_overlay_bridge import ClickTests
+from test_pane_ordering import PaneOrderingTests
+from test_overlay_bridge import ClickTests, BridgeLifecycleTests
 from test_overlay_revision import RevisionTests
 from verify_overlay_revision import mutated
 
 
 CASES = [
-    ('capture capability admission', server.MeetingState, 'start',
-     'if pane is not None or action is not None:', 'if False:',
+    ('caught streaming publication assertion propagates', BridgeLifecycleTests,
+     'test_fake_provider_streams_distinct_chunks_in_order',
+     'return original_push()', "raise AssertionError('injected streaming publication failure')",
+     BridgeLifecycleTests, 'test_fake_provider_streams_distinct_chunks_in_order'),
+    ('delayed destructive controls require lifecycle authorization', server.MeetingState, 'control_boundary',
+     'if not accepted:', 'if False:',
+     PaneOrderingTests, 'test_delayed_destructive_requests_cannot_mutate_new_pane'),
+    ('creation order not delayed GET arrival', server.MeetingState, 'overlay_claim',
+     'creation <= self.overlay_creation', 'False',
+     PaneOrderingTests, 'test_creation_order_wins_even_when_old_lookup_arrives_last'),
+    ('different renderers cannot guess creation order', server.MeetingState, 'overlay_claim',
+     'if self.overlay_client not in (None, client):', 'if False:',
+     PaneOrderingTests, 'test_uncomparable_renderers_and_backend_restart_fail_closed'),
+    ('capture capability admission', server.MeetingState, 'control_boundary',
+     'and self._accept_overlay_action_locked(body.pane, body.action)', 'and True',
      FollowupTests, 'test_capture_start_is_ordered_with_release_and_new_owner'),
     ('release-only claim recovery', server.MeetingState, 'overlay_claim',
      'if self.overlay_pane is None and revision == self.overlay_revision - 1:', 'if False:',
@@ -55,7 +69,8 @@ CASES = [
 def run():
     for label, owner, name, old, new, test_class, test in CASES:
         output = io.StringIO()
-        with patch.object(owner, name, mutated(getattr(owner, name), old, new)):
+        original = getattr(owner, name)
+        with patch.object(owner, name, mutated(getattr(original, '__wrapped__', original), old, new)):
             result = unittest.TextTestRunner(stream=output).run(test_class(test))
         if result.wasSuccessful() or result.errors:
             raise AssertionError(label + ': expected assertion failure\n' + output.getvalue())
@@ -67,8 +82,14 @@ def run():
         ('capture waits for capability',
          "const pane = await claimOverlayPane(life);\n          if (!life.mounted) return false;\n          const ok = await act('/start'",
          "const pane = null;\n          const ok = await act('/start'", 'pending lifecycle'),
-        ('release retry is actionable', 'result?.accepted === false && Number.isInteger(result.retry_revision)',
-         'false', 'release-only claim conflict'),
+        ('creation is assigned before delayed GET', 'creation: life.creation',
+         'creation: ++order.next', 'creation identity precedes'),
+        ('unregister never sends unscoped pause', 'for (const life of lifecycles) {',
+         "api('/pause', {}).catch(() => {}); for (const life of lifecycles) {", 'pane Pause'),
+        ('failed lifecycle includes recovery guidance',
+         ' Close and reopen this pane to retry lifecycle authorization.', '', 'failed lifecycle lookup'),
+        ('empty-session source switch retires local overlay',
+         'const sourceChanged = last && (', 'const sourceChanged = retained && last && (', 'empty-session source'),
         ('Clear retires local overlay', "if (path === '/clear') retireLocalOverlay();", '', 'Clear retires'),
         ('failed scope closes overlay', "const hidden = await api('/overlay/hide', { pane: life.pane, action });",
          'const hidden = {};', 'scope failure retires'),
@@ -93,6 +114,7 @@ def run():
                 raise AssertionError(label + ': expected assertion failure\n' + output)
             print(label + ': RED confirmed', flush=True)
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(FollowupTests)
+    suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(PaneOrderingTests))
     suite.addTest(ClickTests('test_scope_push_uses_current_pane_settings_and_cancels_stale_rows'))
     suite.addTest(RevisionTests('test_capture_transition_between_completed_publication_and_cleanup'))
     if not unittest.TextTestRunner(verbosity=1).run(suite).wasSuccessful():

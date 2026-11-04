@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
+import { webcrypto } from 'node:crypto';
 
 test('capture recovery confirms changed source before destructive restart', async () => {
   for (const accept of [false, true]) {
@@ -46,7 +47,7 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
   const ctx = {
     rest: async (path, options = {}) => {
       requests.push({ path, ...options });
-      const defaults = { '/overlay/lifecycle': { revision: 0 }, '/overlay/claim': { pane: 'test-pane' }, '/overlay/show': { shown: true, owner: 'test-owner' } };
+      const defaults = { '/overlay/lifecycle': { revision: 0, epoch: 'backend-epoch' }, '/overlay/claim': { pane: 'test-pane' }, '/overlay/show': { shown: true, owner: 'test-owner' } };
       const r = respond[path] || defaults[path];
       return typeof r === 'function' ? r(path, options) : (r || {});
     },
@@ -60,8 +61,8 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
     ? type(props || {}) : { type, props: props || {}, children: children.flat(Infinity) };
   const source = readFileSync(new URL('./desktop/plugin.js', import.meta.url), 'utf8')
     .replace(/^import .*;\r?\n/gm, '').replace('export default', 'const plugin =');
-  vm.runInNewContext(source + '\nplugin.register(ctx);', {
-    ctx, h,
+  const unregister = vm.runInNewContext(source + '\nplugin.register(ctx);', {
+    ctx, h, crypto: webcrypto,
     useState: initial => {
       const i = stateIndex++;
       if (!(i in values)) {
@@ -98,7 +99,7 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
     for (const effect of pendingEffects) effect();
     return tree;
   };
-  return { tree: render(), rerender: render, requests, contributions, revealed,
+  return { tree: render(), rerender: render, requests, contributions, revealed, unregister,
     unmount: () => { for (const effect of effects) effect?.cleanup?.(); },
     replayEffects: () => { for (const effect of effects) effect?.cleanup?.(); effects.length = 0; return render(); } };
 }
@@ -106,7 +107,7 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
 function lifecyclePane(respond = {}, settings = {}, statusExtra = {}) {
   const timers = new Map(); let next = 0;
   const p = pane('alpha', true, false, '', settings, {
-    '/overlay/lifecycle': { revision: 0 },
+    '/overlay/lifecycle': { revision: 0, epoch: 'backend-epoch' },
     '/overlay/claim': { pane: 'pane-capability' },
     '/overlay/show': { shown: true, owner: 'show-owner' }, ...respond,
   }, statusExtra, {
@@ -117,6 +118,50 @@ function lifecyclePane(respond = {}, settings = {}, statusExtra = {}) {
   return { ...p, async flushTimers() { const work = [...timers.values()]; timers.clear(); for (const fn of work) await fn(); } };
 }
 function button(tree, label) { return nodes(tree).find(n => n.type === 'button' && n.children.includes(label)); }
+
+test('pane Pause and Clear carry lifecycle authorization; unregister only releases', async () => {
+  const p = lifecyclePane({}, {}, { listening: true, backend: 'macos', segments: [{ text: 'Meeting' }] });
+  await button(p.tree, 'Pause listening').props.onClick();
+  await button(p.rerender(), 'Clear meeting').props.onClick();
+  p.unregister();
+  await Promise.resolve();
+  const pause = p.requests.find(r => r.path === '/pause');
+  const clear = p.requests.find(r => r.path === '/clear');
+  assert.equal(pause.body.pane, 'pane-capability');
+  assert.equal(clear.body.pane, pause.body.pane);
+  assert.ok(clear.body.action > pause.body.action);
+  assert.equal(p.requests.filter(r => r.path === '/pause').length, 1);
+  const release = p.requests.find(r => r.path === '/overlay/release');
+  assert.equal(release.body.pane, pause.body.pane);
+  assert.ok(release.body.action > clear.body.action);
+  p.unmount();
+  assert.equal(p.requests.filter(r => r.path === '/overlay/release').length, 1);
+});
+
+for (const failedPath of ['/overlay/lifecycle', '/overlay/claim']) test(`failed lifecycle lookup/claim shows reopen guidance (${failedPath})`, async () => {
+  const p = lifecyclePane({ [failedPath]: () => { throw new Error('network unavailable'); } });
+  await button(p.tree, 'Show overlay').props.onClick();
+  const text = JSON.stringify(p.rerender());
+  assert.match(text, /network unavailable/);
+  assert.match(text, /[Rr]eopen|[Cc]lose and reopen/);
+  await button(p.rerender(), 'Show overlay').props.onClick();
+  assert.equal(p.requests.filter(r => r.path === '/overlay/lifecycle').length, 1);
+  assert.equal(p.requests.filter(r => r.path === failedPath).length, 1);
+  assert.ok(!p.requests.some(r => r.path === '/overlay/show'));
+  p.unmount();
+});
+
+test('empty-session source switch immediately retires local overlay', async () => {
+  const p = lifecyclePane({}, { 3: true, 4: 'macos', 11: 'system' }, {
+    last_session: { backend: 'macos', transcription_model: 'base.en', audio_source: 'microphone' },
+  });
+  await button(p.tree, 'Show overlay').props.onClick();
+  assert.ok(button(p.rerender(), 'Hide overlay'));
+  await button(p.rerender(), 'Start listening').props.onClick();
+  assert.ok(button(p.rerender(), 'Show overlay'));
+  assert.ok(!button(p.rerender(), 'Hide overlay'));
+  p.unmount();
+});
 
 test('real effects do not auto-sync unchanged Show scope', async () => {
   const p = lifecyclePane();
@@ -147,7 +192,7 @@ test('unmount fences a delayed Show and never sends global hide/pause', async ()
   let resolve;
   const p = lifecyclePane({ '/overlay/show': () => new Promise(r => { resolve = r; }) });
   const pending = button(p.tree, 'Show overlay').props.onClick();
-  for (let i = 0; i < 8 && !resolve; i++) await Promise.resolve();
+  await settle();
   assert.ok(resolve, 'Show must have reached backend before cleanup');
   p.unmount();
   resolve({ shown: true, owner: 'old-show-owner' });
@@ -216,17 +261,39 @@ test('started capture carries the capability and cleanup supersedes it', async (
   assert.ok(release.body.action > start.body.action);
 });
 
-test('release-only claim conflict recovers once without rereading newer owner tickets', async () => {
-  let claims = 0;
-  const p = lifecyclePane({ '/overlay/claim': (_, { body }) => {
-    if (++claims === 1) return { accepted: false, retry_revision: 1 };
-    return { pane: 'recovered-pane' };
-  } });
+test('creation identity precedes delayed lookup across overlapping plugin registrations', async () => {
+  const shared = { crypto: webcrypto };
+  const globals = { globalThis: shared, setInterval: () => 0, clearInterval: () => {} };
+  let deliverOld;
+  const older = pane('', true, false, '', {}, {
+    '/overlay/lifecycle': () => new Promise(resolve => { deliverOld = resolve; }),
+  }, {}, globals, { effects: true });
+  await settle();
+  assert.equal(typeof deliverOld, 'function');
+  const newer = pane('', true, false, '', {}, {}, {}, globals, { effects: true });
+  await button(newer.tree, 'Show overlay').props.onClick();
+  // The newer pane has claimed before the old GET is even handled.
+  deliverOld({ revision: 1, epoch: 'backend-epoch' });
+  await settle();
+  const oldClaim = older.requests.find(r => r.path === '/overlay/claim').body;
+  const newClaim = newer.requests.find(r => r.path === '/overlay/claim').body;
+  assert.equal(oldClaim.client, newClaim.client, 'module re-registration preserves ordering domain');
+  assert.ok(oldClaim.creation < newClaim.creation, 'creation order must not be GET completion order');
+  assert.equal(oldClaim.epoch, 'backend-epoch');
+  older.rerender();
+  older.rerender();
+  older.unregister();
+  newer.unregister();
+  assert.ok(!older.requests.some(r => r.path === '/pause'));
+  assert.ok(!newer.requests.some(r => r.path === '/pause'));
+});
+
+test('legacy retry tickets never trigger a new lifecycle claim', async () => {
+  const p = lifecyclePane({ '/overlay/claim': { accepted: false, retry_revision: 1 } });
   await button(p.tree, 'Show overlay').props.onClick();
-  assert.equal(claims, 2);
-  assert.equal(p.requests.filter(r => r.path === '/overlay/claim')[1].body.revision, 1);
+  assert.equal(p.requests.filter(r => r.path === '/overlay/claim').length, 1);
   assert.equal(p.requests.filter(r => r.path === '/overlay/lifecycle').length, 1);
-  assert.equal(p.requests.find(r => r.path === '/overlay/show')?.body.pane, 'recovered-pane');
+  assert.ok(!p.requests.some(r => r.path === '/overlay/show'));
   p.unmount();
 });
 

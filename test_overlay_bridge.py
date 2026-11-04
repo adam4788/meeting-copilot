@@ -558,17 +558,19 @@ class BridgeLifecycleTests(ClickTests):
         self.assertFalse(any(s.get('busy') for s in overlay.answers.values()))
         overlay.stop()
 
-    def test_stale_scope_reservation_cancels_new_request_without_orphan(self):
-        import time
+    def test_scope_change_during_slot_poll_cancels_request_without_orphan(self):
+        import threading
         cancels = []
+        entered, release = threading.Event(), threading.Event()
+        checked_wait = self.checked_wait
 
         class SlowScope:
             def assist(self, question, scope, row_id, expected_generation=None):
-                time.sleep(0.05)
                 return 'r-stale'
 
             def assist_request(self, request_id):
-                time.sleep(0.5)
+                entered.set()
+                checked_wait(release, 3, 'stale scope polling gate')
                 return {'request_id': request_id, 'status': 'streaming', 'answer': ''}
 
             def cancel(self, request_id):
@@ -578,14 +580,19 @@ class BridgeLifecycleTests(ClickTests):
         overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}],
                         'listening': True, 'generation': 0, 'capture_generation': 0})
         row_id = next(iter(overlay.questions))
-        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
-        time.sleep(0.02)  # let the worker pass transport.assist, then switch scope
-        overlay.set_scope({'project': 'switched'})
-        for thread in list(overlay.threads):
-            thread.join(timeout=10)
-        self.assertEqual(cancels, ['r-stale'])
-        self.assertFalse(overlay.answers.get(row_id, {}).get('busy'))
-        overlay.stop()
+        try:
+            self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
+            self.assertTrue(entered.wait(3), 'request must be mapped before changing scope')
+            overlay.set_scope({'project': 'switched'})
+            release.set()
+            for thread in list(overlay.threads):
+                thread.join(timeout=3)
+                self.assertFalse(thread.is_alive())
+            self.assertEqual(cancels, ['r-stale'])
+            self.assertFalse(overlay.answers.get(row_id, {}).get('busy'))
+        finally:
+            release.set()
+            overlay.stop()
 
     def test_late_answer_events_cannot_resurrect_retired_rows(self):
         import time
@@ -688,7 +695,9 @@ class BridgeLifecycleTests(ClickTests):
             def poll_status(self):
                 raise AssertionError('streaming rows poll their own slot')
 
-        overlay = bridge.OverlayBridge(transport=FakeStreamingTransport(), poll_interval=0.01)
+        transport = FakeStreamingTransport()
+        transport.poll_status = self.checked_callback(transport.poll_status)
+        overlay = bridge.OverlayBridge(transport=transport, poll_interval=0.01)
         overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}], 'listening': True, 'generation': 0, 'capture_generation': 0})
         row_id = next(iter(overlay.questions))
         seen_streaming = []
@@ -699,7 +708,7 @@ class BridgeLifecycleTests(ClickTests):
             if state.get('streaming') or (state.get('answer') and state.get('busy')):
                 seen_streaming.append(state.get('answer'))
             return original_push()
-        overlay.push = spy_push
+        overlay.push = self.checked_callback(spy_push)
         self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
         for thread in list(overlay.threads):
             thread.join(timeout=10)
@@ -728,7 +737,9 @@ class BridgeLifecycleTests(ClickTests):
             def poll_status(self):
                 raise AssertionError('no global polling')
 
-        overlay = bridge.OverlayBridge(transport=CompletedOnly(), poll_interval=0.01)
+        transport = CompletedOnly()
+        transport.poll_status = self.checked_callback(transport.poll_status)
+        overlay = bridge.OverlayBridge(transport=transport, poll_interval=0.01)
         overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}], 'listening': True, 'generation': 0, 'capture_generation': 0})
         row_id = next(iter(overlay.questions))
         self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
@@ -811,18 +822,12 @@ class BridgeLifecycleTests(ClickTests):
         self.assertIsNone(state.overlay)
 
     def test_first_partial_row_answer_visible_before_provider_finishes(self):
-        """End-to-end barrier: the row shows its first partial before release.
-
-        Uses the real MeetingState + BackendTransport with a gated fake
-        provider stream (no models, no network): the engine's first chunk
-        arrives and the row answer becomes visible while the provider is
-        still blocked on an event; only then is the provider released and
-        the stream completes. Cancelling never revives a stale row.
-        """
+        """Real backend/bridge with gated publication; no providers or GUI."""
         import threading
-        import time
+        from unittest.mock import patch
         import server as real_server
-        release = threading.Event()
+        release, partial, complete = (threading.Event() for _ in range(3))
+        checked_wait = self.checked_wait
 
         class FakeGatedEngine:
             def answer_stream(self, question, **kwargs):
@@ -830,52 +835,57 @@ class BridgeLifecycleTests(ClickTests):
                           'web_search': {'used': False}}
                 def gated():
                     yield 'Two '
-                    release.wait(10)  # stay unfinished until row proves arrival
+                    checked_wait(release, 3, 'first partial provider gate')
                     yield 'reviewers.'
                 return header, gated()
             def answer(self, question, **kwargs):
                 raise AssertionError('streaming engine must use answer_stream')
 
-        state = real_server.MeetingState(engine_factory=lambda: FakeGatedEngine())
+        engine = FakeGatedEngine()
+        engine.answer = self.checked_callback(engine.answer)
+        state = real_server.MeetingState(engine_factory=lambda: engine)
         state.add_segment({'speaker': 'remote', 'text': 'Who approves?'})
         state.listening = True
-        real_helper_path = state._overlay_helper_path
-        state._overlay_helper_path = lambda: '/fake/macos_overlay_for_test'
-        try:
-            with _fake_overlay_spawn():
-                shown = state.overlay_show({'project': 'demo'})
-        finally:
-            state._overlay_helper_path = real_helper_path
+        with _fake_overlay_spawn(), patch.object(state, '_overlay_helper_path', return_value='/fake/macos_overlay_for_test'):
+            shown = state.overlay_show({'project': 'demo'})
         self.assertTrue(shown['shown'])
-        transport = bridge.BackendTransport(state)
         overlay = state.overlay
         self.assertIsNotNone(overlay)
         assert overlay is not None
         overlay.update(state.status())
         row_id = next(iter(overlay.questions))
         state.overlay_scope({'owner': state.overlay_owner, 'project': 'demo'})
-        self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
-        # First partial row answer must be visible before release.
-        visible = ''
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            with state.lock:
+        original_push = overlay.push
+
+        def push():
+            result = original_push()
+            # Observe only under bridge.lock, never state.lock -> bridge.lock.
+            with overlay.lock:
+                row = overlay.answers.get(row_id, {})
+                if row.get('answer') == 'Two ':
+                    partial.set()
+                if row.get('completed'):
+                    complete.set()
+            return result
+
+        try:
+            with patch.object(overlay, 'push', self.checked_callback(push)):
+                self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
+                self.assertTrue(partial.wait(3), 'partial must be published while provider is gated')
+                self.assertFalse(release.is_set())
+                release.set()
+                self.assertTrue(complete.wait(3))
                 with overlay.lock:
-                    visible = overlay.answers.get(row_id, {}).get('answer', '')
-            if visible == 'Two ':
-                break
-            time.sleep(0.01)
-        self.assertEqual(visible, 'Two ')
-        self.assertFalse(release.is_set(), 'provider must still be gated')
-        release.set()
-        for thread in list(overlay.threads):
-            thread.join(timeout=10)
-        with overlay.lock:
-            final = overlay.answers[row_id]['answer']
-            completed = overlay.answers[row_id]['completed_only']
-        self.assertEqual(final, 'Two reviewers.')
-        self.assertFalse(completed)
-        state.overlay_hide()
+                    self.assertEqual(overlay.answers[row_id]['answer'], 'Two reviewers.')
+                    self.assertFalse(overlay.answers[row_id]['completed_only'])
+        finally:
+            release.set()
+            # Pusher/status threads are intentionally long-lived. Stop them
+            # BEFORE joining instead of silently spending two 10s join budgets.
+            state.overlay_hide()
+            for thread in list(overlay.threads):
+                thread.join(3)
+                self.assertFalse(thread.is_alive(), thread.name)
         self.assertIsNone(state.overlay)
 
     def test_timeout_cancels_slot_and_reports_retry(self):

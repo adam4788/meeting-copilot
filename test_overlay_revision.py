@@ -41,6 +41,7 @@ class RevisionTests(CheckedThreads):
             self.assertEqual(client.post('/overlay/show', json={'scope': {}}).status_code, 422)
             self.assertEqual(client.post('/overlay/hide', json={}).status_code, 422)
             ticket = client.get('/overlay/lifecycle').json()
+            ticket.update(client='revision-test', creation=1)
             pane = post('/overlay/claim', ticket)['pane']
             shown = post('/overlay/show', {'pane': pane, 'action': 1, 'scope': {'seq': 0}})
             self.assertTrue(shown['shown'])
@@ -68,6 +69,7 @@ class RevisionTests(CheckedThreads):
                     self.assertEqual(overlay.snapshot_id, identity)
                 # A newer pane revokes old actions, even with enormous counters.
                 new_ticket = client.get('/overlay/lifecycle').json()
+                new_ticket.update(client='revision-test', creation=2)
                 newer = post('/overlay/claim', new_ticket)['pane']
                 self.assertFalse(post('/overlay/claim', ticket)['accepted'])
                 self.assertFalse(post('/overlay/hide', {'pane': pane, 'action': 999})['accepted'])

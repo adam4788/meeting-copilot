@@ -20,17 +20,18 @@ class FollowupTests(CheckedThreads):
         state = server.MeetingState()
         with self.client(state) as client:
             first_ticket = client.get('/overlay/lifecycle').json()
-            old = client.post('/overlay/claim', json=first_ticket).json()['pane']
+            # Legacy CAS is internal-only; HTTP claims require creation order.
+            old = state.overlay_claim(first_ticket['revision'])['pane']
             ticket = client.get('/overlay/lifecycle').json()
             self.assertTrue(client.post('/overlay/release', json={'pane': old, 'action': 1}).json()['accepted'])
-            retry = client.post('/overlay/claim', json=ticket).json()
+            retry = state.overlay_claim(ticket['revision'])
             self.assertEqual(retry.get('retry_revision'), state.overlay_revision)
-            recovered = client.post('/overlay/claim', json={'revision': retry['retry_revision']}).json()['pane']
+            recovered = state.overlay_claim(retry['retry_revision'])['pane']
             self.assertNotEqual(old, recovered)
             self.assertFalse(client.post('/overlay/release', json={'pane': old, 'action': 999}).json()['accepted'])
             # Both original ticket and retry are CAS-bound, not a license to steal.
             for rev in (ticket['revision'], first_ticket['revision'], retry['retry_revision']):
-                rejected = client.post('/overlay/claim', json={'revision': rev}).json()
+                rejected = state.overlay_claim(rev)
                 self.assertFalse(rejected['accepted'])
                 self.assertNotIn('retry_revision', rejected)
             self.assertEqual(state.overlay_pane, recovered)
