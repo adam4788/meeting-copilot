@@ -417,6 +417,7 @@ class OverlayBridge:
         self._reader_failed = set()
         self._probe_lock = threading.Lock()
         self._probe_jobs = {}
+        self._show_probe_threads = set()
 
     # -- backend truth in ------------------------------------------------
     def retire_authorization(self):
@@ -990,8 +991,15 @@ class OverlayBridge:
                         job['done'].set()
 
                 worker = threading.Thread(target=inspect_process, name='overlay-show-probe', daemon=True)
-                self.threads.append(worker)
-                worker.start()
+                # Only prune our own finished probes. Other registered threads
+                # may not have started yet; is_alive() would discard those.
+                with self.lock:
+                    finished = {t for t in self._show_probe_threads if not t.is_alive()}
+                    self.threads = [t for t in self.threads if t not in finished]
+                    self._show_probe_threads.difference_update(finished)
+                    self._show_probe_threads.add(worker)
+                    self.threads.append(worker)
+                    worker.start()
         job['done'].wait(.05)
         return job['alive'] if job['done'].is_set() else None
 

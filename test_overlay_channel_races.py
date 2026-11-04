@@ -145,6 +145,13 @@ time.sleep(20)
                         self.assertIsNone(bridge.show_overlay()['shown'])
                         self.assertLess(time.monotonic() - started, .3)
                     self.assertEqual(len(calls), 1, 'retry must reuse a stuck worker')
+                    # Pruning while this probe is in flight must retain it,
+                    # even when a different child's probe completes.
+                    other = type('OtherProcess', (), {'poll': lambda self: None})()
+                    self.assertTrue(bridge._show_process_alive(other))
+                    with bridge.lock:
+                        self.assertIn(calls[0], bridge.threads)
+                        self.assertIn(calls[0], bridge._show_probe_threads)
                     self.assertTrue(bridge.lock.acquire(timeout=.1))
                     bridge.lock.release()
                 finally:
@@ -156,6 +163,32 @@ time.sleep(20)
                             self.assertFalse(worker.is_alive())
                     self.assertFalse(caller.is_alive())
             self.assertTrue(bridge.show_overlay()['reused'])
+
+    def test_direct_reuse_prunes_completed_probes_without_losing_other_workers(self):
+        with closing_display() as (bridge, children, close_stdout):
+            self.assertTrue(bridge.show_overlay()['shown'])
+            release = threading.Event()
+            live = threading.Thread(target=lambda: release.wait(5), daemon=True)
+            unstarted = threading.Thread(target=lambda: None, daemon=True)
+            live.start()
+            with bridge.lock:
+                bridge.threads.extend([live, unstarted])
+            try:
+                for _ in range(400):
+                    self.assertTrue(bridge.show_overlay()['reused'])
+                with bridge.lock:
+                    self.assertIn(live, bridge.threads)
+                    self.assertIn(unstarted, bridge.threads)
+                    probes = [t for t in bridge.threads if t.name == 'overlay-show-probe']
+                    self.assertLessEqual(len(probes), 2)
+                self.assertTrue(bridge.hide_overlay()['stop_confirmed'])
+            finally:
+                with bridge.lock:
+                    if unstarted in bridge.threads:
+                        bridge.threads.remove(unstarted)
+                release.set()
+                live.join(3)
+                self.assertFalse(live.is_alive())
 
     def test_status_warns_immediately_after_live_eof_without_claiming_shutdown(self):
         with closing_display() as (bridge, children, close_stdout):

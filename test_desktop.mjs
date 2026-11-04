@@ -559,6 +559,33 @@ function lifecyclePane(respond = {}, settings = {}, statusExtra = {}) {
 }
 function button(tree, label) { return nodes(tree).find(n => n.type === 'button' && n.children.includes(label)); }
 
+test('local progress error and overlay cleanup have independent paired actions', async () => {
+  const warning = 'Overlay shutdown is not confirmed; retry Hide.';
+  const progress = 'Answer progress unavailable: network. The result still lands below when it completes.';
+  const p = lifecyclePane({}, { 3: true, 4: 'macos', 6: progress }, {
+    error: warning, overlay_cleanup_error: warning, overlay_stop_confirmed: false,
+    listening: false, backend: 'macos',
+  });
+  let tree = p.rerender();
+  const alerts = nodes(tree).filter(n => n.props?.role === 'alert');
+  const local = alerts.find(n => JSON.stringify(n).includes(progress));
+  const overlay = alerts.find(n => JSON.stringify(n).includes(warning));
+  assert.ok(local && overlay && local !== overlay);
+  assert.ok(button(local, 'Dismiss'));
+  assert.ok(!button(local, 'Retry hide overlay'));
+  assert.ok(button(overlay, 'Retry hide overlay'));
+  assert.ok(nodes(tree).some(n => n.props?.role === 'status' && JSON.stringify(n).includes(warning)));
+  assert.equal(button(tree, 'Start listening').props.disabled, true);
+  await button(local, 'Dismiss').props.onClick();
+  tree = p.rerender();
+  assert.doesNotMatch(JSON.stringify(tree), /Answer progress unavailable/);
+  assert.match(JSON.stringify(tree), /Overlay shutdown is not confirmed/);
+  assert.ok(!p.requests.some(r => r.path === '/overlay/hide'));
+  await button(nodes(tree).find(n => n.props?.role === 'alert' && JSON.stringify(n).includes(warning)), 'Retry hide overlay').props.onClick();
+  assert.equal(p.requests.filter(r => r.path === '/overlay/hide').length, 1);
+  p.unmount();
+});
+
 test('pane Pause and Clear carry lifecycle authorization; unregister only releases', async () => {
   const p = lifecyclePane({}, {}, { listening: true, backend: 'macos', segments: [{ text: 'Meeting' }] });
   await button(p.tree, 'Pause listening').props.onClick();

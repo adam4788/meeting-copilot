@@ -498,6 +498,7 @@ export default {
         h('strong', null, 'Meeting Copilot pane retired — actions disabled'),
         h('p', null, paneEntry.retired),
         h('p', null, 'Close this pane and reopen Meeting Copilot. Check capture status and Retry stop if needed before giving fresh consent. If audio remains active, quit the capture process or revoke audio permissions and verify the OS indicator.'));
+      const paneDataError = data.error === data.overlay_cleanup_error ? null : data.error;
       return h('div', { style: { padding: 16, display: 'flex', flexDirection: 'column', gap: 14, height: '100%', minWidth: 0, width: '100%', boxSizing: 'border-box', overflowY: 'auto', overflowX: 'hidden', overflowWrap: 'anywhere', color: 'var(--ui-text-primary)' } },
         h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
           h('strong', { style: { fontSize: 17 } }, 'Meeting Copilot'),
@@ -531,32 +532,37 @@ export default {
             ['Transcript may be incomplete',
              lossText(data.capture),
              data.capture.warning ? `: ${data.capture.warning}` : ''].join(''))),
-        (error || data.error || status.error || data.meetily_clear_error) && h('div', { role: 'alert', style: card },
+        data.overlay_cleanup_error && h('div', { role: 'alert', style: card },
           h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' } },
-            h('span', null, (data.error_request ? (data.error || error) : (error || data.error || data.meetily_clear_error)) || `Backend unavailable: ${status.error?.message}. Check installation and plugin enablement.`),
+            h('span', null, data.overlay_cleanup_error),
+            h(Button, { variant: 'secondary', disabled: pending, onClick: toggleOverlay }, 'Retry hide overlay'))),
+        (error || paneDataError || status.error || data.meetily_clear_error) && h('div', { role: 'alert', style: card },
+          h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' } },
+            h('span', null, (data.error_request ? (paneDataError || error) : (error || paneDataError || data.meetily_clear_error)) || `Backend unavailable: ${status.error?.message}. Check installation and plugin enablement.`),
             (() => {
               // Dismiss only clears local state; it never sends anything.
               // Retry replays the exact failed answer request when one is
               // known (async engine failure, failed assist, or the shown
               // partial result) and otherwise just rechecks backend state —
               // a capture failure recovers through Pause/Start, not re-ask.
-              const storedRetry = data.error_request || null;
-              const failedRetry = (!data.error && !status.error && !!error && assistFailed && lastAsked)
+              const storedRetry = paneDataError ? data.error_request || null : null;
+              const localIssue = !!error && !storedRetry;
+              const failedRetry = (!paneDataError && !status.error && localIssue && assistFailed && lastAsked)
                 ? { question: lastAsked.question, transcript: undefined, ...(lastAsked.scope || {}), ...(lastAsked.extra || {}) } : null;
               const retryReq = storedRetry || failedRetry;
-              const backendIssue = !!status.error && !storedRetry;
+              const backendIssue = !!status.error && !storedRetry && !localIssue && !paneDataError && !data.meetily_clear_error;
               // A capture failure needs capture restarted (consent already
               // given), not a status refresh: label and wire it honestly.
-              const captureIssue = !!data.error && !data.overlay_cleanup_error && !storedRetry && !status.error && !data.stopping;
+              const captureIssue = !!paneDataError && !localIssue && !storedRetry && !data.stopping;
               // A failed forget-boundary needs Clear run again, not a
               // dismiss: the adapter keeps serving its old snapshot until
               // the boundary installs. The user already consented to
               // clearing, so the retry completes their intent.
-              const clearIssue = !!data.meetily_clear_error && !storedRetry && !status.error && !data.error;
-              const label = data.stopping ? 'Recheck status' : data.overlay_cleanup_error ? 'Retry hide overlay' : retryReq ? 'Retry' : backendIssue ? 'Retry' : captureIssue ? (data.listening ? 'Recheck status' : 'Restart capture') : clearIssue ? 'Clear again' : 'Dismiss';
+              const clearIssue = !!data.meetily_clear_error && !localIssue && !storedRetry && !paneDataError;
+              const stopIssue = data.stopping && !localIssue && !!paneDataError;
+              const label = stopIssue ? 'Recheck status' : retryReq ? 'Retry' : backendIssue ? 'Retry' : captureIssue ? (data.listening ? 'Recheck status' : 'Restart capture') : clearIssue ? 'Clear again' : 'Dismiss';
               return h(Button, { variant: 'secondary', disabled: pending || (captureIssue && !data.listening && (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription))), onClick: async () => {
-                if (data.stopping) return qc.invalidateQueries({ queryKey: [ID, 'status'] });
-                if (data.overlay_cleanup_error) return toggleOverlay();
+                if (stopIssue) return qc.invalidateQueries({ queryKey: [ID, 'status'] });
                 if (retryReq) { setError(''); setAssistFailed(false); return replayRequest(retryReq); }
                 if (clearIssue) { if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } return; }
                 if (captureIssue && !data.listening) return startCapture();
