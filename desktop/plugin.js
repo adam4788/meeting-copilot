@@ -26,13 +26,15 @@ export default {
       const [working, setWorking] = useState(false);
       const [notice, setNotice] = useState('');
       const [overlayNotice, setOverlayNotice] = useState('');
-      function reflectOverlay(written) {
-        if (!life.mounted || !written) return;
+      const currentTransition = target => target && life.mounted && target.life === life
+        && target.pane === life.pane && target.owner === life.owner && target.action === life.action;
+      function reflectOverlay(written, target) {
+        if (!currentTransition(target) || !written) return;
         if (written.overlay_credentials === 'retired') {
-          onOverlayTransition?.(written);
-          setOverlayNotice('retired');
+          if (onOverlayTransition?.(written, target) === false) return;
+          setOverlayNotice({ kind: 'retired', target });
         } else if (written.overlay_credentials === 'refreshed') {
-          setOverlayNotice('refreshed');
+          setOverlayNotice({ kind: 'refreshed', target });
         }
       }
       const tokenizerNotice = error => typeof error?.message === 'string' && error.message.includes('credential_tokenizer_unavailable')
@@ -61,11 +63,13 @@ export default {
           if (!/^[A-Za-z0-9._~+/=-]{8,4096}$/.test(value)) { setNotice('Enter an 8–4096 character API key using letters, digits or . _ ~ + / = - only; no spaces, quotes or line breaks.'); return; }
           body.key = value;
         }
+        // A delayed edit/readback may describe an overlay the user replaced.
+        const target = { life, pane: life.pane, owner: life.owner, action: life.action };
         erase(); inFlight.current = true; setWorking(true); setNotice('');
         try {
           const written = await api('/credentials/meta', body);
           delete body.key;
-          reflectOverlay(written); // lifecycle outcome must survive failed readback
+          reflectOverlay(written, target); // lifecycle outcome must survive failed readback
           // Read the exact target back; a successful POST is not readiness.
           const current = await api('/credentials/meta');
           if (!current || typeof current.revision !== 'string' || current.saved !== (action === 'save')) throw new Error('unconfirmed');
@@ -82,20 +86,21 @@ export default {
           setNotice(tokenizerNotice(error) || 'The key change could not be confirmed. Recheck key status before trying again; another settings edit or an unsupported host may have blocked it.');
           // Only recognize a fixed server code, never render transport text.
           if (typeof error?.message === 'string' && error.message.includes('overlay_shutdown_unconfirmed')) {
-            reflectOverlay({ overlay_credentials: 'retired', overlay_stop_confirmed: false });
+            reflectOverlay({ overlay_credentials: 'retired', overlay_stop_confirmed: false }, target);
           }
           try {
             const current = await api('/status');
-            if (current?.overlay_cleanup_error) reflectOverlay({ overlay_credentials: 'retired', overlay_stop_confirmed: false });
-            else if (current?.overlay_shown === false && (life.owner || life.credentialShutdownUnconfirmed)) reflectOverlay({ overlay_credentials: 'retired', overlay_stop_confirmed: true });
+            if (current?.overlay_cleanup_error) reflectOverlay({ overlay_credentials: 'retired', overlay_stop_confirmed: false }, target);
+            else if (current?.overlay_shown === false && (life.owner || life.credentialShutdownUnconfirmed)) reflectOverlay({ overlay_credentials: 'retired', overlay_stop_confirmed: true }, target);
           } catch (_) { /* retain the already confirmed lifecycle warning */ }
         } finally { delete body.key; inFlight.current = false; setWorking(false); }
       }
-      const overlayNoticeText = overlayNotice === 'retired'
+      const overlayNoticeKind = currentTransition(overlayNotice?.target) ? overlayNotice.kind : '';
+      const overlayNoticeText = overlayNoticeKind === 'retired'
         ? (life.credentialShutdownUnconfirmed
           ? 'Overlay credential refresh failed; new overlay questions are disabled but shutdown is not confirmed. Retry hide overlay and verify the old window is gone before sharing.'
           : 'Overlay credential refresh failed; the overlay was closed. Show overlay to reopen with current credentials.')
-        : overlayNotice === 'refreshed' ? 'New overlay questions use a fresh credential snapshot.' : '';
+        : overlayNoticeKind === 'refreshed' ? 'New overlay questions use a fresh credential snapshot.' : '';
       return h('section', { style: card, 'aria-label': 'Meta API key settings' },
         h('strong', null, 'Meta API key'),
         h('p', { style: muted, role: 'status' }, info
@@ -147,6 +152,13 @@ export default {
         if (result?.overlay_stop_confirmed === false) notify('warning', result.overlay_cleanup_error || 'Overlay shutdown is not confirmed. Reopen the pane and Retry hide overlay.');
       }, warnStop);
       return life.release;
+    }
+    // Trust only diagnostics created here, never transport exception text.
+    const lifecycleErrors = new WeakSet();
+    function lifecycleError(message) {
+      const error = new Error(message);
+      lifecycleErrors.add(error);
+      return error;
     }
     function MeetingPane({ registration: paneEntry }) {
       // Fence all outbound work, including previously captured Assist/retry
@@ -281,32 +293,33 @@ export default {
       async function claimOverlayPane(life) {
         if (!life.claim) life.claim = Promise.resolve().then(() => {
           if (!life.mounted) return null;
-          if (!order.client || !Number.isSafeInteger(life.creation)) throw new Error('Pane creation ordering is unavailable.');
+          if (!order.client || !Number.isSafeInteger(life.creation)) throw lifecycleError('Pane creation ordering is unavailable.');
           return api('/overlay/lifecycle');
         }).then(async ticket => {
           if (!life.mounted) return null;
-          if (!ticket.epoch) throw new Error('Update/restart the backend for pane creation ordering.');
+          if (!ticket.epoch) throw lifecycleError('Update/restart the backend for pane creation ordering.');
           life.claimAttempted = true;
           return api('/overlay/claim', { revision: ticket.revision, epoch: ticket.epoch,
             client: order.client, creation: life.creation });
         }).then(result => {
           if (!result && !life.mounted) return null;
-          if (result?.reason === 'different_renderer') throw new Error('Another desktop renderer owns this backend. A reloaded renderer cannot renew its capture lease: the watchdog initiates stop within 32 seconds of the last owner heartbeat. Verify capture has stopped. Return to the original window, or close all Meeting Copilot panes and restart the backend when other sessions are idle, then reopen.');
-          if (result?.accepted === false) throw new Error('Another pane owns the overlay. Close and reopen this pane to take ownership.');
-          if (!result?.pane) throw new Error('Overlay lifecycle protocol unavailable. Update/restart the backend and reopen the pane.');
+          if (result?.reason === 'different_renderer') throw lifecycleError('Another desktop renderer owns this backend. A reloaded renderer cannot renew its capture lease: the watchdog initiates stop within 32 seconds of the last owner heartbeat. Verify capture has stopped. Return to the original window, or close all Meeting Copilot panes and restart the backend when other sessions are idle, then reopen.');
+          if (result?.accepted === false) throw lifecycleError('Another pane owns the overlay. Close and reopen this pane to take ownership.');
+          if (!result?.pane) throw lifecycleError('Overlay lifecycle protocol unavailable. Update/restart the backend and reopen the pane.');
           life.pane = result.pane;
           if (!life.mounted) releaseOverlayPane(life);
           return result.pane;
         }).catch(e => {
+          const detail = lifecycleErrors.has(e) ? e.message : 'Pane authorization unavailable. Check the backend connection.';
           if (!life.claimAttempted) {
             // GET cannot commit. Retry on the next user action using the SAME
             // creation identity; never replay a possibly committed POST.
             life.claim = null;
-            throw new Error(`${String(e.message || e)} Retry the action to look up lifecycle authorization, or close and reopen the pane.`);
+            throw new Error(`${detail} Retry the action to look up lifecycle authorization, or close and reopen the pane.`);
           }
           // A lost claim response may already have committed. Do not mint a
           // new creation ID on retry: reopening is an explicit new lifecycle.
-          throw new Error(`${String(e.message || e)} Close and reopen this pane to retry lifecycle authorization.`);
+          throw new Error(`${detail} Close and reopen this pane to retry lifecycle authorization.`);
         });
         return life.claim;
       }
@@ -405,10 +418,14 @@ export default {
       }
       const cloudUnavailable = backend === 'macos' && transcriptionProvider === 'meta' && !data.capabilities?.meta_asr;
       const overlayNeedsHide = !!data.overlay_cleanup_error || !!overlayActionAt.current.credentialShutdownUnconfirmed;
-      function reflectCredentialOverlay(written) {
+      function reflectCredentialOverlay(written, target) {
         const life = overlayActionAt.current;
-        if (!life.mounted) return;
+        if (!life.mounted || target?.life !== life || target.pane !== life.pane
+            || target.owner !== life.owner || target.action !== life.action) return false;
         retireLocalOverlay();
+        // Subsequent readback for this edit can refine shutdown, but only until
+        // another owner/action supersedes this exact retirement.
+        target.owner = life.owner;
         life.credentialShutdownUnconfirmed = written.overlay_stop_confirmed !== true;
         setOverlayMsg(life.credentialShutdownUnconfirmed
           ? 'Overlay shutdown is not confirmed. Retry hide overlay and verify the window is gone before sharing.'

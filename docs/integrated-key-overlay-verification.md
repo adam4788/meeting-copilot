@@ -120,3 +120,61 @@ Hide/Show to refresh the retained context after those edits. Previously manual
 Meta choices without provenance are indistinguishable from automatic defaults
 and intentionally require a new selection; no old bare Meta value is treated as
 proof of cloud opt-in.
+
+## Final integration regression fixes
+
+Three additional regressions were reproduced with failing assertions before
+production changes:
+
+- Retrying Start after the initial claim failure reflected the cached synthetic
+  transport diagnostic. Lifecycle rejection handling now preserves only
+  locally constructed, actionable protocol messages (tracked by object identity);
+  unexpected transport errors become a fixed connection/reopen instruction.
+  GET retry and the no-replay rule for possibly committed claims are unchanged.
+- A delayed successful key-edit retirement response discarded the owner of a
+  newly shown overlay. Each edit now captures the exact lifecycle, pane, owner,
+  and action generation. Retirement, error fallback, delayed status readback,
+  and notices apply only while that target remains current. A legitimate
+  retirement advances its own expected owner to null so its readback can refine
+  shutdown without touching a subsequent owner/action.
+- A genuine final-publication HTTP 409 combined with failed rebind and
+  unconfirmed shutdown discarded the transition fields. HTTP failures now keep
+  sanitized lifecycle outcomes and the fixed shutdown code while retaining 409
+  and actionable conflict guidance. Host exception details/headers are not
+  reflected. The pane keeps a visible warning and Retry hide even when both
+  credential and status readbacks are unavailable.
+
+The real-effect scenario now pauses capture, verifies the provider control is
+actually enabled, and only then changes provider. Its polling stub explicitly
+refreshes capabilities after removal rather than relying on the old Pause step.
+
+Verification at this checkpoint:
+
+- Focused production-router/credential/overlay suite: **26 tests passed**.
+- Full `npm test`: **715 Python tests, OK (3 skips); 134 Node tests passed**.
+- Real React/ReactDOM/jsdom + production offline router: **28 scenarios passed**,
+  with every scenario run both normally and under StrictMode. Includes lifecycle
+  lookup and claim failures followed by Start/Pause/Clear, preservation of a real
+  different-renderer rejection, delayed retirement with and without readback
+  failure, delayed status fallback after a new Show, and HTTP 409 with unavailable
+  readback/status. Existing activation, provenance, and retirement cases remain.
+- Backend conflict regression exercises the real `_write` final check and a
+  separate secret-bearing HTTPException; body, headers, stdout and stderr are
+  checked for synthetic-secret reflection.
+- Swift helper compiled into managed scratch: `--self-test` printed
+  `overlay state tests passed`; `--protocol-version` printed `meeting-overlay/2`.
+- JavaScript/Python syntax and `git diff --check` passed.
+
+Reproduce the effect-capable gate without installing dependencies:
+
+```sh
+MEETING_REACT_TEST_MODULES=/path/to/existing/compatible/node_modules/ \
+  node test_real_effects_matrix.cjs
+```
+
+The runner uses fresh backend subprocesses with temporary homes, synthetic
+credentials, fake audio/overlay helpers, and network connections forbidden.
+`usePluginQuery` polling and host notifications remain explicit test plumbing;
+this is not live Hermes Desktop/native hardware acceptance. The full npm suite
+and the opt-in React gate are separate because React/jsdom are not project
+runtime dependencies. No main merge, push, install, live app, or real-key access.

@@ -337,10 +337,10 @@ def make_router(change_boundary=None):
                 or (action == 'remove' and 'key' in body)):
             raise HTTPException(400, 'Enter an 8–4096 character API key without spaces, quotes or line breaks; recheck settings before saving.')
         transition = {}
-        def failure(detail):
+        def failure(detail, status_code=503):
             if transition.get('overlay_stop_confirmed') is False:
                 detail += ' overlay_shutdown_unconfirmed: Retry hide overlay and verify the window is gone before sharing.'
-            return _response({'detail': detail, **transition}, 503)
+            return _response({'detail': detail, **transition}, status_code)
         try:
             host = _host()
             host.require_env_writable(KEY, action)
@@ -363,8 +363,12 @@ def make_router(change_boundary=None):
                         status = _status(path, updated)
                     return {**status, **transition}
             return _response(await asyncio.to_thread(apply))
-        except HTTPException:
-            raise
+        except HTTPException as error:
+            # The boundary's finally may retire a helper even on a write
+            # conflict. Keep that outcome independently of the failed write,
+            # without reflecting host exception details or headers (secrets).
+            detail = 'Settings changed. Recheck before saving again.' if error.status_code == 409 else _UNAVAILABLE
+            return failure(detail, error.status_code)
         except HostTokenizerUnavailable:
             return failure(TOKENIZER_UNAVAILABLE)
         except UnsupportedEnvFile:

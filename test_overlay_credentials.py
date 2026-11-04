@@ -156,6 +156,37 @@ with client, _fake_overlay_spawn(), patch.object(state, '_start_overlay_lease_lo
             with self.subTest(denied=denied):
                 self.child(scenario.replace('DENIED', repr(denied)))
 
+    def test_write_conflict_retains_sanitized_unconfirmed_transition(self):
+        scenario = SCENARIO.split('    try:')[0] + r'''
+    writer = credentials._write
+    def conflicting_write(host, path, raw, action, key):
+        # Real _write detects a changed file at its final publication check.
+        path.write_bytes(raw + b'# synthetic competing edit\n')
+        return writer(host, path, raw, action, key)
+    try:
+        with patch.object(credentials, '_write', side_effect=conflicting_write), patch.object(overlay.transport, 'refresh_credentials', side_effect=RuntimeError('fake-sensitive-rebind')), patch.object(overlay, 'hide_overlay', return_value={'stop_confirmed': False, 'error': 'fake-sensitive-cleanup'}):
+            response = edit('save')
+            assert response.status_code == 409, 'write conflict status lost'
+            payload = response.json()
+            assert payload.get('overlay_credentials') == 'retired', 'conflict discarded retirement'
+            assert payload.get('overlay_stop_confirmed') is False, 'conflict discarded uncertain shutdown'
+            assert 'overlay_shutdown_unconfirmed' in payload['detail'], 'missing fixed transport code'
+            assert 'Settings changed. Recheck' in payload['detail'], 'actionable conflict lost'
+            assert 'fake-' not in response.text, 'secret reflected in error body'
+            assert 'fake-' not in str(dict(response.headers)), 'secret reflected in error headers'
+            assert response.headers.get('cache-control') == 'no-store'
+            assert state.overlay is None and state.overlay_owner is None
+            assert state.status(touch=False)['overlay_cleanup_error'], 'fault did not leave pending cleanup'
+    finally:
+        state.listening = False
+        state.overlay_hide()
+        for thread in list(overlay.threads): thread.join(5)
+'''
+        self.child(scenario)
+        with self.subTest(secret_bearing_http_exception=True):
+            self.child(scenario.replace('return writer(host, path, raw, action, key)',
+                "raise credentials.HTTPException(409, {'secret': key}, headers={'X-Sensitive': key})"))
+
     def test_partial_writer_failure_still_rebinds_committed_credentials(self):
         scenario = SCENARIO.split('    try:')[0] + r'''
     writer = credentials._write

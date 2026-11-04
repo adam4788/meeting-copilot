@@ -13,7 +13,17 @@ child.stderr.on('data',x=>stderr+=x);
 const exit=new Promise(resolve=>child.on('exit',resolve));
 createInterface({input:child.stdout}).on('line',line=>{const r=JSON.parse(line);waiting.get(r.id)(r);waiting.delete(r.id)});
 const rpc=data=>new Promise(resolve=>{waiting.set(++id,resolve);child.stdin.write(JSON.stringify({...data,id})+'\n')});
-async function rest(path,options={}){if(failLifecycle && path===failLifecycle)throw new Error('synthetic-sensitive-lifecycle');if(failReadback&&path==='/credentials/meta'&&!options.method)throw new Error('synthetic-sensitive-readback');const r=await rpc({path,...options});traffic.push({path,method:options.method||'GET',code:r.code});if(r.code>=400)throw new Error('HTTP '+r.code+' '+JSON.stringify(r.body));return r.body;}
+let holdWrite=false,heldWrite=null,releaseWrite,failStatus=false;
+let holdStatus=false,heldStatus=null,releaseStatus;
+async function rest(path,options={}){
+ if(failLifecycle && path===failLifecycle)throw new Error('synthetic-sensitive-lifecycle');
+ if(failReadback&&path==='/credentials/meta'&&!options.method)throw new Error('synthetic-sensitive-readback');
+ if(failStatus&&path==='/status')throw new Error('synthetic-sensitive-status');
+ const r=await rpc({path,...options});traffic.push({path,method:options.method||'GET',code:r.code});
+ if(holdWrite&&path==='/credentials/meta'&&options.method){heldWrite=r;await new Promise(resolve=>releaseWrite=resolve);}
+ if(holdStatus&&path==='/status'){heldStatus=r;await new Promise(resolve=>releaseStatus=resolve);}
+ if(r.code>=400)throw new Error('HTTP '+r.code+' '+JSON.stringify(r.body));return r.body;
+}
 let failReadback=false, failLifecycle=process.env.INITIAL_LIFECYCLE_FAULT ? (process.env.INITIAL_LIFECYCLE_FAULT==='claim'?'/overlay/claim':'/overlay/lifecycle') : '';
 let status={capabilities:{macos_transcription:true,overlay:true,meta_asr:true}},registered;
 const ctx={rest,register:c=>{if(c.area==='panes')registered=c;return()=>{}}};
@@ -33,13 +43,39 @@ async function render(){await act(async()=>{root.render(process.env.STRICT?React
 async function refresh(){status=await rest('/status');await render()}
 const button=label=>[...document.querySelectorAll('button')].find(e=>e.textContent===label);
 async function click(label){const b=button(label);assert.ok(b,label);assert.equal(b.disabled,false,label+' disabled');await act(async()=>{b.click();await ticks()});await flush()}
+async function until(check){for(let i=0;i<100;i++){await act(async()=>{await ticks();await rpc({path:'/review/probe'});await ticks()});if(check())return;}throw new Error('gate did not settle');}
+async function clickPending(label){const b=button(label);assert.ok(b,label);assert.equal(b.disabled,false,label+' disabled');await act(async()=>{b.click();await ticks()});}
 async function key(value){const field=document.querySelector('[aria-label="Meta API key"]');await act(async()=>{Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set.call(field,value);field.dispatchEvent(new window.Event('input',{bubbles:true}));});}
 const probe=()=>rest('/review/probe');
 const visible=e=>{for(let n=e;n;n=n.parentElement)if(n.tagName==='DETAILS'&&!n.open)return false;return true;};
 const reports=[];
 (async()=>{
+ if(process.env.CLAIM_CONFLICT){
+  const ticket=await rest('/overlay/lifecycle');
+  const claim=await rest('/overlay/claim',{method:'POST',body:{...ticket,client:'other-synthetic-renderer',creation:1}});
+  assert.ok(claim.pane);
+ }
  await render();
- if(failLifecycle){assert.doesNotMatch(document.body.textContent,/synthetic-sensitive/);assert.match(document.body.textContent,/reopen this pane/);console.log('PASS real effects initial lifecycle sanitization');return;}
+ if(process.env.CLAIM_CONFLICT){
+  await act(async()=>document.querySelector('[aria-label="Capture permission"]').click());
+  await click('Start listening');
+  assert.match(document.body.textContent,/Another desktop renderer owns this backend/,'preserve actionable protocol diagnostics');
+  assert.match(document.body.textContent,/watchdog initiates stop/);
+  assert.equal(traffic.filter(t=>t.path==='/start').length,0);
+  console.log('PASS real effects valid lifecycle rejection preserved');return;
+ }
+ if(failLifecycle){
+  assert.doesNotMatch(document.body.textContent,/synthetic-sensitive/);
+  assert.match(document.body.textContent,/reopen this pane/);
+  const action=process.env.LIFECYCLE_ACTION||'start';
+  if(action==='start')await act(async()=>document.querySelector('[aria-label="Capture permission"]').click());
+  else { await rpc({control:'lifecycle-fixture',listening:action==='pause'});await refresh(); }
+  await click({start:'Start listening',pause:'Pause listening',clear:'Clear meeting'}[action]);
+  assert.doesNotMatch(document.body.textContent,/synthetic-sensitive/,'action retry must not reflect cached transport diagnostics');
+  assert.match(document.body.textContent,/reopen.*pane|Retry.*action/i);
+  assert.equal(traffic.filter(t=>['/start','/pause','/clear'].includes(t.path)).length,0,'no unauthorised action');
+  console.log('PASS real effects lifecycle retry sanitization: '+action);return;
+ }
  reports.push({initialKeyUnavailable:document.body.textContent.includes('Key settings unavailable'),strict:!!process.env.STRICT});
  if(document.body.textContent.includes('Key settings unavailable'))await click('Recheck key status');
  assert.equal(document.querySelector('[aria-label="Transcription provider"]').value,'local');
@@ -47,6 +83,39 @@ const reports=[];
  await key('fake-review-key-one');await click('Save key');
  assert.equal((await probe()).saved_v1,true);
  await click('Show overlay');await refresh();assert.equal(status.overlay_shown,true);
+ if(process.env.DELAYED_STATUS){
+  await rpc({control:'refresh-fault'});failReadback=true;holdStatus=true;
+  await key('fake-review-key-two');await clickPending('Save key');await until(()=>heldStatus);
+  assert.equal(heldStatus.body.overlay_shown,false);
+  assert.ok(button('Show overlay'),'initial retirement was applied');
+  holdStatus=false;
+  await clickPending('Show overlay');await until(()=>button('Hide overlay')&&!button('Hide overlay').disabled);
+  const newer=await probe();assert.ok(newer.overlay_owner);
+  releaseStatus();await flush();
+  assert.ok(button('Hide overlay'),'stale status fallback must not clear new owner');
+  assert.doesNotMatch(document.body.textContent,/overlay was closed/i);
+  assert.equal((await probe()).overlay_owner,newer.overlay_owner);
+  assert.equal((await rest('/status')).overlay_shown,true);
+  console.log('PASS real effects delayed status fallback preserves newer owner');return;
+ }
+ if(process.env.DELAYED_RETIREMENT){
+  await rpc({control:'refresh-fault'});
+  holdWrite=true;
+  await key('fake-review-key-two');await clickPending('Save key');await until(()=>heldWrite);
+  assert.equal(heldWrite.body.overlay_credentials,'retired');
+  assert.equal((await rest('/status')).overlay_shown,false,'old overlay actually retired');
+  await clickPending('Hide overlay');await until(()=>button('Show overlay')&&!button('Show overlay').disabled);
+  await clickPending('Show overlay');await until(()=>button('Hide overlay')&&!button('Hide overlay').disabled);
+  const newer=await probe();assert.ok(newer.overlay_owner);assert.equal(newer.overlay_v2,true);
+  if(process.env.READBACK_FAULT)failReadback=true;
+  releaseWrite();await flush();
+  assert.ok(button('Hide overlay'),'stale retirement must not discard newer owner');
+  assert.doesNotMatch(document.body.textContent,/overlay was closed|overlay is no longer shown/i);
+  assert.equal((await probe()).overlay_owner,newer.overlay_owner,'response must not mutate backend ownership');
+  assert.equal((await rest('/status')).overlay_shown,true);
+  await click('Hide overlay');assert.equal((await rest('/status')).overlay_shown,false,'current owner remains usable');
+  console.log('PASS real effects delayed retirement preserves newer owner');return;
+ }
  await act(async()=>document.querySelector('[aria-label="Capture permission"]').click());
  await click('Start listening');await refresh();assert.equal(status.listening,true);
  await key('fake-review-key-two');await click('Save key');let p=await probe();
@@ -57,10 +126,20 @@ const reports=[];
  assert.match(document.body.textContent,/fresh credential snapshot/);
  reports.push({liveEdit:'PASS',oldCaptureSnapshot:p.capture_v1,freshOverlaySnapshot:p.overlay_v2,controlsDisclosed:true});
  await rpc({control:'segment'});await refresh();await click('Pause listening');await refresh();await click('Resume listening');await refresh();assert.equal((await probe()).capture_v2,true);
- await rpc({control:process.env.WRITE_SHUTDOWN_FAULT?'write-shutdown-fault':'refresh-fault'});
+ await rpc({control:process.env.CONFLICT_SHUTDOWN_FAULT?'conflict-shutdown-fault':process.env.WRITE_SHUTDOWN_FAULT?'write-shutdown-fault':'refresh-fault'});
+ if(process.env.CONFLICT_SHUTDOWN_FAULT){failStatus=true;failReadback=true;}
  if(process.env.READBACK_FAULT)failReadback=true;
  await key('fake-review-key-one');await click('Save key');
- if(process.env.WRITE_SHUTDOWN_FAULT){assert.ok(button('Retry hide overlay'));assert.match(document.body.textContent,/shutdown is not confirmed/);assert.match(document.body.textContent,/could not be confirmed/);assert.doesNotMatch(document.body.textContent,/synthetic-sensitive/);console.log('PASS real effects uncertain write retains shutdown warning');return;}
+ if(process.env.CONFLICT_SHUTDOWN_FAULT)assert.ok(traffic.some(t=>t.path==='/credentials/meta'&&t.code===409),'actual HTTP conflict');
+ if(process.env.WRITE_SHUTDOWN_FAULT||process.env.CONFLICT_SHUTDOWN_FAULT){
+  assert.ok(button('Retry hide overlay'));
+  assert.equal(button('Show overlay'),undefined);
+  assert.ok([...document.querySelectorAll('[role="alert"]')].some(e=>visible(e)&&/shutdown is not confirmed/.test(e.textContent)), 'uncertain shutdown must be a visible alert even without readback');
+  assert.match(document.body.textContent,/could not be confirmed/);
+  assert.doesNotMatch(document.body.textContent,/synthetic-sensitive/);
+  assert.doesNotMatch(stderr,/synthetic-sensitive|fake-review-key/);
+  console.log('PASS real effects uncertain write retains shutdown warning');return;
+ }
  assert.ok(button('Show overlay'),'confirmed retirement immediately changes quick action before polling');
  if(process.env.READBACK_FAULT){assert.match(document.body.textContent,/could not be confirmed/);assert.match(document.body.textContent,/overlay was closed/);console.log('PASS real effects failed readback preserves retirement');return;}
  await refresh();
@@ -69,11 +148,12 @@ const reports=[];
  assert.ok(notice&&visible(notice));
  reports.push({rebindFault:'PASS',notice:notice.textContent,showButtonImmediately:!!button('Show overlay'),hideButtonImmediately:!!button('Hide overlay')});
  if(button('Hide overlay'))await click('Hide overlay');await click('Show overlay');await refresh();
+ await click('Pause listening');await refresh();
  const provider=document.querySelector('[aria-label="Transcription provider"]');
+ assert.equal(provider.disabled,false,'provider change must be a possible user interaction');
  assert.equal([...provider.options].find(o=>o.value==='meta').disabled,false);
  await act(async()=>{provider.value='meta';provider.dispatchEvent(new window.Event('change',{bubbles:true}));});
- await click('Remove saved key');p=await probe();assert.equal(p.saved_v1,false);assert.equal(p.overlay_v1,false);assert.equal(p.overlay_v2,false);assert.equal(p.capture_v2,true);
- await click('Pause listening');await refresh();
+ await click('Remove saved key');await refresh();p=await probe();assert.equal(p.saved_v1,false);assert.equal(p.overlay_v1,false);assert.equal(p.overlay_v2,false);assert.equal(p.capture_v2,true);
  assert.equal(JSON.parse(store.get('meeting-copilot.scope.v2')).transcriptionProvider,'meta');
  assert.equal(JSON.parse(store.get('meeting-copilot.scope.v2')).transcriptionChoiceVersion,1);
  const audio=document.querySelector('[aria-label="Audio source"]');await act(async()=>{audio.value='system';audio.dispatchEvent(new window.Event('change',{bubbles:true}));});

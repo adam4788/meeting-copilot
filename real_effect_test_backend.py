@@ -41,7 +41,8 @@ def probe():
     transport = state.overlay.transport if state.overlay else None
     context = transport._poll_context if transport else None
     overlay_key = context.copy().run(meta_models.resolve_model_api_key) if context else ''
-    return {'saved_v1': 'fake-review-key-one' in raw, 'saved_v2': 'fake-review-key-two' in raw,
+    return {'overlay_owner': state.overlay_owner,
+            'saved_v1': 'fake-review-key-one' in raw, 'saved_v2': 'fake-review-key-two' in raw,
             'running': audio.running, 'capture_v1': audio.key == 'fake-review-key-one',
             'capture_v2': audio.key == 'fake-review-key-two',
             'overlay_v1': overlay_key == 'fake-review-key-one', 'overlay_v2': overlay_key == 'fake-review-key-two',
@@ -59,6 +60,10 @@ with ExitStack() as stack:
         m = json.loads(line)
         if m.get('control') == 'owner':
             owner_allowed = m['value']; result = {'code': 200, 'body': {}}
+        elif m.get('control') == 'lifecycle-fixture':
+            state.listening = m['listening']
+            state.add_segment({'text': 'Synthetic question?'})
+            result = {'code': 200, 'body': {}}
         elif m.get('control') == 'segment':
             state.add_segment({'text': 'Synthetic question?'})
             result = {'code': 200, 'body': {}}
@@ -66,13 +71,16 @@ with ExitStack() as stack:
             assert state.overlay is not None
             stack.enter_context(patch.object(state.overlay.transport, 'refresh_credentials', side_effect=RuntimeError('synthetic-sensitive-fault')))
             result = {'code': 200, 'body': {}}
-        elif m.get('control') == 'write-shutdown-fault':
+        elif m.get('control') in ('write-shutdown-fault', 'conflict-shutdown-fault'):
             assert state.overlay is not None
             writer = credentials._write
             def committed_then_failed(*args):
                 writer(*args)
                 raise RuntimeError('synthetic-sensitive-write-fault')
-            stack.enter_context(patch.object(credentials, '_write', side_effect=committed_then_failed))
+            def conflict(host, path, raw, action, key):
+                path.write_bytes(raw + b'# synthetic competing edit\n')
+                return writer(host, path, raw, action, key)
+            stack.enter_context(patch.object(credentials, '_write', side_effect=conflict if m['control'] == 'conflict-shutdown-fault' else committed_then_failed))
             stack.enter_context(patch.object(state.overlay.transport, 'refresh_credentials', side_effect=RuntimeError('synthetic-sensitive-refresh-fault')))
             stack.enter_context(patch.object(state.overlay, 'hide_overlay', return_value={'stop_confirmed': False, 'error': 'synthetic cleanup denied'}))
             result = {'code': 200, 'body': {}}
