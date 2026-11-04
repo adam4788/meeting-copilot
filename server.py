@@ -1165,6 +1165,7 @@ class MeetingState:
                 with getattr(bridge, 'lock', nullcontext()):
                     shown = (job['done'].is_set() and not job['error']
                              and bool(job['result'].get('shown'))
+                             and process not in getattr(bridge, '_reader_failed', ())
                              and alive is True
                              and getattr(bridge, 'process', None) is process
                              and not isinstance(getattr(process, 'returncode', None), int)
@@ -1232,6 +1233,7 @@ class MeetingState:
         process = getattr(bridge, 'process', None)
         alive = self._overlay_process_alive(process)
         retire = self.overlay is bridge and (getattr(bridge, 'stopping', False) is True
+                 or process in getattr(bridge, '_reader_failed', ())
                  or alive is None or (alive is False and (process is not None or for_show)))
         if retire:
             with self.overlay_lock:
@@ -1300,7 +1302,8 @@ class MeetingState:
                 # Scope publication/status may observe an exit after the
                 # reconciliation probe. Do not commit a known-dead reuse.
                 process = getattr(self.overlay, 'process', None)
-                if isinstance(getattr(process, 'returncode', None), int):
+                if (isinstance(getattr(process, 'returncode', None), int)
+                        or process in getattr(self.overlay, '_reader_failed', ())):
                     self._retire_overlay_locked()
                     raise _unavailable('Overlay helper exited during Show; retry Hide / Show.')
                 if not self.listening and self.pending_stop is None:

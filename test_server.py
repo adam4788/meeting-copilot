@@ -647,7 +647,7 @@ class OverlayScopeOrderingTests(unittest.TestCase):
         import server
         from unittest.mock import Mock
         state = self._state()
-        dead = Mock()
+        dead = Mock(_reader_failed=set())
         dead.process = None
         state.overlay = dead
         state.listening = True

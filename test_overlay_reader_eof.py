@@ -1,13 +1,48 @@
 """EOF evidence tests with inert in-memory streams; portable to Windows."""
 import io
 import threading
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from overlay_bridge import OverlayBridge
 from thread_test_support import CheckedThreads
 
 
 class ReaderEOFTests(CheckedThreads):
+    def test_missing_pipe_evidence_cannot_confirm(self):
+        bridge = OverlayBridge()
+        process = Mock(stdout=io.StringIO(), stdin=None)
+        process.poll.return_value = 0
+        bridge.process = process
+        try:
+            self.assertFalse(bridge.hide_overlay()['stop_confirmed'])
+            self.assertIs(bridge.process, process)
+        finally:
+            assert bridge._cleanup_job is not None
+            bridge._cleanup_job['worker'].join(1)
+            process.stdout.close()
+
+    def test_recovery_never_reads_concurrent_or_replaced_pipe(self):
+        bridge = OverlayBridge()
+        stream = Mock(closed=False)
+        stream.fileno.return_value = 42
+        process = Mock(stdout=stream)
+        bridge._stdout_eof[process] = threading.Event()
+        bridge._stdout_pipes[process] = stream
+        reader = Mock()
+        reader.is_alive.return_value = True
+        import stat
+        with patch('sys.platform', 'darwin'), patch('os.fstat', return_value=Mock(st_mode=stat.S_IFIFO)), \
+                patch('os.read') as read, patch('os.set_blocking', create=True) as nonblocking:
+            bridge._recover_stdout_eof(process, reader)
+            read.assert_not_called()
+            nonblocking.assert_not_called()
+            reader.is_alive.return_value = False
+            process.stdout = Mock()
+            bridge._recover_stdout_eof(process, reader)
+            read.assert_not_called()
+            nonblocking.assert_not_called()
+        self.assertFalse(bridge._stdout_eof[process].is_set())
+
     def test_reader_io_error_is_not_eof_even_after_thread_exits(self):
         class BrokenStream(io.StringIO):
             def __next__(self):

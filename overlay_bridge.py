@@ -411,6 +411,10 @@ class OverlayBridge:
         self.cleanup_error = None
         self._reader = None
         self._stdout_eof = {}
+        self._stdout_pipes = {}
+        self._stdout_readers = {}
+        self._stdout_busy = set()
+        self._reader_failed = set()
 
     # -- backend truth in ------------------------------------------------
     def retire_authorization(self):
@@ -908,8 +912,15 @@ class OverlayBridge:
                 stderr=subprocess.DEVNULL, text=True, start_new_session=True)
             with self.lock:
                 self._process_groups[target] = target.pid
+                self._register_stdout_locked(target)
+                self._stdout_busy.add(target)
                 self.process = target
-            output, _ = target.communicate(timeout=2)
+            try:
+                output, _ = target.communicate(timeout=2)
+                self._stdout_eof[target].set()  # communicate completed its actual read
+            finally:
+                with self.lock:
+                    self._stdout_busy.discard(target)
             valid = target.returncode == 0 and output.strip() == 'meeting-overlay/2'
         except (OSError, ValueError, subprocess.TimeoutExpired):
             pass
@@ -947,7 +958,9 @@ class OverlayBridge:
                                       start_new_session=True)
             with self.lock:
                 self._process_groups[target] = target.pid
+                self._register_stdout_locked(target)
                 self.process = target
+                self._start_stdout_reader(target)
         except (OSError, ValueError, TypeError):
             self.process = None
             return None
@@ -955,6 +968,8 @@ class OverlayBridge:
 
     def show_overlay(self):
         """Explicit pane action: open the overlay window, start forwarding."""
+        if self.process in self._reader_failed:
+            return {'shown': False, 'error': 'Overlay reader failed; retry Hide before Show.'}
         if self.stopping and self.process is not None:
             return {'shown': None, 'stop_confirmed': False,
                     'error': self.cleanup_error or 'Overlay shutdown is not confirmed; retry Hide.'}
@@ -984,19 +999,15 @@ class OverlayBridge:
             return {'shown': False, 'available': False,
                     'error': status.get('error')}
         if process.stdout is not None:
-            self._stdout_eof[process] = threading.Event()
-            reader = threading.Thread(target=self._read_clicks, args=(process,),
-                                      name='overlay-click-reader', daemon=True)
-            self._reader = reader
-            with self.lock:
-                self.threads.append(reader)
-            reader.start()
+            self._start_stdout_reader(process)
         self._start_pusher_locked()
         self._start_poller_locked()
         self.push()
         # Cached Popen evidence only: no potentially blocking poll on caller.
         if self.stopping or isinstance(getattr(process, 'returncode', None), int):
             return {'shown': False, 'error': 'Overlay helper exited or was retired during startup.'}
+        if process in self._reader_failed:
+            return {'shown': False, 'error': 'Overlay reader failed during startup; retry Hide.'}
         return {'shown': True, 'reused': False}
 
     def hide_overlay(self):
@@ -1283,13 +1294,7 @@ class OverlayBridge:
         self.stopping = False
         process = self.process
         if process and process.stdout:
-            self._stdout_eof[process] = threading.Event()
-            reader = threading.Thread(target=self._read_clicks, args=(process,),
-                                      name='overlay-click-reader', daemon=True)
-            self._reader = reader
-            with self.lock:
-                self.threads.append(reader)
-            reader.start()
+            self._start_stdout_reader(process)
         self._start_pusher_locked()
         self._start_poller_locked()
         try:
@@ -1308,6 +1313,27 @@ class OverlayBridge:
             pass
         finally:
             self.stop()
+
+    def _register_stdout_locked(self, process):
+        # Call under bridge.lock BEFORE publishing a newly born process. Even
+        # cancelled startup owns an unset EOF obligation for its original pipe.
+        if process.stdout is not None and process not in self._stdout_eof:
+            self._stdout_eof[process] = threading.Event()
+            self._stdout_pipes[process] = process.stdout
+            self._stdout_readers[process] = None
+
+    def _start_stdout_reader(self, process):
+        with self.lock:
+            self._register_stdout_locked(process)  # injected test launchers too
+            if (self.stopping or process is not self.process or process.stdout is None
+                    or self._stdout_readers.get(process) is not None):
+                return
+            reader = threading.Thread(target=self._read_clicks, args=(process,),
+                                      name='overlay-click-reader', daemon=True)
+            self._reader = reader
+            self._stdout_readers[process] = reader
+            self.threads.append(reader)
+            reader.start()  # registration/start atomic to cleanup's snapshot
 
     def _read_clicks(self, process=None):
         process = self.process if process is None else process
@@ -1344,7 +1370,37 @@ class OverlayBridge:
                 if eof is not None:
                     eof.set()
         except (OSError, ValueError):
-            pass
+            with self.lock:
+                self._reader_failed.add(process)
+
+    def _recover_stdout_eof(self, target, reader):
+        """Cleanup-only raw drain after the original reader has exited.
+
+        The serialized reaper owns this drain; no replacement blocking reader,
+        no decoding, no publication, and no EOF inferred from errors/timeouts.
+        Retain the original pipe object so a newer helper's fd is never used.
+        """
+        import os
+        import stat
+        eof = self._stdout_eof.get(target)
+        stream = self._stdout_pipes.get(target)
+        if (eof is None or eof.is_set() or stream is None
+                or stream is not getattr(target, 'stdout', None)
+                or (reader is not None and reader.is_alive())
+                or sys.platform not in ('darwin', 'linux')):
+            return
+        try:
+            fd = stream.fileno()
+            if stream.closed or not stat.S_ISFIFO(os.fstat(fd).st_mode):
+                return
+            os.set_blocking(fd, False)
+            deadline = time.monotonic() + .05
+            while time.monotonic() < deadline:
+                if os.read(fd, 65536) == b'':
+                    eof.set()
+                    return
+        except (OSError, ValueError, AttributeError, TypeError):
+            pass  # includes EAGAIN: a live holder is not EOF
 
     def _signal_bounded(self, target, name):
         # OS signaling normally returns immediately. Faulty wrappers / OS calls
@@ -1393,7 +1449,9 @@ class OverlayBridge:
         Only the caller publishes the outcome. A late worker cannot clear a
         newer process or resurrect an invalidated bridge.
         """
-        target = process if process is not None else self.process
+        with self.lock:
+            target = process if process is not None else self.process
+            reader = self._stdout_readers.get(target, self._reader)
         if target is None:
             self.cleanup_error = None
             return True
@@ -1402,7 +1460,6 @@ class OverlayBridge:
             if job is None or job['target'] is not target or (job['done'].is_set() and not job['confirmed']):
                 job = {'target': target, 'done': threading.Event(), 'confirmed': False}
                 self._cleanup_job = job
-                reader = self._reader
                 def reap():
                     try:
                         for name in ('terminate', 'kill'):
@@ -1419,9 +1476,13 @@ class OverlayBridge:
                         # and never strand a reaper in an unbounded reader join.
                         if parent_gone and group_gone and reader is not None and reader is not threading.current_thread():
                             reader.join(.05)
-                        reader_gone = reader is None or not reader.is_alive()
+                        reader_gone = (target not in self._stdout_busy
+                                       and (reader is None or not reader.is_alive()))
+                        if parent_gone and reader_gone:
+                            self._recover_stdout_eof(target, reader)
                         eof = self._stdout_eof.get(target)
-                        pipe_eof = eof is None or eof.is_set()
+                        pipe_eof = (getattr(target, 'stdout', None) is None
+                                    or (eof is not None and eof.is_set()))
                         job['confirmed'] = parent_gone and group_gone and reader_gone and pipe_eof
                         if job['confirmed']:
                             for stream in (getattr(target, 'stdout', None), getattr(target, 'stdin', None)):
@@ -1440,6 +1501,9 @@ class OverlayBridge:
                 self.process = None
             self._process_groups.pop(target, None)
             self._stdout_eof.pop(target, None)
+            self._stdout_pipes.pop(target, None)
+            self._stdout_readers.pop(target, None)
+            self._reader_failed.discard(target)
             self.cleanup_error = None
         else:
             self.cleanup_error = ('Overlay shutdown is not confirmed; the helper, its process group, '

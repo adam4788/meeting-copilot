@@ -24,6 +24,9 @@ def real_display(show=True, child_code=None):
         text=True, bufsize=1)
     real_kill = process.kill
     bridge = OverlayBridge()
+    # This injected launcher has the same pipe obligation as real Popen.
+    with bridge.lock:
+        bridge._register_stdout_locked(process)
     ready = threading.Event()
     bridge.on_click_line = lambda line: (ready.set() or False)
     def start():
