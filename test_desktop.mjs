@@ -224,6 +224,32 @@ test('real committed claim with lost reply never replays; explicit new mount rec
   newer.unmount(); await backend.rpc({ command: 'inspect' });
 });
 
+test('actual macOS parser cleanup failure renders unconfirmed and scoped Retry stop recovers', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t);
+  await backend.rpc({ command: 'install-macos-fault' });
+  const p = backend.mount();
+  await button(p.tree, 'Start listening').props.onClick();
+  const failure = await backend.rpc({ command: 'wait-macos-error' });
+  assert.equal(failure.running, true, 'failed signals leave the synthetic worker alive');
+  assert.equal(failure.status.listening, false);
+  assert.equal(failure.status.stop_confirmed, false);
+  const tree = await p.refresh();
+  assert.match(JSON.stringify(tree), /Stopping — unconfirmed/);
+  assert.ok(!button(tree, 'Start listening') && !button(tree, 'Resume listening') && !button(tree, 'New meeting'));
+  await backend.rpc({ command: 'allow-stop' });
+  await button(tree, 'Retry stop').props.onClick();
+  const stopped = await backend.rest('/status');
+  assert.equal(stopped.stopping, false);
+  assert.equal(stopped.stop_confirmed, true);
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, false);
+  const pauses = backend.traffic.filter(r => r.path === '/pause');
+  assert.equal(pauses.length, 1);
+  assert.ok(pauses[0].requestBody.pane && pauses[0].requestBody.action > 0);
+  assert.equal(backend.traffic.filter(r => r.path === '/start').length, 1);
+  assert.ok(!button(await p.refresh(), 'Retry stop'));
+  p.unmount(); await backend.rpc({ command: 'inspect' });
+});
+
 test('accepted release with unconfirmed physical stop does not reopen or claim success', async () => {
   const p = lifecyclePane({ '/overlay/release': { accepted: true, stopping: true, stop_confirmed: false } }, { 3: true, 4: 'macos' });
   await button(p.tree, 'Start listening').props.onClick();

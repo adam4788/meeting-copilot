@@ -410,7 +410,7 @@ class StatusLossAccumulationTests(unittest.TestCase):
 class StopFinalSummaryTests(unittest.TestCase):
     def test_stop_delivers_terminal_state_with_last_known_loss(self):
         from macos_audio import MacOSAudioCapture
-        capture = MacOSAudioCapture.__new__(MacOSAudioCapture)
+        capture = MacOSAudioCapture()
         import threading
         capture._lock = threading.RLock()
         capture._cancel = threading.Event()
@@ -569,7 +569,7 @@ class ForcedShutdownTests(unittest.TestCase):
     def test_unresponsive_worker_is_marked_forced(self):
         import threading
         from macos_audio import MacOSAudioCapture
-        capture = MacOSAudioCapture.__new__(MacOSAudioCapture)
+        capture = MacOSAudioCapture()
         capture._lock = threading.RLock()
         capture._cancel = threading.Event()
         capture._stopping = threading.Event()
@@ -703,7 +703,7 @@ class TeardownErrorVisibilityTests(unittest.TestCase):
     def _capture(self):
         import threading
         from macos_audio import MacOSAudioCapture
-        capture = MacOSAudioCapture.__new__(MacOSAudioCapture)
+        capture = MacOSAudioCapture()
         capture._lock = threading.RLock()
         capture._cancel = threading.Event()
         capture._stopping = threading.Event()

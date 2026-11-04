@@ -130,6 +130,7 @@ class MeetingState:
         self.stop_sequence = 0
         self.stop_attempts = 0
         self.stop_error = None
+        self.overlay_cleanup_error = None
         self.segments = deque(maxlen=120)
         self.listening = False
         self.error = None
@@ -231,6 +232,8 @@ class MeetingState:
             # stale clean flag, and a rejected start must not flip listening
             # on or advance the generation (a retry would then early-return
             # as "already listening" without ever attaching).
+            if self.pending_stop is not None:
+                raise HTTPException(409, self.stop_error)
             if backend == 'meetily' and not new_meeting and self.meetily_clear_error is not None:
                 raise HTTPException(409, self.meetily_clear_error)
             if self.listening:
@@ -246,6 +249,8 @@ class MeetingState:
         # lifecycle -> overlay -> bridge -> state, never state -> bridge.
         boundary = self.overlay_clear_boundary() if switching else nullcontext()
         with boundary, self.lock:
+            if self.pending_stop is not None:
+                raise HTTPException(409, self.stop_error)
             # A new meeting never inherits the prior one: same-settings start
             # defaults to resume (keeps transcript, results, retry data), while
             # an explicit new_meeting — or a different session — clears them.
@@ -286,6 +291,9 @@ class MeetingState:
             status_session_key = self.session_key
         # Lease refresh outside self.lock: _touch_pane_seen takes overlay_lock,
         # and overlay_lock -> self.lock ordering elsewhere forbids the reverse.
+        if switching and self.overlay_cleanup_error is not None:
+            self.pause(retain_tail=False)
+            raise HTTPException(503, self.overlay_cleanup_error)
         if renew_lease:
             self._touch_pane_seen()
         elif self._expire_capture():
@@ -300,6 +308,7 @@ class MeetingState:
                     # trailing speech instead of dropping the last seconds.
                     self.add_segment(segment)
         def status_callback(info):
+            retry_sequence = None
             with self.lock:
                 # Backends disagree on the terminal key: native/macOS audio
                 # emits 'state', Meetily emits 'status'. A status-shaped
@@ -322,6 +331,21 @@ class MeetingState:
                         self._status_generation = capture_generation
                 elif self.listening and self.capture_generation == capture_generation:
                     self.audio_status(info)
+                if (same_session and not self.listening and self.pending_stop is None
+                        and isinstance(info, dict)
+                        and (info.get('running') is True or info.get('stop_confirmed') is False)):
+                    # Terminal status retires delivery, not the physical adapter.
+                    # Publish the fence before another start can replace it. The
+                    # reader must never join itself or wait on lifecycle_lock.
+                    self.pending_stop = self.audio if backend in ('native', 'macos') else self.bridge
+                    self.stop_sequence += 1
+                    self.stop_attempts = 0
+                    self.stop_error = 'Capture stop is not confirmed; stopping audio. Do not assume the microphone is off.'
+                    self.retiring_generations.clear()
+                    self.capture_generation += 1
+                    retry_sequence = self.stop_sequence
+            if retry_sequence is not None:
+                self._start_stop_retry_locked(retry_sequence)
         try:
             if backend == 'meetily':
                 bridge = self.get_bridge()
@@ -428,14 +452,14 @@ class MeetingState:
                 if self._expire_capture():
                     return
 
-    def _start_stop_retry_locked(self):
-        threading.Thread(target=self._retry_stop, args=(self.stop_sequence,),
+    def _start_stop_retry_locked(self, sequence=None):
+        threading.Thread(target=self._retry_stop, args=(self.stop_sequence if sequence is None else sequence,),
                          name='meeting-stop-retry', daemon=True).start()
 
     def _retry_stop(self, sequence):
         # Separate from capture-generation watchdog: logical retirement must
         # not kill the only worker capable of retrying a failed physical stop.
-        for _ in range(2):
+        for _ in range(3):
             time.sleep(2)
             with self.lifecycle_lock:
                 if sequence != self.stop_sequence or self.pending_stop is None:
@@ -458,7 +482,9 @@ class MeetingState:
             status = getattr(type(audio), 'status', None)
             info = status(audio) if callable(status) else None
             if getattr(audio, 'is_running', False) is True or (
-                    isinstance(info, dict) and (info.get('running') is True or info.get('state') == 'stopping')):
+                    isinstance(info, dict) and (info.get('running') is True
+                                              or info.get('stop_confirmed') is False
+                                              or info.get('state', info.get('status')) == 'stopping')):
                 raise RuntimeError('Adapter is still stopping')
         except Exception as exc:
             with self.lock:
@@ -471,7 +497,8 @@ class MeetingState:
         with self.lock:
             self.pending_stop = None
             self.stop_error = None
-            self.capture_info = {**self.capture_info, 'state': 'stopped', 'message': 'Paused / detached'}
+            self.capture_info = {**self.capture_info, 'state': 'stopped', 'running': False,
+                                 'stop_confirmed': True, 'message': 'Paused / detached'}
         return True
 
     def restart_after_clear(self, last_args, clear_generation, clear_session):
@@ -1236,17 +1263,24 @@ class MeetingState:
         lifecycle_lock. Re-show explicitly after Clear to reopen the display.
         """
         bridge = None
+        self.overlay_cleanup_error = None
         try:
             with self.overlay_lock:
                 bridge = self.overlay
-                self._invalidate_overlay_locked(bridge)
+                try:
+                    self._invalidate_overlay_locked(bridge)
+                except Exception as exc:
+                    self.overlay_cleanup_error = f'Overlay invalidation failed: {type(exc).__name__}: {str(exc)[:200]}'
                 self.overlay = None
                 self.overlay_owner = None
                 self.overlay_lease_seq += 1
                 yield
         finally:
             if bridge is not None:
-                bridge.hide_overlay()
+                try:
+                    bridge.hide_overlay()
+                except Exception as exc:
+                    self.overlay_cleanup_error = f'Overlay teardown failed: {type(exc).__name__}: {str(exc)[:200]}'
 
     def overlay_scope(self, scope):
         # Atomic under overlay_lock: bridge acceptance and authoritative
@@ -1334,8 +1368,10 @@ class MeetingState:
             import sys as _sys_cap
             macos_ready = _sys_cap.platform == 'darwin' and self._macos_runtime_ready()
             return {'listening': self.listening, 'stopping': self.pending_stop is not None,
+                    'stop_confirmed': not self.listening and self.pending_stop is None,
                     'stop_attempts': self.stop_attempts,
-                    'segments': list(self.segments), 'error': self.stop_error or self.error or self.capture_error,
+                    'overlay_cleanup_error': self.overlay_cleanup_error,
+                    'segments': list(self.segments), 'error': self.stop_error or self.overlay_cleanup_error or self.error or self.capture_error,
                     'error_request': self.error_request,
                     'busy': self.busy, 'result': self.result, 'requests': {e['request_id']: dict(e) for e in live},
                     'recent': terminal, 'meetily_clear_error': self.meetily_clear_error,
@@ -1560,7 +1596,7 @@ def make_router(state):
                 pass
             state.busy = False
             state.generation += 1
-        if was_listening and last_args and state.meetily_clear_error is None:
+        if was_listening and last_args and state.meetily_clear_error is None and state.overlay_cleanup_error is None:
             # Clear is a forget-everything boundary: stop the running capture
             # and start a new generation on the same session so in-flight
             # pre-clear audio can never resurrect cleared content, while live
@@ -1578,7 +1614,7 @@ def make_router(state):
             # a pause that won the race before this section means the user no
             # longer wants capture, so the restart is skipped.
             state.restart_after_clear(last_args, clear_generation, clear_session)
-        elif was_listening and state.meetily_clear_error is not None:
+        elif was_listening:
             # The boundary install failed: stop capture and stay paused
             # instead of restarting on top of unforgotten adapter state.
             # No tail window — same as Clear's restart path. Like the

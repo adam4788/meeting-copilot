@@ -129,6 +129,8 @@ class MacOSAudioCapture:
         self.model_size, self.source, self.language = model_size, source, language
         self.provider, self.asr_mode = provider, asr_mode
         self._lock = threading.RLock()
+        self._termination_lock = threading.Lock()
+        self._cleanup_confirmed = True
         self._state, self._error = 'idle', None
         self._callback_error = None
         self._process = None
@@ -150,8 +152,10 @@ class MacOSAudioCapture:
 
     def status(self):
         with self._lock:
-            return {'state': self._state, 'running': bool((self._thread and self._thread.is_alive())
-                                                        or (self._process and self._process.poll() is None)),
+            running = bool((self._thread and self._thread.is_alive())
+                           or (self._process and self._process.poll() is None))
+            return {'state': self._state, 'running': running,
+                    'stop_confirmed': self._cleanup_confirmed and not running,
                     'error': self._error, 'callback_error': self._callback_error,
                     'source': self.source, 'model': self.model_size,
                     'provider': getattr(self, 'provider', 'local'),
@@ -190,8 +194,9 @@ class MacOSAudioCapture:
         if not callable(on_segment) or (on_status is not None and not callable(on_status)):
             raise TypeError('on_segment and on_status must be callable')
         with self._lock:
-            if self._thread and self._thread.is_alive():
-                raise RuntimeError('Audio capture is already active or stopping')
+            if not self.status()['stop_confirmed']:
+                raise RuntimeError('Audio capture is active or its cleanup is unconfirmed')
+            self._cleanup_confirmed = False
             self._cancel = threading.Event()
             self._stopping = threading.Event()
             self._on_segment = on_segment
@@ -266,13 +271,28 @@ class MacOSAudioCapture:
         finally:
             if process:
                 try:
-                    terminate_group(process, .2)
+                    self._terminate(process, .2)
                 except Exception:
                     self._notify('error', 'worker')
                 process.stdout.close()
+            else:
+                with self._lock:
+                    self._cleanup_confirmed = True
             with self._lock:
                 if self._cancel.is_set() and self._state != 'error':
                     self._state = 'stopped'
+
+    def _terminate(self, process, timeout):
+        # Reader cleanup and explicit stop may overlap. Serialize signals,
+        # never callbacks or joins; a failed cleanup retains the exact handle.
+        with self._termination_lock:
+            with self._lock:
+                if self._cleanup_confirmed and process.poll() is not None:
+                    return  # do not signal a reaped/reusable process-group ID
+                self._cleanup_confirmed = False
+            terminate_group(process, timeout)
+            with self._lock:
+                self._cleanup_confirmed = True
 
     def stop(self, timeout=3.0):
         """Bounded graceful shutdown: SIGTERM first so the worker flushes its
@@ -311,7 +331,7 @@ class MacOSAudioCapture:
         with self._lock:
             process, thread = self._process, self._thread
         if process:
-            terminate_group(process, min(.5, timeout))
+            self._terminate(process, min(.5, timeout))
         if thread and thread is not threading.current_thread():
             thread.join(max(0, deadline - time.monotonic()))
         with self._lock:

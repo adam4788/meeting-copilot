@@ -6,6 +6,8 @@ import json
 import sys
 import time as real_time
 from types import SimpleNamespace
+from contextlib import ExitStack
+from unittest.mock import patch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import server
@@ -51,11 +53,37 @@ def sleep(seconds):
 server.time = SimpleNamespace(monotonic=lambda: now, time=real_time.time, sleep=sleep)
 app = FastAPI()
 app.include_router(server.make_router(state))
-with TestClient(app) as client:
+fault_process = None
+capture = None
+with ExitStack() as faults, TestClient(app) as client:
     for line in sys.stdin:
         message = json.loads(line)
         try:
-            if message.get('command') == 'tick':
+            if message.get('command') == 'install-macos-fault':
+                # Production parser, status callback and group termination;
+                # only OS I/O is synthetic. Never launch hardware/providers.
+                import macos_audio
+                from test_async_stop_safety import ParserWorker
+                fault_process = ParserWorker()
+                capture = macos_audio.MacOSAudioCapture()
+                state.macos_factory = lambda **kw: capture
+                faults.enter_context(patch('macos_audio.worker_python', return_value='/synthetic/python'))
+                faults.enter_context(patch('macos_audio.subprocess.Popen', return_value=fault_process))
+                faults.enter_context(patch('macos_audio._signal_group', side_effect=fault_process.signal))
+                # Retry time is explicitly driven; no daemon races in UI checks.
+                faults.enter_context(patch.object(state, '_start_stop_retry_locked'))
+                result = {'installed': True}
+            elif message.get('command') == 'wait-macos-error':
+                assert capture is not None and capture._thread is not None and fault_process is not None
+                capture._thread.join(2)
+                assert not capture._thread.is_alive(), 'parser did not finish'
+                assert capture.status()['callback_error'] is None, 'swallowed callback failure'
+                result = {'running': fault_process.alive, 'status': state.status(touch=False)}
+            elif message.get('command') == 'allow-stop':
+                assert fault_process is not None
+                fault_process.denied = False
+                result = {'allowed': True}
+            elif message.get('command') == 'tick':
                 now += message['seconds']
                 sleeps = 0
                 try:
@@ -69,7 +97,7 @@ with TestClient(app) as client:
                 state.add_segment({'text': message['text']})
                 result = {'segments': len(state.segments)}
             elif message.get('command') == 'inspect':
-                result = {'listening': state.listening, 'running': audio.running,
+                result = {'listening': state.listening, 'running': fault_process.alive if fault_process else audio.running,
                           'stops': audio.stops, 'seen': state.pane_seen, 'now': now}
             else:
                 response = client.request(message.get('method', 'GET'), message['path'],
