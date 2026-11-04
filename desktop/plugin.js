@@ -299,6 +299,7 @@ export default {
       // The answer region finds the user: when a live or completed answer
       // updates, scroll it into view instead of leaving it below the fold.
       const answerRef = useRef(null);
+      const composerRef = useRef(null);
       useEffect(() => {
         const el = answerRef.current;
         if ((result?.answer || liveEntry) && el && typeof el.scrollIntoView === 'function') {
@@ -397,7 +398,7 @@ export default {
             ['Transcript may be incomplete',
              lossText(data.capture),
              data.capture.warning ? `: ${data.capture.warning}` : ''].join(''))),
-        h('label', { style: { display: 'grid', gap: 6 } }, h('strong', { id: 'mc-q-label' }, 'What should I say?'),
+        h('label', { ref: composerRef, style: { display: 'grid', gap: 6 } }, h('strong', { id: 'mc-q-label' }, 'What should I say?'),
           h(Textarea, { value: question, onChange: e => setQuestion(e.target.value), placeholder: 'Leave blank to answer the latest question, or type a question… (⌘/Ctrl+Enter to send)', rows: 3, 'aria-labelledby': 'mc-q-label', onKeyDown: e => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !busy && !unsupported) assistNow(); } })),
         ...(unsupported ? [h('p', { role: 'alert', style: muted }, `Suggest is unavailable: ${unsupportedReasons.join(' ')} See Answer setup below, then restart the gateway when other sessions are idle.`)] : []),
         h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
@@ -407,7 +408,7 @@ export default {
               catch (e) { setError(String(e.message || e)); }
             } }, 'Cancel answer'),
           h(Button, { variant: 'secondary', disabled: !result?.answer, onClick: async () => { try { await navigator.clipboard.writeText(result.answer); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch (e) { setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, copied ? 'Copied ✓' : 'Copy'),
-          question && h(Button, { variant: 'secondary', disabled: busy, onClick: () => setQuestion('') }, 'Clear question')),
+          question && h(Button, { variant: 'secondary', disabled: busy, onClick: () => { setQuestion(''); composerRef.current?.querySelector('textarea')?.focus(); } }, 'Clear question')),
         liveEntry && ['queued', 'streaming', 'running'].includes(liveEntry.status) && h('section', { style: card, 'aria-live': 'polite', ref: answerRef },
           h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8 } },
             h('strong', null, liveEntry.status === 'queued' ? 'Queued — waiting for a worker…' : liveEntry.streaming === false ? 'Preparing answer…' : 'Streaming answer…'),
@@ -464,7 +465,7 @@ export default {
               s.partial_tail && h('span', { title: 'Transcribed from trailing audio captured during shutdown' }, ' \u00b7 trailing audio'));
             })
               : [h('p', { key: 'empty', style: { ...muted, margin: 0 } }, 'No transcript segments yet — attach or start listening, then speak.')]))),
-        h('details', { style: { display: 'flex', flexDirection: 'column', gap: 12 } }, h('summary', { style: { cursor: 'pointer', ...muted } }, 'Answer setup — scope, models, overlay, web'),
+        h('details', { style: { display: 'flex', flexDirection: 'column', gap: 14 } }, h('summary', { style: { cursor: 'pointer', fontWeight: 700, color: 'var(--ui-text-primary)', padding: '6px 0', fontSize: 14 } }, 'Answer setup — scope, models, overlay, web'),
         h('label', { style: { display: 'grid', gap: 6 } }, h('strong', { id: 'mc-scope-label' }, 'Search scope'),
           h('select', { value: project, onChange: e => setProject(e.target.value), style: selectStyle, 'aria-labelledby': 'mc-scope-label', disabled: projects.isPending },
             h('option', { value: '' }, 'Past sessions only'),
@@ -472,28 +473,28 @@ export default {
             ...entries.map(p => { const value = typeof p === 'string' ? p : (p.path || p.name); return h('option', { value, key: value }, typeof p === 'string' ? p.split(/[\\/]/).pop() : (p.name || value)); }))),
         projects.error && h('div', { role: 'alert', style: muted }, `Project lookup unavailable: ${projects.error.message}`),
         allProjects && h('p', { style: { ...muted, margin: 0 } }, 'Searches supported text files across up to 100 eligible project folders plus past sessions, not your whole computer. Evidence can include unrelated projects; review it before sharing.'),
-        h('section', { style: card },
+        h('section', { style: { ...card, display: 'grid', gap: 10 } },
           h('span', { id: 'mc-model-label', style: { fontWeight: 700 } }, 'Answer model'),
-          h('div', { style: { display: 'grid', gap: 8, paddingTop: 8 } },
+          h('div', { style: { display: 'grid', gap: 8 } },
             h('label', { style: { display: 'grid', gap: 6 } }, h('span', { id: 'mc-provider-label' }, 'Answer provider'),
               h('select', { style: selectStyle, value: answerProvider, disabled: busy || !data.capabilities?.independent_models, onChange: e => { setAnswerProvider(e.target.value); setAnswerModel(''); }, 'aria-labelledby': 'mc-provider-label' },
                 h('option', { value: '' }, providers.some(p => p.id === 'meta') ? 'Use Meta Muse Spark (default)' : 'Use Hermes configured model'), ...providers.map(p => h('option', { value: p.id, key: p.id }, p.label || p.id)))),
             answerProvider && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Answer model'),
               h('select', { style: selectStyle, value: answerModel, disabled: busy, onChange: e => setAnswerModel(e.target.value), 'aria-label': 'Answer model' },
                 h('option', { value: '' }, 'Choose answer model…'), ...answerModels.map(m => h('option', { value: m.id, key: m.id }, m.label || m.id))))),
-          modelCatalog.error && h('p', { role: 'alert', style: muted }, 'Model catalog unavailable. Use the configured model or check provider setup.'),
-          h('p', { style: muted }, 'Answer selection applies only to this copilot request; it does not change your chat model. Transcription remains local.')),
-        h('label', { style: { ...muted, display: 'flex', gap: 8, alignItems: 'flex-start' } },
+          modelCatalog.error && h('p', { role: 'alert', style: { ...muted, margin: 0 } }, 'Model catalog unavailable. Use the configured model or check provider setup.'),
+          h('p', { style: { ...muted, margin: 0 } }, 'Answer selection applies only to this copilot request; it does not change your chat model. Transcription remains local.')),
+        h('label', { style: { ...muted, display: 'flex', gap: 8, alignItems: 'flex-start', border: '1px solid var(--ui-stroke-secondary)', borderRadius: 10, padding: '10px 12px', background: 'var(--ui-bg-card)', cursor: 'pointer' } },
           h('input', { type: 'checkbox', checked: webFallback, onChange: e => setWebFallback(e.target.checked), 'aria-label': 'Automatic web fallback' }),
           h('span', null, webFallback ? 'Automatic web fallback is ON — a generic public query may be drafted when local evidence is insufficient. Turn off for sensitive calls.' : 'Automatic web fallback is OFF — answers use local evidence and your explicit web query only.')),
-        h('section', { style: card },
+        h('section', { style: { ...card, display: 'grid', gap: 10 } },
           h('strong', null, 'Meeting overlay (macOS)'),
           h('p', { style: { ...muted, marginBottom: 0 } }, 'Display-only window. Tap a question row to stream its answer into that row — nothing is sent until you tap. Press the overlay shortcut (default Ctrl+Option+Cmd+O) to interact; it returns to click-through after about 10 seconds, or press the shortcut again to return early. The overlay may be visible in screen shares.'),
           web.trim() && h('p', { role: 'status', style: { ...muted, marginBottom: 0 } }, `Explicit web query “${web.trim().slice(0, 120)}” applies to overlay row requests until you clear it.`),
-          scopeStale && overlayOn && h('p', { role: 'status', style: muted }, 'Settings changed — syncing overlay scope…'),
-          overlayMsg && h('p', { role: 'status', style: muted }, overlayMsg),
-          !data.capabilities?.overlay && h('p', { role: 'status', style: muted }, 'Overlay helper unavailable. Check the macOS helper build and restart the gateway, then try Show overlay again.'),
-          h('div', { style: { display: 'flex', gap: 8, paddingTop: 8, flexWrap: 'wrap' } },
+          scopeStale && overlayOn && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'Settings changed — syncing overlay scope…'),
+          overlayMsg && h('p', { role: 'status', style: { ...muted, margin: 0 } }, overlayMsg),
+          !data.capabilities?.overlay && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'Overlay helper unavailable. Check the macOS helper build and restart the gateway, then try Show overlay again.'),
+          h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
             h(Button, { variant: overlayOn ? 'secondary' : undefined, disabled: pending || !data.capabilities?.overlay, onClick: async () => {
               setPending(true); setOverlayMsg('');
               overlayActionAt.current = Date.now();
@@ -520,7 +521,7 @@ export default {
               finally { setPending(false); }
             } }, scopeStale ? 'Sync scope •' : 'Sync scope'))),
         h('p', { style: { ...muted, margin: 0 } }, 'If needed, the model drafts a generic public query. Filtering is best-effort, not a privacy guarantee; turn this off for sensitive calls. Selected context still goes to your configured answer model.'),
-        h('details', null, h('summary', { style: { cursor: 'pointer', ...muted } }, 'Search online with a specific query'),
+        h('details', null, h('summary', { style: { cursor: 'pointer', ...muted, padding: '4px 0' } }, 'Search online with a specific query'),
           h('div', { style: { display: 'grid', gap: 8, paddingTop: 10 } },
             h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Specific public web query'),
               h(Input, { value: web, onChange: e => setWeb(e.target.value), placeholder: 'Public query — no client names or meeting details', 'aria-label': 'Specific public web query' })),

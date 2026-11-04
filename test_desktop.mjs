@@ -494,6 +494,18 @@ test('clear question empties the composer', async () => {
     'clear button hides once the question is empty');
 });
 
+test('clearing a question returns focus to the composer without sending', () => {
+  const { tree, rerender, requests } = pane('', true, false, '', { 1: 'Draft question' });
+  const label = nodes(tree).find(n => n.type === 'label' && nodes(n).some(c => c.type === 'textarea'));
+  assert.ok(label.props.ref, 'composer wrapper exposes its DOM ref');
+  let focused = 0;
+  label.props.ref.current = { querySelector: selector => selector === 'textarea' ? { focus: () => { focused++; } } : null };
+  nodes(tree).find(n => n.type === 'button' && n.children.includes('Clear question')).props.onClick();
+  assert.equal(focused, 1, 'focus returns to the question field');
+  assert.equal(nodes(rerender()).find(n => n.type === 'textarea').props.value, '');
+  assert.equal(requests.length, 0, 'clearing does not send a request');
+});
+
 test('setup tiles are separated by real gaps, not touching edges', async () => {
   const { tree } = pane('', true, false, '', {}, {}, {});
   const setup = nodes(tree).find(n => n.type === 'details'
@@ -516,6 +528,28 @@ test('transcript segments render as bounded tiles with accent edges', async () =
     assert.ok(String(tile.props.style.background || '').includes('color-mix'));
     assert.ok(tile.props.style.borderRadius >= 8);
   }
+});
+
+test('setup rhythm: cards use grids and the web toggle is a tile', async () => {
+  const { tree } = pane('', true, false, '', {}, {}, {});
+  const setup = nodes(tree).find(n => n.type === 'details'
+    && JSON.stringify(n.children).includes('Answer setup'));
+  assert.ok(setup.props.style.gap >= 14, `expected setup gap >= 14, got ${setup.props.style.gap}`);
+  const modelCard = nodes(tree).find(n => n.type === 'section'
+    && JSON.stringify(n.children).includes('Answer model'));
+  assert.ok(modelCard, 'answer model card renders');
+  assert.equal(modelCard.props.style.display, 'grid');
+  assert.ok(modelCard.props.style.gap >= 10);
+  const overlayCard = nodes(tree).find(n => n.type === 'section'
+    && JSON.stringify(n.children).includes('Meeting overlay'));
+  assert.ok(overlayCard, 'overlay card renders');
+  assert.equal(overlayCard.props.style.display, 'grid');
+  const toggle = nodes(tree).find(n => n.type === 'label'
+    && n.props.style && String(n.props.style.border || '').includes('var(--ui-stroke-secondary)')
+    && JSON.stringify(n.children).includes('Automatic web fallback'));
+  assert.ok(toggle, 'web fallback toggle renders as a bordered tile');
+  assert.ok(toggle.props.style.borderRadius >= 10);
+  assert.ok(toggle.props.style.padding.includes('12px'));
 });
 
 test('each speaker keeps one distinct color across tiles, with a legend', async () => {
