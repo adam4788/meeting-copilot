@@ -205,7 +205,14 @@ export default {
       const [consent, setConsent] = useState(false);
       const [backend, setBackend] = useState(saved.backend || 'meetily');
       const [recording, setRecording] = useState('');
-      const [error, setError] = useState('');
+      const [error, setErrorValue] = useState('');
+      function setError(value) {
+        setErrorValue(value);
+        // A new local message retires the previous message's retry authority.
+        // Answer submission catches explicitly opt back in; progress-only
+        // functional clears leave unrelated error provenance unchanged.
+        if (typeof value !== 'function') setAssistFailed(false);
+      }
       const [pending, setPending] = useState(false);
       const [showTranscript, setShowTranscript] = useState(false);
       const [webFallback, setWebFallback] = useState(saved.webFallback !== undefined ? saved.webFallback : false);
@@ -645,6 +652,24 @@ export default {
         h('strong', null, 'Meeting Copilot pane retired — actions disabled'),
         h('p', null, paneEntry.retired),
         h('p', null, 'Close this pane and reopen Meeting Copilot. Check capture status and Retry stop if needed before giving fresh consent. If audio remains active, quit the capture process or revoke audio permissions and verify the OS indicator.'));
+      // Each message owns its action. A legacy summary or a retained request
+      // alone is never evidence that the displayed error came from an answer.
+      const answerError = data.answer_error || (data.error_source === 'answer' ? data.error : null);
+      const stopError = data.stop_error || (data.error_source === 'stop' ? data.error : null);
+      const legacyError = !('error_source' in data) && data.error &&
+        ![data.overlay_cleanup_error, data.meetily_clear_error, answerError, stopError, data.capture_error].includes(data.error)
+        ? data.error : null;
+      const captureError = data.capture_error || (data.error_source === 'capture' ? data.error : null);
+      const recheckStatus = () => qc.invalidateQueries({ queryKey: [ID, 'status'] });
+      const errorCard = (message, label, onClick, disabled = false) => message && h('div', { role: 'alert', style: card },
+        h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' } },
+          h('span', null, message), h(Button, { variant: 'secondary', disabled: pending || disabled, onClick }, label)));
+      // A lost submission response cannot authorize replay. Progress failures
+      // likewise recheck without borrowing another message's retry request.
+      const localRecheck = assistFailed || (typeof error === 'string' && error.startsWith('Answer progress'));
+      const restartCapture = !data.listening && !data.stopping;
+      const captureBlocked = overlayNeedsHide || cloudUnavailable || !consent || (backend === 'meetily' && !recording)
+        || (backend === 'macos' && !data.capabilities?.macos_transcription);
       return h('div', { style: { padding: 16, display: 'flex', flexDirection: 'column', gap: 14, height: '100%', minWidth: 0, width: '100%', boxSizing: 'border-box', overflowY: 'auto', overflowX: 'hidden', overflowWrap: 'anywhere', color: 'var(--ui-text-primary)' } },
         h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
           h('strong', { style: { fontSize: 17 } }, 'Meeting Copilot'),
@@ -674,7 +699,7 @@ export default {
             (data.overlay_cleanup_error || (data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending, title: 'Clears past Q&A, transcript segments, and cached snippets for this meeting', onClick: async () => { if (typeof window !== 'undefined' && window.confirm && !window.confirm('Clear this meeting? Past questions, answers, and transcript segments are removed from the pane.')) return; if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } } }, 'Clear meeting'),
             h(Button, { variant: 'secondary', disabled: pending || (!data.capabilities?.overlay && !overlayNeedsHide), title: 'Show or hide the floating meeting overlay (macOS)', onClick: toggleOverlay }, overlayNeedsHide ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay')),
           h('p', { style: { ...muted, margin: 0 } }, 'Screen-share privacy: the overlay may be visible in screenshots or screen sharing. Hide it before sharing; capture exclusion is best-effort, not a guarantee.'),
-          overlayMsg && h('p', { role: 'status', style: { ...muted, margin: 0 } }, overlayMsg),
+          (data.overlay_cleanup_error || overlayMsg) && h('p', { role: 'status', style: { ...muted, margin: 0 } }, data.overlay_cleanup_error || overlayMsg),
           overlayNeedsHide && h('p', { role: 'alert', style: { ...muted, margin: 0 } }, 'Overlay shutdown is not confirmed. Retry hide overlay and verify the window is gone before screen-sharing.'),
           !data.capabilities?.overlay && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'Overlay helper unavailable. Check the macOS helper build and restart the gateway when other sessions are idle.'),
           h('p', { style: { ...muted, margin: 0 } }, 'No additional audio files · disconnect initiates detach/pause; verify stop status before assuming audio is off. Resume keeps this meeting (transcript and latest answer stay); New meeting, different settings, or Clear starts fresh. Pausing can discard the last few seconds of audio.'),
@@ -683,42 +708,26 @@ export default {
             ['Transcript may be incomplete',
              lossText(data.capture),
              data.capture.warning ? `: ${data.capture.warning}` : ''].join(''))),
-        (error || data.error || status.error || data.meetily_clear_error) && h('div', { role: 'alert', style: card },
+        data.overlay_cleanup_error && h('div', { role: 'alert', style: card },
           h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' } },
-            h('span', null, (assistFailed || (typeof error === 'string' && error.startsWith('Answer progress')) ? error : data.error_request ? (data.error || error) : (error || data.error || data.meetily_clear_error)) || `Backend unavailable: ${status.error?.message}. Check installation and plugin enablement.`),
-            (() => {
-              // Dismiss only clears local state; it never sends anything.
-              // Retry replays the exact failed answer request when one is
-              // known (async engine failure or the shown
-              // partial result) and otherwise just rechecks backend state —
-              // a capture failure recovers through Pause/Start, not re-ask.
-              const progressIssue = typeof error === 'string' && error.startsWith('Answer progress');
-              const storedRetry = assistFailed || progressIssue ? null : (data.error_request || null);
-              const retryReq = storedRetry;
-              const backendIssue = !!status.error && !storedRetry;
-              // A capture failure needs capture restarted (consent already
-              // given), not a status refresh: label and wire it honestly.
-              const captureIssue = !assistFailed && !progressIssue && !!data.error && !storedRetry && !status.error && !data.stopping;
-              // A failed forget-boundary needs Clear run again, not a
-              // dismiss: the adapter keeps serving its old snapshot until
-              // the boundary installs. The user already consented to
-              // clearing, so the retry completes their intent.
-              const clearIssue = !!data.meetily_clear_error && !storedRetry && !status.error && !data.error;
-              const label = data.stopping || assistFailed || progressIssue ? 'Recheck status' : retryReq ? 'Retry' : backendIssue ? 'Retry' : captureIssue ? (data.listening ? 'Recheck status' : 'Restart capture') : clearIssue ? 'Clear again' : 'Dismiss';
-              return h(Button, { variant: 'secondary', disabled: pending || (captureIssue && !data.listening && (cloudUnavailable || overlayNeedsHide || !consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription))), onClick: async () => {
-                if (data.stopping) return qc.invalidateQueries({ queryKey: [ID, 'status'] });
-                if (assistFailed) {
-                  try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }); setError(''); setAssistFailed(false); } catch (ignored) {}
-                  return;
-                }
-                if (progressIssue) return qc.invalidateQueries({ queryKey: [ID, 'status'] });
-                if (retryReq) { setError(''); setAssistFailed(false); return replayRequest(retryReq); }
-                if (clearIssue) { if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } return; }
-                if (captureIssue && !data.listening) return startCapture();
-                if (label === 'Dismiss') { setError(''); setAssistFailed(false); return; }
-                return qc.invalidateQueries({ queryKey: [ID, 'status'] });
-              } }, label);
-            })())),
+            h('span', null, data.overlay_cleanup_error),
+            h(Button, { variant: 'secondary', disabled: pending, onClick: toggleOverlay }, 'Retry hide overlay'))),
+        errorCard(error, localRecheck ? 'Recheck status' : 'Dismiss', async () => {
+          if (localRecheck) {
+            try { await recheckStatus(); if (assistFailed) setError(''); } catch (_) {}
+          } else setError('');
+        }),
+        errorCard(answerError, data.error_request ? 'Retry' : 'Recheck status', () =>
+          data.error_request ? replayRequest(data.error_request) : recheckStatus()),
+        errorCard(stopError, 'Recheck status', recheckStatus),
+        errorCard(legacyError, 'Recheck status', recheckStatus),
+        errorCard(captureError, restartCapture ? 'Restart capture' : 'Recheck status',
+          restartCapture ? () => startCapture() : recheckStatus, restartCapture && captureBlocked),
+        errorCard(data.meetily_clear_error, 'Clear again', async () => {
+          if (await act('/clear')) resetMeetingInputs();
+        }),
+        status.error && errorCard(`Backend unavailable: ${String(status.error.message || status.error)}. Check installation and plugin enablement.`,
+          'Retry', recheckStatus),
         persistWarning && h('p', { role: 'status', style: muted }, persistWarning),
         !data.listening && !data.stopping && !result && h('section', { style: card, 'aria-label': 'Getting started' },
           h('strong', null, 'Getting started'),
@@ -858,7 +867,7 @@ export default {
           h('p', { style: { ...muted, marginBottom: 0 } }, 'Display-only window. Tap a question row to stream its answer into that row — nothing is sent until you tap. Press the overlay shortcut (default Ctrl+Option+Cmd+O) to interact; it returns to click-through after about 10 seconds, or press the shortcut again to return early. The overlay may be visible in screen shares.'),
           web.trim() && h('p', { role: 'status', style: { ...muted, marginBottom: 0 } }, `Explicit web query “${web.trim().slice(0, 120)}” applies to overlay row requests until you clear it.`),
           scopeStale && overlayOn && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'Settings changed — syncing overlay scope…'),
-          overlayMsg && h('p', { role: 'status', style: { ...muted, margin: 0 } }, overlayMsg),
+          (data.overlay_cleanup_error || overlayMsg) && h('p', { role: 'status', style: { ...muted, margin: 0 } }, data.overlay_cleanup_error || overlayMsg),
           !data.capabilities?.overlay && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'Overlay helper unavailable. Check the macOS helper build and restart the gateway, then try Show overlay again.'),
           h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
             h(Button, { variant: overlayOn ? 'secondary' : undefined, disabled: pending || (!data.capabilities?.overlay && !overlayNeedsHide), onClick: toggleOverlay }, overlayNeedsHide ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay'),

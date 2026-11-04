@@ -58,6 +58,7 @@ capture = None
 overlay_signals = []
 overlay_process = None
 show_fault = None
+close_overlay_stdout = None
 with ExitStack() as faults, TestClient(app) as client:
     for line in sys.stdin:
         message = json.loads(line)
@@ -77,9 +78,22 @@ with ExitStack() as faults, TestClient(app) as client:
                 assert show_fault is not None
                 show_fault.stop()
                 result = {'allowed': True}
-            elif message.get('command') == 'install-overlay-fault':
-                from test_overlay_teardown import real_display
-                display, overlay_process = faults.enter_context(real_display())
+            elif message.get('command') == 'close-overlay-stdout':
+                assert close_overlay_stdout is not None
+                close_overlay_stdout()
+                result = {'closed': True}
+            elif message.get('command') in ('install-overlay-fault', 'install-overlay-channel-fault'):
+                if message['command'] == 'install-overlay-channel-fault':
+                    from test_overlay_channel_health import closing_display
+                    # The synthetic clock is driven only by explicit tick RPCs,
+                    # not a wall-clock lease daemon racing this EOF scenario.
+                    faults.enter_context(patch.object(state, '_start_overlay_lease_locked'))
+                    display, children, close_overlay_stdout = faults.enter_context(closing_display())
+                    assert display.show_overlay()['shown']
+                    overlay_process = display.process
+                else:
+                    from test_overlay_teardown import real_display
+                    display, overlay_process = faults.enter_context(real_display())
                 state.overlay = display
                 for name in ('terminate', 'kill'):
                     signal_patch = patch.object(overlay_process, name, side_effect=PermissionError('injected denied signaling'))

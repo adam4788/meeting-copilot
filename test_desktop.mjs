@@ -273,7 +273,10 @@ test('actual macOS parser cleanup failure renders unconfirmed and scoped Retry s
   p.unmount(); await backend.rpc({ command: 'inspect' });
 });
 
-test('real denied overlay cleanup stays visible across Clear and failed Hide; retry confirms shutdown', { timeout: 10000 }, async t => {
+test('real denied overlay cleanup stays visible across Clear and failed Hide; retry confirms shutdown', {
+  timeout: 10000,
+  skip: !['darwin', 'linux'].includes(process.platform), // real POSIX pipe/select helper
+}, async t => {
   const backend = await realBackend(t);
   const p = backend.mount();
   await button(p.tree, 'Start listening').props.onClick();
@@ -303,6 +306,39 @@ test('real denied overlay cleanup stays visible across Clear and failed Hide; re
   assert.equal(final.status.listening, false);
   assert.doesNotMatch(JSON.stringify(tree), /Overlay shutdown is not confirmed/);
   assert.ok(button(tree, 'Show overlay'));
+});
+
+test('live helper EOF immediately replaces shown success with actionable cleanup warning', {
+  timeout: 10000, skip: !['darwin', 'linux'].includes(process.platform),
+}, async t => {
+  const backend = await realBackend(t);
+  const p = backend.mount();
+  await button(p.tree, 'Start listening').props.onClick(); // claim using fake audio only
+  await button(await p.refresh(), 'Pause listening').props.onClick();
+  nodes(p.rerender()).find(n => n.props?.['aria-labelledby'] === 'mc-backend-label').props.onChange({ target: { value: 'native' } });
+  await backend.rpc({ command: 'install-overlay-channel-fault' });
+  await button(await p.refresh(), 'Show overlay').props.onClick();
+  assert.ok(JSON.stringify(p.rerender()).includes('Overlay shown'), JSON.stringify(backend.traffic.slice(-3)));
+  await backend.rpc({ command: 'close-overlay-stdout' });
+  let tree = await p.refresh();
+  const status = (await backend.rpc({ command: 'inspect-overlay' })).status;
+  assert.equal(status.overlay_shown, null);
+  assert.equal(status.overlay_stop_confirmed, false);
+  assert.match(JSON.stringify(tree), /click channel failed/);
+  assert.match(JSON.stringify(tree), /shutdown is not confirmed/);
+  assert.doesNotMatch(JSON.stringify(tree), /Overlay shown/);
+  assert.ok(!button(tree, 'Restart capture'), 'overlay fault must not suggest audio restart');
+  assert.equal(button(tree, 'Start listening').props.disabled, true);
+  await button(tree, 'Retry hide overlay').props.onClick();
+  tree = await p.refresh();
+  assert.ok(button(tree, 'Retry hide overlay'));
+  assert.equal((await backend.rpc({ command: 'inspect-overlay' })).alive, true);
+  await backend.rpc({ command: 'allow-overlay-stop' });
+  await button(tree, 'Retry hide overlay').props.onClick();
+  tree = await p.refresh();
+  assert.equal((await backend.rpc({ command: 'inspect-overlay' })).status.overlay_stop_confirmed, true);
+  assert.ok(!button(tree, 'Retry hide overlay'));
+  assert.equal(button(tree, 'Start listening').props.disabled, false);
 });
 
 test('accepted release with unconfirmed physical stop does not reopen or claim success', async () => {
@@ -423,7 +459,7 @@ test('capture recovery confirms changed source before destructive restart', asyn
     const confirmations = [];
     const { tree, requests } = pane('', true, false, '',
       { 3: true, 4: 'macos', 11: 'system' }, {},
-      { error: 'capture failed', result: { answer: 'Retained answer', sources: [] },
+      { error: 'capture failed', error_source: 'capture', result: { answer: 'Retained answer', sources: [] },
         last_session: { backend: 'macos', transcription_model: 'base.en', audio_source: 'microphone' } },
       { window: { confirm: message => { confirmations.push(message); return accept; } } });
     const recovery = nodes(tree).find(n => n.type === 'button' && n.children.includes('Restart capture'));
@@ -436,7 +472,7 @@ test('capture recovery confirms changed source before destructive restart', asyn
 
 test('live capture error offers a status recheck, not a false restart label', async () => {
   const { tree, requests } = pane('', true, false, '', {}, {},
-    { listening: true, backend: 'meetily', error: 'snapshot_unavailable' });
+    { listening: true, backend: 'meetily', error: 'snapshot_unavailable', error_source: 'capture' });
   const recheck = nodes(tree).find(n => n.type === 'button' && n.children.includes('Recheck status'));
   assert.ok(recheck);
   assert.ok(!nodes(tree).some(n => n.type === 'button' && n.children.includes('Restart capture')));
@@ -511,7 +547,7 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
       }
     },
     useQueryClient: () => ({ invalidateQueries: qcBehavior.failInvalidate ? async () => { throw new Error('invalidate failed'); } : async () => {} }),
-    useQuery: options => { if (options.queryKey[1] === 'status') statusQuery = options; return ({ data: options.queryKey[1] === 'status'
+    useQuery: options => { if (options.queryKey[1] === 'status') statusQuery = options; return ({ error: options.queryKey[1] === 'status' ? qcBehavior.statusError : null, data: options.queryKey[1] === 'status'
       ? { capabilities: supported ? { all_projects: true, automatic_web_fallback: true, independent_models: true, macos_transcription: true, overlay: true, overlay_stream: true, overlay_cancel: true } : undefined, ...statusExtra }
       : options.queryKey[1] === 'projects' ? [{ name: 'alpha', path: '/projects/alpha' }]
       : options.queryKey[1] === 'models' ? { providers: [{ id: 'openai-codex', label: 'Codex', models: [{ id: 'gpt-test', label: 'Test model' }] }] } : [] }); },
@@ -841,6 +877,158 @@ function lifecyclePane(respond = {}, settings = {}, statusExtra = {}) {
   return { ...p, async flushTimers() { const work = [...timers.values()]; timers.clear(); for (const fn of work) await fn(); } };
 }
 function button(tree, label) { return nodes(tree).find(n => n.type === 'button' && n.children.includes(label)); }
+
+function alertFor(tree, message) {
+  return nodes(tree).find(n => n.props?.role === 'alert' && JSON.stringify(n.children).includes(message));
+}
+
+test('unclassified legacy errors only recheck even with prior backend and stale retry data', async () => {
+  for (const priorBackend of ['native', 'macos', 'meetily']) {
+    const status = { backend: priorBackend, listening: false,
+      error: 'Unclassified legacy failure',
+      error_request: { question: 'Old question', transcript: 'Private old transcript' } };
+    const p = lifecyclePane({}, { 3: true, 4: 'macos' }, status);
+    try {
+      const alert = alertFor(p.rerender(), status.error);
+      assert.ok(alert);
+      assert.ok(!button(alert, 'Restart capture'), 'legacy summary cannot authorize capture');
+      assert.ok(!button(alert, 'Retry'), 'retained request cannot authorize answer retry');
+      const recheck = button(alert, 'Recheck status');
+      assert.ok(recheck);
+      assert.equal(recheck.props.disabled, false);
+      await recheck.props.onClick();
+      assert.ok(!p.requests.some(r => ['/start', '/assist'].includes(r.path)));
+    } finally { p.unmount(); }
+  }
+});
+
+test('capture error never replays stale answer data after source changes', async () => {
+  const status = { error: 'Answer failed', answer_error: 'Answer failed', error_source: 'answer',
+    error_request: { question: 'Old question', transcript: 'Private old transcript' }, backend: 'macos' };
+  const p = lifecyclePane({}, { 3: true, 4: 'macos' }, status);
+  assert.ok(button(alertFor(p.rerender(), 'Answer failed'), 'Retry'));
+  Object.assign(status, { error: 'Microphone failed', answer_error: null, error_source: 'capture',
+    capture_error: 'Microphone failed', listening: false });
+  let tree = p.rerender();
+  const capture = alertFor(tree, 'Microphone failed');
+  assert.ok(button(capture, 'Restart capture'));
+  assert.ok(!button(capture, 'Retry'));
+  await button(capture, 'Restart capture').props.onClick();
+  assert.ok(p.requests.some(r => r.path === '/start'));
+  assert.ok(!p.requests.some(r => r.path === '/assist'));
+  Object.assign(status, { error: 'System capture failed', capture_error: 'System capture failed', listening: true });
+  tree = p.rerender();
+  await button(alertFor(tree, 'System capture failed'), 'Recheck status').props.onClick();
+  assert.ok(!p.requests.some(r => r.path === '/assist'));
+  p.unmount();
+});
+
+test('progress overlay and forget boundary errors keep their own messages and actions', async () => {
+  const overlay = 'Overlay shutdown is not confirmed; retry Hide.';
+  const boundary = 'Could not install the Meetily forget boundary: retry Clear.';
+  const progress = 'Answer progress unavailable: network.';
+  const status = { error: overlay, overlay_cleanup_error: overlay, meetily_clear_error: boundary,
+    error_request: { question: 'Stale question', transcript: 'Private stale transcript' }, listening: false };
+  const p = lifecyclePane({}, { 6: progress }, status);
+  let tree = p.rerender();
+  assert.ok(button(alertFor(tree, boundary), 'Clear again'));
+  assert.ok(button(alertFor(tree, overlay), 'Retry hide overlay'));
+  await button(alertFor(tree, progress), 'Recheck status').props.onClick();
+  tree = p.rerender();
+  assert.ok(alertFor(tree, progress), 'rechecking is not evidence progress recovered');
+  assert.ok(button(alertFor(tree, boundary), 'Clear again'));
+  assert.ok(button(alertFor(tree, overlay), 'Retry hide overlay'));
+  assert.doesNotMatch(JSON.stringify(tree), /Backend unavailable: undefined/);
+  await button(alertFor(tree, boundary), 'Clear again').props.onClick();
+  assert.ok(p.requests.some(r => r.path === '/clear'));
+  assert.ok(!p.requests.some(r => r.path === '/assist'));
+  assert.ok(alertFor(p.rerender(), overlay));
+  p.unmount();
+});
+
+test('simultaneous answer capture stop boundary and backend errors stay independently actionable', async () => {
+  const messages = { answer_error: 'Answer provider failed', capture_error: 'Microphone failed',
+    stop_error: 'Capture shutdown unconfirmed', overlay_cleanup_error: 'Overlay cleanup denied',
+    meetily_clear_error: 'Meetily forget boundary failed' };
+  const stored = { question: 'Actual failed question', transcript: 'Exact failed transcript' };
+  const p = pane('', true, false, '', {}, {}, { ...messages, error: messages.stop_error,
+    error_source: 'stop', stopping: true, error_request: stored }, {},
+    { statusError: new Error('Connection lost') });
+  for (const [key, message] of Object.entries(messages)) {
+    const label = key === 'answer_error' ? 'Retry' : key === 'meetily_clear_error' ? 'Clear again'
+      : key === 'overlay_cleanup_error' ? 'Retry hide overlay' : 'Recheck status';
+    assert.ok(button(alertFor(p.tree, message), label), `${key} must pair its own action`);
+  }
+  assert.ok(button(alertFor(p.tree, 'Backend unavailable: Connection lost'), 'Retry'));
+  await button(alertFor(p.tree, messages.answer_error), 'Retry').props.onClick();
+  const assist = p.requests.find(r => r.path === '/assist');
+  assert.equal(assist.body.question, stored.question);
+  assert.equal(assist.body.transcript, stored.transcript);
+});
+
+test('non-answer local error replaces failed assist without retaining its retry', async () => {
+  const p = pane('', true, false, '', { 1: 'Old question', 3: true, 4: 'macos' }, {
+    '/assist': () => { throw new Error('Answer submission failed'); },
+    '/start': () => { throw new Error('Microphone could not start'); },
+  });
+  await button(p.tree, 'Suggest answer').props.onClick();
+  let tree = p.rerender();
+  assert.ok(button(alertFor(tree, 'Answer submission was not confirmed'), 'Recheck status'));
+  assert.doesNotMatch(JSON.stringify(tree), /Answer submission failed/);
+  await button(tree, 'Start listening').props.onClick();
+  tree = p.rerender();
+  const capture = alertFor(tree, 'Start was not confirmed');
+  assert.doesNotMatch(JSON.stringify(tree), /Microphone could not start/);
+  assert.ok(button(capture, 'Dismiss'));
+  assert.ok(!button(capture, 'Retry'));
+  await button(capture, 'Dismiss').props.onClick();
+  assert.equal(p.requests.filter(r => r.path === '/assist').length, 1);
+});
+
+test('local progress error and overlay cleanup have independent paired actions', async () => {
+  const warning = 'Overlay shutdown is not confirmed; retry Hide.';
+  const progress = 'Answer progress unavailable: network. The result still lands below when it completes.';
+  const p = lifecyclePane({}, { 3: true, 4: 'macos', 6: progress }, {
+    error: warning, overlay_cleanup_error: warning, overlay_stop_confirmed: false,
+    listening: false, backend: 'macos',
+  });
+  let tree = p.rerender();
+  const alerts = nodes(tree).filter(n => n.props?.role === 'alert');
+  const local = alerts.find(n => JSON.stringify(n).includes(progress));
+  const overlay = alerts.find(n => JSON.stringify(n).includes(warning));
+  assert.ok(local && overlay && local !== overlay);
+  assert.ok(button(local, 'Recheck status'));
+  assert.ok(!button(local, 'Retry hide overlay'));
+  assert.ok(button(overlay, 'Retry hide overlay'));
+  assert.ok(nodes(tree).some(n => n.props?.role === 'status' && JSON.stringify(n).includes(warning)));
+  assert.equal(button(tree, 'Start listening').props.disabled, true);
+  await button(local, 'Recheck status').props.onClick();
+  tree = p.rerender();
+  assert.match(JSON.stringify(tree), /Answer progress unavailable/);
+  assert.ok(!p.requests.some(r => r.path === '/assist'), 'progress recheck never replays');
+  assert.match(JSON.stringify(tree), /Overlay shutdown is not confirmed/);
+  assert.ok(!p.requests.some(r => r.path === '/overlay/hide'));
+  await button(nodes(tree).find(n => n.props?.role === 'alert' && JSON.stringify(n).includes(warning)), 'Retry hide overlay').props.onClick();
+  assert.equal(p.requests.filter(r => r.path === '/overlay/hide').length, 1);
+  p.unmount();
+});
+
+test('attributed capture restart preserves cloud availability and overlay safety gates', async () => {
+  for (const overlayUncertain of [false, true]) {
+    const store = new Map([['meeting-copilot.scope.v2', JSON.stringify({ backend: 'macos', transcriptionProvider: overlayUncertain ? 'local' : 'meta', transcriptionChoiceVersion: 1 })]]);
+    const ui = pane('', true, false, '', { 3: true }, {}, {
+      error_source: 'capture', capture_error: 'Microphone failed',
+      ...(overlayUncertain ? { overlay_cleanup_error: 'Overlay shutdown is not confirmed' } : {}),
+      capabilities: { macos_transcription: true, meta_asr: false },
+    }, { localStorage: { getItem: k => store.get(k), setItem: (k, v) => store.set(k, v) } });
+    const restart = button(alertFor(ui.tree, 'Microphone failed'), 'Restart capture');
+    assert.ok(restart);
+    assert.equal(restart.props.disabled, true);
+    await restart.props.onClick();
+    assert.ok(!ui.requests.some(r => r.path === '/start'), 'handler must also refuse blocked capture');
+    assert.ok(!ui.requests.some(r => r.path === '/assist'));
+  }
+});
 
 test('pane Pause and Clear carry lifecycle authorization; unregister only releases', async () => {
   const p = lifecyclePane({}, {}, { listening: true, backend: 'macos', segments: [{ text: 'Meeting' }] });
@@ -1515,10 +1703,10 @@ test('unsupported setup names the reason beside the answer action', async () => 
   assert.ok(buttons.some(n => n.children.includes('Suggest answer') && n.props.disabled));
 });
 
-test('backend errors offer retry, local errors offer dismiss', async () => {
+test('classified capture errors offer restart, local errors offer dismiss', async () => {
   const { tree: local } = pane('', true, false, '', { 6: 'boom' }, {}, {});
   assert.ok(nodes(local).some(n => n.type === 'button' && n.children.includes('Dismiss')));
-  const { tree: remote } = pane('', true, false, '', {}, {}, { error: 'capture failed' });
+  const { tree: remote } = pane('', true, false, '', {}, {}, { error: 'capture failed', error_source: 'capture' });
   assert.ok(nodes(remote).some(n => n.type === 'button' && n.children.includes('Restart capture')));
 });
 
@@ -1549,9 +1737,10 @@ test('dismiss never sends anything', async () => {
 });
 
 test('capture errors offer an honest capture restart instead of re-asking', async () => {
-  const { tree, requests } = pane('edited', true, false, '', { 23: { question: 'original?', extra: {} } }, {}, { error: 'capture failed' });
+  const { tree, requests } = pane('edited', true, false, '', { 3: true, 4: 'macos', 23: { question: 'original?', extra: {} } }, {}, { error: 'capture failed', error_source: 'capture' });
   const retry = nodes(tree).find(n => n.type === 'button' && (n.children.includes('Restart capture') || n.children.includes('Retry')));
   assert.ok(retry, 'capture errors offer recovery');
+  assert.equal(retry.props.disabled, false);
   await retry.props.onClick();
   assert.ok(!requests.some(r => r.path === '/assist'), 'capture recovery must not re-ask an answer');
   assert.ok(requests.some(r => r.path === '/start'), 'capture recovery restarts capture');
@@ -1569,7 +1758,7 @@ test('partial answers carry a retry for the complete response', async () => {
 
 test('async failure retry replays the stored original request', async () => {
   const stored = { question: 'orig q?', project: '/p', all_projects: false, web_fallback: false, transcript: 'you: hi' };
-  const { tree, requests } = pane('', true, false, '', {}, {}, { error_request: stored, error: 'RuntimeError: down' });
+  const { tree, requests } = pane('', true, false, '', {}, {}, { error_request: stored, error: 'RuntimeError: down', answer_error: 'RuntimeError: down', error_source: 'answer' });
   const retry = nodes(tree).find(n => n.type === 'button' && n.children.includes('Retry'));
   assert.ok(retry);
   await retry.props.onClick();
@@ -1616,7 +1805,7 @@ test('recent entries retry their own stored request', async () => {
 
 test('stored backend errors pair text with retry', async () => {
   const stored = { question: 'orig q?', project: null, all_projects: false, web_fallback: false, transcript: 'you: hi' };
-  const { tree } = pane('', true, false, '', { 6: 'local hiccup' }, {}, { error: 'RuntimeError: down', error_request: stored });
+  const { tree } = pane('', true, false, '', { 6: 'local hiccup' }, {}, { error: 'RuntimeError: down', error_request: stored, answer_error: 'RuntimeError: down', error_source: 'answer' });
   assert.ok(nodes(tree).some(n => n.type === 'button' && n.children.includes('Retry')));
 });
 

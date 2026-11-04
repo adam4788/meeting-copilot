@@ -212,7 +212,7 @@ class LeaseFencingTests(CheckedThreads):
         self.start(pane=pane, action=1)
         seen = self.state.pane_seen
         self.now += 29
-        display = Mock(lock=threading.RLock(), stopping=False,
+        display = Mock(lock=threading.RLock(), stopping=False, _reader_failed=set(),
                        _admission_lock=threading.RLock(), _lifecycle_epoch=0)
         display.show_overlay.side_effect = lambda: (self.tick(2), {'shown': True})[1]
         with patch('overlay_bridge.OverlayBridge', return_value=display):
@@ -253,7 +253,7 @@ class LeaseFencingTests(CheckedThreads):
         self.start(pane=pane, action=1)
         seen = self.state.pane_seen
         self.now += 31
-        display = Mock(lock=threading.RLock(), stopping=False,
+        display = Mock(lock=threading.RLock(), stopping=False, _reader_failed=set(),
                        _admission_lock=threading.RLock(), _lifecycle_epoch=0)
         display.show_overlay.return_value = {'shown': False}
         with patch('overlay_bridge.OverlayBridge', return_value=display):
@@ -299,9 +299,11 @@ class LeaseFencingTests(CheckedThreads):
     def test_explicit_show_reestablishes_expired_display_lease(self):
         pane = self.claim()
         self.now += 31
-        display = Mock(lock=threading.RLock(), stopping=False,
+        display = Mock(lock=threading.RLock(), stopping=False, _reader_failed=set(),
                        _admission_lock=threading.RLock(), _lifecycle_epoch=0)
         display.show_overlay.return_value = {'shown': True}
+        display.process.poll.return_value = None  # explicit live-helper evidence
+        display.process.returncode = None
         display.set_scope.return_value = {}
         with patch('overlay_bridge.OverlayBridge', return_value=display), patch.object(self.state, '_start_overlay_lease_locked'):
             self.post('/overlay/show', {'pane': pane, 'action': 1, 'scope': {}})

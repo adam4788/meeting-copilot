@@ -284,13 +284,14 @@ class MeetingState:
             self.backend = backend
             self.listening = True
             self.error = None
-            # New capture, new counters: restarting with identical options
-            # must not display the previous capture's loss as current.
+            self.error_request = None  # retry data belongs only to an active answer error
+            # Reset capture-owned status before starting the new adapter, not
+            # after its callback: old errors/messages/loss are not evidence
+            # about this generation, even when resuming identical options.
+            # New startup failures and pending-stop evidence must survive.
             # Meeting-level history stays in segments and recent answers.
-            if isinstance(self.capture_info, dict):
-                for _loss_key in ('warning', 'dropped_chunks', 'native_dropped_chunks', 'worker_dropped_chunks',
-                                  'sub_second_dropped_chunks', 'reader_incomplete', 'partial_tail'):
-                    self.capture_info.pop(_loss_key, None)
+            self.capture_info = {}
+            self.capture_error = None
             self.capture_generation += 1
             # The newest capture owns the terminal state from birth: a late
             # terminal from an older capture can never present itself as
@@ -1152,6 +1153,10 @@ class MeetingState:
             job['error'] = f'Overlay startup worker could not start: {exc}'
             job['done'].set()
         job['done'].wait(3)
+        # Observe startup liveness off the lifecycle/publication locks. A hung
+        # poll remains bounded and cannot turn uncertainty into Show success.
+        process = getattr(job['bridge'], 'process', None)
+        alive = self._overlay_process_alive(process) if process is not None else True
         with self.lifecycle_lock:
             self._expire_capture()
             with self.overlay_lock:
@@ -1161,6 +1166,10 @@ class MeetingState:
                 with getattr(bridge, 'lock', nullcontext()):
                     shown = (job['done'].is_set() and not job['error']
                              and bool(job['result'].get('shown'))
+                             and process not in getattr(bridge, '_reader_failed', ())
+                             and alive is True
+                             and getattr(bridge, 'process', None) is process
+                             and not isinstance(getattr(process, 'returncode', None), int)
                              and getattr(bridge, 'stopping', False) is not True)
                     if current and shown:
                         self.pending_overlay = None
@@ -1182,31 +1191,50 @@ class MeetingState:
     def _overlay_process_alive(self, process):
         """Tri-state inspection, with no process method on the caller thread.
 
-        A poll wrapper can hang just like a signal wrapper. Reuse its in-flight
-        probe rather than multiplying threads on status/retry. Workers acquire
-        no controller/publication locks; callers wait at most 50ms even when
-        status is nested under a publication lock. Never cache a live result
-        across completed probes (a subsequent exit must be discoverable).
+        A poll wrapper can hang just like a signal wrapper. One controller-wide
+        slot stays occupied until actual worker exit, including after done is
+        signaled. Same-process callers may join only before completion is
+        published; callers arriving afterward get unknown until worker exit.
+        Publication is not a fresh OS sample: every waiter vetoes healthy
+        evidence contradicted by that handle's known returncode at consumption.
+        Poll runs without control/publication locks; each caller waits at most
+        50ms (subject to scheduling). This is an observation, not a guarantee
+        that the child cannot exit after the last check.
         """
         if process is None:
             return False
         with self._overlay_probe_lock:
             self._overlay_probe_jobs = {target: job for target, job in self._overlay_probe_jobs.items()
-                                        if not job['done'].is_set()}
-            job = self._overlay_probe_jobs.get(process)
-            if job is None:
+                                        if job['worker'].is_alive()}
+            if self._overlay_probe_jobs:
+                target, job = next(iter(self._overlay_probe_jobs.items()))
+                if target is not process or job['done'].is_set():
+                    return None
+            else:
                 job = {'done': threading.Event(), 'alive': None}
                 self._overlay_probe_jobs[process] = job
                 def inspect_process():
+                    alive = None
                     try:
-                        job['alive'] = process.poll() is None
+                        alive = process.poll() is None
                     except Exception:
                         pass  # unknown is not evidence of exit
-                    finally:
+                    # Admission and completion share this lock: a caller either
+                    # joins before publication or cannot consume this result.
+                    with self._overlay_probe_lock:
+                        job['alive'] = alive
                         job['done'].set()
-                threading.Thread(target=inspect_process, name='meeting-overlay-probe', daemon=True).start()
-        job['done'].wait(.05)
-        return job['alive'] if job['done'].is_set() else None
+                job['worker'] = threading.Thread(target=inspect_process, name='meeting-overlay-probe', daemon=True)
+                job['worker'].start()
+        if not job['done'].wait(.05):
+            return None
+        # Publication can lag the OS sample (including inside a poll wrapper).
+        # Each waiter checks the exact handle again, without invoking poll on
+        # a control thread. A known exit contradicts this healthy sample; it
+        # does not itself prove group/reader cleanup or authorize admission.
+        if job['alive'] is True and isinstance(getattr(process, 'returncode', None), int):
+            return None
+        return job['alive']
 
     def _reconcile_overlay_admission(self, *, for_show=False):
         """Discover autonomous bridge retirement before Start or Show.
@@ -1225,6 +1253,7 @@ class MeetingState:
         process = getattr(bridge, 'process', None)
         alive = self._overlay_process_alive(process)
         retire = self.overlay is bridge and (getattr(bridge, 'stopping', False) is True
+                 or process in getattr(bridge, '_reader_failed', ())
                  or alive is None or (alive is False and (process is not None or for_show)))
         if retire:
             with self.overlay_lock:
@@ -1246,8 +1275,13 @@ class MeetingState:
         publication = self.overlay_lock if code == 503 else nullcontext()
         display = getattr(bridge, 'lock', nullcontext()) if code == 503 else nullcontext()
         with publication, display, getattr(bridge, '_admission_lock', nullcontext()):
+            process = getattr(bridge, 'process', None)
+            # Plain cached exit evidence can veto a previously healthy ticket.
+            # Never poll here: freshness/cleanup is established off these locks.
             retired = bridge is not None and (
                 getattr(bridge, 'stopping', False) is True
+                or isinstance(getattr(process, 'returncode', None), int)
+                or process in getattr(bridge, '_reader_failed', ())
                 or getattr(bridge, '_lifecycle_epoch', 0) != epoch)
             if (not retired and self.overlay is bridge and self.pending_overlay is None
                     and not self.overlay_cleanup_error):
@@ -1259,7 +1293,7 @@ class MeetingState:
         # A clean exit in the reconciliation/commit gap is not an unconfirmed
         # helper. Reap outside all admission/publication locks, then continue
         # only if lifecycle ownership is still empty and cleanup is confirmed.
-        if retired and self._overlay_process_alive(bridge.process) is False:
+        if retired and self._overlay_process_alive(process) is False:
             if self.pending_overlay is bridge:
                 self._finish_overlay_cleanup()
             if self.overlay is None and self.pending_overlay is None and not self.overlay_cleanup_error:
@@ -1290,6 +1324,13 @@ class MeetingState:
                     self.overlay.update(self.status())
                 except Exception:
                     pass
+                # Scope publication/status may observe an exit after the
+                # reconciliation probe. Do not commit a known-dead reuse.
+                process = getattr(self.overlay, 'process', None)
+                if (isinstance(getattr(process, 'returncode', None), int)
+                        or process in getattr(self.overlay, '_reader_failed', ())):
+                    self._retire_overlay_locked()
+                    raise _unavailable('Overlay helper exited during Show; retry Hide / Show.')
                 if not self.listening and self.pending_stop is None:
                     self._touch_pane_seen()  # idle display lease only
                 self._start_overlay_lease_locked()
@@ -1537,6 +1578,11 @@ class MeetingState:
                 except Exception:
                     overlay_status = None
                 alive = self._overlay_process_alive(overlay.process)
+                if overlay.process in getattr(overlay, '_reader_failed', ()):
+                    uncertain_overlay = True
+                    cleanup_error = cleanup_error or (
+                        'Overlay click channel failed; the window may still be visible. '
+                        'Overlay shutdown is not confirmed. Retry Hide / Clear before starting capture.')
                 if alive is None:
                     uncertain_overlay = True
                 if alive is False:
@@ -1545,6 +1591,9 @@ class MeetingState:
                     # owned handle; status must not bypass that confirmation.
                     uncertain_overlay = uncertain_overlay or overlay.process is not None
                     overlay = None
+            if uncertain_overlay and not cleanup_error:
+                cleanup_error = ('Overlay shutdown is not confirmed; the window may still be visible. '
+                                 'Retry Hide / Clear before starting capture.')
             # The last session descriptor lets the pane compare the full
             # session key (backend + recording/model/source) before starting:
             # any change begins a fresh meeting and clears retained content.
@@ -1571,7 +1620,12 @@ class MeetingState:
                     'overlay_cleanup_error': cleanup_error,
                     'overlay_stop_confirmed': not uncertain_overlay and overlay is None and cleanup_error is None,
                     'segments': list(self.segments), 'error': self.stop_error or cleanup_error or self.error or self.capture_error,
-                    'error_request': self.error_request,
+                    # Keep the legacy summary, but never infer retry authority
+                    # from it: independent failures can coexist behind it.
+                    'error_source': ('stop' if self.stop_error else 'overlay' if cleanup_error else
+                                     'answer' if self.error else 'capture' if self.capture_error else None),
+                    'stop_error': self.stop_error, 'answer_error': self.error, 'capture_error': self.capture_error,
+                    'error_request': self.error_request if self.error else None,
                     'busy': self.busy, 'result': self.result, 'requests': {e['request_id']: dict(e) for e in live},
                     'recent': terminal, 'meetily_clear_error': self.meetily_clear_error,
                     'capture': ({**self.capture_info, 'state': 'stopping', 'error': self.stop_error,
