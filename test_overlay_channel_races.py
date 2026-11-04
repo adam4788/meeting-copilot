@@ -225,6 +225,12 @@ time.sleep(20)
             try:
                 for _ in range(400):
                     self.assertTrue(bridge.show_overlay()['reused'])
+                    # Pruning requires actual thread exit, not just its result
+                    # publication. A back-to-back call may correctly refuse a
+                    # completed probe whose worker is still unwinding.
+                    for worker in tuple(bridge._show_probe_threads):
+                        worker.join(2)
+                        self.assertFalse(worker.is_alive())
                 with bridge.lock:
                     self.assertIn(live, bridge.threads)
                     self.assertIn(unstarted, bridge.threads)
