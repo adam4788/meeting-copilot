@@ -32,7 +32,10 @@ export default {
       catch (error) { life.release = Promise.reject(error); }
       // Observe cleanup failures too; Restart still receives the rejection.
       const warnStop = () => notify('warning', 'Capture stop is not confirmed. Lease expiry initiates stop but cannot guarantee physical shutdown. Reopen Meeting Copilot to check status and Retry stop; verify the OS audio indicator.');
-      life.release.then(result => { if (result?.stop_confirmed === false || result?.stopping) warnStop(); }, warnStop);
+      life.release.then(result => {
+        if (result?.stop_confirmed === false || result?.stopping) warnStop();
+        if (result?.overlay_stop_confirmed === false) notify('warning', result.overlay_cleanup_error || 'Overlay shutdown is not confirmed. Reopen the pane and Retry hide overlay.');
+      }, warnStop);
       return life.release;
     }
     function MeetingPane({ registration: paneEntry }) {
@@ -220,10 +223,11 @@ export default {
             const hidden = await api('/overlay/hide', { pane: life.pane, action });
             if (!life.mounted || life.action !== action) return;
             if (hidden?.accepted === false) throw new Error('Overlay ownership changed.');
+            if (hidden?.overlay_stop_confirmed === false) throw new Error(hidden.overlay_cleanup_error || 'Overlay shutdown is not confirmed.');
             life.owner = null; setOverlayOn(false);
             setOverlayMsg('Overlay closed because scope synchronization failed. Show overlay to retry current settings.');
           } catch (hideError) {
-            if (life.mounted && life.action === action) setOverlayMsg('Scope sync failed and overlay closure could not be confirmed. Close the pane to stop it, or retry Hide overlay.');
+            if (life.mounted && life.action === action) setOverlayMsg('Scope sync failed and overlay closure could not be confirmed. Retry Hide overlay or quit the helper; closing the pane only requests shutdown.');
           }
         }
       }
@@ -259,8 +263,8 @@ export default {
             if (!life.mounted) return false;
             body = { ...body, pane, action: ++life.action };
           }
-          await api(path, body);
-          if (path === '/clear') retireLocalOverlay();
+          const response = await api(path, body);
+          if (path === '/clear') { retireLocalOverlay(); setOverlayMsg(response?.overlay_cleanup_error || ''); }
         }
         catch (e) { setError(String(e.message || e)); return false; }
         finally { setPending(false); }
@@ -313,10 +317,11 @@ export default {
           const pane = await claimOverlayPane(life);
           if (!life.mounted) return;
           const action = ++life.action;
-          if (overlayOn) {
+          if (overlayOn || data.overlay_cleanup_error) {
             const hidden = await api('/overlay/hide', { pane, action });
             if (!life.mounted || life.action !== action) return;
             if (hidden?.accepted === false) throw new Error('This pane no longer owns the overlay. Reopen the pane to take ownership.');
+            if (hidden?.overlay_stop_confirmed === false) throw new Error(hidden.overlay_cleanup_error || 'Overlay shutdown is not confirmed.');
             life.owner = null; life.syncedKey = null; setOverlayOn(false);
           } else {
             const shown = await api('/overlay/show', { pane, action, scope: { ...scope, ...overlayQuery, seq: scopeSeq.current } });
@@ -516,10 +521,10 @@ export default {
               ? h(Button, { variant: 'secondary', disabled: pending, onClick: () => act('/pause', {}) }, 'Retry stop')
               : data.listening
               ? h(Button, { variant: 'secondary', onClick: () => act('/pause', {}) }, data.backend === 'meetily' ? 'Detach' : 'Pause listening')
-              : h(Button, { disabled: pending || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), onClick: () => startCapture() }, ((data.segments || []).length || result || (data.recent || []).length) ? (backend === 'meetily' ? 'Resume' : 'Resume listening') : (backend === 'meetily' ? 'Attach to Meetily' : 'Start listening')),
-            !data.listening && !data.stopping && ((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), title: 'Starts a fresh meeting; the earlier transcript, answers, and retry data are cleared', onClick: () => startCapture(true) }, 'New meeting'),
-            ((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending, title: 'Clears past Q&A, transcript segments, and cached snippets for this meeting', onClick: async () => { if (typeof window !== 'undefined' && window.confirm && !window.confirm('Clear this meeting? Past questions, answers, and transcript segments are removed from the pane.')) return; if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } } }, 'Clear meeting'),
-            h(Button, { variant: 'secondary', disabled: pending || !data.capabilities?.overlay, title: 'Show or hide the floating meeting overlay (macOS)', onClick: toggleOverlay }, overlayOn ? 'Hide overlay' : 'Show overlay')),
+              : h(Button, { disabled: pending || !!data.overlay_cleanup_error || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), onClick: () => startCapture() }, ((data.segments || []).length || result || (data.recent || []).length) ? (backend === 'meetily' ? 'Resume' : 'Resume listening') : (backend === 'meetily' ? 'Attach to Meetily' : 'Start listening')),
+            !data.listening && !data.stopping && ((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending || !!data.overlay_cleanup_error || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), title: 'Starts a fresh meeting; the earlier transcript, answers, and retry data are cleared', onClick: () => startCapture(true) }, 'New meeting'),
+            (data.overlay_cleanup_error || (data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending, title: 'Clears past Q&A, transcript segments, and cached snippets for this meeting', onClick: async () => { if (typeof window !== 'undefined' && window.confirm && !window.confirm('Clear this meeting? Past questions, answers, and transcript segments are removed from the pane.')) return; if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } } }, 'Clear meeting'),
+            h(Button, { variant: 'secondary', disabled: pending || (!data.capabilities?.overlay && !data.overlay_cleanup_error), title: 'Show or hide the floating meeting overlay (macOS)', onClick: toggleOverlay }, data.overlay_cleanup_error ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay')),
           h('p', { style: { ...muted, margin: 0 } }, 'No additional audio files · disconnect initiates detach/pause; verify stop status before assuming audio is off. Resume keeps this meeting (transcript and latest answer stay); New meeting, different settings, or Clear starts fresh. Pausing can discard the last few seconds of audio.'),
           data.capture && h('div', { style: muted }, data.capture.message || data.capture.state || ''),
           data.capture && (data.capture.warning || lossText(data.capture)) && h('div', { role: 'status', style: muted },
@@ -699,7 +704,7 @@ export default {
           overlayMsg && h('p', { role: 'status', style: { ...muted, margin: 0 } }, overlayMsg),
           !data.capabilities?.overlay && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'Overlay helper unavailable. Check the macOS helper build and restart the gateway, then try Show overlay again.'),
           h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
-            h(Button, { variant: overlayOn ? 'secondary' : undefined, disabled: pending || !data.capabilities?.overlay, onClick: toggleOverlay }, overlayOn ? 'Hide overlay' : 'Show overlay'),
+            h(Button, { variant: overlayOn ? 'secondary' : undefined, disabled: pending || (!data.capabilities?.overlay && !data.overlay_cleanup_error), onClick: toggleOverlay }, data.overlay_cleanup_error ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay'),
             h(Button, { variant: 'secondary', disabled: pending || !overlayOn, onClick: async () => {
               setPending(true); setOverlayMsg('');
               scopeSeq.current += 1;
@@ -767,6 +772,7 @@ export default {
             const released = await releaseOverlayPane(life);
             if (released?.accepted !== true) throw new Error('Pane ownership changed; release was not accepted.');
             if (released?.stop_confirmed === false || released?.stopping) throw new Error('Capture stop is not confirmed; the backend is retrying stop.');
+            if (released?.overlay_stop_confirmed === false) throw new Error(released.overlay_cleanup_error || 'Overlay shutdown is not confirmed. Retry hide overlay before restarting.');
           }
         }
         if (!current()) return;

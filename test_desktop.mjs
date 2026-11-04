@@ -250,6 +250,38 @@ test('actual macOS parser cleanup failure renders unconfirmed and scoped Retry s
   p.unmount(); await backend.rpc({ command: 'inspect' });
 });
 
+test('real denied overlay cleanup stays visible across Clear and failed Hide; retry confirms shutdown', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t);
+  const p = backend.mount();
+  await button(p.tree, 'Start listening').props.onClick();
+  await backend.rpc({ command: 'install-overlay-fault' });
+  await backend.rpc({ command: 'segment', text: 'Question before Clear?' });
+  await button(await p.refresh(), 'Clear meeting').props.onClick();
+  let tree = await p.refresh();
+  assert.match(JSON.stringify(tree), /Overlay shutdown is not confirmed/);
+  assert.ok(button(tree, 'Retry hide overlay'), 'Clear must retain an explicit cleanup retry');
+  assert.equal(button(tree, 'Start listening').props.disabled, true);
+  assert.equal((await backend.rpc({ command: 'inspect' })).running, false);
+  await button(tree, 'Retry hide overlay').props.onClick();
+  tree = await p.refresh();
+  assert.ok(button(tree, 'Retry hide overlay'), 'denied retry is not hidden');
+  await button(tree, 'Clear meeting').props.onClick();
+  tree = await p.refresh();
+  assert.match(JSON.stringify(tree), /Overlay shutdown is not confirmed/);
+  assert.equal((await backend.rpc({ command: 'inspect-overlay' })).alive, true);
+  await backend.rpc({ command: 'allow-overlay-stop' });
+  await button(tree, 'Retry hide overlay').props.onClick();
+  tree = await p.refresh();
+  const final = await backend.rpc({ command: 'inspect-overlay' });
+  assert.equal(final.alive, false);
+  assert.equal(final.pending, false);
+  assert.equal(final.status.overlay_stop_confirmed, true);
+  assert.equal(final.status.overlay_cleanup_error, null);
+  assert.equal(final.status.listening, false);
+  assert.doesNotMatch(JSON.stringify(tree), /Overlay shutdown is not confirmed/);
+  assert.ok(button(tree, 'Show overlay'));
+});
+
 test('accepted release with unconfirmed physical stop does not reopen or claim success', async () => {
   const p = lifecyclePane({ '/overlay/release': { accepted: true, stopping: true, stop_confirmed: false } }, { 3: true, 4: 'macos' });
   await button(p.tree, 'Start listening').props.onClick();
@@ -265,6 +297,22 @@ test('accepted release with unconfirmed physical stop does not reopen or claim s
   closed.unmount(); await new Promise(resolve => setImmediate(resolve));
   assert.ok(closed.requests.some(r => r.path === '/overlay/release'));
   assert.ok(closed.notices.some(n => n.kind === 'warning' && /not confirmed/.test(n.message)));
+});
+
+test('overlay release failure blocks Restart and warns on unmount independently of audio stop', async () => {
+  const reply = { accepted: true, stop_confirmed: true, stopping: false, overlay_stop_confirmed: false,
+    overlay_cleanup_error: 'Overlay shutdown is not confirmed. Retry Hide / Clear.' };
+  const p = lifecyclePane({ '/overlay/release': reply });
+  await button(p.tree, 'Show overlay').props.onClick();
+  const original = p.contributions.find(c => c.area === 'panes');
+  await command(p, 'Restart Meeting Copilot')();
+  assert.equal(p.contributions.find(c => c.area === 'panes'), original);
+  assert.ok(p.notices.some(n => n.kind === 'warning' && /Overlay shutdown is not confirmed/.test(n.message)));
+  assert.ok(!p.notices.some(n => /pane reopened/.test(n.message)));
+  const closed = lifecyclePane({ '/overlay/release': reply });
+  await button(closed.tree, 'Show overlay').props.onClick();
+  closed.unmount(); await new Promise(resolve => setImmediate(resolve));
+  assert.ok(closed.notices.some(n => n.kind === 'warning' && /Overlay shutdown is not confirmed/.test(n.message)));
 });
 
 test('unconfirmed stop is visible and only offers stop retry, not restart capture', async () => {

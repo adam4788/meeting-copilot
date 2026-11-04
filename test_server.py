@@ -516,7 +516,8 @@ class OverlayRequestScopeTests(unittest.TestCase):
         scoped = state.overlay_scope({'owner': state.overlay_owner, 'project': 'alpha'})
         self.assertTrue(scoped['shown'])
         self.assertEqual(state.overlay_scope_value, {'project': 'alpha'})
-        self.assertEqual(state.overlay_hide(), {'shown': False, 'accepted': True})
+        self.assertEqual(state.overlay_hide(), {'shown': False, 'accepted': True,
+                                                'overlay_stop_confirmed': True, 'overlay_cleanup_error': None})
         self.assertIsNone(state.overlay)
 
     def test_overlay_show_fails_closed_without_helper_and_reports_capability(self):

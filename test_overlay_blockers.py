@@ -278,7 +278,9 @@ class BlockerTests(CheckedThreads):
         overlay.request_by_row['row'] = True
         overlay.reserved_generation['row'] = overlay.paused_generation
         overlay.answers['row']['busy'] = True
-        with patch.object(threading.Thread, 'start', lambda worker: pending_workers.append(worker)):
+        original_start = threading.Thread.start
+        with patch.object(threading.Thread, 'start', lambda worker: original_start(worker)
+                          if worker.name == 'meeting-overlay-cleanup' else pending_workers.append(worker)):
             overlay.ask('row', overlay.questions['row'], overlay.paused_generation)
         self.assertEqual(mapped, [True])
         self.assertEqual(len(pending_workers), 1)

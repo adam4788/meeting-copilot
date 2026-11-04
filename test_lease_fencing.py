@@ -114,12 +114,20 @@ class LeaseFencingTests(CheckedThreads):
     def test_claim_returns_live_capability_even_when_old_helper_hide_fails(self):
         pane = self.claim()
         self.start(pane=pane, action=1)
-        self.state.overlay = Mock()
-        self.state.overlay.hide_overlay.side_effect = RuntimeError('old helper pipe closed')
+        display = Mock(process=None)
+        display.hide_overlay.side_effect = RuntimeError('old helper pipe closed')
+        self.state.overlay = display
         new = self.claim(2)
         self.assertFalse(self.state.listening)
         self.assertTrue(self.post('/heartbeat', {'pane': new})['accepted'])
-        self.start(pane=new, action=1)
+        self.assertIs(self.state.pending_overlay, display)
+        self.assertEqual(self.client.post('/start', json=dict(pane=new, action=1, consent=True, backend='macos')).status_code, 409)
+        display.hide_overlay.side_effect = None
+        display.hide_overlay.return_value = {'shown': False, 'stop_confirmed': True}
+        hidden = self.post('/overlay/hide', {'pane': new, 'action': 2})
+        self.assertTrue(hidden['overlay_stop_confirmed'])
+        self.assertIsNone(self.state.pending_overlay)
+        self.start(pane=new, action=3)
 
     def test_claim_stops_without_overlay_lock_and_preserves_liveness(self):
         import threading

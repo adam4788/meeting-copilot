@@ -55,11 +55,31 @@ app = FastAPI()
 app.include_router(server.make_router(state))
 fault_process = None
 capture = None
+overlay_signals = []
+overlay_process = None
 with ExitStack() as faults, TestClient(app) as client:
     for line in sys.stdin:
         message = json.loads(line)
         try:
-            if message.get('command') == 'install-macos-fault':
+            if message.get('command') == 'install-overlay-fault':
+                from test_overlay_teardown import real_display
+                display, overlay_process = faults.enter_context(real_display())
+                state.overlay = display
+                for name in ('terminate', 'kill'):
+                    signal_patch = patch.object(overlay_process, name, side_effect=PermissionError('injected denied signaling'))
+                    signal_patch.start()
+                    faults.callback(signal_patch.stop)
+                    overlay_signals.append(signal_patch)
+                result = {'installed': True}
+            elif message.get('command') == 'allow-overlay-stop':
+                for signal_patch in overlay_signals:
+                    signal_patch.stop()
+                result = {'allowed': True}
+            elif message.get('command') == 'inspect-overlay':
+                result = {'alive': overlay_process is not None and overlay_process.poll() is None,
+                          'pending': state.pending_overlay is not None,
+                          'status': state.status(touch=False)}
+            elif message.get('command') == 'install-macos-fault':
                 # Production parser, status callback and group termination;
                 # only OS I/O is synthetic. Never launch hardware/providers.
                 import macos_audio

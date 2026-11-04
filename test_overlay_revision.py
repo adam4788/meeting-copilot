@@ -162,7 +162,7 @@ class RevisionTests(CheckedThreads):
                 state.bridge = Mock()
                 overlay.answers['row']['answer'] = 'PRIVATE OLD'
                 before = overlay.snapshot_id
-                with patch.object(threading.Thread, 'start'):
+                with patch.object(state, 'watchdog'):
                     state.start(True, recording_id='old' if explicit else 'new', new_meeting=explicit)
                 count = len(overlay.pushed)
                 overlay.push()
@@ -190,9 +190,8 @@ class RevisionTests(CheckedThreads):
         overlay.lock = ObservedLock()
         starter = threading.Thread(target=self.checked_callback(
             lambda: state.start(True, recording_id='new')), daemon=True)
-        original_start = threading.Thread.start
-        # Suppress only capture/lease threads, not the lifecycle contender.
-        with patch.object(threading.Thread, 'start', lambda t: original_start(t) if t is starter else None):
+        # Keep the real cleanup worker; suppress only the unrelated watchdog.
+        with patch.object(state, 'watchdog'):
             with original_lock:
                 starter.start()
                 self.assertTrue(acquired.wait(2), 'Start must synchronously fence the old bridge')

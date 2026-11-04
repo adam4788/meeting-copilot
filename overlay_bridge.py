@@ -399,6 +399,11 @@ class OverlayBridge:
         self._push_queue = _queue.Queue(maxsize=8)
         self._click_queue = _queue.Queue(maxsize=32)
         self._stdin_lock = threading.Lock()
+        self._cleanup_lock = threading.Lock()
+        self._cleanup_job = None
+        self._signal_jobs = {}
+        self.cleanup_error = None
+        self._reader = None
 
     # -- backend truth in ------------------------------------------------
     def retire_authorization(self):
@@ -927,6 +932,9 @@ class OverlayBridge:
 
     def show_overlay(self):
         """Explicit pane action: open the overlay window, start forwarding."""
+        if self.stopping and self.process is not None:
+            return {'shown': None, 'stop_confirmed': False,
+                    'error': self.cleanup_error or 'Overlay shutdown is not confirmed; retry Hide.'}
         if self.process is not None:
             try:
                 if self.process.poll() is None:
@@ -934,7 +942,8 @@ class OverlayBridge:
             except Exception:
                 pass
             # Reaped or exited helper: fall through to a clean relaunch.
-            self._reap_locked(None)
+            if not self._reap_locked(None):
+                return {'shown': None, 'stop_confirmed': False, 'error': self.cleanup_error}
         self.stopping = False
         self.start_helper()
         process = self.process
@@ -950,9 +959,10 @@ class OverlayBridge:
         if process.stdout is not None:
             reader = threading.Thread(target=self._read_clicks,
                                       name='overlay-click-reader', daemon=True)
-            reader.start()
+            self._reader = reader
             with self.lock:
                 self.threads.append(reader)
+            reader.start()
         self._start_pusher_locked()
         self._start_poller_locked()
         self.push()
@@ -960,8 +970,9 @@ class OverlayBridge:
 
     def hide_overlay(self):
         """Explicit pane action: close the window, cancel rows, reap the group."""
-        self.stop()
-        return {'shown': False}
+        confirmed = self.stop()
+        return {'shown': False if confirmed else None, 'stop_confirmed': confirmed,
+                'error': self.cleanup_error}
 
     def _start_pusher_locked(self):
         with self._poller_lock:
@@ -1243,9 +1254,10 @@ class OverlayBridge:
         if process and process.stdout:
             reader = threading.Thread(target=self._read_clicks,
                                       name='overlay-click-reader', daemon=True)
-            reader.start()
+            self._reader = reader
             with self.lock:
                 self.threads.append(reader)
+            reader.start()
         self._start_pusher_locked()
         self._start_poller_locked()
         try:
@@ -1271,12 +1283,18 @@ class OverlayBridge:
             return
         try:
             for line in process.stdout:
+                # A retired reader never publishes errors or clicks, including
+                # a line delivered only after a failed shutdown is retried.
+                if self.stopping or process is not self.process:
+                    break
                 try:
                     import json as _json
                     event = _json.loads(line) if isinstance(line, str) else None
                     if isinstance(event, dict) and event.get('type') == 'error':
                         code = str(event.get('code') or 'overlay')
                         with self.lock:
+                            if self.stopping or process is not self.process:
+                                break
                             if code == 'hotkey':
                                 self._sticky_error = 'Overlay shortcut unavailable — overlay stays click-through. Use the pane Show/Hide actions instead.'
                             else:
@@ -1292,39 +1310,80 @@ class OverlayBridge:
         except (OSError, ValueError):
             pass
 
+    def _signal_bounded(self, target, name):
+        # OS signaling normally returns immediately. Faulty wrappers / OS calls
+        # need not. Keep at most one in-flight call per signal and process;
+        # a hung TERM must not prevent an independent KILL or leak retry threads.
+        key = (target, name)
+        with self._cleanup_lock:
+            worker = self._signal_jobs.get(key)
+            if worker is None or not worker.is_alive():
+                def signal_child():
+                    try:
+                        getattr(target, name)()
+                    except Exception:
+                        pass  # poll, not signal delivery, proves termination
+                worker = threading.Thread(target=signal_child, name='overlay-signal', daemon=True)
+                self._signal_jobs[key] = worker
+                worker.start()
+        worker.join(.05)
+
     def _reap_locked(self, process):
+        """Bounded caller wait; no buffered IO or process methods on caller.
+
+        Despite the historic name, never hold bridge.lock across this call.
+        Only the caller publishes the outcome. A late worker cannot clear a
+        newer process or resurrect an invalidated bridge.
+        """
         target = process if process is not None else self.process
         if target is None:
-            return
-        try:
-            running = target.poll() is None
-        except Exception:
-            running = False
-        if running:
-            try:
-                target.terminate()
-            except (OSError, ProcessLookupError):
-                pass
-            try:
-                target.wait(timeout=2)
-                running = False
-            except subprocess.TimeoutExpired:
-                try:
-                    target.kill()
-                    target.wait(timeout=2)
-                except Exception:
-                    pass
-        # Close pipes only after the child is reaped: closing stdout while the
-        # reader thread is blocked is safe, and closing stdin first avoids the
-        # old stop-while-reader-blocked deadlock.
-        for stream in (getattr(target, 'stdout', None), getattr(target, 'stdin', None)):
-            if stream is not None:
-                try:
-                    stream.close()
-                except (BrokenPipeError, OSError, ValueError):
-                    pass
-        if self.process is target:
-            self.process = None
+            self.cleanup_error = None
+            return True
+        with self._cleanup_lock:
+            job = self._cleanup_job
+            if job is None or job['target'] is not target or (job['done'].is_set() and not job['confirmed']):
+                job = {'target': target, 'done': threading.Event(), 'confirmed': False}
+                self._cleanup_job = job
+                reader = self._reader
+                def reap():
+                    try:
+                        for name in ('terminate', 'kill'):
+                            if target.poll() is not None:
+                                break
+                            self._signal_bounded(target, name)
+                            deadline = time.monotonic() + .15
+                            while target.poll() is None and time.monotonic() < deadline:
+                                time.sleep(.01)
+                        job['confirmed'] = target.poll() is not None
+                    except Exception:
+                        job['confirmed'] = False
+                    finally:
+                        job['done'].set()
+                    if job['confirmed']:
+                        # EOF can be delayed (e.g. inherited pipe descriptors).
+                        # Never close buffered stdout while its reader owns it.
+                        # This worker owns only retired resources, no lifecycle
+                        # or publication locks, and never changes bridge state.
+                        if reader is not None and reader is not threading.current_thread():
+                            reader.join()
+                        for stream in (getattr(target, 'stdout', None), getattr(target, 'stdin', None)):
+                            if stream is not None:
+                                try:
+                                    stream.close()
+                                except (OSError, ValueError):
+                                    pass
+                job['worker'] = threading.Thread(target=reap, name='overlay-reaper', daemon=True)
+                job['worker'].start()
+        job['done'].wait(.5)
+        confirmed = job['done'].is_set() and job['confirmed'] and job['target'] is target
+        if confirmed:
+            if self.process is target:
+                self.process = None
+            self.cleanup_error = None
+        else:
+            self.cleanup_error = ('Overlay shutdown is not confirmed; the old window may still display '
+                                  'meeting content. Retry Hide / Clear. If it persists, quit the overlay helper.')
+        return confirmed
 
     def _retire_lifecycle_locked(self):
         """Invalidate queued taps as well as admitted slots on every exit."""
@@ -1362,12 +1421,7 @@ class OverlayBridge:
                 self._push_queue.get_nowait()
         except Exception:
             pass
-        process = self.process
-        if process is not None:
-            try:
-                self._reap_locked(process)
-            except OSError:
-                pass
+        return self._reap_locked(self.process)
 
 
 def main(argv=None):
