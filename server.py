@@ -173,7 +173,8 @@ class MeetingState:
                 return {'listening': True}
             if backend in ('native', 'macos'):
                 self.get_audio(backend, transcription_model, audio_source, transcription_provider, asr_mode)
-            self.last_start_args = (backend, recording_id, transcription_model, audio_source)
+            self.last_start_args = (backend, recording_id, transcription_model, audio_source,
+                                    transcription_provider, asr_mode)
             session_key = (backend, recording_id if backend == 'meetily'
                            else (transcription_model, audio_source, transcription_provider, asr_mode))
             # A new meeting never inherits the prior one: same-settings start
@@ -384,8 +385,13 @@ class MeetingState:
                     and self.session_key == clear_session):
                 self.pause(retain_tail=False)
                 self.retiring_generations.clear()
-                backend, recording_id, tm, src = last_args
-                self.start(True, backend, recording_id, tm, src)
+                backend, recording_id, tm, src, *rest = last_args
+                # Sessions saved before provider selection existed carry
+                # only four fields; they restart as local/ENDPOINTING.
+                provider = rest[0] if len(rest) > 0 else 'local'
+                asr_mode = rest[1] if len(rest) > 1 else 'ENDPOINTING'
+                self.start(True, backend, recording_id, tm, src,
+                           transcription_provider=provider, asr_mode=asr_mode)
 
     def pause(self, *, retain_tail=True):
         with self.lifecycle_lock:

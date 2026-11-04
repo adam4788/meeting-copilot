@@ -76,6 +76,18 @@ def terminate_group(process, timeout=1.0):
 from pathlib import Path
 import threading
 
+import re as _re
+
+_SPEAKER_LABEL = _re.compile(r'^(you|remote)( \u00b7 Speaker [A-Za-z0-9_-]{1,12})?$|^Speaker [A-Za-z0-9_-]{1,12}$')
+
+
+def _valid_speaker(value):
+    """Worker speaker identities: a source label ('you'/'remote'),
+    optionally carrying a bounded diarization suffix, or a bare bounded
+    'Speaker X' label. Anything else is a protocol violation."""
+    return isinstance(value, str) and bool(_SPEAKER_LABEL.match(value))
+
+
 MODELS = ('tiny.en', 'base.en', 'small.en')
 SOURCES = ('microphone', 'system', 'both')
 PROVIDERS = ('local', 'meta')
@@ -228,7 +240,7 @@ class MacOSAudioCapture:
                 elif kind == 'segment':
                     text, stamp = event.get('text'), event.get('timestamp')
                     if (not isinstance(text, str) or len(text) > 16000 or
-                            event.get('speaker') not in ('you', 'remote') or
+                            not _valid_speaker(event.get('speaker')) or
                             not isinstance(stamp, (float, int)) or not math.isfinite(stamp)):
                         raise ValueError('protocol')
                     segment = {'speaker': event['speaker'],

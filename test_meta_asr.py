@@ -36,7 +36,7 @@ class EventMapperTests(unittest.TestCase):
         self.assertIsNone(mapper.map({'type': 'transcript', 'transcript': 'hel', 'final': False}, 1.0))
         mapper.map({'type': 'speaker', 'label': 'B', 'turnId': 1}, 1.0)
         segment = mapper.map({'type': 'speechComplete', 'turnId': 1, 'transcript': 'Hello there.'}, 2.0)
-        self.assertEqual(segment['speaker'], 'Speaker B')
+        self.assertEqual(segment['speaker'], 'you \u00b7 Speaker B')
         self.assertEqual(segment['text'], 'Hello there.')
         final = mapper.map({'type': 'transcript', 'transcript': 'Done.', 'final': True}, 3.0)
         self.assertEqual(final['speaker'], 'you')
@@ -137,7 +137,7 @@ class FileTranscribeTests(unittest.TestCase):
         self.assertIn(b'name="audio"', body)
         self.assertIn(b'RIFF-fake-wav', body)
         self.assertEqual([s['text'] for s in segments], ['First turn.', 'Second turn.'])
-        self.assertEqual(segments[0]['speaker'], 'Speaker A')
+        self.assertEqual(segments[0]['speaker'], 'you \u00b7 Speaker A')
 
     def test_transcribe_file_requires_key(self):
         with self.assertRaises(meta_asr.MetaAsrError):

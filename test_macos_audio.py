@@ -62,6 +62,45 @@ class GatewayTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertFalse(module.MacOSAudioCapture().devices()['meta_asr_available'])
 
+    def test_diarized_meta_segments_survive_the_adapter(self):
+        # Producer: the real Meta event mapper turns a diarized turn into
+        # a worker segment. Consumer: the real MacOSAudioCapture._run must
+        # accept it (it used to raise protocol and drop the segment).
+        import meta_asr
+        mapper = meta_asr.EventMapper('you')
+        mapper.map({'type': 'speechStart', 'turnId': 1}, 1.0)
+        mapper.map({'type': 'speaker', 'label': 'B'}, 1.1)
+        produced = mapper.map({'type': 'speechComplete', 'turnId': 1,
+                               'transcript': 'Diarized words.'}, 1.2)
+        self.assertEqual(produced['speaker'], 'you \u00b7 Speaker B')
+        module = importlib.import_module('macos_audio')
+        self.assertTrue(module._valid_speaker('you'))
+        self.assertTrue(module._valid_speaker('remote'))
+        self.assertTrue(module._valid_speaker('you \u00b7 Speaker B'))
+        self.assertTrue(module._valid_speaker('Speaker B'))
+        self.assertFalse(module._valid_speaker('you; DROP TABLE'))
+        self.assertFalse(module._valid_speaker('Speaker ' + 'X' * 40))
+        self.assertFalse(module._valid_speaker(''))
+        import json
+        import subprocess
+        import sys
+        import threading
+        real_popen = subprocess.Popen
+        lines = [{'type': 'status', 'state': 'running'}, produced]
+        script = "import json,time; " + "; ".join(
+            f"print(json.dumps({line!r}), flush=True)" for line in lines) + "; time.sleep(60)"
+        def factory(command, **kwargs):
+            return real_popen([sys.executable, '-u', '-c', script], **kwargs)
+        capture = module.MacOSAudioCapture(provider='meta', asr_mode='DIARIZATION')
+        segments, seen = [], threading.Event()
+        with patch.dict(os.environ, {'MEETING_COPILOT_AUDIO_PYTHON': sys.executable}), patch('subprocess.Popen', factory):
+            capture.start(lambda s: (segments.append(s), seen.set()))
+            self.assertTrue(seen.wait(3), capture.status())
+            capture.stop(timeout=1)
+        self.assertEqual(segments, [{'speaker': 'you \u00b7 Speaker B',
+                                     'text': 'Diarized words.', 'timestamp': 1.2}])
+        self.assertNotEqual(capture.status()['state'], 'error')
+
     def test_explicit_start_streams_segments_and_stop_kills_process_group(self):
         import json
         import subprocess

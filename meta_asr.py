@@ -86,7 +86,7 @@ class EventMapper:
             label = str(event.get('label') or '').strip()
             if label:
                 turn = event.get('turnId', self._current_turn)
-                self._turn_speaker[turn] = f'Speaker {label}'
+                self._turn_speaker[turn] = f'{self.default_speaker} \u00b7 Speaker {label}'
             return None
         text = None
         if kind == 'speechComplete':
@@ -95,6 +95,9 @@ class EventMapper:
             text = str(event.get('transcript') or '').strip()
         if not text:
             return None
+        # Preserve the audio-source identity (you/remote) and append the
+        # diarization label: consumers must never lose which source a
+        # labeled turn came from.
         speaker = self._turn_speaker.get(event.get('turnId'), self.default_speaker)
         return {'type': 'segment', 'speaker': speaker,
                 'text': text[:MAX_TEXT], 'timestamp': stamp}
@@ -185,7 +188,7 @@ def transcribe_file(path, api_key, model=DEFAULT_MODEL, mode='ENDPOINTING',
         if text:
             label = turn.get('speaker') or turn.get('label')
             segments.append({'type': 'segment',
-                             'speaker': f'Speaker {label}' if label else 'you',
+                             'speaker': f'you \u00b7 Speaker {label}' if label else 'you',
                              'text': text[:MAX_TEXT], 'timestamp': 0.0})
     if not segments and payload.get('transcript'):
         segments.append({'type': 'segment', 'speaker': 'you',

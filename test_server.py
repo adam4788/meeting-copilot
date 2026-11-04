@@ -1230,8 +1230,10 @@ class ClearBoundaryTests(unittest.TestCase):
         if was_listening and last_args:
             state.pause()
             state.retiring_generations.clear()
-            backend, recording_id, tm, src = last_args
-            state.start(True, backend, recording_id, tm, src)
+            backend, recording_id, tm, src, *rest = last_args
+            state.start(True, backend, recording_id, tm, src,
+                        transcription_provider=rest[0] if len(rest) > 0 else 'local',
+                        asr_mode=rest[1] if len(rest) > 1 else 'ENDPOINTING')
         self.assertTrue(state.listening)
         self.assertEqual(list(state.segments), [])
         # Pre-clear in-flight audio from the old generation is rejected.
@@ -1432,6 +1434,52 @@ class RestartAfterClearTests(unittest.TestCase):
         state.pause()
         state.restart_after_clear(args, gen, session)
         self.assertFalse(state.listening)
+
+
+class ClearRestartProviderTests(unittest.TestCase):
+    def test_clear_restart_preserves_meta_diarization_and_cleared_text(self):
+        import server
+        constructions, callbacks = [], []
+        class FakeMacOSCapture:
+            def __init__(self, **options):
+                constructions.append(dict(options))
+                self.options = dict(options)
+            def start(self, on_segment, on_status=None):
+                callbacks.append(on_segment)
+            def stop(self, timeout=3.0):
+                pass
+        state = server.MeetingState(engine_factory=lambda: None)
+        state.macos_factory = FakeMacOSCapture
+        state.start(True, backend='macos', transcription_provider='meta', asr_mode='DIARIZATION')
+        self.assertEqual(constructions[0]['provider'], 'meta')
+        state.add_segment({'speaker': 'you \u00b7 Speaker B', 'text': 'secret before clear', 'timestamp': 1.0})
+        self.assertEqual(len(state.segments), 1)
+        old_callback = callbacks[-1]
+        # The /clear route boundary: snapshot args/generation/session,
+        # retire the generation, clear content, then restart same session.
+        args = getattr(state, 'last_start_args', None)
+        gen, session = state.capture_generation, state.session_key
+        with state.lock:
+            state.segments.clear()
+            state.result = None
+            state.capture_generation += 1
+        state.restart_after_clear(args, gen, session)
+        self.assertTrue(state.listening)
+        # Provider/mode preserved: no second construction switched to
+        # local, and the live audio options still carry meta/DIARIZATION.
+        self.assertEqual(constructions, [constructions[0]])
+        self.assertEqual(constructions[0]['provider'], 'meta')
+        self.assertEqual(constructions[0]['asr_mode'], 'DIARIZATION')
+        self.assertEqual(state.audio_options,
+                         ('macos', 'base.en', 'microphone', 'meta', 'DIARIZATION'))
+        last = state.status()['last_session']
+        self.assertEqual(last['transcription_provider'], 'meta')
+        self.assertEqual(last['asr_mode'], 'DIARIZATION')
+        # Cleared text stays cleared; pre-clear generation audio is rejected.
+        self.assertEqual(list(state.segments), [])
+        old_callback({'speaker': 'you \u00b7 Speaker B', 'text': 'secret before clear', 'timestamp': 2.0})
+        self.assertEqual(list(state.segments), [])
+        state.pause()
 
 
 class PauseCancellationOrderTests(unittest.TestCase):
