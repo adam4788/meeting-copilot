@@ -1,0 +1,8 @@
+name: meeting-copilot-live
+label: Meeting Copilot
+version: 0.1.0
+author: Adam Nugroho
+description: Read-only live meeting answers grounded in project files and past sessions.
+requires_hermes: ">=0.22.0"
+provides_tools: []
+provides_hooks: []

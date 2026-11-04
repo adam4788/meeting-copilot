@@ -26,7 +26,8 @@ Project root discovery: explicit argument, `MEETING_COPILOT_PROJECT_ROOT`, then
 `~/Documents/Projects`. Hermes home discovery: explicit argument, `HERMES_HOME`,
 then `%LOCALAPPDATA%/hermes` on Windows or `~/.hermes` elsewhere. Only the default
 profile is supported. Project selection must resolve to one direct child of the
-project root. With no selected project, only prior sessions are searched.
+project root. With no selected project, only prior sessions are searched unless
+`all_projects=True` is explicitly enabled.
 
 ## Retrieval and limits
 
@@ -36,9 +37,17 @@ Files are bounded to 256 KB; at most the first 32,000 characters of each file,
 600 chunks, 3,000 examined files and eight directory levels per selected project.
 Chunks are 2,000 characters. Hidden directories/files, dependency/build trees,
 symlinks and auth/config/credential/secret/password/token filenames are excluded.
-File contents are cached for 15 seconds, so edits can take that long to appear.
+File contents are cached for 15 seconds (at most 64 cached project entries,
+each holding up to 600 chunks; scans cycling more projects than that re-read
+within the TTL), so edits can take that long to appear.
 An in-memory SQLite FTS5/BM25 index ranks cached chunks and session candidates.
 The Python SQLite build must include FTS5. No project index is persisted.
+Indexes are cached per engine (LRU, bounded by entry count and total indexed
+characters, not by RSS); each lookup fingerprints the corpus with SHA-256, so
+warm cost is linear in corpus size, a cyclic working set larger than the cache
+rebuilds, ranking is serialized per engine, and corpora above the character
+budget are queried uncached. These are deliberate simplicity/correctness
+tradeoffs, not latency guarantees.
 
 Sessions use `state.db` through a read-only SQLite URI and `query_only=ON`.
 The engine discovers table/column schema before querying. FTS selects at most
@@ -51,11 +60,26 @@ excluded. Inactive/hidden entries are excluded where those schema fields exist.
 Prior assistant statements are explicitly labeled **unverified**; neither an
 assistant claim nor a user request proves an action happened.
 
+## Scope and web fallback
+
+`all_projects=True` searches every eligible direct child project (max 100) plus
+sessions, ranking the full eligible corpus in one FTS index; above 5,000 chunks
+it falls back to per-project FTS candidate pools (a bounded approximation). It
+cannot be combined with `project`.
+`web_fallback=True` runs `web_policy.plan_web` after local retrieval:
+one model call decides whether local evidence suffices and, if not, drafts a generic
+public query; unsafe/invalid output or errors mean no search. Both the synchronous
+engine API and the server `AssistRequest` default `web_fallback` to `False`
+(the pane leaves automatic fallback unchecked); pass it explicitly to enable.
+An explicit `web_query` always takes precedence.
+Results include `web_search: {used, mode, query}`.
+
 ## Privacy and online boundary
 
-Local file/session retrieval runs before any optional web request. Nothing
-constructs a web query from a question, transcript or local evidence. Only the
-caller-supplied, nonblank `web_query` is passed, unchanged, to Hermes
+Local file/session retrieval runs before any optional web request. No query is
+built by string-copying the question, transcript or evidence; with fallback
+enabled the model drafts a filtered generic query (best effort, see Scope above).
+An explicit nonblank `web_query` is passed, unchanged, to Hermes
 `tools.web_tools.web_search_tool(query, limit=3)`. That field must come from an
 explicit user action, never from a model. Web sources are search descriptions,
 not downloaded or verified pages. No web extraction or link following occurs.

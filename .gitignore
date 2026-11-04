@@ -1,6 +1,10 @@
 __pycache__/
 *.py[cod]
 .venv/
+.venv-audio/
+audio-runtime/
+macos_capture
+native/CaptureInfo.plist
 venv/
 .env
 .env.*
