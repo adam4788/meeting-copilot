@@ -1040,7 +1040,7 @@ class MeetingState:
                 module_action.set(token)
             refresh(token)
         except Exception:
-            pass
+            raise _unavailable('Overlay credential scope unavailable. Reopen the pane and retry.') from None
 
     def overlay_claim(self, revision=None, *, client=None, creation=None, epoch=None):
         """Claim once per mounted pane, never once per Show retry.

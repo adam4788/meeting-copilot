@@ -213,10 +213,58 @@ class BackendTransport:
         # happens on the pane's explicit action thread, before native click
         # and answer-worker threads exist). Click/native threads never inherit
         # it, so this is the only explicit propagation path.
+        self._poll_context = self._fresh_action_context()
         try:
-            self._poll_context = _contextvars.copy_context()
+            from agent.secret_scope import current_secret_scope_home
+            self._credential_home = self._poll_context.copy().run(current_secret_scope_home)
+        except ImportError:
+            self._credential_home = None
+
+    @staticmethod
+    def _fresh_action_context(expected_home=None):
+        """Publish fresh secrets, never a request's pre-admission snapshot.
+
+        Call under overlay admission serialization. The host refresh runs inside
+        a COPY of the authenticated action context; no editor identity, global
+        environment mutation, or in-place mutation of admitted workers. An
+        unscoped standalone transport retains its existing non-host behavior.
+        """
+        def capture():
+            try:
+                from agent.secret_scope import current_secret_scope, current_secret_scope_home
+            except ModuleNotFoundError as exc:
+                # Only a genuinely absent standalone host permits fallback.
+                # An installed but incompatible/broken scope API is not proof
+                # that this authenticated request was unscoped.
+                if expected_home is not None or exc.name != 'agent':
+                    raise RuntimeError('Overlay credential scope unavailable') from None
+                return _contextvars.copy_context()
+            previous_scope = current_secret_scope()
+            if previous_scope is None:
+                if expected_home is not None or current_secret_scope_home() is not None:
+                    raise RuntimeError('Overlay credential scope unavailable')
+                return _contextvars.copy_context()
+            from hermes_constants import get_hermes_home
+            from hermes_cli.web_server_profiles import _config_profile_scope
+            home = get_hermes_home().resolve()
+            from pathlib import Path
+            bound = current_secret_scope_home()
+            if (not bound or Path(bound).resolve() != home
+                    or (expected_home is not None and Path(expected_home).resolve() != home)):
+                raise RuntimeError('Overlay credential identity mismatch')
+            with _config_profile_scope('current'):
+                fresh_home = current_secret_scope_home()
+                if (current_secret_scope() is None or current_secret_scope() is previous_scope or not fresh_home
+                        or Path(fresh_home).resolve() != home
+                        or get_hermes_home().resolve() != home):
+                    raise RuntimeError('Overlay credential scope unavailable')
+                return _contextvars.copy_context()
+        try:
+            return _contextvars.copy_context().run(capture)
         except Exception:
-            self._poll_context = None
+            # Never reflect host/credential exceptions through Show or scope.
+            from fastapi import HTTPException
+            raise HTTPException(503, 'Overlay credential scope unavailable. Reopen the pane and retry.') from None
 
     def pane_context_matches(self):
         """Compare the captured security context, excluding our action nonce.
@@ -237,11 +285,9 @@ class BackendTransport:
 
     def refresh_pane_token(self, token):
         """Re-mint the action binding on a later explicit pane action."""
+        self._poll_context = None  # failure closes new admissions
         self._pane_token = token
-        try:
-            self._poll_context = _contextvars.copy_context()
-        except Exception:
-            self._poll_context = None
+        self._poll_context = self._fresh_action_context(self._credential_home)
 
     def refresh_credentials(self):
         """Reload secrets inside the retained pane identity, not the editor's.
@@ -251,22 +297,17 @@ class BackendTransport:
         Never mint a new pane capability or extend its heartbeat here.
         """
         from hermes_constants import get_hermes_home
-        from hermes_cli.web_server_profiles import _config_profile_scope
-        from agent.secret_scope import current_secret_scope
         editor_home = get_hermes_home().resolve()
         previous = self._poll_context
         # Any failure leaves NEW admissions closed, including partial writes.
         self._poll_context = None
-        if previous is None or not self._pane_token:
+        if previous is None or not self._pane_token or not self._credential_home:
             raise RuntimeError('Overlay credential context unavailable')
         def reload():
             if (get_hermes_home().resolve() != editor_home
                     or _PANE_ACTION.get() != self._pane_token):
                 raise RuntimeError('Overlay credential scope mismatch')
-            with _config_profile_scope('current'):
-                if current_secret_scope() is None:
-                    raise RuntimeError('Overlay credential scope unavailable')
-                return _contextvars.copy_context()
+            return self._fresh_action_context(self._credential_home)
         self._poll_context = previous.copy().run(reload)
 
     def admission_guard(self):

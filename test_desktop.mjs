@@ -530,6 +530,53 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
     unmount: () => { for (const effect of effects) effect?.cleanup?.(); },
     replayEffects: () => { for (const effect of effects) effect?.cleanup?.(); effects.length = 0; return render(); } };
 }
+test('legacy automatic Meta preference migrates to local without proof', async () => {
+  const store = new Map([['meeting-copilot.scope.v2', JSON.stringify({ backend: 'macos', transcriptionProvider: 'meta' })]]);
+  const ui = pane('', true, false, '', {}, {}, { capabilities: { macos_transcription: true, meta_asr: true } }, { localStorage: { getItem: k => store.get(k), setItem: (k,v) => store.set(k,v) } });
+  assert.equal(nodes(ui.tree).find(n => n.props['aria-label'] === 'Transcription provider').props.value, 'local');
+});
+
+test('saved explicit unavailable Meta disables capture with actionable guidance', async () => {
+  const store = new Map([['meeting-copilot.scope.v2', JSON.stringify({ backend: 'macos', transcriptionProvider: 'meta', transcriptionChoiceVersion: 1 })]]);
+  const ui = pane('', true, false, '', { 3: true }, {}, { capabilities: { macos_transcription: true, meta_asr: false } }, { localStorage: { getItem: k => store.get(k), setItem: (k,v) => store.set(k,v) } });
+  assert.equal(button(ui.tree, 'Start listening').props.disabled, true);
+  assert.match(JSON.stringify(ui.tree), /Meta.*unavailable.*local.*key/i);
+  await button(ui.tree, 'Start listening').props.onClick();
+  assert.equal(ui.requests.some(r => r.path === '/start'), false, 'stale callback is also guarded');
+});
+
+for (const path of ['/overlay/lifecycle', '/overlay/claim']) test(`initial lifecycle failure never reflects raw sensitive transport text (${path})`, async () => {
+  const ui = pane('', true, false, '', {}, { [path]: () => { throw new Error('fake-sensitive-initial-error'); } }, {}, { setInterval: () => 0, clearInterval: () => {} }, { effects: true });
+  await settle();
+  assert.doesNotMatch(JSON.stringify(ui.rerender()), /fake-sensitive/);
+  assert.match(JSON.stringify(ui.rerender()), /reopen.*pane/i);
+  ui.unregister();
+});
+
+for (const confirmed of [true, false]) test(`retirement survives failed key readback and updates quick control (${confirmed})`, async () => {
+  let written = false;
+  const ui = pane('', true, false, '', {}, { '/credentials/meta': (_path, opts) => {
+    if (opts.method === 'POST') { written = true; return { saved: true, revision: 'r'.repeat(64), overlay_credentials: 'retired', overlay_stop_confirmed: confirmed }; }
+    if (written) throw new Error('fake-sensitive-readback');
+    return { saved: false, revision: 'r'.repeat(64) };
+  }});
+  await button(ui.tree, 'Show overlay').props.onClick();
+  await button(ui.rerender(), 'Recheck key status').props.onClick();
+  const field = nodes(ui.rerender()).find(n => n.props['aria-label'] === 'Meta API key');
+  field.props.ref.current = { value: 'fake-ui-key-only' }; field.props.onChange({ target: field.props.ref.current });
+  await button(ui.rerender(), 'Save key').props.onClick();
+  const tree = ui.rerender();
+  assert.ok(button(tree, confirmed ? 'Show overlay' : 'Retry hide overlay'));
+  assert.match(JSON.stringify(tree), confirmed ? /overlay was closed/i : /shutdown is not confirmed/i);
+  assert.match(JSON.stringify(tree), /could not be confirmed/);
+  assert.doesNotMatch(JSON.stringify(tree), /fake-sensitive/);
+  if (!confirmed) {
+    await button(tree, 'Retry hide overlay').props.onClick();
+    assert.ok(button(ui.rerender(), 'Show overlay'));
+    assert.doesNotMatch(JSON.stringify(ui.rerender()), /shutdown is not confirmed/);
+  }
+});
+
 test('Meta key form saves explicitly, clears input, reads back, and never caches secrets', async () => {
   let saved = false;
   const info = () => ({ saved, request_configured: false, verified: false, activation: 'host-scoped', revision: 'r'.repeat(64) });
@@ -1193,7 +1240,7 @@ for (const timing of ['cached', 'delayed']) test(`local capture default is indep
 });
 
 test('explicit persisted cloud preference survives unrelated preference edits and discloses at Start', async () => {
-  const store = new Map([['meeting-copilot.scope.v2', JSON.stringify({ transcriptionProvider: 'meta' })]]);
+  const store = new Map([['meeting-copilot.scope.v2', JSON.stringify({ transcriptionProvider: 'meta', transcriptionChoiceVersion: 1 })]]);
   const ui = pane('', true, false, '', { 3: true, 4: 'macos' }, {}, { capabilities: { macos_transcription: true, meta_asr: true } }, {
     localStorage: { getItem: key => store.get(key) || null, setItem: (key, value) => store.set(key, value) },
     setInterval: () => 0, clearInterval: () => {},

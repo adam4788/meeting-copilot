@@ -12,7 +12,7 @@ export default {
   description: 'Live answers grounded in your projects, prior sessions, and optional web research.',
   version: '0.2.0',
   register(ctx) {
-    function MetaKeySettings({ api: paneApi, life }) {
+    function MetaKeySettings({ api: paneApi, life, onOverlayTransition }) {
       // Bind callbacks to this exact effect lifecycle, not a mutable ref that
       // could authorize an old password-field callback after a pane remount.
       const api = (path, body) => life.mounted ? paneApi(path, body)
@@ -25,6 +25,16 @@ export default {
       const [info, setInfo] = useState(null);
       const [working, setWorking] = useState(false);
       const [notice, setNotice] = useState('');
+      const [overlayNotice, setOverlayNotice] = useState('');
+      function reflectOverlay(written) {
+        if (!life.mounted || !written) return;
+        if (written.overlay_credentials === 'retired') {
+          onOverlayTransition?.(written);
+          setOverlayNotice('retired');
+        } else if (written.overlay_credentials === 'refreshed') {
+          setOverlayNotice('refreshed');
+        }
+      }
       const tokenizerNotice = error => typeof error?.message === 'string' && error.message.includes('credential_tokenizer_unavailable')
         ? 'Key settings unavailable: the Hermes host tokenizer is unavailable. The saved file is not loaded by the startup bridge. Upgrade Hermes and safely restart after active sessions finish, or ask your administrator to supply MODEL_API_KEY through the service environment. Never paste keys in chat.' : '';
       const erase = () => { if (input.current) input.current.value = ''; setHasDraft(false); };
@@ -55,6 +65,7 @@ export default {
         try {
           const written = await api('/credentials/meta', body);
           delete body.key;
+          reflectOverlay(written); // lifecycle outcome must survive failed readback
           // Read the exact target back; a successful POST is not readiness.
           const current = await api('/credentials/meta');
           if (!current || typeof current.revision !== 'string' || current.saved !== (action === 'save')) throw new Error('unconfirmed');
@@ -64,17 +75,27 @@ export default {
             return;
           }
           setInfo(current);
-          const overlayNotice = written.overlay_credentials === 'retired'
-            ? (written.overlay_stop_confirmed === true
-              ? ' Overlay credential refresh failed; the overlay was closed. Show overlay to reopen with current credentials.'
-              : ' Overlay credential refresh failed; new overlay questions are disabled but shutdown is not confirmed. Retry hide overlay and verify the old window is gone before sharing.')
-            : written.overlay_credentials === 'refreshed' ? ' New overlay questions use a fresh credential snapshot.' : '';
-          setNotice((action === 'save' ? 'Saved — new scoped requests can use the key immediately; existing requests and workers may retain their loaded key. Not verified with Meta.' : 'Saved key removed — new scoped requests may fall back to an inherited key. Existing requests and workers may retain their loaded key. Removal is not revocation.') + overlayNotice);
+          // Key readback and helper shutdown are independent outcomes.
+          setNotice((action === 'save' ? 'Saved — new scoped requests can use the key immediately; existing requests and workers may retain their loaded key. Not verified with Meta.' : 'Saved key removed — new scoped requests may fall back to an inherited key. Existing requests and workers may retain their loaded key. Removal is not revocation.'));
         } catch (error) {
           setInfo(null);
           setNotice(tokenizerNotice(error) || 'The key change could not be confirmed. Recheck key status before trying again; another settings edit or an unsupported host may have blocked it.');
+          // Only recognize a fixed server code, never render transport text.
+          if (typeof error?.message === 'string' && error.message.includes('overlay_shutdown_unconfirmed')) {
+            reflectOverlay({ overlay_credentials: 'retired', overlay_stop_confirmed: false });
+          }
+          try {
+            const current = await api('/status');
+            if (current?.overlay_cleanup_error) reflectOverlay({ overlay_credentials: 'retired', overlay_stop_confirmed: false });
+            else if (current?.overlay_shown === false && (life.owner || life.credentialShutdownUnconfirmed)) reflectOverlay({ overlay_credentials: 'retired', overlay_stop_confirmed: true });
+          } catch (_) { /* retain the already confirmed lifecycle warning */ }
         } finally { delete body.key; inFlight.current = false; setWorking(false); }
       }
+      const overlayNoticeText = overlayNotice === 'retired'
+        ? (life.credentialShutdownUnconfirmed
+          ? 'Overlay credential refresh failed; new overlay questions are disabled but shutdown is not confirmed. Retry hide overlay and verify the old window is gone before sharing.'
+          : 'Overlay credential refresh failed; the overlay was closed. Show overlay to reopen with current credentials.')
+        : overlayNotice === 'refreshed' ? 'New overlay questions use a fresh credential snapshot.' : '';
       return h('section', { style: card, 'aria-label': 'Meta API key settings' },
         h('strong', null, 'Meta API key'),
         h('p', { style: muted, role: 'status' }, info
@@ -91,6 +112,7 @@ export default {
           h(Button, { variant: 'secondary', disabled: working || !info?.saved, onClick: () => change('remove') }, 'Remove saved key'),
           h(Button, { variant: 'secondary', disabled: working, onClick: recheck }, 'Recheck key status')),
         notice && h('p', { role: 'status', style: muted }, notice),
+        overlayNoticeText && h('p', { role: 'status', style: muted }, overlayNoticeText),
         info?.process_differs_from_saved && h('p', { role: 'status', style: muted }, 'A different process-environment key remains available as fallback after removal, or to unscoped code. Update its service or secret-manager source too; restarting alone may retain it.'),
         info && h('p', { style: muted }, info.activation === 'host-scoped' ? 'This status used a host-scoped credential snapshot, not every running worker.' : 'This status used the process environment; process-based code may need a safe gateway restart to load file changes.'),
         h('p', { style: muted }, 'New scoped requests can change immediately: the saved file takes precedence over inherited keys in the supported single-profile host. Existing requests and workers may retain old keys. Other host secret sources may override the file. Pause capture before editing; removal is not revocation.'),
@@ -158,6 +180,9 @@ export default {
               }
             } catch (e) {}
           }
+          // Old versions persisted Meta after automatic capability discovery.
+          // No provenance means no cloud opt-in, even if the value says Meta.
+          if (out.transcriptionProvider === 'meta' && parsed.transcriptionChoiceVersion !== 1) out.transcriptionProvider = 'local';
           return out;
         } catch (e) { return {}; }
       };
@@ -227,7 +252,7 @@ export default {
       useEffect(() => {
         const life = overlayActionAt.current.mounted ? overlayActionAt.current : newOverlayLifecycle();
         overlayActionAt.current = life;
-        claimOverlayPane(life).catch(e => { if (life.mounted) setOverlayMsg(String(e.message || e)); });
+        claimOverlayPane(life).catch(() => { if (life.mounted) setOverlayMsg('Pane authorization unavailable. Retry the action, or close and reopen this pane. Check the backend connection.'); });
         return () => {
           life.mounted = false;
           releaseOverlayPane(life);
@@ -369,7 +394,7 @@ export default {
       const [setupOpen, setSetupOpen] = useState(false);
       useEffect(() => {
         try {
-          if (typeof localStorage !== 'undefined') localStorage.setItem(SCOPE_KEY, JSON.stringify({ project, backend, webFallback, transcriptionModel, audioSource, answerProvider, answerModel, transcriptionProvider, asrMode }));
+          if (typeof localStorage !== 'undefined') localStorage.setItem(SCOPE_KEY, JSON.stringify({ project, backend, webFallback, transcriptionModel, audioSource, answerProvider, answerModel, transcriptionProvider, transcriptionChoiceVersion: 1, asrMode }));
         } catch (e) { setPersistWarning('Preferences could not be saved in this browser (storage unavailable). Settings still apply for this session.'); }
       }, [project, backend, webFallback, transcriptionModel, audioSource, answerProvider, answerModel, transcriptionProvider, asrMode]);
       // Capability discovery never opts a meeting into cloud audio. Only an
@@ -378,9 +403,20 @@ export default {
         setQuestion(''); setWeb(''); setLastAsked(null); setLiveEntry(null);
         setTrackedRequest(null); setError(''); setAssistFailed(false);
       }
+      const cloudUnavailable = backend === 'macos' && transcriptionProvider === 'meta' && !data.capabilities?.meta_asr;
+      const overlayNeedsHide = !!data.overlay_cleanup_error || !!overlayActionAt.current.credentialShutdownUnconfirmed;
+      function reflectCredentialOverlay(written) {
+        const life = overlayActionAt.current;
+        if (!life.mounted) return;
+        retireLocalOverlay();
+        life.credentialShutdownUnconfirmed = written.overlay_stop_confirmed !== true;
+        setOverlayMsg(life.credentialShutdownUnconfirmed
+          ? 'Overlay shutdown is not confirmed. Retry hide overlay and verify the window is gone before sharing.'
+          : 'Overlay was closed after the key edit. Show overlay to reopen with current credentials.');
+      }
       function retireLocalOverlay() {
         const life = overlayActionAt.current;
-        life.owner = null; life.syncedKey = null;
+        life.owner = null; life.syncedKey = null; life.credentialShutdownUnconfirmed = false;
         scopeSeq.current += 1;
         setOverlayOn(false); setScopeStale(false); setOverlayMsg('');
       }
@@ -393,12 +429,12 @@ export default {
           const pane = await claimOverlayPane(life);
           if (!life.mounted) return;
           const action = ++life.action;
-          if (overlayOn || data.overlay_cleanup_error) {
+          if (overlayOn || overlayNeedsHide) {
             const hidden = await api('/overlay/hide', { pane, action });
             if (!life.mounted || life.action !== action) return;
             if (hidden?.accepted === false) throw new Error('This pane no longer owns the overlay. Reopen the pane to take ownership.');
             if (hidden?.overlay_stop_confirmed === false) throw new Error(hidden.overlay_cleanup_error || 'Overlay shutdown is not confirmed.');
-            life.owner = null; life.syncedKey = null; setOverlayOn(false);
+            retireLocalOverlay();
           } else {
             const shown = await api('/overlay/show', { pane, action, scope: { ...scope, ...overlayQuery, seq: scopeSeq.current } });
             if (!life.mounted || life.action !== action) return;
@@ -415,6 +451,7 @@ export default {
         finally { if (life.mounted) setPending(false); }
       }
       async function startCapture(newMeeting = false) {
+        if (cloudUnavailable || overlayNeedsHide) return false;
         const retained = !!((data.segments || []).length || data.result || (data.recent || []).length || data.error_request);
         const last = data.last_session;
         const sourceChanged = last && (
@@ -593,6 +630,7 @@ export default {
             h('input', { type: 'checkbox', checked: consent, disabled: data.listening, onChange: e => setConsent(e.target.checked), 'aria-label': 'Capture permission' }),
             h('span', null, h('strong', null, 'Permission check. '), 'I have permission to capture/read this meeting and use its context with my configured model.')),
           backend === 'macos' && transcriptionProvider === 'meta' && h('p', { 'data-cloud-capture-disclosure': true, role: 'status', style: { ...muted, margin: 0 } }, `Cloud transcription selected: meeting audio is sent to Meta while listening. ${data.listening ? 'Pause to change' : 'Change'} the provider in Transcript source below.`),
+          cloudUnavailable && h('p', { role: 'status', style: muted }, 'Meta cloud transcription is unavailable. Choose Local in Transcript source, or configure a Meta key and recheck backend readiness before Start.'),
           !data.listening && !data.stopping && (pending || !consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)) && h('p', { style: { ...muted, margin: 0 }, role: 'status' },
             pending ? 'Starting…' : !consent ? 'Confirm permission with the check above to enable Start.' : (backend === 'meetily' && !recording) ? 'Select an active Meetily recording below to enable Attach.' : 'Independent macOS transcription is unavailable here — see the source card below.'),
           h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
@@ -600,13 +638,13 @@ export default {
               ? h(Button, { variant: 'secondary', disabled: pending, onClick: () => act('/pause', {}) }, 'Retry stop')
               : data.listening
               ? h(Button, { variant: 'secondary', onClick: () => act('/pause', {}) }, data.backend === 'meetily' ? 'Detach' : 'Pause listening')
-              : h(Button, { disabled: pending || !!data.overlay_cleanup_error || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), onClick: () => startCapture() }, ((data.segments || []).length || result || (data.recent || []).length) ? (backend === 'meetily' ? 'Resume' : 'Resume listening') : (backend === 'meetily' ? 'Attach to Meetily' : 'Start listening')),
-            !data.listening && !data.stopping && ((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending || !!data.overlay_cleanup_error || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), title: 'Starts a fresh meeting; the earlier transcript, answers, and retry data are cleared', onClick: () => startCapture(true) }, 'New meeting'),
+              : h(Button, { disabled: pending || overlayNeedsHide || cloudUnavailable || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), onClick: () => startCapture() }, ((data.segments || []).length || result || (data.recent || []).length) ? (backend === 'meetily' ? 'Resume' : 'Resume listening') : (backend === 'meetily' ? 'Attach to Meetily' : 'Start listening')),
+            !data.listening && !data.stopping && ((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending || overlayNeedsHide || cloudUnavailable || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), title: 'Starts a fresh meeting; the earlier transcript, answers, and retry data are cleared', onClick: () => startCapture(true) }, 'New meeting'),
             (data.overlay_cleanup_error || (data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending, title: 'Clears past Q&A, transcript segments, and cached snippets for this meeting', onClick: async () => { if (typeof window !== 'undefined' && window.confirm && !window.confirm('Clear this meeting? Past questions, answers, and transcript segments are removed from the pane.')) return; if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } } }, 'Clear meeting'),
-            h(Button, { variant: 'secondary', disabled: pending || (!data.capabilities?.overlay && !data.overlay_cleanup_error), title: 'Show or hide the floating meeting overlay (macOS)', onClick: toggleOverlay }, data.overlay_cleanup_error ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay')),
+            h(Button, { variant: 'secondary', disabled: pending || (!data.capabilities?.overlay && !overlayNeedsHide), title: 'Show or hide the floating meeting overlay (macOS)', onClick: toggleOverlay }, overlayNeedsHide ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay')),
           h('p', { style: { ...muted, margin: 0 } }, 'Screen-share privacy: the overlay may be visible in screenshots or screen sharing. Hide it before sharing; capture exclusion is best-effort, not a guarantee.'),
           overlayMsg && h('p', { role: 'status', style: { ...muted, margin: 0 } }, overlayMsg),
-          data.overlay_cleanup_error && h('p', { role: 'alert', style: { ...muted, margin: 0 } }, 'Overlay shutdown is not confirmed. Retry hide overlay and verify the window is gone before screen-sharing.'),
+          overlayNeedsHide && h('p', { role: 'alert', style: { ...muted, margin: 0 } }, 'Overlay shutdown is not confirmed. Retry hide overlay and verify the window is gone before screen-sharing.'),
           !data.capabilities?.overlay && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'Overlay helper unavailable. Check the macOS helper build and restart the gateway when other sessions are idle.'),
           h('p', { style: { ...muted, margin: 0 } }, 'No additional audio files · disconnect initiates detach/pause; verify stop status before assuming audio is off. Resume keeps this meeting (transcript and latest answer stay); New meeting, different settings, or Clear starts fresh. Pausing can discard the last few seconds of audio.'),
           data.capture && h('div', { style: muted }, data.capture.message || data.capture.state || ''),
@@ -637,7 +675,7 @@ export default {
               // clearing, so the retry completes their intent.
               const clearIssue = !!data.meetily_clear_error && !storedRetry && !status.error && !data.error;
               const label = data.stopping ? 'Recheck status' : retryReq ? 'Retry' : backendIssue ? 'Retry' : captureIssue ? (data.listening ? 'Recheck status' : 'Restart capture') : clearIssue ? 'Clear again' : 'Dismiss';
-              return h(Button, { variant: 'secondary', disabled: pending || (captureIssue && !data.listening && (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription))), onClick: async () => {
+              return h(Button, { variant: 'secondary', disabled: pending || (captureIssue && !data.listening && (cloudUnavailable || overlayNeedsHide || !consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription))), onClick: async () => {
                 if (data.stopping) return qc.invalidateQueries({ queryKey: [ID, 'status'] });
                 if (retryReq) { setError(''); setAssistFailed(false); return replayRequest(retryReq); }
                 if (clearIssue) { if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } return; }
@@ -653,7 +691,7 @@ export default {
             h('li', null, backend === 'meetily' ? 'Confirm permission above, pick your active Meetily recording below, then Attach.' : 'Confirm permission above, then Start listening.'),
             h('li', null, 'Type a question (or leave blank for the latest one) and choose Suggest answer.'),
             h('li', null, 'Read the cited answer; open Evidence for sources.'))),
-        h(MetaKeySettings, { api, life: overlayActionAt.current }),
+        h(MetaKeySettings, { api, life: overlayActionAt.current, onOverlayTransition: reflectCredentialOverlay }),
         h(data.listening ? 'details' : 'section', data.listening ? null : { style: card },
           ...(data.listening ? [h('summary', { style: { cursor: 'pointer', ...muted } }, `Transcript source: ${data.backend || backend} — listening (pause to change settings)`)] : []),
           h('span', { id: 'mc-source-label', style: { fontWeight: 700 } }, 'Transcript source'),
@@ -788,7 +826,7 @@ export default {
           overlayMsg && h('p', { role: 'status', style: { ...muted, margin: 0 } }, overlayMsg),
           !data.capabilities?.overlay && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'Overlay helper unavailable. Check the macOS helper build and restart the gateway, then try Show overlay again.'),
           h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
-            h(Button, { variant: overlayOn ? 'secondary' : undefined, disabled: pending || (!data.capabilities?.overlay && !data.overlay_cleanup_error), onClick: toggleOverlay }, data.overlay_cleanup_error ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay'),
+            h(Button, { variant: overlayOn ? 'secondary' : undefined, disabled: pending || (!data.capabilities?.overlay && !overlayNeedsHide), onClick: toggleOverlay }, overlayNeedsHide ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay'),
             h(Button, { variant: 'secondary', disabled: pending || !overlayOn, onClick: async () => {
               setPending(true); setOverlayMsg('');
               scopeSeq.current += 1;

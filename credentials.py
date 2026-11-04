@@ -291,8 +291,8 @@ def _authorize(request):
         raise HTTPException(403, 'Key settings are limited to this backend home.') from None
 
 
-def _response(value):
-    return JSONResponse(value, headers={'Cache-Control': 'no-store'})
+def _response(value, status_code=200):
+    return JSONResponse(value, status_code=status_code, headers={'Cache-Control': 'no-store'})
 
 
 def make_router(change_boundary=None):
@@ -336,6 +336,11 @@ def make_router(change_boundary=None):
                 or (action == 'save' and (not isinstance(key, str) or not _KEY_SHAPE.fullmatch(key)))
                 or (action == 'remove' and 'key' in body)):
             raise HTTPException(400, 'Enter an 8–4096 character API key without spaces, quotes or line breaks; recheck settings before saving.')
+        transition = {}
+        def failure(detail):
+            if transition.get('overlay_stop_confirmed') is False:
+                detail += ' overlay_shutdown_unconfirmed: Retry hide overlay and verify the window is gone before sharing.'
+            return _response({'detail': detail, **transition}, 503)
         try:
             host = _host()
             host.require_env_writable(KEY, action)
@@ -345,6 +350,7 @@ def make_router(change_boundary=None):
             # context propagates, and no key is passed to a subprocess/argv.
             import asyncio
             def apply():
+                nonlocal transition
                 with host._env_write_lock(path):
                     _path()
                     raw = _read(path)
@@ -360,11 +366,11 @@ def make_router(change_boundary=None):
         except HTTPException:
             raise
         except HostTokenizerUnavailable:
-            raise HTTPException(503, TOKENIZER_UNAVAILABLE) from None
+            return failure(TOKENIZER_UNAVAILABLE)
         except UnsupportedEnvFile:
-            raise HTTPException(503, _UNSUPPORTED_FILE) from None
+            return failure(_UNSUPPORTED_FILE)
         except Exception:  # noqa: BLE001 -- credential boundary: sanitize all failures
-            raise HTTPException(503, _UNAVAILABLE) from None
+            return failure(_UNAVAILABLE)
         finally:
             body.clear()
             key = None
