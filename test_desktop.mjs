@@ -494,6 +494,32 @@ test('clear question empties the composer', async () => {
     'clear button hides once the question is empty');
 });
 
+test('setup tiles are separated by real gaps, not touching edges', async () => {
+  const { tree } = pane('', true, false, '', {}, {}, {});
+  const setup = nodes(tree).find(n => n.type === 'details'
+    && JSON.stringify(n.children).includes('Answer setup'));
+  assert.ok(setup, 'answer setup renders');
+  assert.equal(setup.props.style.display, 'flex');
+  assert.ok(setup.props.style.gap >= 12, `expected gap >= 12, got ${setup.props.style.gap}`);
+});
+
+test('transcript segments render as bounded tiles with accent edges', async () => {
+  const { tree } = pane('', true, true, '', {}, {}, { segments: [
+    { speaker: 'Alice', text: 'hello there', timestamp: 1 },
+    { speaker: 'Bob', text: 'general kenobi', timestamp: 2 },
+  ] });
+  const tiles = nodes(tree).filter(n => n.type === 'p'
+    && n.props.style && String(n.props.style.borderLeft || '').includes('var(--ui-accent)'));
+  assert.equal(tiles.length, 2);
+  for (const tile of tiles) {
+    assert.ok(String(tile.props.style.border || '').includes('var(--ui-stroke-secondary)'));
+    assert.ok(String(tile.props.style.background || '').includes('color-mix'));
+    assert.ok(tile.props.style.borderRadius >= 8);
+  }
+  const speakers = tiles.map(t => t.children[0]);
+  assert.ok(speakers.every(s => s && s.props.style && s.props.style.color === 'var(--ui-accent)'));
+});
+
 test('idle pane keeps a prominent start action above the fold', async () => {
   const { tree } = pane('', true, false, '', {}, {}, {});
   assert.ok(nodes(tree).some(n => n.type === 'button' && (n.children.includes('Attach to Meetily') || n.children.includes('Start listening'))));
