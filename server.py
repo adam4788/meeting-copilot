@@ -4,7 +4,7 @@ import time
 from contextlib import contextmanager, nullcontext
 from collections import deque
 from typing import Literal
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 
@@ -22,7 +22,21 @@ def _is_engine_abort(exc):
     return type(exc).__name__ == '_Aborted'
 
 
+# Fixed messages, never exception text or class names (which can be sensitive too).
+ANSWER_FAILURE = 'Answer failed. Check answer setup, credentials, and backend connection, then Retry if you want to resend this question and its saved context.'
+AUTH_FAILURE = 'Provider authentication failed (HTTP 401). Check your API key.'
+
+
+def _safe_answer_error(value):
+    return AUTH_FAILURE if value == AUTH_FAILURE else ANSWER_FAILURE
+
+
+class _AnswerRejected(HTTPException):
+    """Admission failed before any answer worker was scheduled."""
+
+
 class AssistRequest(BaseModel):
+    response_contract: str | None = Field(default=None, max_length=40)
     question: str = Field(default='', max_length=4000)
     request_id: str | None = Field(default=None, max_length=100)
     row_id: str | None = Field(default=None, max_length=200)
@@ -608,7 +622,7 @@ class MeetingState:
         from fastapi import HTTPException
         import secrets
         if all_projects and project:
-            raise HTTPException(400, 'Choose all projects or one project, not both.')
+            raise _AnswerRejected(400, 'Choose all projects or one project, not both.')
         with self.lock:
             # Overlay questions belong to the snapshot the user clicked, not
             # whichever meeting is current when its worker finally arrives.
@@ -616,16 +630,16 @@ class MeetingState:
             # before retaining question/transcript data or reserving capacity.
             # Pane requests omit this optional in-process admission precondition.
             if expected_generation is not None and expected_generation != self.generation:
-                raise HTTPException(409, 'Meeting context changed; refresh and retry the question.')
+                raise _AnswerRejected(409, 'Meeting context changed; refresh and retry the question.')
             if expected_capture_generation is not None and (
                     not self.listening or expected_capture_generation != self.capture_generation):
-                raise HTTPException(409, 'Capture context changed; refresh and retry the question.')
+                raise _AnswerRejected(409, 'Capture context changed; refresh and retry the question.')
             if expected_capture_generation is not None:
                 import importlib
                 module = importlib.import_module(f'{__package__}.overlay_bridge' if __package__ else 'overlay_bridge')
                 current_questions = {r['id']: r['question'] for r in module.suggest_questions(self.segments)}
                 if current_questions.get(row_id) != question:
-                    raise HTTPException(409, 'Question changed; refresh and tap the current row.')
+                    raise _AnswerRejected(409, 'Question changed; refresh and tap the current row.')
             # Cancelled-but-not-yet-exited workers are not owners: a session
             # switch or clear must not block new requests behind them.
             live = [entry for entry in self.requests.values()
@@ -633,17 +647,17 @@ class MeetingState:
             if live:
                 # Explicit row requests never hijack another row: 409 carries the
                 # owner so the caller keeps attribution instead of polling /status.
-                raise HTTPException(409, f"Request {live[0]['request_id']} is already being prepared.")
+                raise _AnswerRejected(409, f"Request {live[0]['request_id']} is already being prepared.")
             transcript = ('\n'.join(f"{s['speaker']}: {s['text']}" for s in list(self.segments)[-40:])[-16000:]
                           if transcript is None else str(transcript)[-16000:])
             if not question.strip():
                 if not transcript:
-                    raise HTTPException(400, 'Enter a question or start listening first.')
+                    raise _AnswerRejected(400, 'Enter a question or start listening first.')
                 question = 'Suggest a concise answer to the most recent question in this transcript.'
             self.request_seq += 1
             request_id = (str(request_id or '').strip() or f'r-{self.request_seq}-{secrets.token_hex(4)}')[:100]
             if request_id in self.requests:
-                raise HTTPException(409, f'Request {request_id} is already being prepared.')
+                raise _AnswerRejected(409, f'Request {request_id} is already being prepared.')
             if len(self.requests) >= 8:
                 # Bound the slot table; drop terminal entries and cancelled
                 # orphans first, never genuinely live ones.
@@ -652,12 +666,12 @@ class MeetingState:
                 for key in droppable[:len(self.requests) - 7]:
                     del self.requests[key]
                 if len(self.requests) >= 8:
-                    raise HTTPException(409, 'Too many pending answer requests.')
+                    raise _AnswerRejected(409, 'Too many pending answer requests.')
             # Reserve worker capacity only after every rejecting check above:
             # a 400/409 must never consume a slot that only a thread exit
             # would release. Thread-start failure below still rolls back.
             if self.live_workers >= 8:
-                raise HTTPException(503, 'Too many answer workers in flight; wait for one to finish and retry.')
+                raise _AnswerRejected(503, 'Too many answer workers in flight; wait for one to finish and retry.')
             self.live_workers += 1
             entry = {'request_id': request_id, 'row_id': row_id, 'question': question[:4000],
                      'status': 'queued', 'answer': '', 'sources': [], 'warnings': [],
@@ -753,8 +767,8 @@ class MeetingState:
                                 # explicit error with retry — never a normal
                                 # answer that hides the failure.
                                 entry_ref['status'] = 'error'
-                                entry_ref['error'] = str(result['provider_error'])[:500]
-                                self.error = str(result['provider_error'])[:500]
+                                entry_ref['error'] = _safe_answer_error(result['provider_error'])
+                                self.error = _safe_answer_error(result['provider_error'])
                                 self.error_request = entry_ref.get('request')
                                 self.result = None
                             else:
@@ -819,8 +833,8 @@ class MeetingState:
                                 result['request'] = entry_ref.get('request')
                                 if result.get('provider_error'):
                                     entry_ref['status'] = 'error'
-                                    entry_ref['error'] = str(result['provider_error'])[:500]
-                                    self.error = str(result['provider_error'])[:500]
+                                    entry_ref['error'] = _safe_answer_error(result['provider_error'])
+                                    self.error = _safe_answer_error(result['provider_error'])
                                     self.error_request = entry_ref.get('request')
                                     self.result = None
                                 else:
@@ -870,7 +884,7 @@ class MeetingState:
                             # as a complete answer, and never as a bare error
                             # that hides what already arrived.
                             warnings = list(entry_ref.get('warnings') or [])
-                            msg = f'Stream interrupted ({type(exc).__name__}); showing a partial answer. Retry for the complete response.'
+                            msg = 'Stream interrupted; showing a partial answer. Retry for the complete response.'
                             if msg not in warnings:
                                 warnings.append(msg)
                             entry_ref['warnings'] = warnings
@@ -880,8 +894,8 @@ class MeetingState:
                                            'model_route': entry_ref.get('model_route', ''), 'streaming': True,
                                            'completed_only': False, 'request': entry_ref.get('request')}
                         else:
-                            entry_ref.update({'status': 'error', 'error': f'{type(exc).__name__}: {str(exc)[:500]}'})
-                            self.error = f'{type(exc).__name__}: {str(exc)[:500]}'
+                            entry_ref.update({'status': 'error', 'error': ANSWER_FAILURE})
+                            self.error = ANSWER_FAILURE
                             # The failed request stays retryable with its exact
                             # original parameters, not current pane state.
                             self.error_request = entry_ref.get('request')
@@ -1682,14 +1696,27 @@ def make_router(state):
 
     @router.post('/assist')
     def assist(body: AssistRequest):
-        return state.assist(body.question, body.project, body.web_query, body.all_projects, body.web_fallback, body.answer_provider, body.answer_model,
-                            request_id=body.request_id, row_id=body.row_id, transcript=body.transcript)
+        try:
+            return state.assist(body.question, body.project, body.web_query, body.all_projects, body.web_fallback, body.answer_provider, body.answer_model,
+                                request_id=body.request_id, row_id=body.row_id, transcript=body.transcript)
+        except _AnswerRejected as exc:
+            if body.response_contract != 'answer-admission-v1':
+                raise
+            # Desktop may discard HTTP error properties at the IPC boundary.
+            # Only a successful, explicit envelope proves non-delivery. Never
+            # classify arbitrary HTTP/transport diagnostic strings as rejection.
+            return {'contract': 'answer-admission-v1', 'accepted': False,
+                    'reason': {400: 'invalid_request', 409: 'busy', 503: 'capacity'}[exc.status_code]}
 
     @router.get('/assist/{request_id}')
-    def assist_request(request_id: str):
+    def assist_request(request_id: str, missing: str = ''):
         from fastapi import HTTPException
         entry = state.assist_request(request_id[:100])
         if entry is None:
+            # Opt-in successful envelope survives Desktop's plain Error bridge.
+            # Keep legacy HTTP semantics for overlay and older clients.
+            if missing == 'sentinel-v1':
+                return {'status': 'missing', 'contract': 'answer-progress-v1'}
             raise HTTPException(404, 'Unknown answer request.')
         return entry
 

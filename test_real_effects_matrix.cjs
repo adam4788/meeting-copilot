@@ -10,7 +10,7 @@ const cases = [
   ['delayed-retirement-readback-failure', { DELAYED_RETIREMENT: '1', READBACK_FAULT: '1' }],
   ['delayed-status-fallback', { DELAYED_STATUS: '1' }],
   ['valid-claim-rejection', { CLAIM_CONFLICT: '1' }],
-  ...['lost', 'replay', 'poll', 'poll-plain', 'provider', 'success'].map(mode => ['answer-' + mode, { ANSWER_FAULT: mode }]),
+  ...['lost', 'replay', 'poll', 'poll-plain', 'provider', 'success', 'missing', 'status-query', 'engine', 'active-replay', 'cancel', 'accepted-refresh', 'legacy', 'legacy-missing', 'legacy-rejected', 'rejected', 'conflict', 'lost-live'].map(mode => ['answer-' + mode, { ANSWER_FAULT: mode }]),
 ];
 for (const code of ['409', '503']) {
   cases.push([`delayed-${code}-pause`, { DELAYED_FAILURE: code }]);

@@ -15,14 +15,20 @@ createInterface({input:child.stdout}).on('line',line=>{const r=JSON.parse(line);
 const rpc=data=>new Promise(resolve=>{waiting.set(++id,resolve);child.stdin.write(JSON.stringify({...data,id})+'\n')});
 let holdWrite=false,heldWrite=null,releaseWrite,failStatus=false;
 let holdStatus=false,heldStatus=null,releaseStatus;
-let answerFault=process.env.ANSWER_FAULT||'', pollFault=false;
+let answerFault=process.env.ANSWER_FAULT||'', pollFault=false, queryFault=false, refreshFault=false;
 const timers=new Map();let timerId=0;
 async function rest(path,options={}){
  if(failLifecycle && path===failLifecycle)throw new Error('synthetic-sensitive-lifecycle');
  if(failReadback&&path==='/credentials/meta'&&!options.method)throw new Error('synthetic-sensitive-readback');
  if(failStatus&&path==='/status')throw new Error('synthetic-sensitive-status');
+ if(answerFault==='cancel' && path==='/assist/cancel')throw new Error('synthetic-sensitive-cancel\nTraceback: synthetic-stack');
+ if(['missing','legacy-missing'].includes(answerFault) && path.startsWith('/assist/'))await rpc({control:'drop-answers'});
+ if(answerFault.startsWith('legacy')){
+  path=path.split('?')[0];
+  if(options.body){options={...options,body:{...options.body}};delete options.body.response_contract;}
+ }
  const r=await rpc({path,...options});traffic.push({path,method:options.method||'GET',code:r.code});
- if(['lost','replay'].includes(answerFault) && path==='/assist')throw new Error('synthetic-sensitive-answer-transport');
+ if(['lost','replay','lost-live'].includes(answerFault) && path==='/assist')throw new Error('synthetic-sensitive-answer-transport');
  if(pollFault && path.startsWith('/assist/'))throw new Error(answerFault==='poll'?'synthetic-sensitive-poll-404 not found':'synthetic-sensitive-poll-transport');
  if(process.env.ACTION_TRANSPORT_FAULT===path)throw new Error('synthetic-sensitive-action-transport');
  if(holdWrite&&path==='/credentials/meta'&&options.method){heldWrite=r;await new Promise(resolve=>releaseWrite=resolve);}
@@ -36,8 +42,8 @@ const source=fs.readFileSync(__dirname+'/desktop/plugin.js','utf8').replace(/^im
 const store=new Map([['meeting-copilot.scope.v2',JSON.stringify({backend:'macos',transcriptionProvider:'meta'})]]);
 const box={...React,h:React.createElement,ctx,crypto:require('node:crypto').webcrypto,console,window:dom.window,
 Button:'button',Input:'input',Textarea:'textarea',Badge:'span',PALETTE_AREA:'palette',setInterval:fn=>{timers.set(++timerId,fn);return timerId},clearInterval:id=>timers.delete(id),setTimeout,clearTimeout,
-host:{notify:()=>{},paneVisibility:()=>({get:()=>true}),revealPane:()=>{}},useValue:a=>a.get(),useQueryClient:()=>({invalidateQueries:async()=>{}}),
-useQuery:q=>({data:q.queryKey[1]==='status'?status:q.queryKey[1]==='models'?{providers:[]}:[]}),
+host:{notify:()=>{},paneVisibility:()=>({get:()=>true}),revealPane:()=>{}},useValue:a=>a.get(),useQueryClient:()=>({invalidateQueries:async()=>{if(refreshFault)throw new Error('synthetic-sensitive-status-refresh');}}),
+useQuery:q=>({error:q.queryKey[1]==='status'&&queryFault?new Error('synthetic-sensitive-status-query\nTraceback: synthetic-stack'):null,data:q.queryKey[1]==='status'?status:q.queryKey[1]==='models'?{providers:[]}:[]}),
 localStorage:{getItem:k=>store.get(k)||null,setItem:(k,v)=>store.set(k,v)}};
 box.globalThis=box;window.confirm=()=>true;
 const unregister=vm.runInNewContext(source+'\nplugin.register(ctx)',box);
@@ -61,6 +67,76 @@ const reports=[];
   assert.ok(claim.pane);
  }
  await render();
+ if(process.env.ANSWER_FAULT && ['status-query','engine','active-replay','cancel','accepted-refresh','rejected','legacy','legacy-rejected','conflict','lost-live'].includes(answerFault)){
+  const posts=()=>traffic.filter(t=>t.path==='/assist').length;
+  const poll=async()=>{for(const fn of [...timers.values()])await act(async()=>{await fn();await ticks()});await flush()};
+  const privateUI=()=>assert.doesNotMatch(document.documentElement.outerHTML,/synthetic-sensitive|Traceback|synthetic-stack/);
+  if(answerFault==='status-query'){
+   queryFault=true;refreshFault=true;await render();privateUI();assert.match(document.body.textContent,/Backend unavailable/);await click('Retry');privateUI();return;
+  }
+  if(answerFault==='lost-live'){
+   await rpc({control:'segment'});await refresh();
+   answerFault='';await click('Suggest answer');await poll();await refresh();
+   answerFault='lost-live';await rpc({control:'hold-answer'});
+   await click('Ask again');privateUI();assert.match(document.body.textContent,/not confirmed/);
+   await click('Recheck status');assert.equal(posts(),2);
+   await refresh();await poll();assert.match(document.body.textContent,/Synthetic live partial/);
+   await rpc({control:'release-answer'});await poll();await refresh();
+   assert.match(document.body.textContent,/Synthetic live partial completed/);assert.equal(posts(),2);return;
+  }
+  if(answerFault==='conflict'){
+   await rpc({control:'hold-answer'});
+   const active=await rpc({path:'/assist',method:'POST',body:{question:'Other synthetic client'}});
+   assert.equal(active.code,200);
+   // Deliberately stale UI: the real router must reject this submission.
+   await click('Suggest answer');privateUI();assert.match(document.body.textContent,/not accepted because another answer is active/);
+   assert.doesNotMatch(document.body.textContent,/may already be running/);
+   await refresh();await poll();assert.match(document.body.textContent,/Synthetic live partial/);
+   assert.equal(posts(),1);await rpc({control:'release-answer'});return;
+  }
+  if(['rejected','legacy-rejected'].includes(answerFault)){
+   await refresh();await click('Suggest answer');privateUI();
+   if(answerFault==='legacy-rejected'){
+    assert.match(document.body.textContent,/not confirmed.*may already be running/);
+    assert.ok(button('Recheck status'));await click('Recheck status');
+   }else{
+    assert.match(document.body.textContent,/not accepted.*question|Enter a question/i);
+    assert.doesNotMatch(document.body.textContent,/may already be running/);
+   }
+   assert.equal(posts(),1);return;
+  }
+  await rpc({control:'segment'});await refresh();
+  if(answerFault==='engine'){
+   await rpc({control:'engine-failure'});await click('Suggest answer');await poll();await refresh();privateUI();
+   const statusJSON=await rest('/status');assert.doesNotMatch(JSON.stringify(statusJSON),/synthetic-sensitive|Traceback/);
+   assert.match(document.body.textContent,/Check answer setup/);assert.ok(button('Retry'));
+   await rpc({control:'engine-failure',value:false});await click('Retry');await poll();await refresh();
+   assert.equal(posts(),2);assert.match(document.body.textContent,/Synthetic offline answer/);return;
+  }
+  if(answerFault==='legacy'){
+   await click('Suggest answer');await poll();await refresh();
+   assert.match(document.body.textContent,/Synthetic offline answer/);assert.equal(posts(),1);return;
+  }
+  await click('Suggest answer');await poll();await refresh();
+  await rpc({control:'hold-answer'});
+  refreshFault=answerFault==='accepted-refresh';
+  await click('Suggest answer');await poll();await refresh();
+  assert.match(document.body.textContent,/Synthetic live partial/);
+  if(answerFault==='active-replay'){
+   assert.ok(button('Ask again').disabled,'history retry disabled while live');
+   await act(async()=>button('Ask again').click());
+   assert.equal(posts(),2,'conflicting replay sends no POST');
+  }else if(answerFault==='cancel'){
+   await click('Cancel answer');privateUI();
+   assert.match(document.body.textContent,/Cancellation was not confirmed/);
+  }else{
+   assert.doesNotMatch(document.body.textContent,/submission was not confirmed/);privateUI();
+  }
+  await poll();assert.match(document.body.textContent,/Synthetic live partial/);
+  await rpc({control:'release-answer'});await poll();await refresh();
+  assert.match(document.body.textContent,/Synthetic live partial completed/);
+  assert.equal(posts(),2);privateUI();console.log('PASS real answer '+answerFault);return;
+ }
  if(process.env.ANSWER_FAULT){
   await rpc({control:'segment'});await refresh();
   if(answerFault==='provider')await rpc({control:'provider-failure'});
@@ -80,6 +156,23 @@ const reports=[];
    await click('Recheck status');
    assert.equal(traffic.filter(t=>t.path==='/assist').length,initialCount,'status recheck must not replay');
    await refresh();assert.match(document.body.textContent,/Synthetic offline answer/);
+  }else if(answerFault==='legacy-missing'){
+   await until(()=>traffic.some(t=>t.path.startsWith('/assist/')));
+   for(let i=0;i<5;i++)await act(async()=>{for(const fn of [...timers.values()])await fn();await ticks()});
+   const polls=traffic.filter(t=>t.path.startsWith('/assist/'));
+   assert.equal(polls.length,3);assert.ok(polls.every(t=>t.code===404));
+   assert.match(document.body.textContent,/Polling is paused.*may still be running or may have been cleared/);
+   assert.doesNotMatch(document.body.textContent,/no longer available/);
+   assert.ok(!button('Retry'));
+   await click('Recheck status');assert.equal(traffic.filter(t=>t.path==='/assist').length,1);
+  }else if(answerFault==='missing'){
+   await until(()=>traffic.some(t=>t.path.startsWith('/assist/')));
+   for(let i=0;i<5;i++)await act(async()=>{for(const fn of [...timers.values()])await fn();await ticks()});
+   assert.match(document.body.textContent,/no longer available/);
+   const polls=traffic.filter(t=>t.path.startsWith('/assist/')).length;
+   for(let i=0;i<3;i++)await act(async()=>{for(const fn of [...timers.values()])await fn();await ticks()});
+   assert.equal(traffic.filter(t=>t.path.startsWith('/assist/')).length,polls,'missing answer stops polling');
+   assert.ok(!button('Cancel answer'));
   }else if(answerFault.startsWith('poll')){
    for(let i=0;i<3;i++)await act(async()=>{for(const fn of [...timers.values()])await fn();await ticks()});
    assert.doesNotMatch(document.body.textContent,/synthetic-sensitive|no longer available/);
