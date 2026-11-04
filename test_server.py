@@ -512,10 +512,10 @@ class OverlayRequestScopeTests(unittest.TestCase):
         self.assertIsNotNone(state.overlay)
         again = state.overlay_show({'project': 'demo'})
         self.assertTrue(again['reused'])
-        scoped = state.overlay_scope({'project': 'alpha'})
+        scoped = state.overlay_scope({'owner': state.overlay_owner, 'project': 'alpha'})
         self.assertTrue(scoped['shown'])
         self.assertEqual(state.overlay_scope_value, {'project': 'alpha'})
-        self.assertEqual(state.overlay_hide(), {'shown': False})
+        self.assertEqual(state.overlay_hide(), {'shown': False, 'accepted': True})
         self.assertIsNone(state.overlay)
 
     def test_overlay_show_fails_closed_without_helper_and_reports_capability(self):
@@ -613,10 +613,11 @@ class OverlayScopeOrderingTests(unittest.TestCase):
             {'scope': {'project': 'new', 'seq': 2}, 'seq': 2, 'ignored_stale': True},
         ]
         state.overlay = bridge
-        first = state.overlay_scope({'project': 'new', 'seq': 2, 'web_fallback': False})
+        state.overlay_owner = 'test-owner'
+        first = state.overlay_scope({'owner': state.overlay_owner, 'project': 'new', 'seq': 2, 'web_fallback': False})
         self.assertTrue(first['accepted'])
         self.assertEqual(state.overlay_scope_value.get('project'), 'new')
-        second = state.overlay_scope({'project': 'old', 'seq': 1, 'web_fallback': True})
+        second = state.overlay_scope({'owner': state.overlay_owner, 'project': 'old', 'seq': 1, 'web_fallback': True})
         self.assertFalse(second['accepted'])
         self.assertEqual(state.overlay_scope_value.get('project'), 'new')
         self.assertFalse(state.overlay_scope_value.get('web_fallback', False))
@@ -629,6 +630,7 @@ class OverlayScopeOrderingTests(unittest.TestCase):
         bridge = Mock()
         bridge.process = None
         state.overlay = bridge
+        state.overlay_owner = 'test-owner'
         state.listening = True
         state.pane_seen = time.monotonic() - 60
         state.backend = 'meetily'
@@ -695,24 +697,49 @@ class SessionSwitchTests(unittest.TestCase):
         import threading
         from unittest.mock import Mock
         state = server.MeetingState(engine_factory=lambda: None)
-        bridge = Mock()
-        def set_scope(scope):
-            import time as _t
-            _t.sleep(0.01 if scope.get('project') == 'new' else 0.05)
-            return {'scope': dict(scope), 'seq': scope.get('seq', 0)}
-        bridge.set_scope.side_effect = set_scope
+        import overlay_bridge
+        bridge = overlay_bridge.OverlayBridge()
         state.overlay = bridge
-        state.overlay_scope_value = {}
-        results = {}
+        state.overlay_owner = 'test-owner'
+        entered, release, attempted = (threading.Event() for _ in range(3))
+        errors, results = [], {}
+        original = bridge.set_scope
+        def set_scope(scope):
+            try:
+                if scope.get('seq') == 1:
+                    entered.set()
+                    if not release.wait(2):
+                        raise AssertionError('scope gate timed out')
+                return original(scope)
+            except BaseException as exc:
+                errors.append(exc)
+                raise
+        bridge.set_scope = set_scope
         def send(name, scope):
-            results[name] = state.overlay_scope(scope)
-        # Older seq sent concurrently must not clobber the newer authority.
-        threads = [threading.Thread(target=send, args=('old-first', {'project': 'old', 'seq': 1})),
-                   threading.Thread(target=send, args=('new', {'project': 'new', 'seq': 2}))]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(10)
+            try:
+                if name == 'new':
+                    attempted.set()
+                results[name] = state.overlay_scope(dict(scope, owner=state.overlay_owner))
+            except BaseException as exc:
+                errors.append(exc)
+        old = threading.Thread(target=send, args=('old-first', {'project': 'old', 'seq': 1}), daemon=True)
+        new = threading.Thread(target=send, args=('new', {'project': 'new', 'seq': 2}), daemon=True)
+        old.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            new.start()
+            self.assertTrue(attempted.wait(2))
+        finally:
+            release.set()
+            old.join(2)
+            if new.ident is not None:
+                new.join(2)
+        self.assertFalse(old.is_alive())
+        self.assertFalse(new.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(results['old-first']['accepted'])
+        self.assertTrue(results['new']['accepted'])
+        self.assertFalse(state.overlay_scope({'owner': 'test-owner', 'seq': 1, 'project': 'old'})['accepted'])
         self.assertEqual(state.overlay_scope_value.get('project'), 'new')
         self.assertEqual(state.overlay_scope_value.get('seq'), 2)
 
@@ -791,6 +818,7 @@ class LifecycleVisibilityTests(unittest.TestCase):
         bridge.process = proc
         bridge.helper_status.return_value = {'available': True}
         state.overlay = bridge
+        state.overlay_owner = 'test-owner'
         status = state.status()
         self.assertFalse(status['overlay_shown'])
 
@@ -802,6 +830,7 @@ class LifecycleVisibilityTests(unittest.TestCase):
         state = server.MeetingState(engine_factory=lambda: None)
         bridge = Mock()
         state.overlay = bridge
+        state.overlay_owner = 'test-owner'
         state.overlay_lease_seq = 4
         stop = threading.Event()
         def heartbeat_loop():

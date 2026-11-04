@@ -99,30 +99,84 @@ export default {
       const unsupported = unsupportedReasons.length > 0;
       // Closing the pane pauses capture: the overlay is hidden and the
       // watchdog alone must not keep recording for ~30s after the user left.
-      useEffect(() => () => { api('/overlay/hide', {}).catch(() => {}); api('/pause', {}).catch(() => {}); }, []);
+      useEffect(() => {
+        const life = overlayActionAt.current.mounted ? overlayActionAt.current : newOverlayLifecycle();
+        overlayActionAt.current = life;
+        claimOverlayPane(life).catch(e => { if (life.mounted) setOverlayMsg(String(e.message || e)); });
+        return () => {
+          life.mounted = false;
+          releaseOverlayPane(life);
+        };
+      }, []);
       // Auto-sync overlay scope when settings change while shown; guard
       // against out-of-order responses clearing a newer stale indicator.
       const [scopeStale, setScopeStale] = useState(false);
       const scopeKey = overlayScopeKey;
       const scopeSeq = useRef(0);
-      const overlayActionAt = useRef(0);
-      useEffect(() => { if (overlayOn) { scopeSeq.current += 1; setScopeStale(true); } }, [scopeKey]);
-      useEffect(() => {
-        if (!overlayOn) return undefined;
-        const seq = scopeSeq.current;
-        const timer = setTimeout(async () => {
-          // A manual Sync (or newer change) supersedes this pending update.
-          if (scopeSeq.current !== seq || !overlayOn) return;
-          try {
-            const res = await api('/overlay/scope', { scope: { ...scope, ...overlayQuery, seq } });
-            if (scopeSeq.current === seq) {
-              if (res && res.accepted === false) setOverlayMsg('Overlay kept its newer settings; a stale sync was ignored. Change a setting to retry.');
-              else setScopeStale(false);
-            }
+      // Owner is minted by Show, not a pane-local counter that resets on remount.
+      function newOverlayLifecycle() {
+        return { at: 0, owner: null, pane: null, claim: null, action: 0,
+          mounted: true, syncedKey: null, released: false };
+      }
+      const overlayActionAt = useRef(newOverlayLifecycle());
+      function releaseOverlayPane(life) {
+        if (!life.pane || life.released) return;
+        life.released = true;
+        api('/overlay/release', { pane: life.pane, action: ++life.action }).catch(() => {});
+      }
+      async function claimOverlayPane(life) {
+        if (!life.claim) life.claim = api('/overlay/lifecycle').then(async ticket => {
+          if (!life.mounted) return null;
+          const result = await api('/overlay/claim', { revision: ticket.revision });
+          // Retry only the release-only CAS ticket, never a fresh owner ticket.
+          if (life.mounted && result?.accepted === false && Number.isInteger(result.retry_revision)) {
+            return api('/overlay/claim', { revision: result.retry_revision });
           }
-          catch (e) { if (scopeSeq.current === seq) setOverlayMsg(String(e.message || e)); }
-        }, 600);
-        return () => clearTimeout(timer);
+          return result;
+        }).then(result => {
+          if (!result && !life.mounted) return null;
+          if (result?.accepted === false) throw new Error('Another pane owns the overlay. Close and reopen this pane to take ownership.');
+          if (!result?.pane) throw new Error('Overlay lifecycle protocol unavailable. Update/restart the backend and reopen the pane.');
+          life.pane = result.pane;
+          if (!life.mounted) releaseOverlayPane(life);
+          return result.pane;
+        });
+        return life.claim;
+      }
+      useEffect(() => { if (overlayOn) { scopeSeq.current += 1; overlayActionAt.current.syncedKey = null; setScopeStale(true); } }, [scopeKey]);
+      async function syncOverlayScope(seq) {
+        const life = overlayActionAt.current;
+        const owner = life.owner;
+        const current = () => life.mounted && scopeSeq.current === seq && life.owner === owner;
+        // Sending is not acknowledgement. Invalidate the old key on every
+        // intervening write, including manual and still-pending requests.
+        life.syncedKey = null;
+        try {
+          const res = await api('/overlay/scope', { scope: { ...scope, ...overlayQuery, seq, owner } });
+          if (!current()) return;
+          if (res?.accepted === false) throw new Error('Overlay scope was rejected.');
+          life.syncedKey = scopeKey; setScopeStale(false);
+          setOverlayMsg('Overlay scope updated to current settings.');
+        } catch (e) {
+          if (!current()) return;
+          // Ordered hide fails closed without closing a newer pane or Show.
+          const action = ++life.action;
+          try {
+            const hidden = await api('/overlay/hide', { pane: life.pane, action });
+            if (!life.mounted || life.action !== action) return;
+            if (hidden?.accepted === false) throw new Error('Overlay ownership changed.');
+            life.owner = null; setOverlayOn(false);
+            setOverlayMsg('Overlay closed because scope synchronization failed. Show overlay to retry current settings.');
+          } catch (hideError) {
+            if (life.mounted && life.action === action) setOverlayMsg('Scope sync failed and overlay closure could not be confirmed. Close the pane to stop it, or retry Hide overlay.');
+          }
+        }
+      }
+      useEffect(() => {
+        if (!overlayOn || overlayActionAt.current.syncedKey === scopeKey) return undefined;
+        // Permission changes are immediate; do not debounce a narrowing.
+        if (overlayActionAt.current.mounted) void syncOverlayScope(scopeSeq.current);
+        return undefined;
       }, [scopeKey, overlayOn]);
       // Reconcile with the authoritative backend state: if the helper died
       // or its lease expired, stop offering Hide/Sync for a gone window.
@@ -130,7 +184,7 @@ export default {
       // whole status object so expiry observed mid-grace is still honored —
       // status polls refresh every few seconds.
       useEffect(() => {
-        if (overlayOn && data && data.overlay_shown === false && Date.now() - overlayActionAt.current > 8000) {
+        if (overlayOn && data && data.overlay_shown === false && Date.now() - overlayActionAt.current.at > 8000) {
           setOverlayOn(false);
           setOverlayMsg('Overlay is no longer shown (helper exited or lease expired). Show overlay to reopen it.');
         }
@@ -142,7 +196,10 @@ export default {
       // must not masquerade as a failed destructive action.
       async function act(path, body = {}) {
         setPending(true); setError('');
-        try { await api(path, body); }
+        try {
+          await api(path, body);
+          if (path === '/clear') retireLocalOverlay();
+        }
         catch (e) { setError(String(e.message || e)); return false; }
         finally { setPending(false); }
         try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }); }
@@ -179,15 +236,37 @@ export default {
         setQuestion(''); setWeb(''); setLastAsked(null); setLiveEntry(null);
         setTrackedRequest(null); setError(''); setAssistFailed(false);
       }
+      function retireLocalOverlay() {
+        const life = overlayActionAt.current;
+        life.owner = null; life.syncedKey = null;
+        scopeSeq.current += 1;
+        setOverlayOn(false); setScopeStale(false); setOverlayMsg('');
+      }
       async function toggleOverlay() {
+        const life = overlayActionAt.current;
+        if (!life.mounted) return;
         setPending(true); setOverlayMsg('');
-        overlayActionAt.current = Date.now();
+        life.at = Date.now();
         try {
-          if (overlayOn) { await api('/overlay/hide', {}); setOverlayOn(false); }
-          else { await api('/overlay/show', { scope: { ...scope, ...overlayQuery, seq: scopeSeq.current } }); setOverlayOn(true); setScopeStale(false); setOverlayMsg('Overlay shown. It returns to click-through after ~10s — press the shortcut to interact, then tap a row for a streamed answer.'); }
+          const pane = await claimOverlayPane(life);
+          if (!life.mounted) return;
+          const action = ++life.action;
+          if (overlayOn) {
+            const hidden = await api('/overlay/hide', { pane, action });
+            if (!life.mounted || life.action !== action) return;
+            if (hidden?.accepted === false) throw new Error('This pane no longer owns the overlay. Reopen the pane to take ownership.');
+            life.owner = null; life.syncedKey = null; setOverlayOn(false);
+          } else {
+            const shown = await api('/overlay/show', { pane, action, scope: { ...scope, ...overlayQuery, seq: scopeSeq.current } });
+            if (!life.mounted || life.action !== action) return;
+            if (shown?.accepted === false || !shown?.owner) throw new Error('This pane no longer owns the overlay. Reopen the pane to take ownership.');
+            life.owner = shown.owner; life.syncedKey = scopeKey;
+            setOverlayOn(true); setScopeStale(false);
+            setOverlayMsg('Overlay shown. It returns to click-through after ~10s — press the shortcut to interact, then tap a row for a streamed answer.');
+          }
           await qc.invalidateQueries({ queryKey: [ID, 'status'] });
-        } catch (e) { setOverlayMsg(String(e.message || e)); if (!overlayOn) setOverlayOn(false); }
-        finally { setPending(false); }
+        } catch (e) { if (life.mounted) { setOverlayMsg(String(e.message || e)); if (!overlayOn) setOverlayOn(false); } }
+        finally { if (life.mounted) setPending(false); }
       }
       async function startCapture(newMeeting = false) {
         const retained = !!((data.segments || []).length || data.result || (data.recent || []).length || data.error_request);
@@ -201,11 +280,20 @@ export default {
           ? 'Start a fresh meeting? The earlier transcript, answers, and retry data are cleared.'
           : 'These settings differ from the previous session, so starting begins a fresh meeting and clears the earlier transcript, answers, and retry data. Continue?';
         if ((newMeeting || changed) && typeof window !== 'undefined' && window.confirm && !window.confirm(message)) return false;
-        const ok = await act('/start', { consent, backend, recording_id: recording || null,
-          transcription_model: transcriptionModel, audio_source: audioSource, new_meeting: newMeeting,
-          transcription_provider: transcriptionProvider, asr_mode: asrMode });
-        if (ok && (newMeeting || changed)) resetMeetingInputs();
-        return ok;
+        const life = overlayActionAt.current;
+        setPending(true);
+        try {
+          const pane = await claimOverlayPane(life);
+          if (!life.mounted) return false;
+          const ok = await act('/start', { pane, action: ++life.action, consent, backend, recording_id: recording || null,
+            transcription_model: transcriptionModel, audio_source: audioSource, new_meeting: newMeeting,
+            transcription_provider: transcriptionProvider, asr_mode: asrMode });
+          if (life.mounted && ok && (newMeeting || changed)) { resetMeetingInputs(); retireLocalOverlay(); }
+          return ok;
+        } catch (e) {
+          if (life.mounted) setError(String(e.message || e));
+          return false;
+        } finally { if (life.mounted) setPending(false); }
       }
       async function assistNow(extra = {}, questionOverride, scopeOverride) {
         const asked = questionOverride !== undefined ? questionOverride : question;
@@ -544,15 +632,8 @@ export default {
               setPending(true); setOverlayMsg('');
               scopeSeq.current += 1;
               const seq = scopeSeq.current;
-              overlayActionAt.current = Date.now();
-              try {
-                const res = await api('/overlay/scope', { scope: { ...scope, ...overlayQuery, seq } });
-                if (scopeSeq.current === seq) {
-                  if (res && res.accepted === false) setOverlayMsg('Overlay kept its newer settings; a stale sync was ignored. Change a setting to retry.');
-                  else { setScopeStale(false); setOverlayMsg('Overlay scope updated to current settings.'); }
-                }
-              }
-              catch (e) { if (scopeSeq.current === seq) setOverlayMsg(String(e.message || e)); }
+              overlayActionAt.current.at = Date.now();
+              try { await syncOverlayScope(seq); }
               finally { setPending(false); }
             } }, scopeStale ? 'Sync scope •' : 'Sync scope'))),
         h('p', { style: { ...muted, margin: 0 } }, 'If needed, the model drafts a generic public query. Filtering is best-effort, not a privacy guarantee; turn this off for sensitive calls. Selected context still goes to your configured answer model.'),

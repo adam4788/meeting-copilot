@@ -38,12 +38,16 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
   const requests = [];
   const contributions = [];
   const revealed = [];
+  const effects = [];
+  let effectIndex = 0;
+  let pendingEffects = [];
   let visible = false;
   const visibility = { get: () => visible };
   const ctx = {
     rest: async (path, options = {}) => {
       requests.push({ path, ...options });
-      const r = respond[path];
+      const defaults = { '/overlay/lifecycle': { revision: 0 }, '/overlay/claim': { pane: 'test-pane' }, '/overlay/show': { shown: true, owner: 'test-owner' } };
+      const r = respond[path] || defaults[path];
       return typeof r === 'function' ? r(path, options) : (r || {});
     },
     register: item => {
@@ -71,7 +75,14 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
       if (!(i in values)) values[i] = { current: initial };
       return values[i];
     },
-    useEffect: () => {},
+    useEffect: (fn, deps) => {
+      if (!qcBehavior.effects) return;
+      const i = effectIndex++;
+      const old = effects[i];
+      if (!old || !deps || deps.some((value, j) => !Object.is(value, old.deps?.[j]))) {
+        pendingEffects.push(() => { old?.cleanup?.(); effects[i] = { deps, cleanup: fn() }; });
+      }
+    },
     useQueryClient: () => ({ invalidateQueries: qcBehavior.failInvalidate ? async () => { throw new Error('invalidate failed'); } : async () => {} }),
     useQuery: options => ({ data: options.queryKey[1] === 'status'
       ? { capabilities: supported ? { all_projects: true, automatic_web_fallback: true, independent_models: true, macos_transcription: true, overlay: true, overlay_stream: true, overlay_cancel: true } : undefined, ...statusExtra }
@@ -81,9 +92,233 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
     host: { paneVisibility: () => visibility, revealPane: id => { revealed.push(id); visible = true; } }, Button: 'button', Input: 'input', Textarea: 'textarea', Badge: 'badge', PALETTE_AREA: 'palette',
     ...browserGlobals,
   });
-  const render = () => { stateIndex = 0; return registered.render(); };
-  return { tree: render(), rerender: render, requests, contributions, revealed };
+  const render = () => {
+    stateIndex = 0; effectIndex = 0; pendingEffects = [];
+    const tree = registered.render();
+    for (const effect of pendingEffects) effect();
+    return tree;
+  };
+  return { tree: render(), rerender: render, requests, contributions, revealed,
+    unmount: () => { for (const effect of effects) effect?.cleanup?.(); },
+    replayEffects: () => { for (const effect of effects) effect?.cleanup?.(); effects.length = 0; return render(); } };
 }
+// Effect-capable lifecycle tests use deterministic timers (no React package).
+function lifecyclePane(respond = {}, settings = {}, statusExtra = {}) {
+  const timers = new Map(); let next = 0;
+  const p = pane('alpha', true, false, '', settings, {
+    '/overlay/lifecycle': { revision: 0 },
+    '/overlay/claim': { pane: 'pane-capability' },
+    '/overlay/show': { shown: true, owner: 'show-owner' }, ...respond,
+  }, statusExtra, {
+    setInterval: () => 0, clearInterval: () => {},
+    setTimeout: fn => { timers.set(++next, fn); return next; },
+    clearTimeout: id => timers.delete(id),
+  }, { effects: true });
+  return { ...p, async flushTimers() { const work = [...timers.values()]; timers.clear(); for (const fn of work) await fn(); } };
+}
+function button(tree, label) { return nodes(tree).find(n => n.type === 'button' && n.children.includes(label)); }
+
+test('real effects do not auto-sync unchanged Show scope', async () => {
+  const p = lifecyclePane();
+  await button(p.tree, 'Show overlay').props.onClick();
+  p.rerender();
+  await p.flushTimers();
+  assert.equal(p.requests.filter(r => r.path === '/overlay/scope').length, 0);
+  p.unmount();
+});
+
+test('real effects still synchronize changed scope with its owner', async () => {
+  const p = lifecyclePane({ '/overlay/scope': { accepted: true } });
+  await button(p.tree, 'Show overlay').props.onClick();
+  let tree = p.rerender();
+  nodes(tree).find(n => n.type === 'select' && n.props.value === 'alpha').props.onChange({ target: { value: '' } });
+  tree = p.rerender();
+  await p.flushTimers();
+  const syncs = p.requests.filter(r => r.path === '/overlay/scope');
+  assert.equal(syncs.length, 1);
+  assert.equal(syncs[0].body.scope.owner, 'show-owner');
+  assert.equal(syncs[0].body.scope.project, null);
+  assert.equal(syncs[0].body.scope.all_projects, false);
+  assert.ok(syncs[0].body.scope.seq > 0);
+  p.unmount();
+});
+
+test('unmount fences a delayed Show and never sends global hide/pause', async () => {
+  let resolve;
+  const p = lifecyclePane({ '/overlay/show': () => new Promise(r => { resolve = r; }) });
+  const pending = button(p.tree, 'Show overlay').props.onClick();
+  for (let i = 0; i < 8 && !resolve; i++) await Promise.resolve();
+  assert.ok(resolve, 'Show must have reached backend before cleanup');
+  p.unmount();
+  resolve({ shown: true, owner: 'old-show-owner' });
+  await pending;
+  const show = p.requests.find(r => r.path === '/overlay/show');
+  const releases = p.requests.filter(r => r.path === '/overlay/release');
+  assert.ok(releases.length, 'cleanup sends ordered release even before Show responds');
+  assert.equal(releases[0].body.pane, show.body.pane);
+  assert.ok(releases[0].body.action > show.body.action);
+  assert.ok(!p.requests.some(r => r.path === '/pause' || (r.path === '/overlay/hide' && !r.body.pane)));
+});
+
+test('unmount while claiming ownership cleans exact capability without showing', async () => {
+  let resolve;
+  const p = lifecyclePane({ '/overlay/claim': () => new Promise(r => { resolve = r; }) });
+  const pending = button(p.tree, 'Show overlay').props.onClick();
+  for (let i = 0; i < 12 && !resolve; i++) await Promise.resolve();
+  assert.ok(resolve, 'ownership request is pending');
+  p.unmount();
+  resolve({ pane: 'late-capability' });
+  await pending;
+  assert.ok(!p.requests.some(r => r.path === '/overlay/show'));
+  assert.equal(p.requests.find(r => r.path === '/overlay/release')?.body.pane, 'late-capability');
+});
+
+test('effect remount gets a fresh capability; old cleanup never releases the new one', async () => {
+  let claims = 0;
+  const p = lifecyclePane({ '/overlay/claim': () => ({ pane: `pane-${++claims}` }) });
+  for (let i = 0; i < 12; i++) await Promise.resolve();
+  const tree = p.replayEffects();
+  await button(tree, 'Show overlay').props.onClick();
+  assert.equal(claims, 2);
+  assert.equal(p.requests.find(r => r.path === '/overlay/show').body.pane, 'pane-2');
+  assert.deepEqual(p.requests.filter(r => r.path === '/overlay/release').map(r => r.body.pane), ['pane-1']);
+  p.unmount();
+  assert.deepEqual(p.requests.filter(r => r.path === '/overlay/release').map(r => r.body.pane), ['pane-1', 'pane-2']);
+});
+
+async function settle() { for (let i = 0; i < 30; i++) await Promise.resolve(); }
+function changeProject(p, value) {
+  const tree = p.rerender();
+  nodes(tree).find(n => n.type === 'select' && n.props['aria-labelledby'] === 'mc-scope-label').props.onChange({ target: { value } });
+  return p.rerender();
+}
+
+test('pending lifecycle cannot start capture after pane closes', async () => {
+  let resolve;
+  const p = lifecyclePane({ '/overlay/lifecycle': () => new Promise(r => { resolve = r; }) }, { 3: true, 4: 'macos' });
+  const pending = button(p.tree, 'Start listening').props.onClick();
+  await settle();
+  const earlyStarts = p.requests.filter(r => r.path === '/start');
+  p.unmount();
+  resolve({ revision: 0 });
+  await pending;
+  assert.equal(earlyStarts.length, 0, 'capture waits for an owner capable of safe cleanup');
+  assert.ok(!p.requests.some(r => ['/start', '/pause', '/overlay/claim'].includes(r.path)));
+});
+
+test('started capture carries the capability and cleanup supersedes it', async () => {
+  const p = lifecyclePane({}, { 3: true, 4: 'macos' });
+  await button(p.tree, 'Start listening').props.onClick();
+  p.unmount();
+  const start = p.requests.find(r => r.path === '/start');
+  const release = p.requests.find(r => r.path === '/overlay/release');
+  assert.equal(start.body.pane, 'pane-capability');
+  assert.ok(release.body.action > start.body.action);
+});
+
+test('release-only claim conflict recovers once without rereading newer owner tickets', async () => {
+  let claims = 0;
+  const p = lifecyclePane({ '/overlay/claim': (_, { body }) => {
+    if (++claims === 1) return { accepted: false, retry_revision: 1 };
+    return { pane: 'recovered-pane' };
+  } });
+  await button(p.tree, 'Show overlay').props.onClick();
+  assert.equal(claims, 2);
+  assert.equal(p.requests.filter(r => r.path === '/overlay/claim')[1].body.revision, 1);
+  assert.equal(p.requests.filter(r => r.path === '/overlay/lifecycle').length, 1);
+  assert.equal(p.requests.find(r => r.path === '/overlay/show')?.body.pane, 'recovered-pane');
+  p.unmount();
+});
+
+test('claim conflict with a newer owner never retries or starts capture', async () => {
+  const p = lifecyclePane({ '/overlay/claim': { accepted: false } }, { 3: true, 4: 'macos' });
+  await button(p.tree, 'Start listening').props.onClick();
+  assert.equal(p.requests.filter(r => r.path === '/overlay/claim').length, 1);
+  assert.ok(!p.requests.some(r => r.path === '/start'));
+  p.unmount();
+});
+
+for (const manual of [false, true]) test(`restoring narrow scope supersedes intervening broad request (manual=${manual})`, async () => {
+  const resolveBroad = []; let backendScope = { project: 'alpha', seq: 0 };
+  const p = lifecyclePane({ '/overlay/scope': (_, { body }) => {
+    const scope = body.scope;
+    if (scope.seq >= backendScope.seq) backendScope = scope;
+    if (scope.all_projects) return new Promise(r => { resolveBroad.push(r); });
+    return { accepted: true };
+  } });
+  await button(p.tree, 'Show overlay').props.onClick();
+  let tree = changeProject(p, '__all_projects__');
+  let broad;
+  if (manual) broad = button(tree, 'Sync scope').props.onClick();
+  else broad = p.flushTimers();
+  await settle();
+  assert.ok(resolveBroad.length);
+  changeProject(p, 'alpha');
+  await p.flushTimers();
+  for (const resolve of resolveBroad) resolve({ accepted: true });
+  await broad;
+  assert.equal(backendScope.project, 'alpha');
+  assert.equal(backendScope.all_projects, false);
+  assert.equal(p.requests.filter(r => r.path === '/overlay/scope').at(-1).body.scope.project, 'alpha');
+  p.unmount();
+});
+
+for (const manual of [false, true]) test(`acknowledged broad scope can return to original narrow scope (manual=${manual})`, async () => {
+  let backendScope;
+  const p = lifecyclePane({ '/overlay/scope': (_, { body }) => {
+    backendScope = body.scope;
+    return { accepted: true };
+  } });
+  await button(p.tree, 'Show overlay').props.onClick();
+  changeProject(p, '__all_projects__');
+  await settle();
+  if (manual) await button(p.rerender(), 'Sync scope').props.onClick();
+  assert.equal(backendScope.all_projects, true);
+  changeProject(p, 'alpha');
+  await settle();
+  assert.equal(backendScope.project, 'alpha');
+  assert.equal(backendScope.all_projects, false);
+  assert.ok(!JSON.stringify(p.rerender()).includes('Settings changed — syncing'));
+  p.unmount();
+});
+
+test('effect-capable Show then first Start retains coherent Hide UI', async () => {
+  const p = lifecyclePane({}, { 3: true, 4: 'macos' });
+  await button(p.tree, 'Show overlay').props.onClick();
+  await button(p.rerender(), 'Start listening').props.onClick();
+  await settle();
+  assert.ok(button(p.rerender(), 'Hide overlay'));
+  const shown = p.requests.find(r => r.path === '/overlay/show');
+  const started = p.requests.find(r => r.path === '/start');
+  assert.equal(started.body.pane, shown.body.pane);
+  assert.ok(started.body.action > shown.body.action);
+  assert.ok(!p.requests.some(r => ['/overlay/scope', '/overlay/hide', '/overlay/release'].includes(r.path)));
+  p.unmount();
+});
+
+test('scope failure retires overlay rather than retaining broader permissions', async () => {
+  const p = lifecyclePane({ '/overlay/scope': () => { throw new Error('sync failed'); } });
+  await button(p.tree, 'Show overlay').props.onClick();
+  changeProject(p, '__all_projects__');
+  await p.flushTimers();
+  await settle();
+  assert.ok(p.requests.some(r => r.path === '/overlay/hide' && r.body.pane === 'pane-capability'));
+  assert.ok(button(p.rerender(), 'Show overlay'));
+  p.unmount();
+});
+
+test('Clear retires local Hide state and permits immediate Show', async () => {
+  const p = lifecyclePane({}, {}, { segments: [{ text: 'Who approves?' }] });
+  await button(p.tree, 'Show overlay').props.onClick();
+  await button(p.rerender(), 'Clear meeting').props.onClick();
+  const reopen = button(p.rerender(), 'Show overlay');
+  assert.ok(reopen, 'Clear already retired the overlay, without an eight-second grace');
+  await reopen.props.onClick();
+  assert.equal(p.requests.filter(r => r.path === '/overlay/show').length, 2);
+  assert.equal(p.requests.filter(r => r.path === '/overlay/hide').length, 0);
+  p.unmount();
+});
+
 function nodes(tree) {
   return tree && typeof tree === 'object' ? [tree, ...(tree.children || []).flatMap(nodes)] : [];
 }
@@ -329,7 +564,7 @@ test('react import parser tolerates CRLF checkouts', () => {
   assert.ok(![...imported].some(s => s.includes('react')), 'no `} from \'react\'` fragments as names');
 });
 
-test('rejected scope sync keeps the stale warning actionable', async () => {
+test('rejected scope sync closes the overlay with an actionable warning', async () => {
   const { rerender } = pane('alpha', true, false, '', {}, { '/overlay/scope': { accepted: false } });
   const findButton = (tree, label) => nodes(tree).filter(n => n.type === 'button')
     .find(n => (Array.isArray(n.children) ? n.children.join('') : String(n.children || '')) === label);
@@ -338,7 +573,19 @@ test('rejected scope sync keeps the stale warning actionable', async () => {
   tree = rerender();
   await findButton(tree, 'Sync scope').props.onClick();
   tree = rerender();
-  assert.ok(JSON.stringify(tree).includes('stale sync was ignored'), 'rejection must stay visible, not clear the stale state');
+  assert.ok(JSON.stringify(tree).includes('Overlay closed because scope synchronization failed'), 'rejection must stay visible, not pretend synchronization succeeded');
+  assert.ok(findButton(tree, 'Show overlay'), 'reopen must apply the visible scope');
+});
+
+test('scope sync carries the owner minted by show', async () => {
+  const { rerender, requests } = pane('alpha', true, false, '', {}, {
+    '/overlay/show': { shown: true, owner: 'owner-A' },
+    '/overlay/scope': { accepted: true },
+  });
+  const button = (label) => nodes(rerender()).find(n => n.type === 'button' && n.children.includes(label));
+  await button('Show overlay').props.onClick();
+  await button('Sync scope').props.onClick();
+  assert.equal(requests.find(r => r.path === '/overlay/scope').body.scope.owner, 'owner-A');
 });
 
 test('accepted scope sync clears the stale indicator', async () => {

@@ -22,6 +22,11 @@ class MacOverlayStateTests(unittest.TestCase):
             result = subprocess.run([binary, '--self-test'], check=True, capture_output=True,
                                     text=True, timeout=15)
             self.assertEqual(result.stdout.strip(), 'overlay state tests passed')
+            version = subprocess.run([binary, '--protocol-version'], check=True, capture_output=True,
+                                     text=True, timeout=5)
+            self.assertEqual(version.stdout.strip(), 'meeting-overlay/2')
+            import overlay_bridge
+            self.assertTrue(overlay_bridge.OverlayBridge(helper=binary)._check_helper_protocol())
 
 
 

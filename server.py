@@ -1,6 +1,7 @@
 """Read-only meeting copilot backend. Importing never starts audio capture."""
 import threading
 import time
+from contextlib import contextmanager, nullcontext
 from collections import deque
 from typing import Literal
 from fastapi import APIRouter
@@ -43,7 +44,18 @@ class OverlayScopeRequest(BaseModel):
     scope: dict = Field(default_factory=dict)
 
 
+class OverlayClaimRequest(BaseModel):
+    revision: int = Field(ge=0, strict=True)
+
+
+class OverlayActionRequest(OverlayScopeRequest):
+    pane: str = Field(min_length=1, max_length=100)
+    action: int = Field(ge=1, strict=True)
+
+
 class CaptureRequest(BaseModel):
+    pane: str | None = Field(default=None, min_length=1, max_length=100)
+    action: int | None = Field(default=None, ge=1, strict=True)
     consent: bool = False
     backend: Literal['meetily', 'native', 'macos'] = 'meetily'
     recording_id: str | None = Field(default=None, max_length=500)
@@ -87,6 +99,7 @@ class MeetingState:
         self.generation = 0
         self.capture_generation = 0
         self._status_generation = 0
+        self.status_seq = 0
         self.retiring_generations = {}
         self.lock = threading.RLock()
         self.lifecycle_lock = threading.RLock()
@@ -103,6 +116,10 @@ class MeetingState:
         self.meetily_clear_error = None
         self.overlay = None
         self.overlay_scope_value = {}
+        self.overlay_owner = None
+        self.overlay_pane = None
+        self.overlay_action = 0
+        self.overlay_revision = 0
 
     def add_segment(self, segment):
         text = str(segment.get('text', '')).strip()[:4000]
@@ -156,10 +173,17 @@ class MeetingState:
             return self.audio
 
     def start(self, consent, backend='meetily', recording_id=None, transcription_model='base.en', audio_source='microphone',
-              new_meeting=False, transcription_provider='local', asr_mode='ENDPOINTING'):
+              new_meeting=False, transcription_provider='local', asr_mode='ENDPOINTING', *, pane=None, action=None):
         # Serialize the actual backend operation, not merely the UI state transition.
         # Status/segment callbacks take only self.lock, so stop/join cannot deadlock them.
         with self.lifecycle_lock:
+            # Pane starts and cleanup share one capability and total order.
+            # A delayed start arriving after Release must never resume capture.
+            if pane is not None or action is not None:
+                with self.overlay_lock:
+                    if not self._accept_overlay_action_locked(pane, action):
+                        from fastapi import HTTPException
+                        raise HTTPException(409, 'Capture pane was closed or superseded.')
             return self._start(consent, backend, recording_id, transcription_model, audio_source, new_meeting,
                                transcription_provider, asr_mode)
 
@@ -187,6 +211,11 @@ class MeetingState:
                                     transcription_provider, asr_mode)
             session_key = (backend, recording_id if backend == 'meetily'
                            else (transcription_model, audio_source, transcription_provider, asr_mode))
+            switching = (self.session_key is not None and self.session_key != session_key) or new_meeting
+        # Retire before publishing the new session, with lock order
+        # lifecycle -> overlay -> bridge -> state, never state -> bridge.
+        boundary = self.overlay_clear_boundary() if switching else nullcontext()
+        with boundary, self.lock:
             # A new meeting never inherits the prior one: same-settings start
             # defaults to resume (keeps transcript, results, retry data), while
             # an explicit new_meeting — or a different session — clears them.
@@ -348,14 +377,16 @@ class MeetingState:
                 with self.overlay_lock:
                     expired = time.monotonic() - self.pane_seen > 30
                     if expired:
-                        self.listening = False
-                        self.capture_generation += 1
                         # Same bounded tail window as explicit pause: flushed
                         # audio during teardown still belongs to this meeting.
                         with self.lock:
+                            self.listening = False
+                            self.capture_generation += 1
                             self.retiring_generations[capture_generation] = time.monotonic() + 5.0
                         overlay = self.overlay
+                        self._invalidate_overlay_locked(overlay)
                         self.overlay = None
+                        self.overlay_owner = None
                     else:
                         overlay = None
                 if not expired:
@@ -464,12 +495,28 @@ class MeetingState:
                     self.engine = module.KnowledgeEngine()
             return self.engine
 
-    def assist(self, question, project=None, web_query=None, all_projects=False, web_fallback=False, answer_provider=None, answer_model=None, request_id=None, row_id=None, transcript=None):
+    def assist(self, question, project=None, web_query=None, all_projects=False, web_fallback=False, answer_provider=None, answer_model=None, request_id=None, row_id=None, transcript=None, expected_generation=None, expected_capture_generation=None):
         from fastapi import HTTPException
         import secrets
         if all_projects and project:
             raise HTTPException(400, 'Choose all projects or one project, not both.')
         with self.lock:
+            # Overlay questions belong to the snapshot the user clicked, not
+            # whichever meeting is current when its worker finally arrives.
+            # Compare under the same lock as clear/start and slot allocation,
+            # before retaining question/transcript data or reserving capacity.
+            # Pane requests omit this optional in-process admission precondition.
+            if expected_generation is not None and expected_generation != self.generation:
+                raise HTTPException(409, 'Meeting context changed; refresh and retry the question.')
+            if expected_capture_generation is not None and (
+                    not self.listening or expected_capture_generation != self.capture_generation):
+                raise HTTPException(409, 'Capture context changed; refresh and retry the question.')
+            if expected_capture_generation is not None:
+                import importlib
+                module = importlib.import_module(f'{__package__}.overlay_bridge' if __package__ else 'overlay_bridge')
+                current_questions = {r['id']: r['question'] for r in module.suggest_questions(self.segments)}
+                if current_questions.get(row_id) != question:
+                    raise HTTPException(409, 'Question changed; refresh and tap the current row.')
             # Cancelled-but-not-yet-exited workers are not owners: a session
             # switch or clear must not block new requests behind them.
             live = [entry for entry in self.requests.values()
@@ -843,7 +890,9 @@ class MeetingState:
                 return True
             if time.monotonic() - self.pane_seen <= 30:
                 return False
+            self._invalidate_overlay_locked(overlay)
             self.overlay = None
+            self.overlay_owner = None
             self.overlay_lease_seq += 1
         try:
             overlay.hide_overlay()
@@ -858,7 +907,7 @@ class MeetingState:
             threading.Thread(target=self._overlay_lease, args=(overlay, seq),
                              name='meeting-overlay-lease', daemon=True).start()
 
-    def _refresh_overlay_token_locked(self):
+    def _refresh_overlay_token_locked(self, force=False):
         # Re-bind the transport to this explicit pane action. Must run under
         # overlay_lock on the pane's request thread so the captured context
         # (and token) belong to the authenticated action, not a worker.
@@ -875,6 +924,12 @@ class MeetingState:
             module_action = None
         if not callable(refresh):
             return
+        matches = getattr(transport, 'pane_context_matches', None)
+        if not force and callable(matches) and matches() is True:
+            return
+        retire = getattr(bridge, 'retire_authorization', None)
+        if callable(retire):
+            retire()
         try:
             token = secrets.token_hex(16)
             if module_action is not None:
@@ -883,11 +938,68 @@ class MeetingState:
         except Exception:
             pass
 
-    def overlay_show(self, scope):
+    def overlay_claim(self, revision=None):
+        """Claim once per mounted pane, never once per Show retry.
+
+        A later pane revokes the old capability. Only the current capability
+        can send ordered Show/Hide/Release actions; counters never rebind it.
+        """
+        import secrets
+        with self.lifecycle_lock, self.overlay_lock:
+            if revision is not None and revision != self.overlay_revision:
+                # Only an immediately preceding release can be recovered. Do
+                # not issue fresh tickets on conflicts with another claimant:
+                # an old pane must never retry its way over a newer owner.
+                if self.overlay_pane is None and revision == self.overlay_revision - 1:
+                    return {'accepted': False, 'retry_revision': self.overlay_revision}
+                return {'accepted': False}
+            self.overlay_revision += 1
+            old = self.overlay
+            self._invalidate_overlay_locked(old)
+            self.overlay = None
+            self.overlay_owner = None
+            self.overlay_lease_seq += 1
+            self.overlay_pane = secrets.token_hex(16)
+            self.overlay_action = 0
+            pane = self.overlay_pane
+        if old is not None:
+            old.hide_overlay()
+        return {'pane': pane}
+
+    def _accept_overlay_action_locked(self, pane, action):
+        if (not pane or pane != self.overlay_pane or type(action) is not int
+                or action <= self.overlay_action):
+            return False
+        self.overlay_action = action
+        return True
+
+    def overlay_release(self, pane, action):
+        # Cleanup must not pause capture or hide the helper of a newer pane.
+        with self.lifecycle_lock:
+            with self.overlay_lock:
+                if not self._accept_overlay_action_locked(pane, action):
+                    return {'accepted': False}
+                self.overlay_pane = None
+                self.overlay_revision += 1
+                old = self.overlay
+                self._invalidate_overlay_locked(old)
+                self.overlay = None
+                self.overlay_owner = None
+                self.overlay_lease_seq += 1
+            if old is not None:
+                old.hide_overlay()
+            self.pause()
+        return {'accepted': True, 'shown': False}
+
+    def overlay_show(self, scope, *, pane=None, action=None):
         """Explicit pane action: backend-managed bridge owns one helper process."""
         import importlib
         import secrets
         with self.overlay_lock:
+            # Internal callers without a pane are trusted lifecycle operations;
+            # HTTP endpoints require both capability and action sequence.
+            if pane is not None and not self._accept_overlay_action_locked(pane, action):
+                return {'shown': self.overlay is not None, 'accepted': False}
             cleaned = self._clean_overlay_scope(scope)
             if self.overlay is not None:
                 try:
@@ -903,16 +1015,20 @@ class MeetingState:
                         pass
                     self.overlay = None
                 else:
+                    # Explicit Show establishes a new owner even when the
+                    # native process is reused across pane remounts.
+                    self.overlay_owner = secrets.token_hex(16)
+                    self.overlay.scope_seq = 0
                     result = self.overlay.set_scope(cleaned)
                     if not (isinstance(result, dict) and result.get('ignored_stale')):
                         self.overlay_scope_value = cleaned
-                        self._refresh_overlay_token_locked()
+                        self._refresh_overlay_token_locked(force=True)
                     try:
                         self.overlay.update(self.status())
                     except Exception:
                         pass
                     self._start_overlay_lease_locked()
-                    return {'shown': True, 'reused': True, 'available': True}
+                    return {'shown': True, 'reused': True, 'available': True, 'owner': self.overlay_owner}
             try:
                 module = importlib.import_module(f'{__package__}.overlay_bridge' if __package__ else 'overlay_bridge')
             except ImportError:
@@ -944,23 +1060,58 @@ class MeetingState:
             except Exception:
                 pass
             self.overlay = bridge
+            self.overlay_owner = secrets.token_hex(16)
             self._start_overlay_lease_locked()
             if isinstance(result, dict):
                 out = dict(result)
                 out.setdefault('available', True)
+                out['owner'] = self.overlay_owner
                 return out
-            return {'shown': True, 'reused': False, 'available': True}
+            return {'shown': True, 'reused': False, 'available': True, 'owner': self.overlay_owner}
 
-    def overlay_hide(self):
+    @staticmethod
+    def _invalidate_overlay_locked(bridge):
+        # overlay_lock -> bridge.lock -> state.lock; no teardown/pipe IO.
+        # Legacy injected display-only bridges may not expose invalidate.
+        invalidate = getattr(bridge, 'invalidate', None)
+        if callable(invalidate):
+            invalidate()
+
+    def overlay_hide(self, *, pane=None, action=None):
         with self.overlay_lock:
+            if pane is not None and not self._accept_overlay_action_locked(pane, action):
+                return {'shown': self.overlay is not None, 'accepted': False}
+            self._invalidate_overlay_locked(self.overlay)
             bridge, self.overlay = self.overlay, None
+            self.overlay_owner = None
             self.overlay_lease_seq += 1
         if bridge is not None:
             try:
                 bridge.hide_overlay()
             except Exception:
                 pass
-        return {'shown': False}
+        return {'shown': False, 'accepted': True}
+
+    @contextmanager
+    def overlay_clear_boundary(self):
+        """Clear closes the native display, including in-flight publication.
+
+        Order: lifecycle -> overlay -> bridge -> state. The caller acquires
+        state.lock only AFTER this entry; helper teardown is outside all but
+        lifecycle_lock. Re-show explicitly after Clear to reopen the display.
+        """
+        bridge = None
+        try:
+            with self.overlay_lock:
+                bridge = self.overlay
+                self._invalidate_overlay_locked(bridge)
+                self.overlay = None
+                self.overlay_owner = None
+                self.overlay_lease_seq += 1
+                yield
+        finally:
+            if bridge is not None:
+                bridge.hide_overlay()
 
     def overlay_scope(self, scope):
         # Atomic under overlay_lock: bridge acceptance and authoritative
@@ -968,14 +1119,16 @@ class MeetingState:
         with self.overlay_lock:
             cleaned = self._clean_overlay_scope(scope)
             bridge = self.overlay
-            if bridge is None:
-                self.overlay_scope_value = cleaned
-                return {'shown': False, 'scope': cleaned}
+            if (bridge is None or not isinstance(scope, dict) or not self.overlay_owner
+                    or scope.get('owner') != self.overlay_owner):
+                return {'shown': bridge is not None, 'scope': dict(self.overlay_scope_value), 'accepted': False}
             result = bridge.set_scope(cleaned)
             if isinstance(result, dict) and result.get('ignored_stale'):
                 return {'shown': True, 'scope': dict(self.overlay_scope_value), 'accepted': False}
+            changed = ({k: v for k, v in self.overlay_scope_value.items() if k != 'seq'}
+                       != {k: v for k, v in cleaned.items() if k != 'seq'})
             self.overlay_scope_value = cleaned
-            self._refresh_overlay_token_locked()
+            self._refresh_overlay_token_locked(force=changed)
             try:
                 bridge.update(self.status())
             except Exception:
@@ -1000,6 +1153,9 @@ class MeetingState:
         if touch:
             self._touch_pane_seen()
         with self.lock:
+            # Order snapshots at capture, not delivery. Includes successive
+            # snapshots within one meeting/capture epoch (e.g. corrections).
+            self.status_seq += 1
             live = [dict(e) for e in self.requests.values() if e.get('status') in ('queued', 'streaming', 'running')]
             terminal = [dict(e) for e in self.requests.values() if e.get('status') in ('done', 'error')]
             terminal = terminal[-5:]
@@ -1045,7 +1201,7 @@ class MeetingState:
                     'busy': self.busy, 'result': self.result, 'requests': {e['request_id']: dict(e) for e in live},
                     'recent': terminal, 'meetily_clear_error': self.meetily_clear_error,
                     'capture': self.capture_info, 'backend': self.backend, 'last_session': last_session,
-                    'generation': self.generation,
+                    'generation': self.generation, 'status_seq': self.status_seq,
                     'capture_generation': self.capture_generation, 'pane_seen': self.pane_seen,
                     'overlay_shown': overlay is not None,
                     'capabilities': {'all_projects': True, 'automatic_web_fallback': True, 'independent_models': True,
@@ -1119,7 +1275,7 @@ def make_router(state):
     def start(body: CaptureRequest):
         return state.start(body.consent, body.backend, body.recording_id, body.transcription_model, body.audio_source,
                            new_meeting=body.new_meeting, transcription_provider=body.transcription_provider,
-                           asr_mode=body.asr_mode)
+                           asr_mode=body.asr_mode, pane=body.pane, action=body.action)
 
     @router.get('/recordings')
     def recordings():
@@ -1159,13 +1315,26 @@ def make_router(state):
     def assist_cancel(body: AssistCancelRequest):
         return state.cancel_assist(body.request_id)
 
+    @router.get('/overlay/lifecycle')
+    def overlay_lifecycle():
+        with state.overlay_lock:
+            return {'revision': state.overlay_revision}
+
+    @router.post('/overlay/claim')
+    def overlay_claim(body: OverlayClaimRequest):
+        return state.overlay_claim(body.revision)
+
     @router.post('/overlay/show')
-    def overlay_show(body: OverlayScopeRequest):
-        return state.overlay_show(body.scope if isinstance(body.scope, dict) else {})
+    def overlay_show(body: OverlayActionRequest):
+        return state.overlay_show(body.scope, pane=body.pane, action=body.action)
 
     @router.post('/overlay/hide')
-    def overlay_hide():
-        return state.overlay_hide()
+    def overlay_hide(body: OverlayActionRequest):
+        return state.overlay_hide(pane=body.pane, action=body.action)
+
+    @router.post('/overlay/release')
+    def overlay_release(body: OverlayActionRequest):
+        return state.overlay_release(body.pane, body.action)
 
     @router.post('/overlay/scope')
     def overlay_scope(body: OverlayScopeRequest):
@@ -1184,7 +1353,7 @@ def make_router(state):
         # Without this, Clear could read state.bridge while a start has set
         # listening but not yet created the bridge, skip the forget boundary,
         # and restart capture onto unforgotten adapter state.
-        with state.lifecycle_lock, state.lock:
+        with state.lifecycle_lock, state.overlay_clear_boundary(), state.lock:
             state.segments.clear()
             state.result = None
             state.error = None
