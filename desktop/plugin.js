@@ -422,6 +422,8 @@ export default {
       const [transcriptionProvider, setTranscriptionProvider] = useState(saved.transcriptionProvider === 'meta' ? 'meta' : 'local');
       const [asrMode, setAsrMode] = useState(['ENDPOINTING', 'DIARIZATION', 'PUSH_TO_TALK'].includes(saved.asrMode) ? saved.asrMode : 'ENDPOINTING');
       const [setupOpen, setSetupOpen] = useState(false);
+      const [answerUncertain, setAnswerUncertain] = useState(false);
+      const [progressPaused, setProgressPaused] = useState(false);
       useEffect(() => {
         try {
           if (typeof localStorage !== 'undefined') localStorage.setItem(SCOPE_KEY, JSON.stringify({ project, backend, webFallback, transcriptionModel, audioSource, answerProvider, answerModel, transcriptionProvider, transcriptionChoiceVersion: 1, asrMode }));
@@ -432,6 +434,7 @@ export default {
       function resetMeetingInputs() {
         setQuestion(''); setWeb(''); setLastAsked(null); setLiveEntry(null);
         setTrackedRequest(null); setError(''); setAssistFailed(false);
+        setAnswerUncertain(false); setProgressPaused(false);
       }
       const cloudUnavailable = backend === 'macos' && transcriptionProvider === 'meta' && !data.capabilities?.meta_asr;
       const overlayNeedsHide = !!data.overlay_cleanup_error || !!overlayActionAt.current.credentialShutdownUnconfirmed;
@@ -518,63 +521,107 @@ export default {
           return false;
         } finally { if (life.mounted) setPending(false); }
       }
+      const answerSubmitting = useRef(false);
+      const answerBlocked = !!(busy || answerUncertain || trackedRequest || Object.keys(data.requests || {}).length);
+      // Bound every outgoing answer string, including stored legacy replays.
+      // Reject oversized saved snapshots/identifiers rather than silently
+      // changing exact replay context or routing to a truncated project/model.
+      const boundedAnswer = body => {
+        const limits = { question: 4000, transcript: 16000, project: 1000, web_query: 300,
+          answer_provider: 100, answer_model: 200, row_id: 200, request_id: 100 };
+        for (const [key, limit] of Object.entries(limits)) {
+          if (body[key] != null && (typeof body[key] !== 'string' || body[key].length > limit)) {
+            setError('Answer was not sent: question, saved context, or selected settings exceed supported field limits. Edit the question/settings and ask explicitly.');
+            setAssistFailed(false);
+            return null;
+          }
+        }
+        return body;
+      };
+      const answerFailure = () => 'Answer failed. Check answer setup, credentials, and backend connection, then Retry if you want to resend this question and its saved context.';
+      const acceptAnswer = res => {
+        if (res?.contract === 'answer-admission-v1' && res.accepted === false &&
+            ['invalid_request', 'busy', 'capacity'].includes(res.reason)) {
+          setError({ invalid_request: 'Answer was not accepted. Enter a question or start listening; check the selected scope.',
+            busy: 'Answer was not accepted because another answer is active. Wait for it to finish or cancel it, then ask again.',
+            capacity: 'Answer was not accepted because workers are still busy. Wait for them to finish, then ask again.' }[res.reason]);
+          setAssistFailed(true);
+          return;
+        }
+        if (!res?.request_id) throw new Error('Unconfirmed answer submission');
+        setAnswerUncertain(false); setProgressPaused(false);
+        setLiveEntry(null); setTrackedRequest(res.request_id);
+      };
       async function assistNow(extra = {}, questionOverride, scopeOverride) {
-        if (!usable() || !overlayActionAt.current.mounted) return;
+        if (!usable() || !overlayActionAt.current.mounted || answerBlocked || answerSubmitting.current) return;
         const asked = questionOverride !== undefined ? questionOverride : question;
         const scopeUsed = scopeOverride || scope;
+        const body = boundedAnswer({ question: asked, ...scopeUsed, ...extra, response_contract: 'answer-admission-v1' });
+        if (!body) return;
+        answerSubmitting.current = true;
         if (questionOverride !== undefined) setQuestion(questionOverride);
-        setPending(true); setError(''); setAssistFailed(false); setLiveEntry(null); setTrackedRequest(null);
+        setPending(true); setError(''); setAssistFailed(false);
         // Remember for explicit partial replay, not automatic transport retry.
         setLastAsked({ question: asked, extra, scope: { ...scopeUsed } });
         // Request outcome and status refresh are separate: an accepted
         // assist whose refresh fails must not be reported as failed (and
         // retried into a duplicate) — the tracked request already exists.
         try {
-          const res = await api('/assist', { question: asked, ...scopeUsed, ...extra });
-          if (res && res.request_id) setTrackedRequest(res.request_id);
+          const res = await api('/assist', body);
+          acceptAnswer(res);
         }
-        catch (e) { setError('Answer submission was not confirmed. Check the backend connection and recheck status; the request may already be running or complete. Review the result before asking again.'); setAssistFailed(true); }
-        finally { setPending(false); }
+        catch (e) { setAnswerUncertain(true); setError('Answer submission was not confirmed. Check the backend connection and recheck status; the request may already be running or complete. Review the result before asking again.'); setAssistFailed(true); }
+        finally { answerSubmitting.current = false; setPending(false); }
         try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }); }
         catch (e) {}
       }
       // Exact replay: resend a stored request verbatim (question, scope,
       // transcript snapshot) instead of whatever the pane currently shows.
       async function replayRequest(req) {
-        if (!usable() || !overlayActionAt.current.mounted || !req) return;
+        if (!usable() || !overlayActionAt.current.mounted || !req || answerBlocked || answerSubmitting.current) return;
+        const body = boundedAnswer({ response_contract: 'answer-admission-v1', question: req.question || '', project: req.project ?? null,
+          all_projects: !!req.all_projects, web_fallback: !!req.web_fallback,
+          ...(req.web_query ? { web_query: req.web_query } : {}),
+          ...(req.answer_provider ? { answer_provider: req.answer_provider, answer_model: req.answer_model } : {}),
+          ...(typeof req.transcript === 'string' ? { transcript: req.transcript } : {}),
+          ...(req.row_id ? { row_id: req.row_id } : {}) });
+        if (!body) return;
+        answerSubmitting.current = true;
         if (typeof req.question === 'string') setQuestion(req.question);
-        setPending(true); setError(''); setAssistFailed(false); setLiveEntry(null); setTrackedRequest(null);
+        setPending(true); setError(''); setAssistFailed(false);
         // A lost replay response may still mean the backend accepted it.
         setLastAsked({ question: req.question || '', extra: { web_query: req.web_query }, scope: req });
         try {
-          const body = { question: req.question || '', project: req.project ?? null,
-            all_projects: !!req.all_projects, web_fallback: !!req.web_fallback,
-            ...(req.web_query ? { web_query: req.web_query } : {}),
-            ...(req.answer_provider ? { answer_provider: req.answer_provider, answer_model: req.answer_model } : {}),
-            ...(typeof req.transcript === 'string' ? { transcript: req.transcript } : {}),
-            ...(req.row_id ? { row_id: req.row_id } : {}) };
           const res = await api('/assist', body);
-          if (res && res.request_id) setTrackedRequest(res.request_id);
+          acceptAnswer(res);
         }
-        catch (e) { setError('Answer submission was not confirmed. Check the backend connection and recheck status; the request may already be running or complete. Review the result before asking again.'); setAssistFailed(true); }
-        finally { setPending(false); }
+        catch (e) { setAnswerUncertain(true); setError('Answer submission was not confirmed. Check the backend connection and recheck status; the request may already be running or complete. Review the result before asking again.'); setAssistFailed(true); }
+        finally { answerSubmitting.current = false; setPending(false); }
         // Same split as a fresh ask: a replayed request that the backend
         // accepted must not become a duplicate through a failed refresh.
         try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }); }
         catch (e) {}
       }
+      const [progressRetry, setProgressRetry] = useState(0);
       useEffect(() => {
         if (!trackedRequest) return undefined;
         let alive = true;
         let inFlight = false;
+        let paused = false;
         let misses = 0;
         const poll = async () => {
           // Serialize: a slow backend must not let polls resolve out of order.
-          if (inFlight) return;
+          if (inFlight || paused) return;
           inFlight = true;
           try {
-            const entry = await ctx.rest(`/assist/${trackedRequest}`);
+            const entry = await ctx.rest(`/assist/${trackedRequest}?missing=sentinel-v1`);
             if (!alive) return;
+            if (entry?.contract === 'answer-progress-v1' && entry.status === 'missing') {
+              setTrackedRequest(null); setLiveEntry(null);
+              setError('That answer is no longer available (new meeting or restart cleared it). Ask again.');
+              try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }); } catch (ignored) {}
+              return;
+            }
             if (!entry) {
               // The slot is gone (cleared by a newer session or restart): stop tracking
               // with an actionable explanation instead of stale progress.
@@ -586,39 +633,58 @@ export default {
               return;
             }
             misses = 0;
+            setProgressPaused(false);
             setLiveEntry(entry);
             // A recovered poll clears a stale progress error; other errors stay.
             setError(prev => (typeof prev === 'string' && (prev.startsWith('Answer progress') || prev.startsWith('That answer is no longer'))) ? '' : prev);
             if (entry && (entry.status === 'done' || entry.status === 'error' || entry.status === 'cancelled')) {
+              setAnswerUncertain(false); setAssistFailed(false);
+              setError(current => /^(Answer submission|Cancellation was not confirmed|Answer progress unavailable)/.test(current) ? '' : current);
               setTrackedRequest(null);
-              await qc.invalidateQueries({ queryKey: [ID, 'status'] });
+              // TanStack invalidate resolves on refetch failure by default.
+              // Keep terminal progress independently of the status cache.
+              try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }, { throwOnError: true }); } catch (ignored) {}
             }
           } catch (e) {
-            // The regular status poll recovers next cycle; three consecutive
-            // failures surface instead of spinning silently. A missing slot
-            // (404: cleared by a newer session or restart) stops tracking
-            // with an actionable explanation instead of stale progress.
+            // Older Desktop bridges expose only a plain Error, even for HTTP
+            // rejection. Never parse its potentially secret-bearing text. On
+            // old backends a missing slot is indistinguishable from a network
+            // failure: pause after three failures, retain tracking, and let an
+            // explicit status recheck resume GETs (never POST the transcript).
             if (!alive) return;
-            if (e && e.status === 404) {
-              setTrackedRequest(null); setLiveEntry(null);
-              setError('That answer is no longer available (new meeting or restart cleared it). Ask again.');
-              try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }); } catch (ignored) {}
-            } else if (++misses >= 3) setError('Answer progress unavailable. Check the backend connection; polling will continue. Recheck status for the result before asking again.');
+            if (++misses >= 3) {
+              paused = true;
+              setProgressPaused(true);
+              setError('Answer progress unavailable. Polling is paused; the answer may still be running or may have been cleared. Check the backend connection and Recheck status to resume progress checks before asking again.');
+            }
           } finally { inFlight = false; }
         };
         poll();
         const timer = setInterval(poll, 1000);
         return () => { alive = false; clearInterval(timer); };
-      }, [trackedRequest]);
+      }, [trackedRequest, progressRetry]);
       // Reattach: reopening the pane mid-request resumes tracking the live
       // slot reported by status instead of losing its partials and Cancel.
       const liveIds = Object.keys(data.requests || {});
       useEffect(() => {
-        if (!trackedRequest && !liveEntry && liveIds.length > 0) setTrackedRequest(liveIds[0]);
+        // A terminal entry from the last answer must not hide an accepted
+        // replay whose POST response was lost. Status is authoritative for
+        // live ownership; reattach without ever resending the request.
+        if (!trackedRequest && liveIds.length > 0) setTrackedRequest(liveIds[0]);
       }, [liveIds.join(',')]);
       const cancellableId = trackedRequest || liveIds[0] || null;
       const entries = Array.isArray(projects.data) ? projects.data : (projects.data?.projects || []);
-      const result = data.result;
+      // A verified terminal GET is an answer even when status refetch fails.
+      // Never carry it across a backend meeting-generation boundary.
+      const currentLive = liveEntry && (data.generation == null || liveEntry.generation == null || data.generation === liveEntry.generation) ? liveEntry : null;
+      const result = currentLive?.status === 'done' ? currentLive : data.result;
+      useEffect(() => {
+        if (!liveEntry || !['done', 'error', 'cancelled'].includes(liveEntry.status)) return;
+        // Once status has actually observed this terminal slot, the canonical
+        // result owns the view again (including later answers from the overlay).
+        const reconciled = !status.error && (data.recent || []).some(entry => entry.request_id === liveEntry.request_id && ['done', 'error', 'cancelled'].includes(entry.status));
+        if (!currentLive || reconciled) setLiveEntry(null);
+      }, [liveEntry, data.generation, data.recent, !!status.error]);
       const transcript = data.segments || [];
       const failed = !!(data.error_request || data.error || (data.capture && (data.capture.error || /fail|error|could not/i.test(data.capture.warning || ''))));
       const statusLabel = status.isPending ? 'Connecting…' : status.error ? 'Unavailable' : data.stopping ? 'Stopping — unconfirmed' : failed ? 'Needs attention' : data.listening ? 'Listening' : 'Paused';
@@ -658,22 +724,25 @@ export default {
       const stopError = data.stop_error || (data.error_source === 'stop' ? data.error : null);
       const legacyError = !('error_source' in data) && data.error &&
         ![data.overlay_cleanup_error, data.meetily_clear_error, answerError, stopError, data.capture_error].includes(data.error)
-        ? data.error : null;
+        ? (data.error_request ? answerFailure() : data.error) : null;
       const captureError = data.capture_error || (data.error_source === 'capture' ? data.error : null);
-      const recheckStatus = () => qc.invalidateQueries({ queryKey: [ID, 'status'] });
+      const recheckStatus = async () => {
+        try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }, { throwOnError: true }); }
+        catch (_) { setError('Backend unavailable. Check the backend connection, installation, and plugin enablement.'); }
+      };
       const errorCard = (message, label, onClick, disabled = false) => message && h('div', { role: 'alert', style: card },
         h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' } },
           h('span', null, message), h(Button, { variant: 'secondary', disabled: pending || disabled, onClick }, label)));
       // A lost submission response cannot authorize replay. Progress failures
       // likewise recheck without borrowing another message's retry request.
-      const localRecheck = assistFailed || (typeof error === 'string' && error.startsWith('Answer progress'));
+      const localRecheck = assistFailed || (typeof error === 'string' && /^(Answer progress|Answer submission|Cancellation was not confirmed)/.test(error));
       const restartCapture = !data.listening && !data.stopping;
       const captureBlocked = overlayNeedsHide || cloudUnavailable || !consent || (backend === 'meetily' && !recording)
         || (backend === 'macos' && !data.capabilities?.macos_transcription);
       return h('div', { style: { padding: 16, display: 'flex', flexDirection: 'column', gap: 14, height: '100%', minWidth: 0, width: '100%', boxSizing: 'border-box', overflowY: 'auto', overflowX: 'hidden', overflowWrap: 'anywhere', color: 'var(--ui-text-primary)' } },
         h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
           h('strong', { style: { fontSize: 17 } }, 'Meeting Copilot'),
-          h(Badge, { title: status.error ? `Backend unavailable: ${status.error.message}. Check installation and plugin enablement.` : status.isPending ? 'Contacting backend…' : undefined }, statusLabel)),
+          h(Badge, { title: status.error ? 'Backend unavailable. Check the backend connection, installation, and plugin enablement.' : status.isPending ? 'Contacting backend…' : undefined }, statusLabel)),
         // Capture session first: the permission check and the primary
         // start/pause actions live at the top, before any setup detail.
         h('section', { style: { ...card, display: 'grid', gap: 10 }, 'aria-label': 'Capture session' },
@@ -714,11 +783,18 @@ export default {
             h(Button, { variant: 'secondary', disabled: pending, onClick: toggleOverlay }, 'Retry hide overlay'))),
         errorCard(error, localRecheck ? 'Recheck status' : 'Dismiss', async () => {
           if (localRecheck) {
-            try { await recheckStatus(); if (assistFailed) setError(''); } catch (_) {}
+            // Resume GET-only progress checks; never replay an uncertain POST.
+            setAssistFailed(false); setProgressPaused(false);
+            setProgressRetry(value => value + 1);
+            try {
+              await qc.invalidateQueries({ queryKey: [ID, 'status'] }, { throwOnError: true });
+              // Only recovered progress/terminal evidence clears this message.
+              // A successful status refresh alone does not prove recovery.
+            } catch (_) { setError(data.stopping ? 'Backend status unavailable. Check the connection and recheck status; stopping is not yet confirmed.' : 'Answer progress unavailable. Recheck status or explicitly reset local tracking after reviewing the uncertainty.'); }
           } else setError('');
         }),
-        errorCard(answerError, data.error_request ? 'Retry' : 'Recheck status', () =>
-          data.error_request ? replayRequest(data.error_request) : recheckStatus()),
+        errorCard(answerError ? answerFailure() : null, data.error_request ? 'Retry' : 'Recheck status', () =>
+          data.error_request ? replayRequest(data.error_request) : recheckStatus(), !!data.error_request && answerBlocked),
         errorCard(stopError, 'Recheck status', recheckStatus),
         errorCard(legacyError, 'Recheck status', recheckStatus),
         errorCard(captureError, restartCapture ? 'Restart capture' : 'Recheck status',
@@ -726,7 +802,7 @@ export default {
         errorCard(data.meetily_clear_error, 'Clear again', async () => {
           if (await act('/clear')) resetMeetingInputs();
         }),
-        status.error && errorCard(`Backend unavailable: ${String(status.error.message || status.error)}. Check installation and plugin enablement.`,
+        status.error && errorCard('Backend unavailable. Check the backend connection, installation, and plugin enablement.',
           'Retry', recheckStatus),
         persistWarning && h('p', { role: 'status', style: muted }, persistWarning),
         !data.listening && !data.stopping && !result && h('section', { style: card, 'aria-label': 'Getting started' },
@@ -771,28 +847,39 @@ export default {
             h('span', { style: muted }, 'Meetily manages its own saved recordings and transcripts. Pausing here detaches the copilot; it does not stop Meetily recording.')),
           h('p', { style: { ...muted, marginBottom: 0 } }, 'Permission and session controls are in the Capture session card at the top.')),
         h('label', { ref: composerRef, style: { display: 'grid', gap: 6 } }, h('strong', { id: 'mc-q-label' }, 'What should I say?'),
-          h(Textarea, { value: question, onChange: e => setQuestion(e.target.value), placeholder: 'Leave blank to answer the latest question, or type a question… (⌘/Ctrl+Enter to send)', rows: 3, 'aria-labelledby': 'mc-q-label', onKeyDown: e => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !e.repeat && !e.nativeEvent?.isComposing && !busy && !unsupported) { e.preventDefault(); assistNow(); } } })),
+          h(Textarea, { value: question, maxLength: 4000, onChange: e => setQuestion(e.target.value.slice(0, 4000)), placeholder: 'Leave blank to answer the latest question, or type a question… (⌘/Ctrl+Enter to send)', rows: 3, 'aria-labelledby': 'mc-q-label', onKeyDown: e => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !e.repeat && !e.nativeEvent?.isComposing && !busy && !unsupported) { e.preventDefault(); assistNow(); } } })),
         ...(unsupported ? [h('p', { role: 'alert', style: muted }, `Suggest is unavailable: ${unsupportedReasons.join(' ')} See Answer setup below, then restart the gateway when other sessions are idle.`)] : []),
         h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
-          h(Button, { disabled: busy || unsupported, onClick: () => assistNow() }, busy ? 'Checking your sources…' : 'Suggest answer'),
+          h(Button, { disabled: answerBlocked || unsupported, onClick: () => assistNow() }, busy ? 'Checking your sources…' : 'Suggest answer'),
+          (answerUncertain || progressPaused || (assistFailed && trackedRequest)) && h(Button, { variant: 'secondary', disabled: pending, onClick: () => {
+            if (typeof window === 'undefined' || typeof window.confirm !== 'function' || !window.confirm('Reset only local answer tracking? The earlier request may still be running or complete. This does not cancel it or send anything. Review available answers first. Asking again afterwards may resend the same meeting context and create a duplicate.')) return;
+            setTrackedRequest(null); setLiveEntry(null); setAnswerUncertain(false);
+            setProgressPaused(false); setAssistFailed(false); setError('');
+          } }, 'Reset local answer tracking'),
           cancellableId && h(Button, { variant: 'secondary', onClick: async () => {
-              try { await api('/assist/cancel', { request_id: cancellableId }); setTrackedRequest(null); setLiveEntry(null); await qc.invalidateQueries({ queryKey: [ID, 'status'] }); }
-              catch (e) { setError(String(e.message || e)); }
+              try { await api('/assist/cancel', { request_id: cancellableId }); }
+              catch (e) { setError('Cancellation was not confirmed. The answer may still be running; recheck status before asking again.'); setAssistFailed(true); return; }
+              setTrackedRequest(null); setLiveEntry(null);
+              try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }); }
+              catch (e) { setError('Answer progress unavailable after cancellation. Recheck status before asking again.'); }
             } }, 'Cancel answer'),
           h(Button, { variant: 'secondary', disabled: !result?.answer, onClick: async () => { if (!usable()) return; try { await navigator.clipboard.writeText(result.answer); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch (e) { setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, copied ? 'Copied ✓' : 'Copy'),
           question && h(Button, { variant: 'secondary', disabled: busy, onClick: () => { setQuestion(''); composerRef.current?.querySelector('textarea')?.focus(); } }, 'Clear question')),
+        currentLive && ['error', 'cancelled'].includes(currentLive.status) && !data.error && h('section', { style: card, 'aria-live': 'polite', 'data-terminal-answer': true },
+          h('p', null, currentLive.status === 'error' ? answerFailure() : 'Answer cancelled.'),
+          currentLive.request && h(Button, { variant: 'secondary', disabled: answerBlocked, onClick: () => replayRequest(currentLive.request) }, 'Retry this answer')),
         liveEntry && ['queued', 'streaming', 'running'].includes(liveEntry.status) && h('section', { style: card, 'aria-live': 'polite', ref: answerRef },
           h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8 } },
             h('strong', null, liveEntry.status === 'queued' ? 'Queued — waiting for a worker…' : liveEntry.streaming === false ? 'Preparing answer…' : 'Streaming answer…'),
             h('span', { style: muted }, `${liveEntry.model_route || ''}${liveEntry.streaming === false ? ' · completed mode' : ''}`)),
           h('div', { style: { whiteSpace: 'pre-wrap', lineHeight: 1.65, paddingTop: 8 } }, liveEntry.answer || 'Contacting your sources…'),
           ...((liveEntry.warnings || []).map((w, i) => h('p', { key: `lw-${i}`, style: muted }, w)))),
-        result && h('section', { style: card, 'aria-live': 'polite', ref: answerRef },
+        result && h('section', { style: card, 'aria-live': 'polite', ref: answerRef, 'data-answer-result': true },
           h('div', { style: { display: 'flex', justifyContent: 'space-between' } }, h('strong', null, 'Suggested answer'), h('span', { style: muted }, `${Number.isFinite(result.elapsed_seconds) ? `${result.elapsed_seconds.toFixed(1)}s` : ''}${result.model_route ? ` · ${result.model_route}` : ''}`)),
           h('div', { style: { whiteSpace: 'pre-wrap', lineHeight: 1.65, paddingTop: 10 } }, result.answer),
           result.web_search?.used && h('p', { style: muted }, `${result.web_search.mode === 'automatic' ? 'Automatic web fallback' : 'Explicit web search'}: ${result.web_search.query}`),
           ...(result.warnings || []).map((w, i) => h('p', { key: `warning-${i}`, style: muted }, w)),
-          result.answer && /partial|interrupt/i.test((result.warnings || []).join(' ')) && (result.request || lastAsked) && h('div', { style: { paddingTop: 8 } }, h(Button, { variant: 'secondary', onClick: () => replayRequest(result.request || { question: lastAsked.question, ...(lastAsked.scope || {}) }) }, 'Retry for the complete response')),
+          result.answer && /partial|interrupt/i.test((result.warnings || []).join(' ')) && (result.request || lastAsked) && h('div', { style: { paddingTop: 8 } }, h(Button, { variant: 'secondary', disabled: answerBlocked, onClick: () => replayRequest(result.request || { question: lastAsked.question, ...(lastAsked.scope || {}) }) }, 'Retry for the complete response')),
           h('details', { style: { marginTop: 12 } }, h('summary', { style: { cursor: 'pointer', ...muted } }, `Evidence · ${(result.sources || []).length} sources`),
             ...(result.sources || []).map((s, i) => h('div', { key: s.id || i, style: { ...muted, marginTop: 8, padding: '8px 10px', border: '1px solid var(--ui-stroke-secondary)', borderRadius: 8, overflowWrap: 'anywhere' } },
               h('strong', null, `[${i + 1}] ${s.title || s.source || 'Source'}`),
@@ -836,7 +923,7 @@ export default {
               ...(entry.sources || []).slice(0, 6).map((s, k) => h('div', { key: s.id || k, style: { ...muted, paddingTop: 6, overflowWrap: 'anywhere' } }, h('strong', null, `[${k + 1}] ${s.title || s.source || 'Source'}`)))),
             h('div', { style: { paddingTop: 8, display: 'flex', gap: 8, flexWrap: 'wrap' } },
               entry.answer && h(Button, { variant: 'secondary', onClick: async () => { if (!usable()) return; try { await navigator.clipboard.writeText(entry.answer); } catch (e) { setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, 'Copy this answer'),
-              entry.request && h(Button, { variant: 'secondary', onClick: () => replayRequest(entry.request) }, /partial|interrupt|unavailable|failed|error/i.test((entry.warnings || []).join(' ') + ' ' + (entry.status || '')) ? 'Retry for the complete response' : 'Ask again'))))),
+              entry.request && h(Button, { variant: 'secondary', disabled: answerBlocked, onClick: () => replayRequest(entry.request) }, /partial|interrupt|unavailable|failed|error/i.test((entry.warnings || []).join(' ') + ' ' + (entry.status || '')) ? 'Retry for the complete response' : 'Ask again'))))),
         h('details', { open: setupOpen, onToggle: e => setSetupOpen(e.currentTarget.open), style: { border: '1px solid var(--ui-stroke-secondary)', borderRadius: 12, padding: '2px 14px 14px', background: 'var(--ui-bg-card)' } },
         h('summary', { style: { cursor: 'pointer', fontWeight: 700, color: 'var(--ui-text-primary)', padding: '12px 0', fontSize: 14 } }, setupOpen ? '\u25be Answer setup — scope, models, overlay, web' : '\u25b8 Answer setup — scope, models, overlay, web'),
         h('div', { style: { display: 'flex', flexDirection: 'column', gap: 14, paddingTop: 4 } },
@@ -883,7 +970,7 @@ export default {
         h('details', null, h('summary', { style: { cursor: 'pointer', ...muted, padding: '4px 0' } }, 'Search online with a specific query'),
           h('div', { style: { display: 'grid', gap: 8, paddingTop: 10 } },
             h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Specific public web query'),
-              h(Input, { value: web, onChange: e => setWeb(e.target.value), placeholder: 'Public query — no client names or meeting details', 'aria-label': 'Specific public web query' })),
+              h(Input, { value: web, maxLength: 300, onChange: e => setWeb(e.target.value.slice(0, 300)), placeholder: 'Public query — no client names or meeting details', 'aria-label': 'Specific public web query' })),
             h('span', { style: muted }, 'This explicit query overrides automatic fallback for this request. Do not include private details.'),
             h(Button, { variant: 'secondary', disabled: busy || unsupported || !web.trim(), onClick: () => assistNow({ web_query: web.trim() }) }, 'Check sources + web'))),
         )),

@@ -77,12 +77,59 @@ expectations described above. After reconciling those assertions and adding the
 combined capture gate regression, the complete npm gate passed. No tests were
 silenced or removed to obtain the final result.
 
-## Still required before eventual main integration
+## Completed immutable answer follow-up integration
 
-**The other combined agent's newer answer-poll fixes are not in either immutable
-parent and are NOT included here. Integrate that completed immutable commit
-separately, inspect semantic conflicts in `desktop/plugin.js`, and rerun the full
-and effect gates before considering the candidate final.**
+The previously pending answer-poll integration is complete. The merge inputs are
+`3220b2607568bb569d7422a0ea3f1055291f65f8` (final overlay/key candidate) and
+`9e13f8c5eb0256536b462eec1126a03433c01a13` (immutable answer follow-up, including
+its `29777f5` predecessor). Their merge base is
+`300e848c44bcd6c22217d3c1748b41d78a65d895`.
+
+Two textual hunks were resolved:
+
+- `desktop/plugin.js`, error actions: disjoint intents combined. Keep independent
+  answer/capture/stop/overlay/forget cards and consent/credential cleanup gates;
+  add sanitized answer/status diagnostics, blocked uncertain answer retries,
+  GET-only polling recovery, and independent terminal-answer evidence. A status
+  refresh alone does not dismiss progress uncertainty. The adjacent shared status
+  handler catches rejected refetches without exposing raw errors. Legacy retained
+  requests sanitize diagnostics but confer no replay authority.
+- `server.py`, status attribution: design collision resolved in favor of the
+  independent fields (`answer_error`, `capture_error`, `stop_error`) and exact
+  answer request retained alongside concurrent failures. Keep `stop` attribution
+  and existing summary priority; answer diagnostics are sanitized upstream by the
+  incoming change. A capture error cannot borrow the answer request's action.
+
+Cloud transcription remains explicit opt-in; the owner-scoped API key editor
+remains masked. Existing credential/overlay liveness code is retained. Tests that
+expected raw provider/backend diagnostics were reconciled to the incoming privacy
+contract without deleting independent action assertions. A new legacy diagnostic
+regression verifies sanitization without granting retry authority.
+
+Final executed gates (isolated HOME/HERMES_HOME/TMPDIR, synthetic credentials):
+
+- Full `npm test`: **776 Python tests, OK (3 skips); 143 Node tests passed**;
+  JavaScript syntax check passed. Receipt:
+  `/Users/adamnugroho/.hermes/cache/scratch/final-candidate-gate-jb5d83_6/npm.log`.
+- Focused answer/model/credential/overlay attribution and liveness regression:
+  **272 tests passed**. Receipt:
+  `/Users/adamnugroho/.hermes/cache/scratch/answer-merge-focused-zcl5fati/focused.log`.
+- Real React/ReactDOM/jsdom effects, including installed TanStack QueryClient,
+  normal and StrictMode: **104 scenarios passed**. Existing dependencies were
+  loaded read-only; none installed. Receipt:
+  `/Users/adamnugroho/.hermes/cache/scratch/final-candidate-gate-4olsa7cb/effects.log`.
+- Swift rebuilt in managed scratch: `--self-test` returned
+  `overlay state tests passed`; protocol is `meeting-overlay/2`. Receipt:
+  `/Users/adamnugroho/.hermes/cache/scratch/final-candidate-gate-e3kwui0p/swift.log`.
+- Working/staged diff checks passed; no conflict markers remain.
+
+Initial gates exposed incompatible raw-diagnostic expectations, premature progress
+message clearing, and an uncaught shared status-refetch rejection; those were
+resolved and the complete gates rerun. The first effect dependency location lacked
+TanStack Query; a compatible already-installed dependency tree was used instead.
+Python gate connections were prohibited, and effect backends forbid connections;
+provider/host scenarios use fake transports. No live provider/app, real key,
+hardware capture, installation, push, deployment, or main merge was performed.
 
 This receipt is offline integration evidence, not live Desktop/native window,
 macOS capture permission, screen-sharing exclusion, or provider acceptance.

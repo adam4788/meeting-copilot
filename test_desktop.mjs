@@ -889,8 +889,9 @@ test('unclassified legacy errors only recheck even with prior backend and stale 
       error_request: { question: 'Old question', transcript: 'Private old transcript' } };
     const p = lifecyclePane({}, { 3: true, 4: 'macos' }, status);
     try {
-      const alert = alertFor(p.rerender(), status.error);
+      const alert = alertFor(p.rerender(), 'Answer failed. Check answer setup');
       assert.ok(alert);
+      assert.doesNotMatch(JSON.stringify(p.rerender()), /Unclassified legacy failure/);
       assert.ok(!button(alert, 'Restart capture'), 'legacy summary cannot authorize capture');
       assert.ok(!button(alert, 'Retry'), 'retained request cannot authorize answer retry');
       const recheck = button(alert, 'Recheck status');
@@ -957,13 +958,27 @@ test('simultaneous answer capture stop boundary and backend errors stay independ
   for (const [key, message] of Object.entries(messages)) {
     const label = key === 'answer_error' ? 'Retry' : key === 'meetily_clear_error' ? 'Clear again'
       : key === 'overlay_cleanup_error' ? 'Retry hide overlay' : 'Recheck status';
-    assert.ok(button(alertFor(p.tree, message), label), `${key} must pair its own action`);
+    assert.ok(button(alertFor(p.tree, key === 'answer_error' ? 'Answer failed. Check answer setup' : message), label), `${key} must pair its own action`);
   }
-  assert.ok(button(alertFor(p.tree, 'Backend unavailable: Connection lost'), 'Retry'));
-  await button(alertFor(p.tree, messages.answer_error), 'Retry').props.onClick();
+  assert.ok(button(alertFor(p.tree, 'Backend unavailable. Check the backend connection'), 'Retry'));
+  assert.doesNotMatch(JSON.stringify(p.tree), /Answer provider failed|Connection lost/);
+  await button(alertFor(p.tree, 'Answer failed. Check answer setup'), 'Retry').props.onClick();
   const assist = p.requests.find(r => r.path === '/assist');
   assert.equal(assist.body.question, stored.question);
   assert.equal(assist.body.transcript, stored.transcript);
+});
+
+test('legacy answer diagnostics are private without granting stale retry authority', async () => {
+  const p = pane('', true, false, '', {}, {}, {
+    error: 'synthetic-sensitive-legacy-provider-error',
+    error_request: { question: 'Old question', transcript: 'Old private context' },
+  });
+  const alert = alertFor(p.tree, 'Answer failed. Check answer setup');
+  assert.ok(alert);
+  assert.doesNotMatch(JSON.stringify(p.tree), /synthetic-sensitive-legacy-provider-error/);
+  assert.ok(!button(alert, 'Retry'));
+  await button(alert, 'Recheck status').props.onClick();
+  assert.ok(!p.requests.some(r => r.path === '/assist'));
 });
 
 test('non-answer local error replaces failed assist without retaining its retry', async () => {

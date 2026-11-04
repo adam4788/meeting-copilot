@@ -1,5 +1,5 @@
 """Offline review bridge, production router/secret scopes; no network/hardware."""
-import sys, os, json, socket
+import sys, os, json, socket, threading
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 def forbidden(*args, **kwargs):
@@ -26,7 +26,20 @@ class Audio:
 audio = Audio()
 class FakeEngine:
     provider_failure = False
+    engine_failure = False
+    hold = threading.Event()
+    hold.set()
+    def answer_stream(self, question, **kwargs):
+        if self.hold.is_set():
+            raise NotImplementedError
+        def chunks():
+            yield 'Synthetic live partial'
+            self.hold.wait(10)
+            yield ' completed'
+        return {}, chunks()
     def answer(self, question, **kwargs):
+        if self.engine_failure:
+            raise RuntimeError('synthetic-sensitive-engine\nTraceback: synthetic-stack')
         if self.provider_failure:
             return {'answer': '', 'sources': [], 'warnings': [],
                     'provider_error': 'Provider authentication failed (HTTP 401). Check your API key.'}
@@ -88,8 +101,22 @@ with ExitStack() as stack:
             bridge = state.pending_overlay
             bridge.hide_overlay = type(bridge).hide_overlay.__get__(bridge)
             result = {'code': 200, 'body': {}}
+        elif m.get('control') == 'hold-answer':
+            FakeEngine.hold.clear()
+            result = {'code': 200, 'body': {}}
+        elif m.get('control') == 'release-answer':
+            FakeEngine.hold.set()
+            result = {'code': 200, 'body': {}}
+        elif m.get('control') == 'engine-failure':
+            FakeEngine.engine_failure = m.get('value', True)
+            result = {'code': 200, 'body': {}}
         elif m.get('control') == 'provider-failure':
             FakeEngine.provider_failure = True
+            result = {'code': 200, 'body': {}}
+        elif m.get('control') == 'drop-answers':
+            with state.lock:
+                state.requests.clear()
+                state.result = None
             result = {'code': 200, 'body': {}}
         elif m.get('control') == 'segment':
             state.add_segment({'text': 'Synthetic question?'})
@@ -115,5 +142,6 @@ with ExitStack() as stack:
             response = client.request(m.get('method', 'GET'), m['path'], **({'json': m['body']} if 'body' in m else {}))
             result = {'code': response.status_code, 'body': response.json()}
         print(json.dumps({'id': m['id'], **result}), flush=True)
+    FakeEngine.hold.set()
     state.pause(retain_tail=False)
     state.overlay_hide()
