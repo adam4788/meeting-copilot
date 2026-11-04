@@ -475,6 +475,25 @@ test('stored backend errors pair text with retry', async () => {
   assert.ok(nodes(tree).some(n => n.type === 'button' && n.children.includes('Retry')));
 });
 
+test('answer region carries a scroll ref so new answers find the user', async () => {
+  const { tree } = pane('', true, false, '', {}, {},
+    { result: { answer: 'Ship it Monday.', sources: [], elapsed_seconds: 1 } });
+  const section = nodes(tree).find(n => n.type === 'section'
+    && JSON.stringify(n.children).includes('Suggested answer'));
+  assert.ok(section, 'result section renders');
+  assert.ok(section.props.ref && typeof section.props.ref === 'object',
+    'result section is attached to the answer scroll ref');
+});
+
+test('clear question empties the composer', async () => {
+  const { tree, rerender } = pane('', true, false, '', { 1: 'Why is the sky blue?' }, {}, {});
+  const clear = nodes(tree).find(n => n.type === 'button' && n.children.includes('Clear question'));
+  assert.ok(clear, 'clear button shows when a question is typed');
+  await clear.props.onClick();
+  assert.ok(!nodes(rerender()).some(n => n.type === 'button' && n.children.includes('Clear question')),
+    'clear button hides once the question is empty');
+});
+
 test('idle pane keeps a prominent start action above the fold', async () => {
   const { tree } = pane('', true, false, '', {}, {}, {});
   assert.ok(nodes(tree).some(n => n.type === 'button' && (n.children.includes('Attach to Meetily') || n.children.includes('Start listening'))));
