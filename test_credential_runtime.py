@@ -26,6 +26,7 @@ class CredentialRuntimeTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertNotIn('fake-', result.stdout + result.stderr)
 
+    @host_scope_test
     def test_fresh_start_nonempty_precedence_model_and_asr(self):
         for inherited in (None, '', '  \t ', 'fake-process-key'):
             with self.subTest(inherited=bool(inherited and inherited.strip())):
@@ -54,6 +55,44 @@ def fake_asr(request):
     return io.BytesIO(json.dumps({'transcript': 'Synthetic transcript'}).encode())
 assert meta_asr.transcribe_file(path, macos_audio._model_api_key(), opener=fake_asr)[0]['text'] == 'Synthetic transcript'
 ''', inherited)
+
+    @host_scope_test
+    def test_actual_launch_rejects_host_parser_disagreement(self):
+        self.child(r'''
+import os
+from pathlib import Path
+from agent import secret_scope
+from hermes_constants import pin_process_hermes_home
+from hermes_cli.web_server_profiles import _config_profile_scope
+home = Path(os.environ['HERMES_HOME'])
+pin_process_hermes_home(str(home))
+# dotenv sees the target, but the installed host sees a different name.
+(home / '.env').write_text("'MODEL_API_KEY'=fake-quoted-name\n")
+assert 'MODEL_API_KEY' not in secret_scope.load_env_file(home / '.env')
+import meta_models
+assert not os.environ.get('MODEL_API_KEY', '').strip(), 'startup published unsupported key'
+assert meta_models.resolve_model_api_key() == ''
+with _config_profile_scope('current'):
+    assert meta_models.resolve_model_api_key() == '', 'host scope acquired an unsupported launch key'
+''')
+
+    def test_launch_without_host_tokenizer_fails_closed(self):
+        self.child(r'''
+import os, sys
+from unittest.mock import patch
+# Emulate an absent host and an older host missing the tokenizer, at import time.
+from types import SimpleNamespace
+with patch.dict(sys.modules, {'agent': SimpleNamespace(secret_scope=SimpleNamespace(serves_routed_profile=lambda: False))}):
+    import meta_models
+assert not os.environ.get('MODEL_API_KEY', '').strip(), 'startup published a key without host parser'
+''')
+        self.child(r'''
+import os, sys
+from unittest.mock import patch
+with patch.dict(sys.modules, {'agent': None}):
+    import meta_models
+assert not os.environ.get('MODEL_API_KEY', '').strip(), 'standalone startup published an unvalidated key'
+''')
 
     @host_scope_test
     def test_trusted_host_scope_foreign_missing_and_owner(self):

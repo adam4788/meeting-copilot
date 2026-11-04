@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse
 
 _revision_secret = secrets.token_bytes(32)
 _KEY_SHAPE = re.compile(r'[A-Za-z0-9._~+/=-]{8,4096}\Z')
+_REVISION_SHAPE = re.compile(r'[0-9a-f]{64}\Z')
 _UNAVAILABLE = 'Key settings unavailable. Use Hermes Settings → Plugins → Meeting Copilot, or check the active home permissions and host version.'
 _UNSUPPORTED_FILE = 'Unsupported credential file syntax. No changes made. Multiline values or parser differences require manual review with the host administrator; this editor will not rewrite unrelated data.'
 
@@ -323,7 +324,7 @@ def make_router():
         if not isinstance(body, dict) or set(body) - {'action', 'key', 'revision'}:
             raise HTTPException(400, 'Invalid key-settings request.')
         action, key, revision = body.get('action'), body.get('key'), body.get('revision')
-        if (action not in ('save', 'remove') or not isinstance(revision, str) or len(revision) != 64
+        if (action not in ('save', 'remove') or not isinstance(revision, str) or not _REVISION_SHAPE.fullmatch(revision)
                 or (action == 'save' and (not isinstance(key, str) or not _KEY_SHAPE.fullmatch(key)))
                 or (action == 'remove' and 'key' in body)):
             raise HTTPException(400, 'Enter an 8–4096 character API key without spaces, quotes or line breaks; recheck settings before saving.')

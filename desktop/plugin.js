@@ -82,7 +82,7 @@ export default {
           h(Button, { variant: 'secondary', disabled: working, onClick: recheck }, 'Recheck key status')),
         notice && h('p', { role: 'status', style: muted }, notice),
         info?.process_differs_from_saved && h('p', { role: 'status', style: muted }, 'A different process-environment key remains available as fallback after removal, or to unscoped code. Update its service or secret-manager source too; restarting alone may retain it.'),
-        h('p', { style: muted }, info?.activation === 'host-scoped' ? 'This status used a host-scoped credential snapshot, not every running worker.' : 'This status used the process environment; process-based code may need a safe gateway restart to load file changes.'),
+        info && h('p', { style: muted }, info.activation === 'host-scoped' ? 'This status used a host-scoped credential snapshot, not every running worker.' : 'This status used the process environment; process-based code may need a safe gateway restart to load file changes.'),
         h('p', { style: muted }, 'New scoped requests can change immediately: the saved file takes precedence over inherited keys in the supported single-profile host. Existing requests and workers may retain old keys. Other host secret sources may override the file. Pause capture before editing; removal is not revocation.'),
         h('details', null,
           h('summary', { style: { ...muted, cursor: 'pointer', marginTop: 8 } }, 'Safe transition & verification'),

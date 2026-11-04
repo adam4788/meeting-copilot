@@ -182,6 +182,45 @@ for complete, worker, old_key in retained:
 assert meta_models.resolve_model_api_key() == expected, 'editor changed unscoped environment'
 ''', inherited)
 
+    def test_actual_capture_threads_keep_snapshots_across_edits(self):
+        for inherited in ('', 'fake-inherited-key'):
+            with self.subTest(inherited=bool(inherited)):
+                self.child(r'''
+import threading
+put(b'MODEL_API_KEY=fake-original-key\n')
+captures, snapshots = [], []
+release = threading.Event()
+started = threading.Event()
+def fake_run(capture, environment):
+    snapshots.append(environment)
+    started.set()
+    release.wait(10)
+def start():
+    started.clear()
+    capture = macos_audio.MacOSAudioCapture(provider='meta')
+    with _config_profile_scope('current'):
+        capture.start(lambda row: None)
+    assert started.wait(5), 'capture thread did not start'
+    captures.append(capture)
+try:
+    with patch.object(macos_audio.MacOSAudioCapture, '_run', fake_run):
+        start()
+        assert edit('save').status_code == 200
+        start()
+        assert edit('remove').status_code == 200
+        for capture in captures:
+            assert capture.status()['running'], 'capture thread did not survive edit'
+        check_asr(snapshots[0].get('MODEL_API_KEY', ''), 'fake-original-key')
+        check_asr(snapshots[1].get('MODEL_API_KEY', ''), 'fake-saved-key')
+        with _config_profile_scope('current'):
+            check_asr(macos_audio.worker_env().get('MODEL_API_KEY', ''), os.environ['MODEL_API_KEY'])
+finally:
+    release.set()
+    for capture in captures:
+        capture._thread.join(5)
+        assert not capture._thread.is_alive(), 'capture thread did not finish'
+''', inherited)
+
     def test_actual_foreign_request_scope_never_borrows_owner_key(self):
         self.child(r'''
 put(b'MODEL_API_KEY=fake-owner-disk-key\n')

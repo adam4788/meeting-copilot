@@ -150,6 +150,9 @@ class FileTranscribeTests(unittest.TestCase):
 
 class KeyResolutionTests(unittest.TestCase):
     def test_dotenv_seeds_env_once_and_env_wins(self):
+        import importlib.util
+        if importlib.util.find_spec('agent') is None:
+            self.skipTest('Startup bridge requires the installed host tokenizer')
         import os
         import tempfile
         import unittest.mock

@@ -59,9 +59,10 @@ to its pre-write request scope; the pane's separate GET reads a fresh snapshot.
    Test Muse Voice separately with participant consent. A fallback answer does
    not verify Meta; a working text answer does not verify Muse Voice permission.
 
-The existing `meta_models` launchd startup bridge reads the active home's saved
-key when no nonempty process key exists; `model_selection.selected_completion`
-uses that resolver for Meta, and audio workers consume their startup environment.
+The existing `meta_models` launchd startup bridge reads a supported active-home
+saved key when no nonempty process key exists and the host tokenizer is available;
+`model_selection.selected_completion` uses that resolver for Meta, and audio
+workers consume their startup environment.
 Other host launch modes must load their normal Hermes environment on restart;
 if the configured badge remains false, use the host's supported secret setup.
 The editor does not bypass provider selection or add a competing runtime resolver.
@@ -140,8 +141,10 @@ merely satisfying the manifest's minimum Hermes version.
   the saved flag. A different writer between those requests produces a conflict
   notice, never confirmation that this pane's key was saved.
 - Startup and editing use non-interpolating dotenv bindings; multiline files are
-  refused, not partially rewritten. Supported single-line export/quotes/duplicates
-  must agree with the host tokenizer before edits. Empty/whitespace inherited keys
+  refused, not partially rewritten. Every binding must agree with the installed
+  host tokenizer before either editing or launchd startup seeding. If the host or
+  tokenizer is missing, startup does not seed from the file; a separately supplied
+  process key remains usable. Empty/whitespace inherited keys
   do not block the launchd startup bridge; nonempty process keys retain precedence
   **only for that startup bridge/unscoped code**, not fresh host-scoped requests.
   Runtime Meta resolution uses Hermes' trusted `agent.secret_scope` API. Foreign

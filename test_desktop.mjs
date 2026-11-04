@@ -121,6 +121,22 @@ test('Meta key form saves explicitly, clears input, reads back, and never caches
   assert.ok(!JSON.stringify(tree).includes('fake-ui-key-only'));
 });
 
+test('Meta key never claims a status source before or after a failed check', async () => {
+  const ui = pane('', true, false, '', {}, {
+    '/credentials/meta': () => { throw new Error('unavailable'); },
+  });
+  const verifyUnknown = tree => {
+    const text = JSON.stringify(tree);
+    assert.match(text, /Key status not checked/);
+    assert.doesNotMatch(text, /This status used/);
+  };
+  verifyUnknown(ui.tree);
+  await nodes(ui.tree).find(n => n.type === 'button' && n.children.includes('Recheck key status')).props.onClick();
+  const after = ui.rerender();
+  verifyUnknown(after);
+  assert.match(JSON.stringify(after), /Key settings unavailable/);
+});
+
 test('Meta key explains scoped activation, process fallback and snapshot limits', async () => {
   for (const activation of ['host-scoped', 'process']) {
     const ui = pane('', true, false, '', {}, { '/credentials/meta': () => ({
@@ -130,6 +146,7 @@ test('Meta key explains scoped activation, process fallback and snapshot limits'
     await nodes(ui.tree).find(n => n.type === 'button' && n.children.includes('Recheck key status')).props.onClick();
     const text = JSON.stringify(ui.rerender());
     assert.match(text, /Configured for this status request/);
+    assert.match(text, activation === 'host-scoped' ? /This status used a host-scoped credential snapshot/ : /This status used the process environment/);
     assert.match(text, /new scoped requests.*immediately/i);
     assert.match(text, /saved file.*precedence.*inherited/i);
     assert.match(text, /existing requests.*workers.*retain/i);
@@ -224,7 +241,7 @@ for (const realHost of [false, true]) for (const race of [false, true]) test(`Me
     assert.deepEqual(await call('/test/saved-effect'), { saved: false, mode_private: true, runtime_unchanged: true });
     const rendered = JSON.stringify(ui.rerender());
     assert.match(rendered, /changed.*after|another.*edit/i);
-    assert.doesNotMatch(rendered, /Saved — restart/);
+    assert.doesNotMatch(rendered, /Saved — new scoped requests can use the key immediately/);
     assert.doesNotMatch(rendered, /fake-other-writer-key|fake-ui-key-only/);
     return;
   }

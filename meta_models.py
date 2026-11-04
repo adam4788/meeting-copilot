@@ -40,7 +40,11 @@ def _load_dotenv_key_once():
         return
     try:
         scope = _secret_scope()
-        if scope is not None and scope.serves_routed_profile():
+        if scope is None or scope.serves_routed_profile():
+            return
+        # Do not seed unvalidated values when an older host lacks its tokenizer.
+        host_parser = getattr(scope, '_parse_env_text', None)
+        if not callable(host_parser):
             return
         if __package__:
             from .credential_env import bindings, saved
@@ -51,7 +55,7 @@ def _load_dotenv_key_once():
             raw = file.read(1024 * 1024 + 1)
         if len(raw) > 1024 * 1024:
             return
-        value = saved(bindings(raw)).strip()
+        value = saved(bindings(raw, host_parser=host_parser)).strip()
         if value and not os.environ.get('MODEL_API_KEY', '').strip():
             os.environ['MODEL_API_KEY'] = value
     except Exception:

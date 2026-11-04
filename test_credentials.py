@@ -118,6 +118,28 @@ class CredentialTests(unittest.TestCase):
         self.assertEqual(self.save('fake-new-key', revision).status_code, 409)
         self.assertNotIn('fake-new-key', (self.home / '.env').read_text())
 
+    def test_malformed_revisions_are_rejected_before_lock_or_mutation(self):
+        path = self.home / '.env'
+        original = b'OTHER=fake-unrelated-key\nMODEL_API_KEY=fake-original-key\n'
+        path.write_bytes(original)
+        path.chmod(0o600)
+        before = path.stat()
+        for revision in ('é' * 64, '０' * 64, 'g' * 64, 'A' * 64, '0' * 63, '0' * 65, '0' * 63 + '\n'):
+            for action in ('save', 'remove'):
+                with self.subTest(revision=repr(revision), action=action):
+                    body = {'action': action, 'revision': revision}
+                    if action == 'save':
+                        body['key'] = 'fake-replacement-key'
+                    response = self.client.post('/credentials/meta', json=body)
+                    self.assertEqual(response.status_code, 400)
+                    self.assertNotIn('fake-', response.text)
+                    self.assertEqual(path.read_bytes(), original)
+                    after = path.stat()
+                    for field in ('st_ino', 'st_mode', 'st_uid', 'st_gid', 'st_size', 'st_mtime_ns', 'st_ctime_ns'):
+                        self.assertEqual(getattr(after, field), getattr(before, field))
+                    self.assertFalse((self.home / '.env.lock').exists())
+                    self.assertFalse(list(self.home.glob('.env-stage-*')))
+
     def test_untrusted_requests_cannot_read_or_write_even_with_spoofed_headers(self):
         self.owner = False
         for method in ('get', 'post'):
