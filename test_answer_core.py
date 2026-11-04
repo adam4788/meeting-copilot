@@ -1280,6 +1280,26 @@ class AskCliTests(unittest.TestCase):
             self.assertIn('not verified', out.lower())
             self.assertNotIn('private-sentinel', out)
 
+    def test_doctor_meta_key_length_matches_answer_preflight(self):
+        import ask
+        for key, ready in [('', False), ('   ', False), (' abcdefg ', False),
+                           (' abcdefgh ', True)]:
+            with self.subTest(key=repr(key)), unittest.mock.patch.dict('os.environ', {'MODEL_API_KEY': key}):
+                for json_mode in (False, True):
+                    argv = ['--docs', self.docs, '--doctor', '--provider', 'meta']
+                    code, out, err = self._capture(argv + (['--json'] if json_mode else []))
+                    self.assertEqual(code, 0 if ready else 2)
+                    self.assertNotIn(key.strip() or 'unprintable-secret', out + err)
+                    if json_mode:
+                        payload = json.loads(out)
+                        self.assertEqual(payload['provider']['ready'], ready)
+                        self.assertFalse(payload['provider']['connection_verified'])
+                        if not ready:
+                            self.assertIn('8', ' '.join(payload['problems']))
+                if not ready:
+                    with self.assertRaises(SystemExit):
+                        ask.build_completion('meta', None)
+
     def test_doctor_empty_docs_is_actionable_failure(self):
         empty = Path(self.docs) / 'elsewhere'
         empty.mkdir()

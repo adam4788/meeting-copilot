@@ -534,15 +534,20 @@ def main(argv=None):
             except (OSError, ValueError) as exc:
                 transcript_report = {'ok': False, 'error': str(exc)}
                 problems.append(f'transcript: {exc}')
-        if args.provider == 'meta' and not os.environ.get('MODEL_API_KEY'):
-            problems.append('provider meta: MODEL_API_KEY is not set')
-        provider_report = {'provider': args.provider,
-                           'ready': not (args.provider == 'meta'
-                                         and not os.environ.get('MODEL_API_KEY'))}
+        provider_ready = True
+        if args.provider == 'meta':
+            try:
+                from .meta_models import api_key_present
+            except ImportError:
+                from meta_models import api_key_present
+            provider_ready = api_key_present()
+            if not provider_ready:
+                problems.append('provider meta: MODEL_API_KEY must be at least 8 characters after trimming whitespace')
+        provider_report = {'provider': args.provider, 'ready': provider_ready}
         if args.provider == 'meta':
             provider_report['connection_verified'] = False
             warn('Meta provider credentials, network access, and model availability are not verified; '
-                 'doctor only checks whether MODEL_API_KEY is set.')
+                 'doctor only checks MODEL_API_KEY length.')
         ok = bool(project_reports) and all(r['chunks'] for r in project_reports) and not problems
         payload = {'docs': str(docs), 'projects': project_reports,
                    'provider': provider_report, 'problems': problems, 'ok': ok}
@@ -558,8 +563,8 @@ def main(argv=None):
                 print(f"  - {report['name']}: {report['files']} file(s), {report['chunks']} searchable chunk(s)")
             if not project_reports:
                 print('  - no project folders found (expected <docs>/<project>/*.md|txt|rst)')
-            provider_status = ('MODEL_API_KEY set; connection not verified' if provider_report['ready']
-                               else 'MODEL_API_KEY not set; connection not verified') if args.provider == 'meta' else 'ready (offline)'
+            provider_status = ('MODEL_API_KEY length accepted; connection not verified' if provider_report['ready']
+                               else 'MODEL_API_KEY missing or too short; connection not verified') if args.provider == 'meta' else 'ready (offline)'
             print(f'Provider: {args.provider} ({provider_status})')
             if transcript_report is not None:
                 print(f"Transcript: {'ok, ' + str(transcript_report['characters']) + ' characters' if transcript_report['ok'] else 'failed: ' + transcript_report['error']}")

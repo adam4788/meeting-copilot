@@ -33,8 +33,9 @@ python ask.py --docs ./my-docs --question "When is the Acme renewal?"
 
 `--doctor --json` reports setup failures in its `problems` array, including
 missing project folders and how to arrange the documents; it exits `2` when
-not ready. For `--provider meta`, this offline check only tests whether
-`MODEL_API_KEY` is set: it does not validate the key, network, or model.
+not ready. For `--provider meta`, this offline check only checks that
+`MODEL_API_KEY` has at least 8 characters after trimming surrounding whitespace;
+it does not validate the credential, network, or model.
 JSON's `provider.ready` reflects that local check, while
 `provider.connection_verified` is `false`.
 
