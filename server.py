@@ -1257,6 +1257,7 @@ class MeetingState:
         with publication, display, getattr(bridge, '_admission_lock', nullcontext()):
             retired = bridge is not None and (
                 getattr(bridge, 'stopping', False) is True
+                or getattr(bridge, 'process', None) in getattr(bridge, '_reader_failed', ())
                 or getattr(bridge, '_lifecycle_epoch', 0) != epoch)
             if (not retired and self.overlay is bridge and self.pending_overlay is None
                     and not self.overlay_cleanup_error):
@@ -1514,6 +1515,11 @@ class MeetingState:
                 except Exception:
                     overlay_status = None
                 alive = self._overlay_process_alive(overlay.process)
+                if overlay.process in getattr(overlay, '_reader_failed', ()):
+                    uncertain_overlay = True
+                    cleanup_error = cleanup_error or (
+                        'Overlay click channel failed; the window may still be visible. '
+                        'Overlay shutdown is not confirmed. Retry Hide / Clear before starting capture.')
                 if alive is None:
                     uncertain_overlay = True
                 if alive is False:
@@ -1522,6 +1528,9 @@ class MeetingState:
                     # owned handle; status must not bypass that confirmation.
                     uncertain_overlay = uncertain_overlay or overlay.process is not None
                     overlay = None
+            if uncertain_overlay and not cleanup_error:
+                cleanup_error = ('Overlay shutdown is not confirmed; the window may still be visible. '
+                                 'Retry Hide / Clear before starting capture.')
             # The last session descriptor lets the pane compare the full
             # session key (backend + recording/model/source) before starting:
             # any change begins a fresh meeting and clears retained content.

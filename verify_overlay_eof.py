@@ -14,6 +14,7 @@ from test_overlay_portability import OverlayPortabilityTests
 from test_overlay_reader_eof import ReaderEOFTests
 from test_overlay_eof_recovery import EOFRecoveryTests
 from test_overlay_channel_health import ChannelHealthTests
+from test_overlay_channel_races import ChannelRaceTests
 from test_overlay_startup_admission import StartupAdmissionTests
 
 
@@ -59,6 +60,33 @@ def main():
         ("or (eof is not None and eof.is_set()))", "or eof is None or eof.is_set())")])],
         ReaderEOFTests('test_missing_pipe_evidence_cannot_confirm'))
     if sys.platform in ('darwin', 'linux'):
+        verify('EOF publication shares the admission fence', [mutate(OverlayBridge, '_fail_reader_locked', [
+            ('with self._admission_lock:', 'with nullcontext():')])],
+            ChannelRaceTests('test_reader_failure_publication_serializes_with_admission'))
+        verify('EOF advances lifecycle epoch', [mutate(OverlayBridge, '_fail_reader_locked', [
+            ('self._lifecycle_epoch += 1', 'pass')])],
+            ChannelRaceTests('test_reader_failure_publication_serializes_with_admission'))
+        verify('known EOF rejects all three Start admission boundaries', [
+            mutate(OverlayBridge, '_fail_reader_locked', [('self._lifecycle_epoch += 1', 'pass')]),
+            mutate(MeetingState, '_overlay_admission_guard', [
+                ("or getattr(bridge, 'process', None) in getattr(bridge, '_reader_failed', ())", 'or False')])],
+            ChannelRaceTests('test_eof_between_each_start_admission_guard_rejects_audio'))
+        verify('direct reuse rechecks reader health after polling', [mutate(OverlayBridge, 'show_overlay', [
+            ('if process in self._reader_failed:', 'if False:')])],
+            ChannelRaceTests('test_direct_reuse_rechecks_eof_published_inside_poll'))
+        verify('direct reuse poll stays bounded', [mutate(OverlayBridge, 'show_overlay', [
+            ('alive = self._show_process_alive(process)', 'alive = process.poll() is None')])],
+            ChannelRaceTests('test_direct_reuse_poll_is_bounded_and_reuses_inflight_probe'))
+        verify('display uses explicit UTF-8 rather than locale', [
+            patch('locale.getencoding', return_value='ascii'),
+            mutate(OverlayBridge, 'start_helper', [("encoding='utf-8', errors='strict', ", '')])],
+            ChannelRaceTests('test_display_decodes_international_json_as_strict_utf8'))
+        verify('display decoding remains strict', [mutate(OverlayBridge, 'start_helper', [
+            ("errors='strict'", "errors='ignore'")])],
+            ChannelRaceTests('test_display_decodes_international_json_as_strict_utf8'))
+        verify('status exposes live channel EOF promptly', [mutate(MeetingState, 'status', [
+            ("if overlay.process in getattr(overlay, '_reader_failed', ()):", 'if False:')])],
+            ChannelRaceTests('test_status_warns_immediately_after_live_eof_without_claiming_shutdown'))
         verify('protocol text-mode decode must not lose EOF', [mutate(OverlayBridge, '_check_helper_protocol', [
             ('text=False', 'text=True'),
             ("output = output.decode('utf-8', errors='strict')", 'pass')])],
@@ -79,7 +107,7 @@ def main():
             ChannelHealthTests('test_protocol_live_pipe_holder_retains_uncertainty_until_real_eof'))
         for entry in ('fresh_direct', 'fresh_controller', 'repeated_direct', 'repeated_controller'):
             verify(f'active stdout EOF rejects {entry} Show', [mutate(OverlayBridge, '_read_clicks', [
-                ('self._reader_failed.add(process)', 'pass  # lost active EOF health')])],
+                ('self._fail_reader_locked(process)', 'pass  # lost active EOF health')])],
                 ChannelHealthTests(f'test_{entry}_show_rejects_active_stdout_eof'))
         verify('reader failure recovers real EOF', [
             patch.object(OverlayBridge, '_recover_stdout_eof', lambda *args: None)],
@@ -92,12 +120,15 @@ def main():
             patch.object(OverlayBridge, '_start_stdout_reader', lambda *args: None)],
             EOFRecoveryTests('test_retired_startup_registers_pipe_before_publication'))
         verify('direct Show rejects known reader failure', [mutate(OverlayBridge, 'show_overlay', [
-            ('if self.process in self._reader_failed:', 'if False:')])],
+            ('if self.process in self._reader_failed:', 'if False:'),
+            ('if process in self._reader_failed:', 'if False:')])],
             EOFRecoveryTests('test_known_reader_failure_rejects_direct_and_controller_show'))
         verify('controller startup rejects known reader failure', [mutate(MeetingState, 'overlay_show', [
             ("and process not in getattr(bridge, '_reader_failed', ())", 'and True')])],
             EOFRecoveryTests('test_controller_startup_commit_rejects_known_reader_failure'))
         verify('controller reuse rejects known reader failure', [
+            mutate(MeetingState, '_overlay_admission_guard', [
+                ("or getattr(bridge, 'process', None) in getattr(bridge, '_reader_failed', ())", 'or False')]),
             mutate(MeetingState, '_reconcile_overlay_admission', [
                 ("or process in getattr(bridge, '_reader_failed', ())", 'or False')]),
             mutate(MeetingState, '_overlay_show', [
@@ -118,6 +149,7 @@ def main():
             StartupAdmissionTests('test_show_rejects_helper_exited_before_startup_commit'))
         verify('direct Show rejects cached dead launch', [mutate(OverlayBridge, 'show_overlay', [
             ('if process in self._reader_failed:', 'if False:'),
+            ('if process in self._reader_failed:', 'if False:'),
             ("if self.stopping or isinstance(getattr(process, 'returncode', None), int):", 'if False:')])],
             StartupAdmissionTests('test_direct_show_does_not_report_cached_dead_launch'))
         verify('reused Show rejects cached exit', [mutate(MeetingState, '_overlay_show', [
@@ -129,7 +161,7 @@ def main():
              'alive = process.poll() is None if process is not None else True')])],
             StartupAdmissionTests('test_startup_liveness_probe_is_bounded_and_off_lifecycle_lock'))
     suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(cls)
-                               for cls in (ReaderEOFTests, EOFRecoveryTests, ChannelHealthTests,
+                               for cls in (ReaderEOFTests, EOFRecoveryTests, ChannelHealthTests, ChannelRaceTests,
                                            OverlayPortabilityTests, OverlayDescendantTests, StartupAdmissionTests))
     if not unittest.TextTestRunner(verbosity=1).run(suite).wasSuccessful():
         raise SystemExit(1)

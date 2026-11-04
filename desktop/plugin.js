@@ -547,15 +547,16 @@ export default {
               const backendIssue = !!status.error && !storedRetry;
               // A capture failure needs capture restarted (consent already
               // given), not a status refresh: label and wire it honestly.
-              const captureIssue = !!data.error && !storedRetry && !status.error && !data.stopping;
+              const captureIssue = !!data.error && !data.overlay_cleanup_error && !storedRetry && !status.error && !data.stopping;
               // A failed forget-boundary needs Clear run again, not a
               // dismiss: the adapter keeps serving its old snapshot until
               // the boundary installs. The user already consented to
               // clearing, so the retry completes their intent.
               const clearIssue = !!data.meetily_clear_error && !storedRetry && !status.error && !data.error;
-              const label = data.stopping ? 'Recheck status' : retryReq ? 'Retry' : backendIssue ? 'Retry' : captureIssue ? (data.listening ? 'Recheck status' : 'Restart capture') : clearIssue ? 'Clear again' : 'Dismiss';
+              const label = data.stopping ? 'Recheck status' : data.overlay_cleanup_error ? 'Retry hide overlay' : retryReq ? 'Retry' : backendIssue ? 'Retry' : captureIssue ? (data.listening ? 'Recheck status' : 'Restart capture') : clearIssue ? 'Clear again' : 'Dismiss';
               return h(Button, { variant: 'secondary', disabled: pending || (captureIssue && !data.listening && (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription))), onClick: async () => {
                 if (data.stopping) return qc.invalidateQueries({ queryKey: [ID, 'status'] });
+                if (data.overlay_cleanup_error) return toggleOverlay();
                 if (retryReq) { setError(''); setAssistFailed(false); return replayRequest(retryReq); }
                 if (clearIssue) { if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } return; }
                 if (captureIssue && !data.listening) return startCapture();
@@ -701,7 +702,7 @@ export default {
           h('p', { style: { ...muted, marginBottom: 0 } }, 'Display-only window. Tap a question row to stream its answer into that row — nothing is sent until you tap. Press the overlay shortcut (default Ctrl+Option+Cmd+O) to interact; it returns to click-through after about 10 seconds, or press the shortcut again to return early. The overlay may be visible in screen shares.'),
           web.trim() && h('p', { role: 'status', style: { ...muted, marginBottom: 0 } }, `Explicit web query “${web.trim().slice(0, 120)}” applies to overlay row requests until you clear it.`),
           scopeStale && overlayOn && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'Settings changed — syncing overlay scope…'),
-          overlayMsg && h('p', { role: 'status', style: { ...muted, margin: 0 } }, overlayMsg),
+          (data.overlay_cleanup_error || overlayMsg) && h('p', { role: 'status', style: { ...muted, margin: 0 } }, data.overlay_cleanup_error || overlayMsg),
           !data.capabilities?.overlay && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'Overlay helper unavailable. Check the macOS helper build and restart the gateway, then try Show overlay again.'),
           h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
             h(Button, { variant: overlayOn ? 'secondary' : undefined, disabled: pending || (!data.capabilities?.overlay && !data.overlay_cleanup_error), onClick: toggleOverlay }, data.overlay_cleanup_error ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay'),

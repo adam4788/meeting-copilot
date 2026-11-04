@@ -814,7 +814,7 @@ class LifecycleVisibilityTests(unittest.TestCase):
         import server
         from unittest.mock import Mock
         state = server.MeetingState(engine_factory=lambda: None)
-        bridge = Mock()
+        bridge = Mock(_reader_failed=set())
         proc = Mock()
         proc.poll.return_value = 1
         bridge.process = proc
@@ -822,7 +822,9 @@ class LifecycleVisibilityTests(unittest.TestCase):
         state.overlay = bridge
         state.overlay_owner = 'test-owner'
         status = state.status()
-        self.assertFalse(status['overlay_shown'])
+        self.assertIsNone(status['overlay_shown'])
+        self.assertFalse(status['overlay_stop_confirmed'])
+        self.assertIn('shutdown is not confirmed', status['overlay_cleanup_error'])
 
     def test_lease_survives_concurrent_heartbeat(self):
         import server

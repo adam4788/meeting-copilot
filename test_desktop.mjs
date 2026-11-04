@@ -285,6 +285,39 @@ test('real denied overlay cleanup stays visible across Clear and failed Hide; re
   assert.ok(button(tree, 'Show overlay'));
 });
 
+test('live helper EOF immediately replaces shown success with actionable cleanup warning', {
+  timeout: 10000, skip: !['darwin', 'linux'].includes(process.platform),
+}, async t => {
+  const backend = await realBackend(t);
+  const p = backend.mount();
+  await button(p.tree, 'Start listening').props.onClick(); // claim using fake audio only
+  await button(await p.refresh(), 'Pause listening').props.onClick();
+  nodes(p.rerender()).find(n => n.props?.['aria-labelledby'] === 'mc-backend-label').props.onChange({ target: { value: 'native' } });
+  await backend.rpc({ command: 'install-overlay-channel-fault' });
+  await button(await p.refresh(), 'Show overlay').props.onClick();
+  assert.ok(JSON.stringify(p.rerender()).includes('Overlay shown'), JSON.stringify(backend.traffic.slice(-3)));
+  await backend.rpc({ command: 'close-overlay-stdout' });
+  let tree = await p.refresh();
+  const status = (await backend.rpc({ command: 'inspect-overlay' })).status;
+  assert.equal(status.overlay_shown, null);
+  assert.equal(status.overlay_stop_confirmed, false);
+  assert.match(JSON.stringify(tree), /click channel failed/);
+  assert.match(JSON.stringify(tree), /shutdown is not confirmed/);
+  assert.doesNotMatch(JSON.stringify(tree), /Overlay shown/);
+  assert.ok(!button(tree, 'Restart capture'), 'overlay fault must not suggest audio restart');
+  assert.equal(button(tree, 'Start listening').props.disabled, true);
+  await button(tree, 'Retry hide overlay').props.onClick();
+  tree = await p.refresh();
+  assert.ok(button(tree, 'Retry hide overlay'));
+  assert.equal((await backend.rpc({ command: 'inspect-overlay' })).alive, true);
+  await backend.rpc({ command: 'allow-overlay-stop' });
+  await button(tree, 'Retry hide overlay').props.onClick();
+  tree = await p.refresh();
+  assert.equal((await backend.rpc({ command: 'inspect-overlay' })).status.overlay_stop_confirmed, true);
+  assert.ok(!button(tree, 'Retry hide overlay'));
+  assert.equal(button(tree, 'Start listening').props.disabled, false);
+});
+
 test('accepted release with unconfirmed physical stop does not reopen or claim success', async () => {
   const p = lifecyclePane({ '/overlay/release': { accepted: true, stopping: true, stop_confirmed: false } }, { 3: true, 4: 'macos' });
   await button(p.tree, 'Start listening').props.onClick();
