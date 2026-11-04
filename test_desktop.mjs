@@ -334,6 +334,32 @@ test('accepted scope sync clears the stale indicator', async () => {
   assert.ok(JSON.stringify(tree).includes('Overlay scope updated to current settings'));
 });
 
+test('composer shortcut sends once without inserting a newline or interrupting composition', () => {
+  for (const modifier of ['metaKey', 'ctrlKey']) {
+    const { tree, requests } = pane('', true, false, '', { 1: 'My question' });
+    const composer = nodes(tree).find(n => n.type === 'textarea');
+    let prevented = 0;
+    const event = { key: 'Enter', [modifier]: true, preventDefault: () => { prevented++; } };
+    composer.props.onKeyDown({ ...event, nativeEvent: { isComposing: true } });
+    composer.props.onKeyDown({ ...event, repeat: true });
+    composer.props.onKeyDown({ ...event, key: 'a' });
+    composer.props.onKeyDown({ key: 'Enter', preventDefault: event.preventDefault });
+    assert.equal(requests.length, 0);
+    assert.equal(prevented, 0, 'ordinary typing and IME composition remain untouched');
+    composer.props.onKeyDown(event);
+    assert.equal(prevented, 1);
+    assert.equal(requests.filter(r => r.path === '/assist').length, 1);
+    assert.equal(requests[0].body.question, 'My question');
+  }
+  for (const [supported, status] of [[true, { busy: true }], [false, {}]]) {
+    const { tree, requests } = pane(supported ? '' : '__all_projects__', supported, false, '', {}, {}, status);
+    let prevented = false;
+    nodes(tree).find(n => n.type === 'textarea').props.onKeyDown({ key: 'Enter', metaKey: true, preventDefault: () => { prevented = true; } });
+    assert.equal(requests.length, 0, 'disabled shortcut must not send');
+    assert.equal(prevented, false);
+  }
+});
+
 test('suggesting an answer tracks the request and offers cancel', async () => {
   const { tree, rerender, requests } = pane('', true, false, '', {}, { '/assist': { accepted: true, request_id: 'r-9' } });
   await nodes(tree).find(n => n.type === 'button' && n.children.includes('Suggest answer')).props.onClick();
