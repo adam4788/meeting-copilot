@@ -40,6 +40,136 @@ class FakeDisplay:
 
 
 class ControllerProbeSlotTests(CheckedThreads):
+    def test_status_probe_shares_with_concurrent_start_or_show(self):
+        for action in ('start', 'show'):
+            with self.subTest(action=action):
+                starts = []
+                state = server.MeetingState(audio_factory=lambda: SimpleNamespace(
+                    start=lambda **kwargs: starts.append(True), stop=lambda: None))
+                poll_entered, action_entered, release = (threading.Event() for _ in range(3))
+                polls, results = [], {}
+                event_wait = threading.Event.wait
+                def observed_wait(event, timeout=None):
+                    if (threading.current_thread().name == 'concurrent-action' and timeout == .05
+                            and any(job['done'] is event for job in state._overlay_probe_jobs.values())):
+                        action_entered.set()  # admitted before completion, now waiting
+                    return event_wait(event, timeout)
+                def poll():
+                    polls.append(threading.current_thread())
+                    poll_entered.set()
+                    self.checked_wait(release, 2, 'release status poll')
+                    return None
+                process = Mock(returncode=None, poll=self.checked_callback(poll))
+                display = FakeDisplay(process)
+                state.overlay = display
+                def run_action():
+                    results['action'] = (state.start(True, backend='native') if action == 'start'
+                                         else state.overlay_show({}))
+                status_thread = threading.Thread(target=self.checked_callback(
+                    lambda: results.update(status=state.status(touch=False))))
+                action_thread = threading.Thread(target=self.checked_callback(run_action),
+                                                 name='concurrent-action')
+                try:
+                    with patch.object(threading.Event, 'wait', observed_wait), \
+                            patch.object(state, '_start_overlay_lease_locked'):
+                        status_thread.start()
+                        self.assertTrue(poll_entered.wait(1))
+                        action_thread.start()
+                        self.assertTrue(action_entered.wait(1))
+                        # sleep(.025) can overshoot the entire 50ms budget on
+                        # heavily loaded hosts; hold the gate for 25ms directly.
+                        deadline = time.monotonic() + .025
+                        while time.monotonic() < deadline:
+                            pass
+                        release.set()
+                        status_thread.join(2)
+                        action_thread.join(2)
+                        self.assertFalse(status_thread.is_alive())
+                        self.assertFalse(action_thread.is_alive())
+                        self.assertTrue(results['status']['overlay_shown'])
+                        self.assertIs(state.overlay, display)
+                        self.assertIsNone(state.pending_overlay)
+                        if action == 'start':
+                            self.assertTrue(state.listening)
+                            self.assertEqual(starts, [True])
+                        else:
+                            self.assertTrue(results['action']['shown'])
+                        for worker in polls:
+                            worker.join(2)
+                            self.assertFalse(worker.is_alive())
+                finally:
+                    release.set()
+                    status_thread.join(2)
+                    if action_thread.ident is not None:
+                        action_thread.join(2)
+                    for worker in polls:
+                        worker.join(2)
+                    state.overlay_hide()
+                    if state.listening:
+                        state.pause(retain_tail=False)
+
+    def test_multiple_waiters_share_only_inflight_result_and_time_out(self):
+        for stalled in (False, True):
+            with self.subTest(stalled=stalled):
+                state = server.MeetingState()
+                entered, release, all_waiting = (threading.Event() for _ in range(3))
+                wait_lock = threading.Lock()
+                waiters_seen, results, workers = set(), {}, []
+                original_wait = threading.Event.wait
+                def observed_wait(event, timeout=None):
+                    if (threading.current_thread().name.startswith('probe-caller-')
+                            and timeout == .05
+                            and any(job['done'] is event for job in state._overlay_probe_jobs.values())):
+                        with wait_lock:
+                            waiters_seen.add(threading.current_thread().name)
+                            if len(waiters_seen) == 4:
+                                all_waiting.set()
+                    return original_wait(event, timeout)
+                def poll():
+                    workers.append(threading.current_thread())
+                    entered.set()
+                    self.checked_wait(release, 5, 'release shared poll')
+                    return None
+                process = Mock(poll=self.checked_callback(poll))
+                other = Mock(poll=Mock(return_value=None))
+                def call(index):
+                    results[index] = state._overlay_process_alive(process)
+                callers = [threading.Thread(target=self.checked_callback(lambda i=i: call(i)),
+                                            name=f'probe-caller-{i}') for i in range(4)]
+                try:
+                    with patch.object(threading.Event, 'wait', observed_wait):
+                        callers[0].start()
+                        self.assertTrue(entered.wait(1))
+                        for caller in callers[1:]:
+                            caller.start()
+                        self.assertTrue(all_waiting.wait(1))
+                        self.assertIsNone(state._overlay_process_alive(other))
+                        other.poll.assert_not_called()
+                        if not stalled:
+                            release.set()
+                        for caller in callers:
+                            caller.join(2)
+                            self.assertFalse(caller.is_alive())
+                        self.assertEqual(results, {i: None if stalled else True for i in range(4)})
+                        self.assertEqual(len(workers), 1)
+                        if stalled:
+                            self.assertIsNone(state._overlay_process_alive(process))
+                        release.set()
+                        workers[0].join(2)
+                        self.assertFalse(workers[0].is_alive())
+                        self.assertTrue(state._overlay_process_alive(other))
+                        other.poll.assert_called_once()
+                finally:
+                    release.set()
+                    for caller in callers:
+                        if caller.ident is not None:
+                            caller.join(2)
+                    for worker in workers:
+                        worker.join(2)
+                    for job in state._overlay_probe_jobs.values():
+                        job['worker'].join(2)
+                        self.assertFalse(job['worker'].is_alive())
+
     def test_show_hide_caps_hung_probes_across_process_generations(self):
         state = server.MeetingState()
         entered, release = threading.Event(), threading.Event()

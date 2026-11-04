@@ -1193,10 +1193,10 @@ class MeetingState:
 
         A poll wrapper can hang just like a signal wrapper. One controller-wide
         slot stays occupied until actual worker exit, including after done is
-        signaled. Only the caller that starts a probe may use its result; later
-        callers get unknown, even for the same child, because it may have exited
-        since that poll. Workers acquire no controller/publication locks; the
-        initiating caller waits at most 50ms.
+        signaled. Same-process callers may join only before completion is
+        published; callers arriving afterward get unknown until worker exit.
+        Workers acquire no controller/publication locks; each caller waits at
+        most 50ms.
         """
         if process is None:
             return False
@@ -1204,20 +1204,26 @@ class MeetingState:
             self._overlay_probe_jobs = {target: job for target, job in self._overlay_probe_jobs.items()
                                         if job['worker'].is_alive()}
             if self._overlay_probe_jobs:
-                return None  # occupied evidence belongs only to its initiating call
-            job = {'done': threading.Event(), 'alive': None}
-            self._overlay_probe_jobs[process] = job
-            def inspect_process():
-                try:
-                    job['alive'] = process.poll() is None
-                except Exception:
-                    pass  # unknown is not evidence of exit
-                finally:
-                    job['done'].set()
-            job['worker'] = threading.Thread(target=inspect_process, name='meeting-overlay-probe', daemon=True)
-            job['worker'].start()
-        job['done'].wait(.05)
-        return job['alive'] if job['done'].is_set() else None
+                target, job = next(iter(self._overlay_probe_jobs.items()))
+                if target is not process or job['done'].is_set():
+                    return None
+            else:
+                job = {'done': threading.Event(), 'alive': None}
+                self._overlay_probe_jobs[process] = job
+                def inspect_process():
+                    alive = None
+                    try:
+                        alive = process.poll() is None
+                    except Exception:
+                        pass  # unknown is not evidence of exit
+                    # Admission and completion share this lock: a caller either
+                    # joins before publication or cannot consume this result.
+                    with self._overlay_probe_lock:
+                        job['alive'] = alive
+                        job['done'].set()
+                job['worker'] = threading.Thread(target=inspect_process, name='meeting-overlay-probe', daemon=True)
+                job['worker'].start()
+        return job['alive'] if job['done'].wait(.05) else None
 
     def _reconcile_overlay_admission(self, *, for_show=False):
         """Discover autonomous bridge retirement before Start or Show.
