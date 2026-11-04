@@ -19,7 +19,8 @@ python ask.py --docs ./sample-docs --list-projects
 python ask.py --docs ./sample-docs --search "unit price"
 python ask.py --question "What is the unit price?" --docs ./sample-docs --provider fake
 python ask.py --question "What is the unit price?" --docs ./sample-docs --transcript ./sample-docs/transcript.sample
-MODEL_API_KEY=YOUR_REAL_KEY python ask.py --question "..." --docs ./sample-docs --provider meta
+# With MODEL_API_KEY already provided by your approved secret manager:
+python ask.py --question "..." --docs ./sample-docs --provider meta
 ```
 
 Your own documents use one folder per project:
@@ -51,6 +52,16 @@ unavailable standalone — the CLI says so instead of failing obscurely.
 Library use: `answer_core.AnswerCore` with injected
 `completion`/`search`/`history` providers; `hermes_adapters` holds the
 host-backed factories the plugin uses by default.
+
+## Meta API key
+
+In the pane, open **Meta API key**, paste into the masked field and explicitly
+**Save key**. Never paste a credential into chat. Saved, running-backend configured
+and provider-verified status are separate; saving does not verify Meta or reload
+workers. Pause capture and safely restart the active gateway before using a changed
+key. **Remove saved key** does not remove inherited service-environment values.
+See [key setup and security boundaries](docs/meta-api-key.md), including the
+Settings → Plugins fallback for hosts without native-owner credential editing.
 
 ## Design
 

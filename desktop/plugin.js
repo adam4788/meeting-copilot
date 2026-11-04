@@ -13,6 +13,76 @@ export default {
   version: '0.2.0',
   register(ctx) {
     const api = (path, body) => ctx.rest(path, body === undefined ? {} : { method: 'POST', body });
+    function MetaKeySettings() {
+      // Secret stays only in this uncontrolled password field and one POST.
+      // Never send it through React Query, plugin storage, chat or notifications.
+      const input = useRef(null);
+      const inFlight = useRef(false);
+      const [hasDraft, setHasDraft] = useState(false);
+      const [info, setInfo] = useState(null);
+      const [working, setWorking] = useState(false);
+      const [notice, setNotice] = useState('');
+      const erase = () => { if (input.current) input.current.value = ''; setHasDraft(false); };
+      async function recheck() {
+        if (inFlight.current) return;
+        inFlight.current = true; setWorking(true);
+        try {
+          const current = await api('/credentials/meta');
+          if (!current || typeof current.revision !== 'string') throw new Error('unsupported');
+          setInfo(current); setNotice('');
+        } catch (_) {
+          setInfo(null);
+          setNotice('Key settings unavailable on this connection. Use the local Desktop owner connection or Hermes Settings → Plugins → Meeting Copilot. Older backends may need a gateway restart.');
+        } finally { inFlight.current = false; setWorking(false); }
+      }
+      useEffect(() => { recheck(); return () => { if (input.current) input.current.value = ''; }; }, []);
+      async function change(action) {
+        if (inFlight.current || !info?.revision) return;
+        if (action === 'remove' && (typeof window === 'undefined' || !window.confirm || !window.confirm('Remove the saved Meta key from this profile? Running workers may still use their loaded key until you pause capture and restart the gateway.'))) return;
+        if (action === 'save' && info.saved && (typeof window === 'undefined' || !window.confirm || !window.confirm('Replace this profile’s saved Meta key? This also changes MODEL_API_KEY for other tools using it after restart.'))) return;
+        const body = { action, revision: info.revision };
+        if (action === 'save') {
+          const value = input.current?.value || '';
+          if (!/^[A-Za-z0-9._~+/=-]{8,4096}$/.test(value)) { setNotice('Enter the API key without spaces, quotes or line breaks.'); return; }
+          body.key = value;
+        }
+        erase(); inFlight.current = true; setWorking(true); setNotice('');
+        try {
+          await api('/credentials/meta', body);
+          delete body.key;
+          // Read the exact target back; a successful POST is not readiness.
+          const current = await api('/credentials/meta');
+          if (!current || typeof current.revision !== 'string' || current.saved !== (action === 'save')) throw new Error('unconfirmed');
+          setInfo(current);
+          setNotice(action === 'save' ? 'Saved — restart the gateway safely before using the new key.' : 'Saved key removed — pause capture and restart the gateway to drop loaded credentials.');
+        } catch (_) {
+          setInfo(null);
+          setNotice('The key change could not be confirmed. Recheck key status before trying again; another settings edit or an unsupported host may have blocked it.');
+        } finally { delete body.key; inFlight.current = false; setWorking(false); }
+      }
+      return h('section', { style: card, 'aria-label': 'Meta API key settings' },
+        h('strong', null, 'Meta API key'),
+        h('p', { style: muted, role: 'status' }, info
+          ? `${info.saved ? 'Saved in this profile' : 'No saved key'} · ${info.runtime_configured ? 'Configured in running backend' : 'Not configured in running backend'} · Not verified with Meta`
+          : 'Key status not checked'),
+        h('label', { style: { display: 'grid', gap: 6 } }, 'MODEL_API_KEY',
+          h('input', { ref: input, type: 'password', autoComplete: 'new-password', spellCheck: false,
+            autoCapitalize: 'none', maxLength: 4096, 'aria-label': 'Meta API key', style: selectStyle,
+            placeholder: info?.saved ? 'Enter a replacement key' : 'Paste key here — never in chat', disabled: working,
+            onChange: e => setHasDraft(!!e.target.value),
+            onKeyDown: e => { if (e.key === 'Enter') e.preventDefault(); } })),
+        h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 10 } },
+          h(Button, { disabled: working || !info || !hasDraft, onClick: () => change('save') }, 'Save key'),
+          h(Button, { variant: 'secondary', disabled: working || !info?.saved, onClick: () => change('remove') }, 'Remove saved key'),
+          h(Button, { variant: 'secondary', disabled: working, onClick: recheck }, 'Recheck key status')),
+        notice && h('p', { role: 'status', style: muted }, notice),
+        info?.runtime_override && h('p', { role: 'status', style: muted }, 'The running backend has a different process-environment key. Saving or removing here does not override it. If it is supplied by your service or secret manager, update that source too; restarting alone may keep the old key.'),
+        h('details', { open: !!info?.reload_required },
+          h('summary', { style: { ...muted, cursor: 'pointer', marginTop: 8 } }, 'Safe restart & verification'),
+          h('p', { style: muted }, 'Pause capture. Wait for all gateway sessions and answers to finish, then use Hermes’ gateway restart control for this connection. Reopen this pane and Recheck key status. Do not restart while another session is working.'),
+          h('p', { style: muted }, 'Saving is configuration only, not a Meta authentication test. After restart, select Meta for answers and try a non-sensitive question; test Muse Voice separately with consent. An answer fallback or configured badge does not verify Meta or audio permissions.')),
+        h('p', { style: { ...muted, marginBottom: 0 } }, 'Used for Muse Voice and Meta answers. Stored only in this backend’s active HERMES_HOME/.env; never returned by this editor. Saving does not reload the gateway or change a running capture.'));
+    }
     function MeetingPane() {
       const qc = useQueryClient();
       const SCOPE_KEY = 'meeting-copilot.scope.v2';
@@ -405,6 +475,7 @@ export default {
             h('li', null, backend === 'meetily' ? 'Confirm permission above, pick your active Meetily recording below, then Attach.' : 'Confirm permission above, then Start listening.'),
             h('li', null, 'Type a question (or leave blank for the latest one) and choose Suggest answer.'),
             h('li', null, 'Read the cited answer; open Evidence for sources.'))),
+        h(MetaKeySettings),
         h(data.listening ? 'details' : 'section', data.listening ? null : { style: card },
           ...(data.listening ? [h('summary', { style: { cursor: 'pointer', ...muted } }, `Transcript source: ${data.backend || backend} — listening (pause to change settings)`)] : []),
           h('span', { id: 'mc-source-label', style: { fontWeight: 700 } }, 'Transcript source'),

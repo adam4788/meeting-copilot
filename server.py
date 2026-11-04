@@ -1106,6 +1106,9 @@ def _unavailable(message):
 
 def make_router(state):
     router = APIRouter()
+    import importlib
+    credentials = importlib.import_module(f'{__package__}.credentials' if __package__ else 'credentials')
+    router.include_router(credentials.make_router())
 
     @router.get('/status')
     def status():

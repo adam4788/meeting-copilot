@@ -6,3 +6,9 @@ description: Read-only live meeting answers grounded in project files and past s
 requires_hermes: ">=0.22.0"
 provides_tools: []
 provides_hooks: []
+config_schema:
+  meta_api_key:
+    type: secret
+    env: MODEL_API_KEY
+    label: Meta API key
+    description: Used for Muse Voice and Meta answers. Never paste into chat. Pause capture and safely restart the gateway after changing this key; configuration is not provider verification.

@@ -84,6 +84,102 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
   const render = () => { stateIndex = 0; return registered.render(); };
   return { tree: render(), rerender: render, requests, contributions, revealed };
 }
+test('Meta key form saves explicitly, clears input, reads back, and never caches secrets', async () => {
+  let saved = false;
+  const info = () => ({ saved, runtime_configured: false, verified: false, reload_required: saved, revision: 'r'.repeat(64) });
+  const ui = pane('', true, false, '', {}, {
+    '/credentials/meta': (_path, opts) => {
+      if (opts.method === 'POST') {
+        assert.equal(opts.body.action, 'save');
+        assert.equal(opts.body.key, 'fake-ui-key-only');
+        saved = true;
+      }
+      return info();
+    },
+  });
+  const button = (tree, text) => nodes(tree).find(n => n.type === 'button' && n.children.includes(text));
+  let tree = ui.tree;
+  const field = nodes(tree).find(n => n.props['aria-label'] === 'Meta API key');
+  assert.ok(field, 'masked key field exists inside the pane');
+  assert.equal(field.props.type, 'password');
+  assert.equal(field.props.autoComplete, 'new-password');
+  assert.equal(button(tree, 'Save key').props.disabled, true, 'unknown status cannot overwrite');
+  await button(tree, 'Recheck key status').props.onClick();
+  tree = ui.rerender();
+  const input = nodes(tree).find(n => n.props['aria-label'] === 'Meta API key');
+  input.props.ref.current = { value: 'fake-ui-key-only' };
+  input.props.onChange({ target: input.props.ref.current });
+  assert.equal(ui.requests.filter(r => r.method === 'POST').length, 0, 'typing never saves');
+  tree = ui.rerender();
+  await button(tree, 'Save key').props.onClick();
+  assert.equal(input.props.ref.current.value, '', 'erase draft immediately after submission');
+  tree = ui.rerender();
+  assert.ok(saved, 'save changed the backend fixture');
+  assert.equal(ui.requests.at(-1).method, undefined, 'separate exact-target readback');
+  assert.match(JSON.stringify(tree), /Saved.*restart/i);
+  assert.match(JSON.stringify(tree), /Not verified/i);
+  assert.ok(!JSON.stringify(tree).includes('fake-ui-key-only'));
+});
+
+test('Meta key save errors do not echo transport secrets or claim readiness', async () => {
+  const ui = pane('', true, false, '', {}, {
+    '/credentials/meta': (_path, opts) => {
+      if (opts.method === 'POST') throw new Error('fake-ui-key-only');
+      return { saved: false, runtime_configured: false, verified: false, revision: 'r'.repeat(64) };
+    },
+  });
+  const button = (tree, text) => nodes(tree).find(n => n.type === 'button' && n.children.includes(text));
+  await button(ui.tree, 'Recheck key status').props.onClick();
+  const input = nodes(ui.rerender()).find(n => n.props['aria-label'] === 'Meta API key');
+  input.props.ref.current = { value: 'fake-ui-key-only' };
+  input.props.onChange({ target: input.props.ref.current });
+  await button(ui.rerender(), 'Save key').props.onClick();
+  const tree = ui.rerender();
+  assert.equal(input.props.ref.current.value, '');
+  assert.ok(!JSON.stringify(tree).includes('fake-ui-key-only'));
+  assert.match(JSON.stringify(tree), /could not be confirmed/i);
+});
+
+test('Meta key pane effects reach the isolated ASGI backend and private env file', async t => {
+  const { spawn } = await import('node:child_process');
+  const { createInterface } = await import('node:readline');
+  const child = spawn(process.env.PYTHON || 'python', ['-u', 'test_credentials.py', '--ui-bridge'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const lines = createInterface({ input: child.stdout });
+  const pending = [];
+  let stderr = '';
+  child.stderr.on('data', chunk => { stderr += chunk.toString(); });
+  lines.on('line', line => {
+    const slot = pending.shift();
+    const response = JSON.parse(line);
+    if (response.status >= 400) slot.reject(new Error('Backend refused request'));
+    else slot.resolve(response.body);
+  });
+  child.on('exit', () => { for (const slot of pending.splice(0)) slot.reject(new Error('Backend exited')); });
+  const call = (path, opts = {}) => new Promise((resolve, reject) => {
+    pending.push({ resolve, reject });
+    child.stdin.write(JSON.stringify({ path, opts }) + '\n');
+  });
+  t.after(async () => {
+    child.stdin.end();
+    await new Promise(resolve => { if (child.exitCode !== null) resolve(); else child.once('exit', resolve); });
+    assert.ok(!stderr.includes('fake-ui-key-only'), 'stderr contains no synthetic key');
+  });
+  const ui = pane('', true, false, '', {}, { '/credentials/meta': call }, {}, { window: { confirm: () => true } });
+  const button = (tree, text) => nodes(tree).find(n => n.type === 'button' && n.children.includes(text));
+  await button(ui.tree, 'Recheck key status').props.onClick();
+  const field = nodes(ui.rerender()).find(n => n.props['aria-label'] === 'Meta API key');
+  field.props.ref.current = { value: 'fake-ui-key-only' };
+  field.props.onChange({ target: field.props.ref.current });
+  assert.equal((await call('/test/saved-effect')).saved, false);
+  await button(ui.rerender(), 'Save key').props.onClick();
+  assert.deepEqual(await call('/test/saved-effect'), { saved: true, mode_private: true, runtime_unchanged: true });
+  assert.equal(field.props.ref.current.value, '');
+  assert.match(JSON.stringify(ui.rerender()), /Not verified/);
+  await button(ui.rerender(), 'Remove saved key').props.onClick();
+  assert.deepEqual(await call('/test/saved-effect'), { saved: false, mode_private: true, runtime_unchanged: true });
+  assert.match(JSON.stringify(ui.rerender()), /No saved key/);
+});
+
 function nodes(tree) {
   return tree && typeof tree === 'object' ? [tree, ...(tree.children || []).flatMap(nodes)] : [];
 }
