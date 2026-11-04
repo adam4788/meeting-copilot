@@ -1,6 +1,9 @@
-"""Controller probe lifetime regressions with fake processes only."""
+"""Controller probe lifetime regressions with inert children and fakes."""
+import subprocess
+import sys
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from fastapi import HTTPException
@@ -90,6 +93,82 @@ class ControllerProbeSlotTests(CheckedThreads):
                 spawn.assert_not_called()
                 kill.assert_not_called()
                 killpg.assert_not_called()
+
+    def test_completed_live_probe_cannot_authorize_later_status_or_start(self):
+        for action in ('status', 'start'):
+            with self.subTest(action=action):
+                starts = []
+                state = server.MeetingState(audio_factory=lambda: SimpleNamespace(
+                    start=lambda **kwargs: starts.append(True), stop=lambda: None))
+                exiting, release = threading.Event(), threading.Event()
+                workers = []
+                test = self
+                original_thread = threading.Thread
+
+                class ExitGatedThread(original_thread):
+                    def run(self):
+                        try:
+                            super().run()
+                        finally:
+                            if self.name == 'meeting-overlay-probe':
+                                exiting.set()
+                                test.checked_wait(release, 10, 'release completed probe')
+
+                def make_thread(*args, **kwargs):
+                    worker = ExitGatedThread(*args, **kwargs)
+                    if kwargs.get('name') == 'meeting-overlay-probe':
+                        workers.append(worker)
+                    return worker
+
+                child = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'],
+                                         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
+                other = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'],
+                                         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
+                state.overlay = FakeDisplay(child)
+                try:
+                    with patch('server.threading.Thread', side_effect=make_thread):
+                        self.assertIs(state._overlay_process_alive(child), True)
+                        self.assertTrue(exiting.wait(2))
+                        self.assertTrue(workers[0].is_alive())
+                        child.stdin.close()
+                        child.wait(timeout=3)
+                        self.assertEqual(child.returncode, 0)
+                        started = time.monotonic()
+                        if action == 'status':
+                            status = state.status(touch=False)
+                            self.assertIsNone(status['overlay_shown'])
+                            self.assertFalse(status['overlay_stop_confirmed'])
+                            self.assertTrue(status['overlay_cleanup_error'])
+                        else:
+                            with self.assertRaises(HTTPException) as rejected:
+                                state.start(True, backend='native')
+                            self.assertEqual(rejected.exception.status_code, 409)
+                            self.assertFalse(state.listening)
+                            self.assertEqual(starts, [])
+                        self.assertLess(time.monotonic() - started, .5)
+                        self.assertIsNone(state._overlay_process_alive(child))
+                        self.assertIsNone(state._overlay_process_alive(other))
+                        self.assertEqual(len(workers), 1)
+                        self.assertEqual(len(state._overlay_probe_jobs), 1)
+                        release.set()
+                        workers[0].join(2)
+                        self.assertFalse(workers[0].is_alive())
+                        self.assertIs(state._overlay_process_alive(child), False)
+                        workers[-1].join(2)
+                        self.assertIs(state._overlay_process_alive(other), True)
+                finally:
+                    release.set()
+                    for worker in workers:
+                        worker.join(2)
+                        self.assertFalse(worker.is_alive())
+                    state.overlay_hide()
+                    if not child.stdin.closed:
+                        child.stdin.close()
+                    child.wait(timeout=3)
+                    other.stdin.close()
+                    other.wait(timeout=3)
 
     def test_completed_probe_holds_slot_until_actual_worker_exit(self):
         state = server.MeetingState()

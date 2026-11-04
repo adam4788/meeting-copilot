@@ -1191,33 +1191,31 @@ class MeetingState:
     def _overlay_process_alive(self, process):
         """Tri-state inspection, with no process method on the caller thread.
 
-        A poll wrapper can hang just like a signal wrapper. Reuse its in-flight
-        probe rather than multiplying threads on status/retry or new children.
-        One controller-wide slot stays occupied until actual worker exit.
-        Workers acquire no controller/publication locks; callers wait at most
-        50ms even when status is nested under a publication lock. Never cache a live result
-        across completed probes (a subsequent exit must be discoverable).
+        A poll wrapper can hang just like a signal wrapper. One controller-wide
+        slot stays occupied until actual worker exit, including after done is
+        signaled. Only the caller that starts a probe may use its result; later
+        callers get unknown, even for the same child, because it may have exited
+        since that poll. Workers acquire no controller/publication locks; the
+        initiating caller waits at most 50ms.
         """
         if process is None:
             return False
         with self._overlay_probe_lock:
             self._overlay_probe_jobs = {target: job for target, job in self._overlay_probe_jobs.items()
                                         if job['worker'].is_alive()}
-            job = self._overlay_probe_jobs.get(process)
-            if job is None:
-                if self._overlay_probe_jobs:
-                    return None  # another generation's result proves nothing
-                job = {'done': threading.Event(), 'alive': None}
-                self._overlay_probe_jobs[process] = job
-                def inspect_process():
-                    try:
-                        job['alive'] = process.poll() is None
-                    except Exception:
-                        pass  # unknown is not evidence of exit
-                    finally:
-                        job['done'].set()
-                job['worker'] = threading.Thread(target=inspect_process, name='meeting-overlay-probe', daemon=True)
-                job['worker'].start()
+            if self._overlay_probe_jobs:
+                return None  # occupied evidence belongs only to its initiating call
+            job = {'done': threading.Event(), 'alive': None}
+            self._overlay_probe_jobs[process] = job
+            def inspect_process():
+                try:
+                    job['alive'] = process.poll() is None
+                except Exception:
+                    pass  # unknown is not evidence of exit
+                finally:
+                    job['done'].set()
+            job['worker'] = threading.Thread(target=inspect_process, name='meeting-overlay-probe', daemon=True)
+            job['worker'].start()
         job['done'].wait(.05)
         return job['alive'] if job['done'].is_set() else None
 
