@@ -12,8 +12,11 @@ export default {
   description: 'Live answers grounded in your projects, prior sessions, and optional web research.',
   version: '0.2.0',
   register(ctx) {
-    const api = (path, body) => ctx.rest(path, body === undefined ? {} : { method: 'POST', body });
-    function MetaKeySettings() {
+    function MetaKeySettings({ api: paneApi, life }) {
+      // Bind callbacks to this exact effect lifecycle, not a mutable ref that
+      // could authorize an old password-field callback after a pane remount.
+      const api = (path, body) => life.mounted ? paneApi(path, body)
+        : Promise.reject(new Error('This pane is retired. Close and reopen it.'));
       // Secret stays only in this uncontrolled password field and one POST.
       // Never send it through React Query, plugin storage, chat or notifications.
       const input = useRef(null);
@@ -92,7 +95,38 @@ export default {
           h('p', { style: muted }, 'Saving is configuration only, not a Meta authentication test. Select Meta for answers and try a non-sensitive question; test Muse Voice separately with consent. An answer fallback or configured badge does not verify Meta or audio permissions.')),
         h('p', { style: { ...muted, marginBottom: 0 } }, 'Used for Muse Voice and Meta answers. Stored only in this backend’s active HERMES_HOME/.env; never returned by this editor. Saving does not reload the gateway or change a running capture.'));
     }
-    function MeetingPane() {
+    const request = (path, body) => ctx.rest(path, body === undefined ? {} : { method: 'POST', body });
+    // Survives plugin unregister/re-register in the SAME renderer. Neither a
+    // wall clock nor HTTP arrival can establish pane creation order.
+    const orderKey = Symbol.for('meeting-copilot.pane-creation.v1');
+    const order = globalThis[orderKey] ||= { client: globalThis.crypto?.randomUUID?.(), next: 0 };
+    const registration = order.registration = (order.registration || 0) + 1;
+    let active = true;
+    let paneRegistration = null;
+    const registered = () => active && order.registration === registration;
+    const lifecycles = new Set();
+    const notify = (kind, message) => { try { host.notify({ kind, message }); } catch (e) {} };
+    function releaseOverlayPane(life) {
+      lifecycles.delete(life);
+      if (life.release) return life.release;
+      if (!life.pane) return Promise.resolve({ accepted: false });
+      life.released = true;
+      try { life.release = Promise.resolve(request('/overlay/release', { pane: life.pane, action: ++life.action })); }
+      catch (error) { life.release = Promise.reject(error); }
+      // Observe cleanup failures too; Restart still receives the rejection.
+      const warnStop = () => notify('warning', 'Capture stop is not confirmed. Lease expiry initiates stop but cannot guarantee physical shutdown. Reopen Meeting Copilot to check status and Retry stop; verify the OS audio indicator.');
+      life.release.then(result => {
+        if (result?.stop_confirmed === false || result?.stopping) warnStop();
+        if (result?.overlay_stop_confirmed === false) notify('warning', result.overlay_cleanup_error || 'Overlay shutdown is not confirmed. Reopen the pane and Retry hide overlay.');
+      }, warnStop);
+      return life.release;
+    }
+    function MeetingPane({ registration: paneEntry }) {
+      // Fence all outbound work, including previously captured Assist/retry
+      // callbacks. Release uses the registration-level request, never fallback.
+      const usable = () => registered() && paneEntry.active && !paneEntry.retired;
+      const api = (path, body) => (usable() || (path === '/status' && body === undefined)) ? request(path, body)
+        : Promise.reject(new Error('This pane is retired. Close and reopen it.'));
       const qc = useQueryClient();
       const SCOPE_KEY = 'meeting-copilot.scope.v2';
       const loadScope = () => {
@@ -151,7 +185,18 @@ export default {
       // polls use touch=false so only this heartbeat extends the 30s watchdog.
       useEffect(() => {
         if (status.error) return undefined;
-        const beat = () => api('/heartbeat', {}).catch(() => {});
+        const beat = async () => {
+          const life = overlayActionAt.current;
+          // A rejected/uncertain claim is not authority, and must not fall back
+          // to unscoped heartbeats or fresh revision tickets.
+          if (!life.mounted || !life.pane || life.released) return;
+          try {
+            const result = await api('/heartbeat', { pane: life.pane });
+            if (result?.accepted === false && life.mounted) setOverlayMsg('Pane lease expired or ownership changed. Capture will pause; close and reopen this pane.');
+          } catch (e) {
+            if (life.mounted) setOverlayMsg('Heartbeat failed. Capture will pause if the connection does not recover within 30 seconds.');
+          }
+        };
         const timer = setInterval(beat, 10000);
         return () => clearInterval(timer);
       }, [!!status.error]);
@@ -178,30 +223,102 @@ export default {
       const unsupported = unsupportedReasons.length > 0;
       // Closing the pane pauses capture: the overlay is hidden and the
       // watchdog alone must not keep recording for ~30s after the user left.
-      useEffect(() => () => { api('/overlay/hide', {}).catch(() => {}); api('/pause', {}).catch(() => {}); }, []);
+      useEffect(() => {
+        const life = overlayActionAt.current.mounted ? overlayActionAt.current : newOverlayLifecycle();
+        overlayActionAt.current = life;
+        claimOverlayPane(life).catch(e => { if (life.mounted) setOverlayMsg(String(e.message || e)); });
+        return () => {
+          life.mounted = false;
+          releaseOverlayPane(life);
+        };
+      }, []);
       // Auto-sync overlay scope when settings change while shown; guard
       // against out-of-order responses clearing a newer stale indicator.
       const [scopeStale, setScopeStale] = useState(false);
       const scopeKey = overlayScopeKey;
       const scopeSeq = useRef(0);
-      const overlayActionAt = useRef(0);
-      useEffect(() => { if (overlayOn) { scopeSeq.current += 1; setScopeStale(true); } }, [scopeKey]);
-      useEffect(() => {
-        if (!overlayOn) return undefined;
-        const seq = scopeSeq.current;
-        const timer = setTimeout(async () => {
-          // A manual Sync (or newer change) supersedes this pending update.
-          if (scopeSeq.current !== seq || !overlayOn) return;
-          try {
-            const res = await api('/overlay/scope', { scope: { ...scope, ...overlayQuery, seq } });
-            if (scopeSeq.current === seq) {
-              if (res && res.accepted === false) setOverlayMsg('Overlay kept its newer settings; a stale sync was ignored. Change a setting to retry.');
-              else setScopeStale(false);
-            }
+      // Owner is minted by Show, not a pane-local counter that resets on remount.
+      function newOverlayLifecycle() {
+        const life = { at: 0, owner: null, pane: null, claim: null, action: 0,
+          creation: ++order.next,
+          alive: true, syncedKey: null, released: false,
+          get mounted() { return this.alive && registered() && paneEntry.active && paneRegistration === paneEntry; },
+          set mounted(value) { this.alive = value; } };
+        paneEntry.retired = null;  // a genuinely new effect owns its own recovery
+        paneEntry.retire?.(null);
+        paneEntry.life = life;
+        lifecycles.add(life);
+        return life;
+      }
+      const overlayActionAt = useRef(null);
+      if (!overlayActionAt.current) overlayActionAt.current = newOverlayLifecycle();
+      async function claimOverlayPane(life) {
+        if (!life.claim) life.claim = Promise.resolve().then(() => {
+          if (!life.mounted) return null;
+          if (!order.client || !Number.isSafeInteger(life.creation)) throw new Error('Pane creation ordering is unavailable.');
+          return api('/overlay/lifecycle');
+        }).then(async ticket => {
+          if (!life.mounted) return null;
+          if (!ticket.epoch) throw new Error('Update/restart the backend for pane creation ordering.');
+          life.claimAttempted = true;
+          return api('/overlay/claim', { revision: ticket.revision, epoch: ticket.epoch,
+            client: order.client, creation: life.creation });
+        }).then(result => {
+          if (!result && !life.mounted) return null;
+          if (result?.reason === 'different_renderer') throw new Error('Another desktop renderer owns this backend. A reloaded renderer cannot renew its capture lease: the watchdog initiates stop within 32 seconds of the last owner heartbeat. Verify capture has stopped. Return to the original window, or close all Meeting Copilot panes and restart the backend when other sessions are idle, then reopen.');
+          if (result?.accepted === false) throw new Error('Another pane owns the overlay. Close and reopen this pane to take ownership.');
+          if (!result?.pane) throw new Error('Overlay lifecycle protocol unavailable. Update/restart the backend and reopen the pane.');
+          life.pane = result.pane;
+          if (!life.mounted) releaseOverlayPane(life);
+          return result.pane;
+        }).catch(e => {
+          if (!life.claimAttempted) {
+            // GET cannot commit. Retry on the next user action using the SAME
+            // creation identity; never replay a possibly committed POST.
+            life.claim = null;
+            throw new Error(`${String(e.message || e)} Retry the action to look up lifecycle authorization, or close and reopen the pane.`);
           }
-          catch (e) { if (scopeSeq.current === seq) setOverlayMsg(String(e.message || e)); }
-        }, 600);
-        return () => clearTimeout(timer);
+          // A lost claim response may already have committed. Do not mint a
+          // new creation ID on retry: reopening is an explicit new lifecycle.
+          throw new Error(`${String(e.message || e)} Close and reopen this pane to retry lifecycle authorization.`);
+        });
+        return life.claim;
+      }
+      useEffect(() => { if (overlayOn) { scopeSeq.current += 1; overlayActionAt.current.syncedKey = null; setScopeStale(true); } }, [scopeKey]);
+      async function syncOverlayScope(seq) {
+        const life = overlayActionAt.current;
+        const owner = life.owner;
+        const current = () => life.mounted && scopeSeq.current === seq && life.owner === owner;
+        // Sending is not acknowledgement. Invalidate the old key on every
+        // intervening write, including manual and still-pending requests.
+        life.syncedKey = null;
+        try {
+          const res = await api('/overlay/scope', { scope: { ...scope, ...overlayQuery, seq, owner } });
+          if (!current()) return;
+          if (res?.accepted === false) throw new Error('Overlay scope was rejected.');
+          life.syncedKey = scopeKey; setScopeStale(false);
+          setOverlayMsg('Overlay scope updated to current settings.');
+        } catch (e) {
+          if (!current()) return;
+          // Ordered hide fails closed without closing a newer pane or Show.
+          const action = ++life.action;
+          try {
+            const hidden = await api('/overlay/hide', { pane: life.pane, action });
+            if (!life.mounted || life.action !== action) return;
+            if (hidden?.accepted === false) throw new Error('Overlay ownership changed.');
+            if (hidden?.overlay_stop_confirmed === false) throw new Error(hidden.overlay_cleanup_error || 'Overlay shutdown is not confirmed.');
+            life.owner = null; setOverlayOn(false);
+            setOverlayMsg('Overlay closed because scope synchronization failed. Show overlay to retry current settings.');
+          } catch (hideError) {
+            if (life.mounted && life.action === action) setOverlayMsg('Scope sync failed and overlay closure could not be confirmed. Retry Hide overlay or quit the helper; closing the pane only requests shutdown.');
+          }
+        }
+      }
+      useEffect(() => {
+        if (!overlayOn || overlayActionAt.current.syncedKey === scopeKey) return undefined;
+        // Permission changes are immediate; do not debounce a narrowing.
+        if (overlayActionAt.current.mounted) void syncOverlayScope(scopeSeq.current);
+        return undefined;
       }, [scopeKey, overlayOn]);
       // Reconcile with the authoritative backend state: if the helper died
       // or its lease expired, stop offering Hide/Sync for a gone window.
@@ -209,7 +326,7 @@ export default {
       // whole status object so expiry observed mid-grace is still honored —
       // status polls refresh every few seconds.
       useEffect(() => {
-        if (overlayOn && data && data.overlay_shown === false && Date.now() - overlayActionAt.current > 8000) {
+        if (overlayOn && data && data.overlay_shown === false && Date.now() - overlayActionAt.current.at > 8000) {
           setOverlayOn(false);
           setOverlayMsg('Overlay is no longer shown (helper exited or lease expired). Show overlay to reopen it.');
         }
@@ -220,8 +337,18 @@ export default {
       // 2.5s status poll heals a missed invalidation, and a failed refresh
       // must not masquerade as a failed destructive action.
       async function act(path, body = {}) {
+        if (!overlayActionAt.current.mounted) return false;
         setPending(true); setError('');
-        try { await api(path, body); }
+        try {
+          if (path === '/pause' || path === '/clear') {
+            const life = overlayActionAt.current;
+            const pane = await claimOverlayPane(life);
+            if (!life.mounted) return false;
+            body = { ...body, pane, action: ++life.action };
+          }
+          const response = await api(path, body);
+          if (path === '/clear') { retireLocalOverlay(); setOverlayMsg(response?.overlay_cleanup_error || ''); }
+        }
         catch (e) { setError(String(e.message || e)); return false; }
         finally { setPending(false); }
         try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }); }
@@ -258,20 +385,43 @@ export default {
         setQuestion(''); setWeb(''); setLastAsked(null); setLiveEntry(null);
         setTrackedRequest(null); setError(''); setAssistFailed(false);
       }
+      function retireLocalOverlay() {
+        const life = overlayActionAt.current;
+        life.owner = null; life.syncedKey = null;
+        scopeSeq.current += 1;
+        setOverlayOn(false); setScopeStale(false); setOverlayMsg('');
+      }
       async function toggleOverlay() {
+        const life = overlayActionAt.current;
+        if (!life.mounted) return;
         setPending(true); setOverlayMsg('');
-        overlayActionAt.current = Date.now();
+        life.at = Date.now();
         try {
-          if (overlayOn) { await api('/overlay/hide', {}); setOverlayOn(false); }
-          else { await api('/overlay/show', { scope: { ...scope, ...overlayQuery, seq: scopeSeq.current } }); setOverlayOn(true); setScopeStale(false); setOverlayMsg('Overlay shown. It returns to click-through after ~10s — press the shortcut to interact, then tap a row for a streamed answer.'); }
+          const pane = await claimOverlayPane(life);
+          if (!life.mounted) return;
+          const action = ++life.action;
+          if (overlayOn || data.overlay_cleanup_error) {
+            const hidden = await api('/overlay/hide', { pane, action });
+            if (!life.mounted || life.action !== action) return;
+            if (hidden?.accepted === false) throw new Error('This pane no longer owns the overlay. Reopen the pane to take ownership.');
+            if (hidden?.overlay_stop_confirmed === false) throw new Error(hidden.overlay_cleanup_error || 'Overlay shutdown is not confirmed.');
+            life.owner = null; life.syncedKey = null; setOverlayOn(false);
+          } else {
+            const shown = await api('/overlay/show', { pane, action, scope: { ...scope, ...overlayQuery, seq: scopeSeq.current } });
+            if (!life.mounted || life.action !== action) return;
+            if (shown?.accepted === false || !shown?.owner) throw new Error('This pane no longer owns the overlay. Reopen the pane to take ownership.');
+            life.owner = shown.owner; life.syncedKey = scopeKey;
+            setOverlayOn(true); setScopeStale(false);
+            setOverlayMsg('Overlay shown. It returns to click-through after ~10s — press the shortcut to interact, then tap a row for a streamed answer.');
+          }
           await qc.invalidateQueries({ queryKey: [ID, 'status'] });
-        } catch (e) { setOverlayMsg(String(e.message || e)); if (!overlayOn) setOverlayOn(false); }
-        finally { setPending(false); }
+        } catch (e) { if (life.mounted) { setOverlayMsg(String(e.message || e)); if (!overlayOn) setOverlayOn(false); } }
+        finally { if (life.mounted) setPending(false); }
       }
       async function startCapture(newMeeting = false) {
         const retained = !!((data.segments || []).length || data.result || (data.recent || []).length || data.error_request);
         const last = data.last_session;
-        const changed = retained && last && (
+        const sourceChanged = last && (
           last.backend !== backend || (backend === 'meetily'
             ? last.recording_id !== (recording || null)
             : last.transcription_model !== transcriptionModel || last.audio_source !== audioSource
@@ -279,14 +429,24 @@ export default {
         const message = newMeeting
           ? 'Start a fresh meeting? The earlier transcript, answers, and retry data are cleared.'
           : 'These settings differ from the previous session, so starting begins a fresh meeting and clears the earlier transcript, answers, and retry data. Continue?';
-        if ((newMeeting || changed) && typeof window !== 'undefined' && window.confirm && !window.confirm(message)) return false;
-        const ok = await act('/start', { consent, backend, recording_id: recording || null,
-          transcription_model: transcriptionModel, audio_source: audioSource, new_meeting: newMeeting,
-          transcription_provider: transcriptionProvider, asr_mode: asrMode });
-        if (ok && (newMeeting || changed)) resetMeetingInputs();
-        return ok;
+        if ((newMeeting || (retained && sourceChanged)) && typeof window !== 'undefined' && window.confirm && !window.confirm(message)) return false;
+        const life = overlayActionAt.current;
+        setPending(true);
+        try {
+          const pane = await claimOverlayPane(life);
+          if (!life.mounted) return false;
+          const ok = await act('/start', { pane, action: ++life.action, consent, backend, recording_id: recording || null,
+            transcription_model: transcriptionModel, audio_source: audioSource, new_meeting: newMeeting,
+            transcription_provider: transcriptionProvider, asr_mode: asrMode });
+          if (life.mounted && ok && (newMeeting || sourceChanged)) { resetMeetingInputs(); retireLocalOverlay(); }
+          return ok;
+        } catch (e) {
+          if (life.mounted) setError(String(e.message || e));
+          return false;
+        } finally { if (life.mounted) setPending(false); }
       }
       async function assistNow(extra = {}, questionOverride, scopeOverride) {
+        if (!usable() || !overlayActionAt.current.mounted) return;
         const asked = questionOverride !== undefined ? questionOverride : question;
         const scopeUsed = scopeOverride || scope;
         if (questionOverride !== undefined) setQuestion(questionOverride);
@@ -308,7 +468,7 @@ export default {
       // Exact replay: resend a stored request verbatim (question, scope,
       // transcript snapshot) instead of whatever the pane currently shows.
       async function replayRequest(req) {
-        if (!req) return;
+        if (!usable() || !overlayActionAt.current.mounted || !req) return;
         if (typeof req.question === 'string') setQuestion(req.question);
         setPending(true); setError(''); setAssistFailed(false); setLiveEntry(null); setTrackedRequest(null);
         // Remember before sending: a failed replay stays retryable as itself,
@@ -390,7 +550,7 @@ export default {
       const result = data.result;
       const transcript = data.segments || [];
       const failed = !!(data.error_request || data.error || (data.capture && (data.capture.error || /fail|error|could not/i.test(data.capture.warning || ''))));
-      const statusLabel = status.isPending ? 'Connecting…' : status.error ? 'Unavailable' : failed ? 'Needs attention' : data.listening ? 'Listening' : 'Paused';
+      const statusLabel = status.isPending ? 'Connecting…' : status.error ? 'Unavailable' : data.stopping ? 'Stopping — unconfirmed' : failed ? 'Needs attention' : data.listening ? 'Listening' : 'Paused';
         // Always-visible listening bar: the source card collapses while
         // listening, but Pause/Detach and loss evidence must never hide.
         // Native frames, worker chunks, and sub-second tails are distinct
@@ -415,6 +575,12 @@ export default {
           try { el.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); } catch (ignored) {}
         }
       }, [result?.answer, liveEntry?.answer, liveEntry?.status]);
+      const [, setRetirement] = useState('');
+      paneEntry.retire = message => { paneEntry.retired = message; setRetirement(message); };
+      if (paneEntry.retired) return h('section', { role: 'alert', style: card },
+        h('strong', null, 'Meeting Copilot pane retired — actions disabled'),
+        h('p', null, paneEntry.retired),
+        h('p', null, 'Close this pane and reopen Meeting Copilot. Check capture status and Retry stop if needed before giving fresh consent. If audio remains active, quit the capture process or revoke audio permissions and verify the OS indicator.'));
       return h('div', { style: { padding: 16, display: 'flex', flexDirection: 'column', gap: 14, height: '100%', minWidth: 0, width: '100%', boxSizing: 'border-box', overflowY: 'auto', overflowX: 'hidden', overflowWrap: 'anywhere', color: 'var(--ui-text-primary)' } },
         h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
           h('strong', { style: { fontSize: 17 } }, 'Meeting Copilot'),
@@ -424,23 +590,25 @@ export default {
         h('section', { style: { ...card, display: 'grid', gap: 10 }, 'aria-label': 'Capture session' },
           h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
             h('strong', null, 'Capture session'),
-            h('span', { style: muted, role: 'status' }, data.listening
+            h('span', { style: muted, role: 'status' }, data.stopping ? 'Stop is not confirmed — audio may still be active.' : data.listening
               ? `Listening via ${data.backend || backend}${lossText(data.capture)}${data.capture?.warning ? ' · transcript may be incomplete' : ''}`
               : ((data.segments || []).length || result || (data.recent || []).length) ? 'Paused — resume this meeting or start a fresh one.' : 'Not capturing yet.')),
           h('label', { style: { display: 'flex', gap: 8, alignItems: 'flex-start', border: '1px solid var(--ui-stroke-secondary)', borderRadius: 10, padding: '10px 12px', background: 'var(--ui-bg-card)' } },
             h('input', { type: 'checkbox', checked: consent, disabled: data.listening, onChange: e => setConsent(e.target.checked), 'aria-label': 'Capture permission' }),
             h('span', null, h('strong', null, 'Permission check. '), 'I have permission to capture/read this meeting and use its context with my configured model.')),
           backend === 'macos' && transcriptionProvider === 'meta' && h('p', { 'data-cloud-capture-disclosure': true, role: 'status', style: { ...muted, margin: 0 } }, `Cloud transcription selected: meeting audio is sent to Meta while listening. ${data.listening ? 'Pause to change' : 'Change'} the provider in Transcript source below.`),
-          !data.listening && (pending || !consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)) && h('p', { style: { ...muted, margin: 0 }, role: 'status' },
+          !data.listening && !data.stopping && (pending || !consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)) && h('p', { style: { ...muted, margin: 0 }, role: 'status' },
             pending ? 'Starting…' : !consent ? 'Confirm permission with the check above to enable Start.' : (backend === 'meetily' && !recording) ? 'Select an active Meetily recording below to enable Attach.' : 'Independent macOS transcription is unavailable here — see the source card below.'),
           h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
-            data.listening
+            data.stopping
+              ? h(Button, { variant: 'secondary', disabled: pending, onClick: () => act('/pause', {}) }, 'Retry stop')
+              : data.listening
               ? h(Button, { variant: 'secondary', onClick: () => act('/pause', {}) }, data.backend === 'meetily' ? 'Detach' : 'Pause listening')
-              : h(Button, { disabled: pending || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), onClick: () => startCapture() }, ((data.segments || []).length || result || (data.recent || []).length) ? (backend === 'meetily' ? 'Resume' : 'Resume listening') : (backend === 'meetily' ? 'Attach to Meetily' : 'Start listening')),
-            !data.listening && ((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), title: 'Starts a fresh meeting; the earlier transcript, answers, and retry data are cleared', onClick: () => startCapture(true) }, 'New meeting'),
-            ((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending, title: 'Clears past Q&A, transcript segments, and cached snippets for this meeting', onClick: async () => { if (typeof window !== 'undefined' && window.confirm && !window.confirm('Clear this meeting? Past questions, answers, and transcript segments are removed from the pane.')) return; if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } } }, 'Clear meeting'),
-            h(Button, { variant: 'secondary', disabled: pending || !data.capabilities?.overlay, title: 'Show or hide the floating meeting overlay (macOS)', onClick: toggleOverlay }, overlayOn ? 'Hide overlay' : 'Show overlay')),
-          h('p', { style: { ...muted, margin: 0 } }, 'No additional audio files · copilot detaches/pauses if this pane disconnects. Resume keeps this meeting (transcript and latest answer stay); New meeting, different settings, or Clear starts fresh. Pausing can discard the last few seconds of audio.'),
+              : h(Button, { disabled: pending || !!data.overlay_cleanup_error || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), onClick: () => startCapture() }, ((data.segments || []).length || result || (data.recent || []).length) ? (backend === 'meetily' ? 'Resume' : 'Resume listening') : (backend === 'meetily' ? 'Attach to Meetily' : 'Start listening')),
+            !data.listening && !data.stopping && ((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending || !!data.overlay_cleanup_error || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), title: 'Starts a fresh meeting; the earlier transcript, answers, and retry data are cleared', onClick: () => startCapture(true) }, 'New meeting'),
+            (data.overlay_cleanup_error || (data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending, title: 'Clears past Q&A, transcript segments, and cached snippets for this meeting', onClick: async () => { if (typeof window !== 'undefined' && window.confirm && !window.confirm('Clear this meeting? Past questions, answers, and transcript segments are removed from the pane.')) return; if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } } }, 'Clear meeting'),
+            h(Button, { variant: 'secondary', disabled: pending || (!data.capabilities?.overlay && !data.overlay_cleanup_error), title: 'Show or hide the floating meeting overlay (macOS)', onClick: toggleOverlay }, data.overlay_cleanup_error ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay')),
+          h('p', { style: { ...muted, margin: 0 } }, 'No additional audio files · disconnect initiates detach/pause; verify stop status before assuming audio is off. Resume keeps this meeting (transcript and latest answer stay); New meeting, different settings, or Clear starts fresh. Pausing can discard the last few seconds of audio.'),
           data.capture && h('div', { style: muted }, data.capture.message || data.capture.state || ''),
           data.capture && (data.capture.warning || lossText(data.capture)) && h('div', { role: 'status', style: muted },
             ['Transcript may be incomplete',
@@ -462,14 +630,15 @@ export default {
               const backendIssue = !!status.error && !storedRetry;
               // A capture failure needs capture restarted (consent already
               // given), not a status refresh: label and wire it honestly.
-              const captureIssue = !!data.error && !storedRetry && !status.error;
+              const captureIssue = !!data.error && !storedRetry && !status.error && !data.stopping;
               // A failed forget-boundary needs Clear run again, not a
               // dismiss: the adapter keeps serving its old snapshot until
               // the boundary installs. The user already consented to
               // clearing, so the retry completes their intent.
               const clearIssue = !!data.meetily_clear_error && !storedRetry && !status.error && !data.error;
-              const label = retryReq ? 'Retry' : backendIssue ? 'Retry' : captureIssue ? (data.listening ? 'Recheck status' : 'Restart capture') : clearIssue ? 'Clear again' : 'Dismiss';
+              const label = data.stopping ? 'Recheck status' : retryReq ? 'Retry' : backendIssue ? 'Retry' : captureIssue ? (data.listening ? 'Recheck status' : 'Restart capture') : clearIssue ? 'Clear again' : 'Dismiss';
               return h(Button, { variant: 'secondary', disabled: pending || (captureIssue && !data.listening && (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription))), onClick: async () => {
+                if (data.stopping) return qc.invalidateQueries({ queryKey: [ID, 'status'] });
                 if (retryReq) { setError(''); setAssistFailed(false); return replayRequest(retryReq); }
                 if (clearIssue) { if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } return; }
                 if (captureIssue && !data.listening) return startCapture();
@@ -478,13 +647,13 @@ export default {
               } }, label);
             })())),
         persistWarning && h('p', { role: 'status', style: muted }, persistWarning),
-        !data.listening && !result && h('section', { style: card, 'aria-label': 'Getting started' },
+        !data.listening && !data.stopping && !result && h('section', { style: card, 'aria-label': 'Getting started' },
           h('strong', null, 'Getting started'),
           h('ol', { style: { ...muted, margin: '8px 0 0', paddingLeft: 20, display: 'grid', gap: 4 } },
             h('li', null, backend === 'meetily' ? 'Confirm permission above, pick your active Meetily recording below, then Attach.' : 'Confirm permission above, then Start listening.'),
             h('li', null, 'Type a question (or leave blank for the latest one) and choose Suggest answer.'),
             h('li', null, 'Read the cited answer; open Evidence for sources.'))),
-        h(MetaKeySettings),
+        h(MetaKeySettings, { api, life: overlayActionAt.current }),
         h(data.listening ? 'details' : 'section', data.listening ? null : { style: card },
           ...(data.listening ? [h('summary', { style: { cursor: 'pointer', ...muted } }, `Transcript source: ${data.backend || backend} — listening (pause to change settings)`)] : []),
           h('span', { id: 'mc-source-label', style: { fontWeight: 700 } }, 'Transcript source'),
@@ -528,7 +697,7 @@ export default {
               try { await api('/assist/cancel', { request_id: cancellableId }); setTrackedRequest(null); setLiveEntry(null); await qc.invalidateQueries({ queryKey: [ID, 'status'] }); }
               catch (e) { setError(String(e.message || e)); }
             } }, 'Cancel answer'),
-          h(Button, { variant: 'secondary', disabled: !result?.answer, onClick: async () => { try { await navigator.clipboard.writeText(result.answer); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch (e) { setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, copied ? 'Copied ✓' : 'Copy'),
+          h(Button, { variant: 'secondary', disabled: !result?.answer, onClick: async () => { if (!usable()) return; try { await navigator.clipboard.writeText(result.answer); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch (e) { setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, copied ? 'Copied ✓' : 'Copy'),
           question && h(Button, { variant: 'secondary', disabled: busy, onClick: () => { setQuestion(''); composerRef.current?.querySelector('textarea')?.focus(); } }, 'Clear question')),
         liveEntry && ['queued', 'streaming', 'running'].includes(liveEntry.status) && h('section', { style: card, 'aria-live': 'polite', ref: answerRef },
           h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8 } },
@@ -584,7 +753,7 @@ export default {
             (entry.sources || []).length > 0 && h('details', { style: { marginTop: 8 } }, h('summary', { style: { cursor: 'pointer', ...muted } }, `Evidence · ${entry.sources.length} sources${entry.sources.length > 6 ? ' (showing first 6)' : ''}`),
               ...(entry.sources || []).slice(0, 6).map((s, k) => h('div', { key: s.id || k, style: { ...muted, paddingTop: 6, overflowWrap: 'anywhere' } }, h('strong', null, `[${k + 1}] ${s.title || s.source || 'Source'}`)))),
             h('div', { style: { paddingTop: 8, display: 'flex', gap: 8, flexWrap: 'wrap' } },
-              entry.answer && h(Button, { variant: 'secondary', onClick: async () => { try { await navigator.clipboard.writeText(entry.answer); } catch (e) { setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, 'Copy this answer'),
+              entry.answer && h(Button, { variant: 'secondary', onClick: async () => { if (!usable()) return; try { await navigator.clipboard.writeText(entry.answer); } catch (e) { setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, 'Copy this answer'),
               entry.request && h(Button, { variant: 'secondary', onClick: () => replayRequest(entry.request) }, /partial|interrupt|unavailable|failed|error/i.test((entry.warnings || []).join(' ') + ' ' + (entry.status || '')) ? 'Retry for the complete response' : 'Ask again'))))),
         h('details', { open: setupOpen, onToggle: e => setSetupOpen(e.currentTarget.open), style: { border: '1px solid var(--ui-stroke-secondary)', borderRadius: 12, padding: '2px 14px 14px', background: 'var(--ui-bg-card)' } },
         h('summary', { style: { cursor: 'pointer', fontWeight: 700, color: 'var(--ui-text-primary)', padding: '12px 0', fontSize: 14 } }, setupOpen ? '\u25be Answer setup — scope, models, overlay, web' : '\u25b8 Answer setup — scope, models, overlay, web'),
@@ -619,20 +788,13 @@ export default {
           overlayMsg && h('p', { role: 'status', style: { ...muted, margin: 0 } }, overlayMsg),
           !data.capabilities?.overlay && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'Overlay helper unavailable. Check the macOS helper build and restart the gateway, then try Show overlay again.'),
           h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
-            h(Button, { variant: overlayOn ? 'secondary' : undefined, disabled: pending || !data.capabilities?.overlay, onClick: toggleOverlay }, overlayOn ? 'Hide overlay' : 'Show overlay'),
+            h(Button, { variant: overlayOn ? 'secondary' : undefined, disabled: pending || (!data.capabilities?.overlay && !data.overlay_cleanup_error), onClick: toggleOverlay }, data.overlay_cleanup_error ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay'),
             h(Button, { variant: 'secondary', disabled: pending || !overlayOn, onClick: async () => {
               setPending(true); setOverlayMsg('');
               scopeSeq.current += 1;
               const seq = scopeSeq.current;
-              overlayActionAt.current = Date.now();
-              try {
-                const res = await api('/overlay/scope', { scope: { ...scope, ...overlayQuery, seq } });
-                if (scopeSeq.current === seq) {
-                  if (res && res.accepted === false) setOverlayMsg('Overlay kept its newer settings; a stale sync was ignored. Change a setting to retry.');
-                  else { setScopeStale(false); setOverlayMsg('Overlay scope updated to current settings.'); }
-                }
-              }
-              catch (e) { if (scopeSeq.current === seq) setOverlayMsg(String(e.message || e)); }
+              overlayActionAt.current.at = Date.now();
+              try { await syncOverlayScope(seq); }
               finally { setPending(false); }
             } }, scopeStale ? 'Sync scope •' : 'Sync scope'))),
         h('p', { style: { ...muted, margin: 0 } }, 'If needed, the model drafts a generic public query. Filtering is best-effort, not a privacy guarantee; turn this off for sensitive calls. Selected context still goes to your configured answer model.'),
@@ -647,14 +809,28 @@ export default {
     }
     const paneId = `${ID}:pane`;
     const visibility = typeof host.paneVisibility === 'function' ? host.paneVisibility(paneId) : null;
-    const registerPane = () => ctx.register({ id: 'pane', area: 'panes', title: 'Meeting Copilot', data: { placement: 'right', width: '440px' }, render: () => h(MeetingPane) });
+    const registerPane = () => {
+      const entry = { active: true, life: null };
+      paneRegistration = entry;
+      const remove = ctx.register({ id: 'pane', area: 'panes', title: 'Meeting Copilot', data: { placement: 'right', width: '440px' },
+        render: () => registered() && entry.active && paneRegistration === entry ? h(MeetingPane, { registration: entry }) : null });
+      return () => {
+        if (!registered() || paneRegistration !== entry || !entry.active) return;
+        entry.active = false;
+        paneRegistration = null;
+        if (entry.life) { entry.life.mounted = false; releaseOverlayPane(entry.life); }
+        remove();
+      };
+    };
     let removePane = registerPane();
     const openPane = () => {
+      if (!registered()) return;
       if (!removePane) removePane = registerPane();
       if (typeof host.revealPane === 'function') host.revealPane(paneId);
       else host.notify({ kind: 'error', message: 'Update Hermes Desktop to reopen contributed panes.' });
     };
     const togglePane = () => {
+      if (!registered()) return;
       // Read current host state on click, not a potentially stale render closure.
       if (visibility?.get() && typeof removePane === 'function') {
         removePane();
@@ -662,12 +838,38 @@ export default {
       } else openPane();
     };
     async function restartPlugin() {
-      let pauseOk = true;
-      try { await api('/pause', {}); } catch (e) { pauseOk = false; }
-      try { if (typeof removePane === 'function') removePane(); } catch (e) {}
-      removePane = null;
-      openPane();
-      try { host.notify({ kind: pauseOk ? 'info' : 'warning', message: pauseOk ? 'Meeting Copilot restarted. Capture paused and pane reopened. If answers still look stale, restart the gateway itself when other sessions are idle.' : 'Pane reopened, but capture pause failed. Restart the gateway itself when other sessions are idle.' }); } catch (e) {}
+      if (!registered()) return;
+      const entry = paneRegistration, remove = removePane;
+      if (!entry) { openPane(); return; }
+      if (entry.restarting) return;
+      entry.restarting = true;
+      entry.retire?.('Restart in progress. Capture pause is not confirmed; all actions are disabled.');
+      const life = entry.life;
+      const current = () => registered() && paneRegistration === entry && removePane === remove && entry.life === life;
+      try {
+        if (life) {
+          // Retire callbacks/heartbeats BEFORE awaiting. A new pane may open
+          // meanwhile; this continuation never owns that registration.
+          life.mounted = false;
+          if (life.claim) await life.claim;
+          if (life.pane) {
+            const released = await releaseOverlayPane(life);
+            if (released?.accepted !== true) throw new Error('Pane ownership changed; release was not accepted.');
+            if (released?.stop_confirmed === false || released?.stopping) throw new Error('Capture stop is not confirmed; the backend is retrying stop.');
+            if (released?.overlay_stop_confirmed === false) throw new Error(released.overlay_cleanup_error || 'Overlay shutdown is not confirmed. Retry hide overlay before restarting.');
+          }
+        }
+        if (!current()) return;
+        remove(); removePane = null;
+        openPane();
+        notify('info', 'Meeting Copilot pane reopened. Its owned capture was paused before reopening; Resume requires consent.');
+      } catch (e) {
+        if (current()) {
+          const message = `Restart was not completed: ${String(e.message || e)} Capture pause is not confirmed. Lease expiry initiates stop, but cannot guarantee physical shutdown.`;
+          entry.retire?.(message);
+          notify('warning', message + ' Close and reopen the pane to check status and Retry stop.');
+        }
+      } finally { entry.restarting = false; }
     };
     function StatusButton() {
       const visible = visibility ? useValue(visibility) : false;
@@ -706,6 +908,12 @@ export default {
     ctx.register({ id: 'open', area: PALETTE_AREA, data: { id: `${ID}.open`, label: 'Open Meeting Copilot', keywords: ['meeting', 'copilot', 'show', 'restore'], run: openPane } });
     ctx.register({ id: 'restart', area: PALETTE_AREA, data: { id: `${ID}.restart`, label: 'Restart Meeting Copilot', keywords: ['meeting', 'copilot', 'restart', 'reload'], run: restartPlugin } });
     ctx.register({ id: 'meeting-help', area: PALETTE_AREA, data: { label: 'Meeting Copilot: usage', run: () => host.notify({ kind: 'info', message: 'Open Meeting Copilot. Choose one project, All projects + sessions, or sessions only. Web fallback is off by default and can be enabled. Confirm consent and attach your recording, then Suggest answer.' }) } });
-    return () => { api('/pause', {}).catch(() => {}); };
+    return () => {
+      for (const life of lifecycles) {
+        life.mounted = false;
+        releaseOverlayPane(life);
+      }
+      active = false;
+    };
   },
 };

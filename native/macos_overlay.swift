@@ -30,10 +30,12 @@ struct Snapshot: Decodable {
     var shareWarning: String? = nil
     var listening: Bool? = nil
     var truncated: Bool? = nil
-    init(transcript: [TranscriptLine] = [], questions: [QuestionRow] = [], message: String? = nil, shareWarning: String? = nil, listening: Bool? = nil, truncated: Bool? = nil) {
+    var snapshotID: String? = nil
+    init(transcript: [TranscriptLine] = [], questions: [QuestionRow] = [], message: String? = nil, shareWarning: String? = nil, listening: Bool? = nil, truncated: Bool? = nil, snapshotID: String? = nil) {
+        self.snapshotID = snapshotID
         self.transcript = transcript; self.questions = questions; self.message = message; self.shareWarning = shareWarning; self.listening = listening; self.truncated = truncated
     }
-    enum CodingKeys: String, CodingKey { case transcript, questions, message, shareWarning = "share_warning", listening, truncated }
+    enum CodingKeys: String, CodingKey { case transcript, questions, message, shareWarning = "share_warning", listening, truncated, snapshotID = "snapshot_id" }
     init(from decoder: Decoder) throws {
         let box = try decoder.container(keyedBy: CodingKeys.self)
         transcript = (try? box.decode([TranscriptLine].self, forKey: .transcript)) ?? []
@@ -42,6 +44,7 @@ struct Snapshot: Decodable {
         shareWarning = try? box.decode(String.self, forKey: .shareWarning)
         listening = try? box.decode(Bool.self, forKey: .listening)
         truncated = try? box.decode(Bool.self, forKey: .truncated)
+        snapshotID = try? box.decode(String.self, forKey: .snapshotID)
     }
 }
 
@@ -53,7 +56,9 @@ struct OverlayState {
     private(set) var shareWarning: String? = nil
     private(set) var listening: Bool = true
     private(set) var truncated: Bool = false
+    private(set) var snapshotID: String? = nil
     mutating func update(_ snapshot: Snapshot) {
+        snapshotID = snapshot.snapshotID
         transcript = Array(snapshot.transcript.suffix(6))
         questions = Array(snapshot.questions.suffix(20))
         message = snapshot.message
@@ -68,8 +73,8 @@ struct OverlayState {
 }
 
 func clickEvent(id: String, interactive: Bool, state: OverlayState) -> String? {
-    guard interactive, state.clickable(id),
-          let data = try? JSONSerialization.data(withJSONObject: ["type": "click", "id": id]) else { return nil }
+    guard interactive, state.clickable(id), let snapshotID = state.snapshotID,
+          let data = try? JSONSerialization.data(withJSONObject: ["type": "click", "id": id, "snapshot_id": snapshotID]) else { return nil }
     return String(data: data, encoding: .utf8)
 }
 
@@ -77,8 +82,9 @@ final class OverlayModel: ObservableObject {
     @Published var state = OverlayState()
     @Published var interactive = false
     func apply(_ snapshot: Snapshot) { state.update(snapshot) }
-    func click(_ id: String) {
-        guard let line = clickEvent(id: id, interactive: interactive, state: state) else { return }
+    func click(_ id: String, displayedSnapshotID: String?) {
+        guard displayedSnapshotID == state.snapshotID,
+              let line = clickEvent(id: id, interactive: interactive, state: state) else { return }
         print(line); fflush(stdout)
     }
 }
@@ -96,6 +102,7 @@ struct OverlayView: View {
         return map
     }
     var body: some View {
+        let displayedSnapshotID = model.state.snapshotID
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text("Meeting Copilot").font(.headline)
@@ -129,7 +136,7 @@ struct OverlayView: View {
                 LazyVStack(alignment: .leading, spacing: 8) {
                     ForEach(model.state.questions) { row in
                         VStack(alignment: .leading, spacing: 4) {
-                            Button(action: { model.click(row.id) }) {
+                            Button(action: { model.click(row.id, displayedSnapshotID: displayedSnapshotID) }) {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(row.question).font(.subheadline).bold()
                                     if row.busy == true {
@@ -266,7 +273,7 @@ func selfTest() -> Bool {
     let lines = (0..<8).map { TranscriptLine(id: String($0), speaker: "s", text: String($0)) }
     let rows = (0..<22).map { QuestionRow(id: String($0), question: "q", answer: nil, busy: $0 == 21) }
     var state = OverlayState()
-    state.update(Snapshot(transcript: lines, questions: rows, message: nil))
+    state.update(Snapshot(transcript: lines, questions: rows, message: nil, snapshotID: "meeting:1"))
     guard state.transcript.count == 6, state.transcript.first?.id == "2",
           state.questions.count == 20, state.questions.first?.id == "2",
           state.clickable("20"), !state.clickable("21"), !state.clickable("missing"),
@@ -275,8 +282,8 @@ func selfTest() -> Bool {
           let event = clickEvent(id: "20", interactive: true, state: state),
           let eventData = event.data(using: .utf8),
           let decoded = try? JSONSerialization.jsonObject(with: eventData) as? [String: String],
-          decoded["type"] == "click", decoded["id"] == "20" else { return false }
-    let wire = #"{"type":"snapshot","transcript":[{"id":"a","speaker":"remote","text":"hello"}],"questions":[{"id":"q","question":"Why?","answer":"Because","busy":true,"streaming":true,"completed_only":false}],"share_warning":"Overlay may be visible."}"#
+          decoded["type"] == "click", decoded["id"] == "20", decoded["snapshot_id"] == "meeting:1" else { return false }
+    let wire = #"{"type":"snapshot","snapshot_id":"meeting:2","transcript":[{"id":"a","speaker":"remote","text":"hello"}],"questions":[{"id":"q","question":"Why?","answer":"Because","busy":true,"streaming":true,"completed_only":false}],"share_warning":"Overlay may be visible."}"#
     guard let decodedSnapshot = try? JSONDecoder().decode(Snapshot.self, from: Data(wire.utf8)),
           decodedSnapshot.questions.first?.answer == "Because",
           decodedSnapshot.questions.first?.streaming == true,
@@ -284,17 +291,22 @@ func selfTest() -> Bool {
           decodedSnapshot.shareWarning == "Overlay may be visible." else { return false }
     state.update(decodedSnapshot)
     guard state.transcript.first?.text == "hello", !state.clickable("q"),
-          state.shareWarning == "Overlay may be visible." else { return false }
+          state.shareWarning == "Overlay may be visible.", state.snapshotID == "meeting:2" else { return false }
     let completedWire = #"{"questions":[{"id":"c","question":"Why?","answer":"Done.","busy":false,"completed_only":true}]}"#
     guard let completedSnapshot = try? JSONDecoder().decode(Snapshot.self, from: Data(completedWire.utf8)),
           completedSnapshot.questions.first?.completedOnly == true,
           completedSnapshot.shareWarning == nil else { return false }
+    state.update(completedSnapshot)
+    guard clickEvent(id: "c", interactive: true, state: state) == nil else { return false }
     state.update(Snapshot(transcript: [], questions: [], message: "paused"))
     return state.transcript.isEmpty && state.questions.isEmpty && state.message == "paused"
 }
 
 @main struct Main {
     static func main() {
+        if CommandLine.arguments.dropFirst().elementsEqual(["--protocol-version"]) {
+            print("meeting-overlay/2"); return
+        }
         if CommandLine.arguments.dropFirst().elementsEqual(["--self-test"]) {
             if selfTest() { print("overlay state tests passed"); return }
             exit(1)

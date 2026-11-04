@@ -192,7 +192,12 @@ class MeetilyBridge:
         return rows
 
     def status(self):
-        return dict(self._state)
+        worker = getattr(self, '_thread', None)
+        running = bool(worker and worker.is_alive())
+        state = dict(self._state)
+        if state['status'] == 'stopping' and not running:
+            state.update(status='idle', message='Not attached')
+        return {**state, 'running': running, 'stop_confirmed': not running}
 
     def attach(self, recording_id, on_segment, on_status):
         """Explicitly attach an active recording; callbacks run on a daemon thread."""
@@ -202,6 +207,8 @@ class MeetilyBridge:
         if not callable(on_segment) or not callable(on_status):
             raise ValueError('Callbacks must be callable')
         self.stop()
+        if not self.status()['stop_confirmed']:
+            raise RuntimeError('Meetily reader is still stopping')
         self._recording_id = recording_id
         with self._cursor_lock:
             # Bound per-folder bulk memory. The Clear high-water mark and
@@ -259,7 +266,7 @@ class MeetilyBridge:
         if event.is_set():
             return
         self._state = {'status': status, 'backend': 'meetily', 'message': message, 'error': error}
-        self._notify(event, callback, dict(self._state))
+        self._notify(event, callback, self.status())
 
     def _poll(self, folder, event, on_segment, on_status):
         initial = True
@@ -273,6 +280,8 @@ class MeetilyBridge:
                 meta = None
             try:
                 snapshot = self._read(folder, 'transcripts.json')
+                if event.is_set():
+                    return  # a blocked read cannot advance a retired scan
                 if snapshot.get('version') != '1.0':
                     self._set_status(event, on_status, 'error', 'Unsupported Meetily transcript schema version', 'unsupported_schema')
                     return
@@ -411,12 +420,14 @@ class MeetilyBridge:
                 return
             event.wait(self.poll_interval)
 
-    def stop(self):
+    def stop(self, timeout=1.):
         """Cancel delivery and wait at most one second for the worker."""
         event = getattr(self, '_event', None)
         if event is not None:
             event.set()
         worker = getattr(self, '_thread', None)
         if worker is not None and worker is not threading.current_thread():
-            worker.join(timeout=1.)
-        self._state = {'status': 'idle', 'backend': 'meetily', 'message': 'Not attached', 'error': None}
+            worker.join(timeout=max(0., min(float(timeout), 1.)))
+        running = bool(worker and worker.is_alive())
+        self._state = {'status': 'stopping' if running else 'idle', 'backend': 'meetily',
+                       'message': 'Reader stop is not confirmed' if running else 'Not attached', 'error': None}
