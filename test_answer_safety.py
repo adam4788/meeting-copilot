@@ -18,6 +18,98 @@ class AnswerSafetyTests(unittest.TestCase):
         app.include_router(server.make_router(state))
         return state, TestClient(app)
 
+    def test_validation_errors_never_echo_sensitive_body_or_diagnostic(self):
+        _, client = self.client()
+        marker = 'synthetic-sensitive-meeting-question'
+        with client:
+            for path, body in [('/assist', {'question': marker * 200}),
+                               ('/assist', {'transcript': marker * 1000}),
+                               ('/assist', {'question': {'private': marker}}),
+                               ('/assist/cancel', {'request_id': marker * 20}),
+                               ('/start', {'consent': {'private': marker}})]:
+                with self.subTest(path=path, body_type=type(body)):
+                    response = client.post(path, json=body)
+                    self.assertEqual(response.status_code, 422)
+                    host_error = f'HTTP {response.status_code} {response.text}'
+                    self.assertNotIn(marker, host_error)
+                    self.assertNotIn('input', response.text)
+                    self.assertLess(len(response.text), 300)
+            response = client.post('/assist', content='{"question":"' + marker,
+                                   headers={'content-type': 'application/json'})
+            self.assertEqual(response.status_code, 422)
+            self.assertNotIn(marker, response.text)
+
+    def test_real_knowledge_engine_diagnostics_are_fixed_across_public_surfaces(self):
+        from knowledge import KnowledgeEngine
+        import tempfile
+        from unittest.mock import patch
+        private_type = type('synthetic-sensitive-exception-name', (RuntimeError,), {})
+        def fail(*args, **kwargs):
+            raise private_type(SECRET)
+        for streaming in (False, True):
+            with self.subTest(stream=streaming), tempfile.TemporaryDirectory() as home:
+                class Completion:
+                    supports_streaming = streaming
+                    def __call__(self, *args, **kwargs): return fail()
+                    def stream(self, *args, **kwargs): return fail()
+                engine = KnowledgeEngine(project_root=home, hermes_home=home,
+                                         _completion=Completion(), _search=fail, _history=None, _standalone=True)
+                state, client = self.client(lambda: engine)
+                output = io.StringIO()
+                with patch.object(engine, 'search', return_value=[]), contextlib.redirect_stdout(output), contextlib.redirect_stderr(output), client:
+                    accepted = client.post('/assist', json={'question': 'Synthetic question?', 'web_query': 'public topic'})
+                    for _ in range(200):
+                        status = client.get('/status').json()
+                        if not status['busy']: break
+                        time.sleep(.005)
+                    self.assertFalse(status['busy'])
+                    entry = client.get('/assist/' + accepted.json()['request_id']).json()
+                    combined = json.dumps([entry, status]) + output.getvalue()
+                    self.assertNotIn('synthetic-sensitive', combined)
+                    self.assertNotIn('Traceback', combined)
+                    self.assertIn('Check answer setup', combined)
+                    self.assertIn('Web search failed', combined)
+                    self.assertNotIn('HTTP 401', combined)
+
+    def test_capture_error_owns_status_not_stale_answer_retry(self):
+        state, client = self.client()
+        state.capture_error = 'Capture failed. Restart capture.'
+        state.error_request = {'question': 'stale context'}
+        with client:
+            status = client.get('/status').json()
+            self.assertEqual(status.get('error_source'), 'capture')
+            self.assertIsNone(status['error_request'])
+
+    def test_real_engine_success_keeps_generic_web_warning_and_history_failure_is_private(self):
+        from knowledge import KnowledgeEngine
+        from unittest.mock import patch
+        import tempfile
+        private_type = type('synthetic-sensitive-exception-name', (RuntimeError,), {})
+        def fail(*args, **kwargs):
+            raise private_type(SECRET)
+        with tempfile.TemporaryDirectory() as home:
+            engine = KnowledgeEngine(project_root=home, hermes_home=home, _standalone=True,
+                                     _completion=lambda *a, **k: 'Synthetic answer', _search=fail)
+            _, client = self.client(lambda: engine)
+            output = io.StringIO()
+            with patch.object(engine, 'search', return_value=[]), client, contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                accepted = client.post('/assist', json={'question': 'Synthetic question?', 'web_query': 'public topic'})
+                status = {}
+                for _ in range(200):
+                    status = client.get('/status').json()
+                    if not status['busy']: break
+                    time.sleep(.005)
+                self.assertFalse(status['busy'])
+                entry = client.get('/assist/' + accepted.json()['request_id']).json()
+                self.assertEqual(entry['status'], 'done')
+                self.assertIn('Web search failed; using local evidence only.', entry['warnings'])
+                self.assertEqual(status['recent'][0]['warnings'], entry['warnings'])
+                self.assertNotIn('synthetic-sensitive', json.dumps([entry, status]) + output.getvalue())
+            history_engine = KnowledgeEngine(project_root=home, hermes_home=home, _standalone=True,
+                                             _completion=lambda *a, **k: 'unused', _history=fail)
+            with self.assertRaisesRegex(RuntimeError, '^History provider failed\\.$'):
+                history_engine.search('Synthetic question?')
+
     def test_missing_sentinel_is_opt_in_and_legacy_404_remains(self):
         _, client = self.client()
         with client:

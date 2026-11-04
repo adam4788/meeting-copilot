@@ -26,7 +26,8 @@
 
 Engine exception messages/classes are not published in answer/status/history or
 logged by the exception handler. Failed provider-result diagnostics are replaced
-with fixed guidance (the exact known authentication guidance is allowlisted).
+with fixed guidance. Provider prose alone is not evidence of HTTP 401, so the
+pane does not promise authentication-specific diagnosis.
 Interrupted streams keep their partial answer and a fixed retry notice.
 
 Status-query tooltips/alerts, failed status rechecks, Cancel, and answer transport
@@ -73,3 +74,52 @@ Legacy compatibility scenarios strip the opt-in fields and use the router's
 legacy behavior; they do not run a separately installed historical backend.
 No live Desktop, real credentials, providers, audio, installation, push, or merge
 was exercised. This is not a claim of live end-to-end verification.
+
+## Follow-up blocker fixes (base `29777f5`)
+
+- Recheck resets submission-failure and progress-pause flags independently and
+  restarts GET polling even after failed Cancel. It never replays a POST.
+- Lost submission responses gate new answer intents. Legacy missing-slot 404
+  plus Cancel 404 has an explicit **Reset local answer tracking** escape hatch.
+  It requires confirmation acknowledging that the old request may be running
+  or complete and a later ask may duplicate context. Reset itself neither sends
+  nor cancels anything. Declining confirmation preserves the gate.
+- Real KnowledgeEngine model/search/history diagnostics use fixed messages,
+  including exception-class names and web warnings on otherwise successful
+  answers. Status/progress/history and captured output are checked together.
+- Question/public-query editors cap input; outgoing answer fields are validated
+  before POST. Oversized saved snapshots/identifiers are rejected locally, not
+  truncated into a different replay or route. The router returns a fixed 422
+  response without Pydantic input, location, parser context, or exception text.
+  Tests cover malformed JSON, invalid types and lengths through actual FastAPI
+  plus the Desktop-shaped `HTTP 422 <body>` error representation.
+- Status identifies the displayed error source and omits stale answer retry
+  context when capture/stop/overlay errors own the alert. Capture recovery cannot
+  accidentally replay that old context.
+- Verified terminal progress stays visible when status refetch fails. Tests use
+  real TanStack QueryClient 5.104.1 (with React/ReactDOM 19.3.0, jsdom 29.1.1),
+  confirm its default invalidate-on-error resolution, and inspect HTML attributes
+  as well as text for synthetic diagnostic leaks. Successful reconciliation
+  relinquishes the fallback to newer canonical results; Clear removes it.
+- The offline bridge rejects outstanding RPCs on child exit. The matrix also
+  requires an explicit assertion/cleanup completion marker, preventing an
+  unresolved Promise and crashed child from falsely passing with exit zero.
+
+Verification of these changes:
+
+- Deterministic RED cases reproduced Cancel/Recheck, ambiguous second click,
+  missing legacy reset, wrong capture retry, unbounded question/422 reflection,
+  and terminal invisibility. Running the real QueryClient case against the
+  original `29777f5` UI failed the terminal-visibility assertion; current UI passed.
+- `python -m unittest test_answer_safety test_answer_core test_knowledge test_model_selection`:
+  **292 tests passed**, including redaction and actual engine/router checks.
+- `MEETING_REACT_TEST_MODULES=/path/to/existing/node_modules/ node test_real_effects_matrix.cjs`:
+  **104 scenarios passed**, normal effects and StrictMode, retaining the prior
+  lifecycle, credential, overlay, cancellation and exact-replay scenarios.
+- Full `npm test`: **724 Python tests, OK (3 existing skips); 134 Node tests
+  passed**, JavaScript syntax check passed.
+- Scratch-only Swift compilation followed by `--self-test`: **overlay state
+  tests passed**; `--protocol-version`: **meeting-overlay/2**.
+- `git diff --check`: passed. No dependency installation, live Desktop/provider,
+  real secrets/audio, push, or merge. Legacy cases use the current router's
+  real legacy HTTP paths with opt-ins stripped, not an installed old backend.

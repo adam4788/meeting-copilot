@@ -10,6 +10,8 @@ const cases = [
   ['delayed-retirement-readback-failure', { DELAYED_RETIREMENT: '1', READBACK_FAULT: '1' }],
   ['delayed-status-fallback', { DELAYED_STATUS: '1' }],
   ['valid-claim-rejection', { CLAIM_CONFLICT: '1' }],
+  ...['cancel-recheck','uncertain','terminal','capture','legacy-reset','input-cap','oversized-replay'].map(mode => ['blocker-' + mode, { BLOCKER_CASE: mode }]),
+  ...['terminal','terminal-error','cancel-recheck'].map(mode => ['query-client-' + mode, { BLOCKER_CASE: mode, REAL_QUERY: '1' }]),
   ...['lost', 'replay', 'poll', 'poll-plain', 'provider', 'success', 'missing', 'status-query', 'engine', 'active-replay', 'cancel', 'accepted-refresh', 'legacy', 'legacy-missing', 'legacy-rejected', 'rejected', 'conflict', 'lost-live'].map(mode => ['answer-' + mode, { ANSWER_FAULT: mode }]),
 ];
 for (const code of ['409', '503']) {
@@ -37,6 +39,7 @@ for (const strict of [false, true]) {
     const label = `${strict ? 'StrictMode' : 'normal'}: ${name}`;
     if (result.status !== 0) console.error(result.stdout, result.stderr, result.error || '');
     assert.equal(result.status, 0, label);
+    assert.match(result.stdout, /EFFECT_SCENARIO_COMPLETE/, label + ': must finish assertions and cleanup');
     console.log('PASS ' + label);
     passed++;
   }

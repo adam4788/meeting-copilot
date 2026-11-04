@@ -5,6 +5,9 @@ from contextlib import contextmanager, nullcontext
 from collections import deque
 from typing import Literal
 from fastapi import APIRouter, HTTPException
+from fastapi.exceptions import RequestValidationError
+from fastapi.routing import APIRoute
+from starlette.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 
@@ -24,15 +27,33 @@ def _is_engine_abort(exc):
 
 # Fixed messages, never exception text or class names (which can be sensitive too).
 ANSWER_FAILURE = 'Answer failed. Check answer setup, credentials, and backend connection, then Retry if you want to resend this question and its saved context.'
-AUTH_FAILURE = 'Provider authentication failed (HTTP 401). Check your API key.'
 
 
 def _safe_answer_error(value):
-    return AUTH_FAILURE if value == AUTH_FAILURE else ANSWER_FAILURE
+    # Provider prose is not structured proof of an authentication failure.
+    return ANSWER_FAILURE
 
 
 class _AnswerRejected(HTTPException):
     """Admission failed before any answer worker was scheduled."""
+
+
+class _PrivateValidationRoute(APIRoute):
+    """Host transports log 4xx bodies; never serialize rejected meeting data.
+
+    Route-local wrapping also works when a host mounts this router without
+    installing our exception handlers. Discard input, ctx, loc, and parser
+    messages (even a field name or JSON syntax context can be private).
+    """
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+        async def private_validation(request):
+            try:
+                return await handler(request)
+            except RequestValidationError:
+                return JSONResponse(status_code=422, content={
+                    'detail': 'Invalid meeting request. Check field types and length limits.'})
+        return private_validation
 
 
 class AssistRequest(BaseModel):
@@ -1584,8 +1605,9 @@ class MeetingState:
                     'stop_attempts': self.stop_attempts,
                     'overlay_cleanup_error': cleanup_error,
                     'overlay_stop_confirmed': not uncertain_overlay and overlay is None and cleanup_error is None,
-                    'segments': list(self.segments), 'error': self.stop_error or cleanup_error or self.error or self.capture_error,
-                    'error_request': self.error_request,
+                    'segments': list(self.segments), 'error': self.stop_error or cleanup_error or self.capture_error or self.error,
+                    'error_source': ('capture' if self.stop_error else 'overlay' if cleanup_error else 'capture' if self.capture_error else 'answer' if self.error else None),
+                    'error_request': self.error_request if self.error and not (self.stop_error or cleanup_error or self.capture_error) else None,
                     'busy': self.busy, 'result': self.result, 'requests': {e['request_id']: dict(e) for e in live},
                     'recent': terminal, 'meetily_clear_error': self.meetily_clear_error,
                     'capture': ({**self.capture_info, 'state': 'stopping', 'error': self.stop_error,
@@ -1652,7 +1674,7 @@ def _unavailable(message):
 
 
 def make_router(state):
-    router = APIRouter()
+    router = APIRouter(route_class=_PrivateValidationRoute)
     import importlib
     credentials = importlib.import_module(f'{__package__}.credentials' if __package__ else 'credentials')
     router.include_router(credentials.make_router(state.credential_change_boundary))
