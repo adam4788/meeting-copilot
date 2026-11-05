@@ -1,7 +1,6 @@
 # Optional Meta API route
 
-Configure the optional **Meta API key** only in **Hermes Settings → Plugins →
-Meeting Copilot**. The plugin declares `MODEL_API_KEY` as a secret and resolves it
+Configure the optional **Meta API key** only in **Hermes Settings → Plugins → meeting-copilot-live (default profile)**. The plugin declares `MODEL_API_KEY` as a secret and resolves it
 through the bound Hermes `agent.secret_scope.get_secret` API. Missing or failed
 host scope is unavailable; the plugin does not read credential files or borrow
 an unscoped launch environment key.

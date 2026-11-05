@@ -38,7 +38,7 @@ def catalog():
     for provider, (label, name, _) in PROVIDERS.items():
         configured=bool(secret(name))
         providers.append(dict(id=provider, label=label, models=[], custom_model=True,
-            configured=configured, status='Key available; connection and model unverified' if configured else 'Set key in Hermes Settings → Plugins → Meeting Copilot'))
+            configured=configured, status='Key available; connection and model unverified' if configured else 'Set key in Hermes Settings → Plugins → meeting-copilot-live (default profile)'))
     return {'providers': providers}
 
 

@@ -1,8 +1,7 @@
 # Bring your own API key
 
 Meeting Copilot supports explicit OpenAI and OpenRouter Chat Completions routes.
-Configure the corresponding API key in **Hermes Settings → Plugins → Meeting
-Copilot**. These settings are declared secret fields in `plugin.yaml`; the
+Configure the corresponding API key in **Hermes Settings → Plugins → meeting-copilot-live (default profile)**. Use the OpenAI API key or OpenRouter API key field, then **Save settings**. These settings are declared secret fields in `plugin.yaml`; the
 plugin obtains them only through `agent.secret_scope.get_secret` in a bound
 Hermes scope. An unavailable scope fails closed. Reopen the pane after changing
 settings. Never paste a key into chat, a model field, or an answer request.

@@ -14,7 +14,7 @@ export default {
   register(ctx) {
     function MetaKeySettings() {
       return h('section', { style: card }, h('strong', null, 'Bring your own API key'),
-        h('p', { style: muted }, 'Configure OpenAI or OpenRouter in Hermes Settings → Plugins → Meeting Copilot. Keys stay in Hermes-managed secret settings. Never enter keys in chat or model fields. Reopen this pane after setup. Local transcription does not use an answer key.'));
+        h('p', { style: muted }, 'Configure OpenAI or OpenRouter in Hermes Settings → Plugins → meeting-copilot-live (default profile). Keys stay in Hermes-managed secret settings. Never enter keys in chat or model fields. Reopen this pane after setup. Local transcription does not use an answer key.'));
     }
     const request = (path, body) => ctx.rest(path, body === undefined ? {} : { method: 'POST', body });
     // Survives plugin unregister/re-register in the SAME renderer. Neither a
@@ -82,6 +82,11 @@ export default {
               }
             } catch (e) {}
           }
+          // Reset routes the current pane cannot display; a blank select must never
+          // retain a hidden provider/model pair from an earlier version.
+          if (!['openai', 'openrouter'].includes(out.answerProvider)) {
+            delete out.answerProvider; delete out.answerModel;
+          }
           // Old versions persisted Meta after automatic capability discovery.
           // No provenance means no cloud opt-in, even if the value says Meta.
           if (out.transcriptionProvider === 'meta' && parsed.transcriptionChoiceVersion !== 1) out.transcriptionProvider = 'local';
@@ -142,7 +147,7 @@ export default {
       const data = status.data || {};
       const modelCatalog = useQuery({ queryKey: [ID, 'models'], queryFn: () => api('/models'), enabled: !!data.capabilities?.independent_models, staleTime: 60000, retry: 1 });
       const providers = modelCatalog.data?.providers || [];
-      const answerModels = providers.find(p => p.id === answerProvider)?.models || [];
+      const answerProviderAvailable = ['openai', 'openrouter'].includes(answerProvider) && providers.some(p => p.id === answerProvider);
       const busy = pending || data.busy;
       const allProjects = project === '__all_projects__';
       // Suggest answers stay local-first: the explicit web query travels
@@ -155,7 +160,7 @@ export default {
       const unsupportedReasons = [
         allProjects && !data.capabilities?.all_projects ? 'All-projects search needs the updated backend (restart the gateway when other sessions are idle).' : null,
         webFallback && !data.capabilities?.automatic_web_fallback ? 'Automatic web fallback needs the updated backend.' : null,
-        (!answerProvider || !answerModel || !data.capabilities?.independent_models) ? 'Answer model selection needs the updated backend and a chosen model.' : null,
+        (!answerProviderAvailable || !answerModel || !data.capabilities?.independent_models) ? 'Answer model selection needs the updated backend and a chosen model.' : null,
         excludeHistory && !data.capabilities?.history_opt_out ? 'Excluding past sessions needs the updated backend. Restart the gateway when other work is idle.' : null,
         excludeHistory && (!project || allProjects || webFallback || web.trim()) ? 'To exclude past sessions, choose one project and turn off web search.' : null,
       ].filter(Boolean);
@@ -226,6 +231,10 @@ export default {
       }
       useEffect(() => { if (overlayOn) { scopeSeq.current += 1; overlayActionAt.current.syncedKey = null; setScopeStale(true); } }, [scopeKey]);
       async function syncOverlayScope(seq) {
+        if (!answerProviderAvailable) {
+          setScopeStale(true); setOverlayMsg('Choose an available answer provider and model before syncing the overlay.');
+          return;
+        }
         const life = overlayActionAt.current;
         const owner = life.owner;
         const current = () => life.mounted && scopeSeq.current === seq && life.owner === owner;
@@ -357,8 +366,8 @@ export default {
       async function toggleOverlay() {
         const life = overlayActionAt.current;
         if (!life.mounted) return;
-        if (!overlayOn && !overlayNeedsHide && excludeHistory && unsupported) {
-          setOverlayMsg('Choose one project, turn off web search, and use the updated backend before showing the overlay.');
+        if (!overlayOn && !overlayNeedsHide && (!answerProviderAvailable || (excludeHistory && unsupported))) {
+          setOverlayMsg('Choose an available answer provider and model; for history exclusion choose one project and turn off web search before showing the overlay.');
           return;
         }
         setPending(true); setOverlayMsg('');
@@ -673,7 +682,7 @@ export default {
               : h(Button, { disabled: pending || overlayNeedsHide || cloudUnavailable || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), onClick: () => startCapture() }, ((data.segments || []).length || result || (data.recent || []).length) ? (backend === 'meetily' ? 'Resume' : 'Resume listening') : (backend === 'meetily' ? 'Attach to Meetily' : 'Start listening')),
             !data.listening && !data.stopping && ((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending || overlayNeedsHide || cloudUnavailable || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), title: 'Starts a fresh meeting; the earlier transcript, answers, and retry data are cleared', onClick: () => startCapture(true) }, 'New meeting'),
             (data.overlay_cleanup_error || (data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending, title: 'Clears past Q&A, transcript segments, and cached snippets for this meeting', onClick: async () => { if (typeof window !== 'undefined' && window.confirm && !window.confirm('Clear this meeting? Past questions, answers, and transcript segments are removed from the pane.')) return; if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } } }, 'Clear meeting'),
-            h(Button, { variant: 'secondary', disabled: pending || (!data.capabilities?.overlay && !overlayNeedsHide), title: 'Show or hide the floating meeting overlay (macOS)', onClick: toggleOverlay }, overlayNeedsHide ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay')),
+            h(Button, { variant: 'secondary', disabled: pending || (!data.capabilities?.overlay && !overlayNeedsHide) || (!overlayOn && !overlayNeedsHide && !answerProviderAvailable), title: 'Show or hide the floating meeting overlay (macOS)', onClick: toggleOverlay }, overlayNeedsHide ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay')),
           h('p', { style: { ...muted, margin: 0 } }, 'Screen-share privacy: the overlay may be visible in screenshots or screen sharing. Hide it before sharing; capture exclusion is best-effort, not a guarantee.'),
           web.trim() && h('p', { 'data-overlay-web-disclosure': true, role: 'status', style: { ...muted, margin: 0 } }, `Overlay questions use the public query “${web.trim().slice(0, 120)}”; it is sent to the web when you ask, until you clear it.`),
           (data.overlay_cleanup_error || overlayMsg) && h('p', { role: 'status', style: { ...muted, margin: 0 } }, data.overlay_cleanup_error || overlayMsg),
@@ -870,7 +879,7 @@ export default {
           (data.overlay_cleanup_error || overlayMsg) && h('p', { role: 'status', style: { ...muted, margin: 0 } }, data.overlay_cleanup_error || overlayMsg),
           !data.capabilities?.overlay && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'Overlay helper unavailable. Check the macOS helper build and restart the gateway, then try Show overlay again.'),
           h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
-            h(Button, { variant: overlayOn ? 'secondary' : undefined, disabled: pending || (!data.capabilities?.overlay && !overlayNeedsHide), onClick: toggleOverlay }, overlayNeedsHide ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay'),
+            h(Button, { variant: overlayOn ? 'secondary' : undefined, disabled: pending || (!data.capabilities?.overlay && !overlayNeedsHide) || (!overlayOn && !overlayNeedsHide && !answerProviderAvailable), onClick: toggleOverlay }, overlayNeedsHide ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay'),
             h(Button, { variant: 'secondary', disabled: pending || !overlayOn, onClick: async () => {
               setPending(true); setOverlayMsg('');
               scopeSeq.current += 1;

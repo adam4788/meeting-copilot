@@ -553,7 +553,7 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
     useQuery: options => { if (options.queryKey[1] === 'status') statusQuery = options; return ({ error: options.queryKey[1] === 'status' ? qcBehavior.statusError : null, data: options.queryKey[1] === 'status'
       ? { capabilities: supported ? { all_projects: true, automatic_web_fallback: true, independent_models: true, history_opt_out: true, macos_transcription: true, overlay: true, overlay_stream: true, overlay_cancel: true } : undefined, ...statusExtra }
       : options.queryKey[1] === 'projects' ? [{ name: 'alpha', path: '/projects/alpha' }]
-      : options.queryKey[1] === 'models' ? { providers: [{ id: 'openai', label: 'OpenAI API', models: [], custom_model: true, configured: true, status: 'Key available; connection and model unverified' }] } : [] }); },
+      : options.queryKey[1] === 'models' ? { providers: qcBehavior.providers ?? [{ id: 'openai', label: 'OpenAI API', models: [], custom_model: true, configured: true, status: 'Key available; connection and model unverified' }] } : [] }); },
     useValue: atom => atom.get(),
     host: { notify: notice => notices.push(notice), paneVisibility: () => visibility, revealPane: id => { revealed.push(id); visible = true; } }, Button: 'button', Input: 'input', Textarea: 'textarea', Badge: 'badge', PALETTE_AREA: 'palette',
     ...browserGlobals,
@@ -686,7 +686,7 @@ for (const path of ['/overlay/lifecycle', '/overlay/claim']) test(`initial lifec
 test('BYOK setup points to Hermes and never renders credential entry or makes credential calls', () => {
   const ui=pane('alpha',true,false);
   const tree=ui.tree;
-  assert.match(JSON.stringify(tree), /Hermes Settings.*Plugins.*Meeting Copilot/);
+  assert.match(JSON.stringify(tree), /Hermes Settings.*Plugins.*meeting-copilot-live/);
   assert.match(JSON.stringify(tree), /Never enter keys in chat or model fields/);
   assert.ok(!nodes(tree).some(n=>n.props?.type==='password'));
   assert.ok(!ui.requests.some(r=>r.path.startsWith('/credentials')));
@@ -701,6 +701,38 @@ test('fresh panes require explicit BYOK selection and default to history exclude
   assert.equal(suggest.props.disabled,true);
   await suggest.props.onClick();
   assert.ok(!ui.requests.some(r=>r.path==='/assist'));
+});
+
+for (const storageKey of ['meeting-copilot.scope.v2','meeting-copilot.scope']) test(`persisted unsupported Meta selection clears visibly and cannot submit (${storageKey})`, async () => {
+  const store=new Map([[storageKey,JSON.stringify({answerProvider:'meta',answerModel:'muse-spark-1.3'})]]);
+  const ui=pane('alpha',true,false,'',{}, {}, {}, {localStorage:{getItem:k=>store.get(k)||null,setItem:(k,v)=>store.set(k,v)}}, {freshDefaults:true});
+  const provider=nodes(ui.tree).find(n=>n.props['aria-labelledby']==='mc-provider-label');
+  assert.equal(provider.props.value,'');
+  assert.ok(!nodes(ui.tree).some(n=>n.props['aria-label']==='Answer model'));
+  assert.equal(button(ui.tree,'Suggest answer').props.disabled,true);
+  assert.equal(button(ui.tree,'Show overlay').props.disabled,true);
+  await button(ui.tree,'Suggest answer').props.onClick();
+  await button(ui.tree,'Show overlay').props.onClick();
+  assert.ok(!ui.requests.some(r=>['/assist','/overlay/show','/overlay/scope'].includes(r.path)));
+});
+for (const provider of ['openai','openrouter']) test(`valid saved BYOK selection stays visible and submits exactly (${provider})`, async () => {
+  const store=new Map([['meeting-copilot.scope.v2',JSON.stringify({answerProvider:provider,answerModel:'vendor/exact-model',excludeHistory:false})]]);
+  const ui=pane('alpha',true,false,'',{}, {}, {}, {localStorage:{getItem:k=>store.get(k)||null,setItem:(k,v)=>store.set(k,v)}}, {freshDefaults:true,providers:[{id:provider,label:provider,custom_model:true,configured:true}]});
+  assert.equal(nodes(ui.tree).find(n=>n.props['aria-labelledby']==='mc-provider-label').props.value,provider);
+  assert.equal(nodes(ui.tree).find(n=>n.props['aria-label']==='Answer model').props.value,'vendor/exact-model');
+  assert.equal(button(ui.tree,'Suggest answer').props.disabled,false);
+  await button(ui.tree,'Suggest answer').props.onClick();
+  const request=ui.requests.find(r=>r.path==='/assist');
+  assert.equal(request.body.answer_provider,provider);
+  assert.equal(request.body.answer_model,'vendor/exact-model');
+});
+test('supported provider absent from advertised catalog blocks Suggest and overlay publication', async () => {
+  const ui=pane('alpha',true,false,'',{12:'openrouter',13:'vendor/exact-model'});
+  assert.equal(button(ui.tree,'Suggest answer').props.disabled,true);
+  assert.equal(button(ui.tree,'Show overlay').props.disabled,true);
+  await button(ui.tree,'Suggest answer').props.onClick();
+  await button(ui.tree,'Show overlay').props.onClick();
+  assert.ok(!ui.requests.some(r=>['/assist','/overlay/show','/overlay/scope'].includes(r.path)));
 });
 
 // Effect-capable lifecycle tests use deterministic timers (no React package).
