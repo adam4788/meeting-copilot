@@ -1,109 +1,148 @@
 # Meeting Copilot
 
-A read-only meeting assistant for Hermes Desktop by Adam Nugroho. Capture a
-consented meeting, select a project, then explicitly ask for a short answer
-with numbered evidence sources. Nothing is spoken, posted or submitted for you.
+**Meeting answers grounded in your project files.**
 
-**Development status:** native microphone and system-audio paths have been tested
-with fictional content. Native frame drops remain an open reliability issue.
-OpenAI/OpenRouter live account responses are still unverified; automated tests
-use a synthetic vendor. Passing doctor or validation is not production readiness.
+A community plugin for Hermes Desktop by [Adam Nugroho](https://github.com/adam4788).
+Capture a consented meeting, choose a project, and explicitly ask for a short
+answer with numbered evidence sources. Read the suggestion and decide how to use
+it. Nothing is spoken, posted, or submitted for you.
 
-## Setup
+<!-- Visual integration pending: supplied generated conceptual hero art.
+     Inspect the image and verify local bytes before adding its image reference.
+     It must be labelled as generated artwork, not a product screenshot. -->
 
-Requires Hermes **0.22.7+**. The manifest declares `fastapi>=0.115,<1`, resolved
-under Hermes's core constraints. In a source checkout:
+[Get started](docs/getting-started.md) · [Try the offline demo](DEMO.md) ·
+[Privacy](SECURITY.md) · [Documentation](docs/README.md)
 
-```sh
-hermes plugins doctor "$PWD" --ci
-hermes plugins validate "$PWD" --install-deps
+## Current status
+
+**Early developer preview.** The published source includes OpenAI/OpenRouter
+bring-your-own-key setup. Live responses from those accounts remain unverified.
+Native audio is experimental; macOS fictional-audio checks found dropped frames.
+Windows Desktop installation is still being checked separately from CI.
+
+| Platform | Automated checks at the pinned revision | Desktop and native audio status |
+| --- | --- | --- |
+| Windows | Python 3.11/3.12 suite and JavaScript checks passed in CI | Desktop setup under verification; SoundCard/WASAPI capture remains experimental |
+| macOS | Python 3.12 suite, JavaScript checks, and overlay helper build/self-test passed in CI | Microphone/system-audio checks used fictional content; native frame loss remains unresolved |
+| Linux | Python 3.11/3.12 suite and JavaScript checks passed in CI | Native audio and Desktop use are not established by these checks |
+
+This status describes source revision
+[`b1e9089`](https://github.com/adam4788/meeting-copilot/commit/b1e9089eef0d55da3c724306b13e5d4479a1eef0).
+See [CI](https://github.com/adam4788/meeting-copilot/actions),
+[verification notes](docs/verification.md), and the
+[native loss investigation](docs/native-backpressure.md).
+CI and plugin validation do not prove a complete meeting works on your computer.
+
+## What it does
+
+- Reads supported text files from a selected project and shows the evidence used
+  for each answer. Markdown, plain text, and reStructuredText are supported.
+- Uses local Whisper transcription, optional explicit Meta cloud transcription,
+  or an optional, unofficial Meetily JSON attachment, depending on platform setup.
+- Sends an answer request to the provider and exact model you select in
+  **Answer setup**. OpenAI and OpenRouter are the main Desktop answer routes.
+- Keeps past sessions excluded and web search off by default in new panes.
+  Broader scopes are explicit choices; saved choices persist.
+- Offers a macOS meeting overlay. It may appear in screen shares.
+
+```mermaid
+flowchart LR
+    A[Consented capture] --> B[Transcription]
+    B --> C[Meeting context]
+    P[Selected project files] --> R[Read-only retrieval]
+    C --> Q[You choose Suggest answer]
+    R --> Q
+    Q --> M[Selected provider and exact model]
+    M --> E[Suggested answer and numbered sources]
+    E --> U[You review and decide]
 ```
 
-A catalog entry is being prepared; the local BYOK commits are not published yet.
-Do not treat this project as an admitted catalog plugin. See
-[catalog readiness and disclosures](docs/catalog-readiness.md) and
-[compatibility cautions](docs/catalog-compatibility.md).
+Capture, transcription, retrieval, and answer generation are separate steps.
+Local transcription does not make hosted answers local.
 
-For the existing custom local installation, close the pane and finish active
-Hermes work before running `python install.py` in the appropriate profile. It
-backs up replaced plugin files and preserves configuration. A mounted backend
-needs a safe gateway restart to load changed code. Do not restart active work.
+## Install in Hermes Desktop
 
-On macOS, `python prepare_macos.py --home /path/to/profile` prepares the installed
-plugin's separate Python 3.12 audio runtime and builds/signs its Swift helpers
-from source. Both catalog checkout and custom installer layouts are supported.
-It needs uv and Apple Command Line Tools; it installs audio requirements but
-never starts capture or requests recording permission. No compiled executable
-is committed. Windows native capture is experimental and requires the optional
-`requirements-audio.txt` dependencies and separate hardware verification.
-Meetily JSON attachment is optional and unofficial.
-
-## Choose a provider and use the pane
-
-1. In Hermes Settings → Plugins → **meeting-copilot-live**, select the default
-   profile, enter an OpenAI or OpenRouter key in its secure field, and Save
-   settings. Never put keys in chat or model fields. Reopen the pane afterward.
-2. In Answer setup, choose that provider and its exact model ID. Keys, credits
-   and Chat Completions compatibility are account-dependent. There is no
-   automatic provider/model fallback or account model discovery.
-3. Choose one project. Keep **Exclude past sessions** checked and web off for
-   project-only retrieval. Saved intentional scope choices persist.
-4. Select the transcription source. Local Whisper is independent of the answer
-   key. Confirm permission, then Start. A new OS permission prompt needs approval.
-5. Type a question or ask about the latest conversation, then Suggest answer.
-   Inspect sources and uncertainty. Pause when finished and check the stop status.
-   Closing the pane initiates pause; it is not an instant-stop guarantee.
-
-The optional explicit Meta API route and transcription remain available for
-existing integrations; they are never the default. The old in-pane key editor,
-startup dotenv bridge and generic host-model fallback have been removed.
-See [BYOK boundaries](docs/byok.md) and [optional Meta setup](docs/meta-api-key.md).
-
-## Data and execution disclosure
-
-Selected questions, bounded transcript and retrieved excerpts leave the device
-when sent to the explicitly selected OpenAI/OpenRouter or optional Meta HTTPS
-API. Optional Meta transcription sends audio off-device. Provider billing and
-retention rules apply. Local transcription uses cached/downloadable Whisper
-weights and does not make answers local.
-
-Retrieval reads selected project files outside plugin-owned storage, and prior
-Hermes session SQLite data only when history is enabled. Optional web search
-sends a query through the host dispatcher. Filtering is best-effort; review
-sources before sharing. New panes default to history excluded and web off.
-
-Capture/overlay/audio workers are child processes; preparation runs local
-compiler, signing and dependency-install commands. Recording requires explicit
-consent and Start. No extra raw audio files are saved by capture. The overlay
-may appear in screen shares; no invisibility guarantee is made. No telemetry or
-self-updater is introduced. Credentials use Hermes-managed scoped settings;
-production code does not edit credential stores. Standalone CLI environment
-credentials are a separate explicit mode.
-
-Private host scope/search imports remain version-sensitive. Development-only
-mutation and backpressure probes are reviewable source and are not installed
-runtime entrypoints. See [security boundaries](SECURITY.md) and
-[native backpressure evidence](docs/native-backpressure.md).
-
-`python export_catalog_runtime.py /new/output/directory` creates an allowlisted
-runtime source release from a clean committed checkout without publishing it.
-It retains source provenance and does not change the scanner; development
-mutators/tests stay in the source commit. The release must independently pass
-doctor/validation, and its own full commit must be the catalog pin.
-
-## Offline checks and development
+Requires **Hermes 0.22.7 or newer**. Install the published source at a full revision:
 
 ```sh
-python ask.py --docs sample-docs --provider fake --question "What is the unit price?"
-python demo_standalone.py
-python -m unittest discover -v
-node --check desktop/plugin.js
-node --test test_desktop.mjs
-python verify_native_backpressure.py
+hermes plugins install adam4788/meeting-copilot --ref b1e9089eef0d55da3c724306b13e5d4479a1eef0 --enable
+hermes plugins doctor meeting-copilot-live --ci
 ```
 
-Install `requirements-dev.txt` in a development environment for tests. The
-backpressure probe needs Swift but opens no audio devices. Standalone BYOK uses
-`--provider openai|openrouter --model EXACT_ID` with the corresponding key supplied
-in the calling environment. It does not read credential files. Synthetic tests
-are not a live-provider or hardware reliability claim. See [contributing](CONTRIBUTING.md).
+Open the command palette and run **Open Meeting Copilot**. Audio preparation is
+separate and platform-specific; installation and doctor do not start recording
+or verify a live provider. See [the setup guide](docs/getting-started.md) before
+enabling capture. Catalog admission has not been established; this is a managed
+Git installation of a community project.
+
+At the 2026-11-05 Windows checkpoint, Hermes stopped the pinned upgrade for scanner
+review; this revision has not been installed there. Review findings before
+continuing. Do not treat an older enabled custom installation as this build.
+
+## Ask your first question
+
+1. Configure an OpenAI or OpenRouter API key in the secret field for
+   **meeting-copilot-live** in Hermes plugin settings, then save and reopen the
+   pane. Never put keys in chat or model fields.
+2. Open **Answer setup**, choose the matching provider, and enter an exact model
+   ID supported by your account's Chat Completions API.
+3. Select one project. Keep **Exclude past sessions** checked, automatic web
+   fallback off, and the specific public web query empty.
+4. Type a question about a synthetic project file and choose **Suggest answer**.
+   Open **Evidence** and compare the answer with its sources.
+5. To add meeting context, prepare the platform's transcript source, confirm
+   participant permission, and explicitly start capture. Pause when finished
+   and check that stopping is confirmed.
+
+Start with [the synthetic walkthrough](DEMO.md). It also includes an offline CLI
+demo that needs no API key, audio device, or Hermes installation.
+
+## Privacy and control
+
+Answer requests send the question, bounded meeting context, and retrieved
+excerpts to the selected HTTPS provider. Provider billing and retention rules
+apply. Optional Meta transcription also sends meeting audio off-device; local
+Whisper may download model weights during preparation.
+
+Project retrieval can read files outside plugin storage. Session history is
+read only when enabled. Web opt-in sends a public query through Hermes search;
+query filtering is best effort. Select only sources you may send to the chosen
+provider and review evidence before sharing an answer.
+
+Capture requires consent and Start. No extra raw audio or transcript files are
+saved by this plugin; Meetily retains its own files under its own settings.
+Closing the pane initiates pause, and an in-flight provider request cannot be
+recalled. Check stop status instead of assuming the device has stopped.
+
+Read [security and privacy](SECURITY.md) and the
+[architecture and data flow](docs/architecture.md) for the complete boundaries.
+
+## Known limits
+
+- Native capture can lose audio under load. Long meetings, broad device
+  compatibility, and multi-speaker accuracy are not established.
+- OpenAI/OpenRouter access, credits, exact model IDs, and API compatibility
+  depend on the account. There is no automatic provider/model fallback.
+- Sources are evidence supplied to a model, not proof of every generated claim.
+  Missing or adversarial evidence can still produce an incorrect answer.
+- PDF, DOCX, and XLSX extraction is not implemented. Project scans and session
+  reads are bounded; this is not a search of the whole computer.
+- Two dashboard search/scope integrations still depend on private Hermes APIs.
+  Review the [version compatibility cautions](docs/catalog-compatibility.md).
+
+## Explore the repository
+
+| Goal | Guide |
+| --- | --- |
+| Set up providers, project scope, and audio | [Getting started](docs/getting-started.md) |
+| Run a synthetic demonstration | [Demo guide](DEMO.md) |
+| Understand keys and model boundaries | [BYOK](docs/byok.md) |
+| Understand retrieval and source limits | [Knowledge engine](KNOWLEDGE.md) |
+| Work on the code or run tests | [Development](docs/development.md) and [contributing](CONTRIBUTING.md) |
+| Review catalog packaging and disclosures | [Catalog preflight](docs/catalog-readiness.md) |
+| Use the visual direction and assets | [Project brand guide](docs/brand-guide.md) |
+
+Meeting Copilot is an independent community project. It is not an official Nous
+Research product and is not endorsed by Nous Research. Code is licensed under
+[MIT](LICENSE).

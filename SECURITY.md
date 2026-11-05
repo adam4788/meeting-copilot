@@ -2,8 +2,8 @@
 
 ## Data flow
 
-- Microphone and loopback audio are processed locally after explicit consent when using native capture.
-- The preferred Meetily adapter reads only an explicitly attached active recording's live JSON snapshots. Meetily independently saves audio/transcripts according to its own settings; this project does not erase or change those files.
+- Microphone and loopback audio are processed locally after explicit consent when using native capture with local transcription. Optional explicit Meta transcription sends audio off-device; local model preparation may download weights.
+- The optional, unofficial Meetily adapter reads only an explicitly attached active recording's live JSON snapshots. Meetily independently saves audio/transcripts according to its own settings; this project does not erase or change those files.
 - This project does not write additional raw audio or transcripts to disk. Transcripts and
   answer results remain in bounded process memory until cleared or the process exits.
 - A configured answer provider receives the question, bounded recent transcript,
@@ -16,16 +16,21 @@
 - The desktop integration uses the host's authenticated plugin API. Do not expose
   a development server or plugin API without authentication to a network.
 
-## Meta credential editor
+## Credentials and model selection
 
-The in-pane key editor is restricted to the native Desktop owner of the active
-backend home. It reuses Hermes’ private `.env` storage and atomic-write lock,
-never returns key material, and does not hot-reload running workers. New scoped
-requests can change immediately; existing requests/workers retain snapshots and
-removal can expose an inherited fallback. Ambiguous parser syntax is refused
-before mutation, not silently repaired. Shared/hosted authentication alone does
-not authorize credential edits. See the full
-[trust boundary and activation guidance](docs/meta-api-key.md).
+Configure API keys only in Hermes-managed secret settings for this plugin's
+default profile. Production requests use `agent.secret_scope.get_secret` in a
+bound host scope; unavailable scopes fail closed. The plugin does not edit
+credential stores. The old in-pane editor and startup dotenv bridge are retired.
+
+Choose an explicit provider and exact model ID in Answer setup. There is no
+generic host-model fallback. Reopen the pane after settings changes, after
+finishing requests and pausing capture. Already admitted workers retain their
+credential snapshots; a submitted request cannot be recalled by changing keys.
+
+Standalone CLI BYOK is a separate explicit mode using process environment
+credentials; it reads no credential files. See [BYOK boundaries](docs/byok.md)
+and the [optional Meta route](docs/meta-api-key.md).
 
 ## Limitations
 

@@ -10,9 +10,12 @@ from knowledge import KnowledgeEngine
 engine = KnowledgeEngine(project_root=None, hermes_home=None)
 projects = engine.projects()  # [{"name": ..., "path": ...}]
 hits = engine.search("release approval", project="example-project", limit=6)
-result = engine.answer("What approval is required?", transcript="", project="example-project")
+result = engine.answer("What approval is required?", transcript="", project="example-project",
+                       answer_provider="openai", answer_model="EXACT_MODEL_ID",
+                       include_history=False)
 # Only after explicit user consent for this exact query:
-# result = engine.answer("...", project="example-project", web_query="public product documentation")
+# result = engine.answer("...", project="example-project", web_query="public product documentation",
+#                        answer_provider="openai", answer_model="EXACT_MODEL_ID")
 ```
 
 `search` returns dictionaries with `id`, `title`, `source`, `text`, and `updated_at`
@@ -84,20 +87,20 @@ An explicit nonblank `web_query` is passed, unchanged, to Hermes
 explicit user action, never from a model. Web sources are search descriptions,
 not downloaded or verified pages. No web extraction or link following occurs.
 
-Answer generation is **not necessarily offline**: it reuses the configured
-Hermes model/auth through `agent.auxiliary_client.call_llm`, task
-`meeting_copilot`, with no tools, 600 output tokens, low reasoning effort and
-a requested 30-second timeout. The existing task override is honored if present;
-otherwise Hermes chooses its configured route. No credentials are copied,
-printed, or set by this module. The selected question (2,000 characters), recent
+Answer generation requires an explicit provider and exact model ID, or an
+injected standalone completion function. The Desktop uses scoped BYOK settings
+for OpenAI/OpenRouter; optional Meta routing is explicit. The former generic
+Hermes configured-model fallback is unavailable. OpenAI/OpenRouter requests have
+a 30-second timeout and 2048-token output limit, without automatic retry or
+provider/model fallback. See [BYOK](docs/byok.md) for account compatibility and
+credential boundaries. The selected question (2,000 characters), recent
 transcript (6,000 characters), and up to nine selected evidence snippets (2,050
 characters each for local/session evidence, 1,500 for web; six local/session plus
 three web) may leave the machine for
 the configured hosted model. Only titles/text/citation numbers are sent, not
 absolute source paths. The caller must disclose this before enabling answers.
-Hermes/provider retries, auth refresh, initialization and queue waits can exceed
-the requested timeout; `elapsed_seconds` measures the actual wall time, not a
-latency promise. Parent UI should run background jobs and show elapsed status.
+`elapsed_seconds` measures actual wall time, including retrieval and setup; it
+is not a latency promise. Parent UI should run background jobs and show status.
 
 Common key/password/token patterns and PEM private keys are redacted. This is
 best-effort, not a complete DLP guarantee: select only approved projects and do
@@ -105,7 +108,7 @@ not store secrets in searchable notes. Retrieval evidence and meeting transcript
 are untrusted data, not model instructions. Prompt injection remains a model
 risk, but the model has no tools or action permissions. No plugins/config are
 enabled or changed by this module. Hermes itself may update its normal runtime
-caches/auth/logs when its configured model/web client is used.
+caches/auth/logs when its host integration or web client is used.
 
 ## Tests
 
@@ -125,16 +128,12 @@ leaking exception text; missing evidence is never replaced with invented facts.
 ## Hermes integration references
 
 - Official architecture: https://hermes-agent.nousresearch.com/docs/developer-guide/architecture/
-- Installed `agent/auxiliary_client.py`: synchronous `call_llm(task=..., messages=...,
-  tools=None, max_tokens=..., timeout=..., reasoning_config=...)` handles configured
-  provider/auth routing, including provider-specific response normalization.
 - Installed `tools/web_tools.py`: synchronous `web_search_tool(query, limit)` returns
   a JSON string with `success` and `data.web` metadata.
-- `hermes_cli/runtime_provider.py` exposes `resolve_runtime_provider`; this engine
-  deliberately delegates routing to the auxiliary client instead of resolving,
-  duplicating or caching provider credentials itself.
+- The optional public-facade embedding helpers and remaining dashboard private
+  search/scope seams are described in [compatibility review](docs/catalog-compatibility.md).
 
-These are internal Hermes APIs and may change between releases; retrieval tests
-are independent of them, while live model/web integration requires an installed,
-configured Hermes environment. No additional pip packages are needed for this
+Private Hermes APIs may change between releases; retrieval tests are independent
+of them, while live Desktop/web integration requires an installed, configured
+Hermes environment. No additional pip packages are needed for this
 module's deterministic tests or text/session retrieval.

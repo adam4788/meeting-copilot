@@ -1,5 +1,10 @@
 # Verification
 
+> Historical engineering record. Counts, installed artifacts, and provider routes
+> below belong to their stated checkpoints. Credential editing and generic
+> host-model defaults were later retired. Use [current BYOK](byok.md) and the
+> [current platform status](../README.md#current-status) for today's setup and limits.
+
 For the combined masked-key / overlay follow-up, see the
 [integrated key / overlay verification receipt](integrated-key-overlay-verification.md).
 
