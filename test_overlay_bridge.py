@@ -234,6 +234,33 @@ class ClickTests(CheckedThreads):
         self.assertFalse(overlay.answers[row_id]['busy'])
         self.assertTrue(any(entry.get('cancelled') == 'r-x' for entry in calls))
 
+    def test_rejected_tap_remains_row_scoped_after_status_polls(self):
+        class FailingTransport:
+            def assist(self, question, scope, row_id, expected_generation=None):
+                raise RuntimeError('private provider diagnostic')
+
+        overlay = bridge.OverlayBridge(transport=FailingTransport())
+        status = {'segments': [{'id': 'a', 'text': 'First?'},
+                               {'id': 'b', 'text': 'Second?'}],
+                  'listening': True, 'generation': 1, 'capture_generation': 1}
+        overlay.update(status)
+        overlay.answers['b'].update(answer='Existing answer', completed=True)
+        self.assertTrue(overlay.on_click_line(json.dumps(
+            {'type': 'click', 'id': 'a', 'snapshot_id': overlay.snapshot_id})))
+        for thread in list(overlay.threads):
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+        for _ in range(3):
+            overlay.update(status)
+        rows = {row['id']: row for row in overlay.pushed[-1]['questions']}
+        self.assertFalse(rows['a']['busy'])
+        self.assertTrue(any('tap' in w.lower() and 'retry' in w.lower()
+                            for w in rows['a']['warnings']))
+        self.assertEqual(rows['b']['answer'], 'Existing answer')
+        self.assertEqual(rows['b']['warnings'], [])
+        self.assertNotIn('private provider diagnostic', json.dumps(overlay.pushed[-1]))
+        self.assertNotIn('RuntimeError', json.dumps(overlay.pushed[-1]))
+
     def test_assist_rejection_marks_row_idle_without_raise(self):
         class FailingTransport:
             def assist(self, question, scope, row_id, expected_generation=None):
@@ -252,7 +279,7 @@ class ClickTests(CheckedThreads):
         for _thread in list(overlay.threads):
             _thread.join(timeout=10)
         self.assertFalse(overlay.answers[row_id]['busy'])
-        self.assertIn('failed', (overlay.message or '').lower())
+        self.assertIn('failed', ' '.join(overlay.pushed[-1]['questions'][0]['warnings']).lower())
 
     def test_scope_push_uses_current_pane_settings_and_cancels_stale_rows(self):
         calls = []
@@ -1316,6 +1343,24 @@ class ScopeOrderingTests(CheckedThreads):
 
 
 class WarningPriorityTests(CheckedThreads):
+    def test_failed_answer_preserves_overflow_notice(self):
+        status = {'segments': [{'speaker': 's', 'text': 'When is the review?'}], 'listening': True}
+        row_id = bridge.suggest_questions(status['segments'])[0]['id']
+        warnings = ['Model provider disclosure', 'Single-project scope', 'Web search failed', 'Model failed']
+        snapshot = bridge.build_snapshot(status, {row_id: {'admission_error': 'Answer failed; tap to retry.', 'warnings': warnings}})
+        rendered = snapshot['questions'][0]['warnings']
+        self.assertEqual(rendered[0], 'Answer failed; tap to retry.')
+        self.assertLessEqual(len(rendered), 3)
+        self.assertTrue(any('more warning' in w.lower() for w in rendered), rendered)
+
+    def test_previously_summarized_warnings_do_not_claim_a_wrong_count(self):
+        status = {'segments': [{'speaker': 's', 'text': 'When is the review?'}], 'listening': True}
+        row_id = bridge.suggest_questions(status['segments'])[0]['id']
+        # Polling has already reduced five backend warnings to three entries.
+        prior = bridge._prioritize_warnings(['a', 'b', 'c', 'd', 'e'])
+        row = bridge.build_snapshot(status, {row_id: {'admission_error': 'Failed; retry.', 'warnings': prior}})['questions'][0]
+        self.assertEqual(row['warnings'], ['Failed; retry.', 'a', 'More warnings in the pane.'])
+
     def test_interruption_warning_survives_cap(self):
         warnings = ['Selected snippets may be sent.', 'All-project scope searches up to 100 folders.',
                     'Single-project scope still includes prior sessions.',

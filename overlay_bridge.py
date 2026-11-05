@@ -150,7 +150,7 @@ def suggest_questions(segments, limit=QUESTION_ROWS):
     return rows[-limit:]
 
 
-def _prioritize_warnings(warnings):
+def _prioritize_warnings(warnings, limit=3):
     """Order overlay warnings so critical ones survive the display cap.
 
     Interruption/partial, truncation and citation warnings decide whether an
@@ -171,9 +171,28 @@ def _prioritize_warnings(warnings):
             return 2
         return 3
     ordered = sorted(seen, key=rank)
-    if len(ordered) > 3:
-        return ordered[:2] + [f'+{len(ordered) - 2} more warning(s) in the pane.']
-    return ordered[:3]
+    if len(ordered) > limit:
+        return ordered[:limit - 1] + [f'+{len(ordered) - (limit - 1)} more warning(s) in the pane.']
+    return ordered
+
+
+def _admission_failure_message(transport, error):
+    """Map only known in-process backend rejections to fixed, safe text."""
+    if isinstance(transport, BackendTransport) and error is not None:
+        import importlib
+        module = importlib.import_module(f'{__package__}.server' if __package__ else 'server')
+        if isinstance(error, module._AnswerRejected):
+            detail = error.detail
+            if error.status_code == 409 and detail in ('Meeting context changed; refresh and retry the question.',
+                          'Capture context changed; refresh and retry the question.',
+                          'Question changed; refresh and tap the current row.'):
+                return 'Meeting or question changed; wait for the current row, then tap to retry.'
+            if error.status_code == 409 and isinstance(detail, str) and (detail == 'Too many pending answer requests.' or
+                    (detail.startswith('Request ') and detail.endswith(' is already being prepared.'))):
+                return 'Another answer is being prepared; wait for it to finish, then tap to retry.'
+            if error.status_code == 503 and detail == 'Too many answer workers in flight; wait for one to finish and retry.':
+                return 'Answer capacity is busy; wait for an answer to finish, then tap to retry.'
+    return 'Answer request failed; tap this row to retry or check the Meeting Copilot pane.'
 
 
 def build_snapshot(status, answers=None, message=None):
@@ -194,7 +213,16 @@ def build_snapshot(status, answers=None, message=None):
     for row in suggest_questions(segments):
         entry = answers.get(row['id'], {})
         answer = entry.get('answer')
-        warnings = _prioritize_warnings([str(w)[:200] for w in (entry.get('warnings') or []) if isinstance(w, str)])
+        raw_warnings = [str(w)[:200] for w in (entry.get('warnings') or []) if isinstance(w, str)]
+        if entry.get('admission_error'):
+            warnings = _prioritize_warnings(raw_warnings, limit=2)
+            # Polling may already have summarized warnings; avoid counting
+            # that summary as a single warning when reducing the display.
+            if len(set(raw_warnings)) > 2:
+                warnings[-1] = 'More warnings in the pane.'
+            warnings = [entry['admission_error']] + warnings
+        else:
+            warnings = _prioritize_warnings(raw_warnings)
         sources = [str(s)[:80] for s in (entry.get('source_titles') or []) if isinstance(s, str)][:3]
         questions.append({
             'id': row['id'],
@@ -562,6 +590,10 @@ class OverlayBridge:
                 self.scope_seq = incoming
             if scope != self.scope:
                 self.scope = scope
+                if self.message in ('Answer not accepted: transport lacks expected_generation safety support; check the pane.',
+                                    'Too many pending clicks; wait before retrying.'):
+                    self.message = getattr(self, '_sticky_error', None) or default_message(
+                        {'listening': self._listening})
                 self.questions = {}
                 self.answers = {}
                 self.order = []
@@ -622,6 +654,8 @@ class OverlayBridge:
                 # First sight of a pause/switch/idle revision: retire rows so no
                 # stale request can launch after this revision.
                 self.paused_generation += 1
+                for answer in self.answers.values():
+                    answer.pop('admission_error', None)
                 for request_id in list(self.row_by_request):
                     self._cancel_locked(request_id)
                 self.request_by_row = {k: v for k, v in self.request_by_row.items() if v is True}
@@ -744,6 +778,10 @@ class OverlayBridge:
                 return False
             click_generation = self.paused_generation
             state.update({'answer': None, 'busy': True, 'streaming': False, 'completed_only': True})
+            state.pop('admission_error', None)
+            state.pop('warnings', None)
+            state.pop('source_titles', None)
+            state.pop('completed', None)
             # Reserve synchronously: a second immediate click sees busy even
             # before the worker thread drains the queue.
             self.request_by_row[row_id] = True
@@ -755,7 +793,8 @@ class OverlayBridge:
                 self.request_by_row.pop(row_id, None)
                 self.reserved_generation.pop(row_id, None)
                 state['busy'] = False
-                self.message = 'Too many pending clicks; try one row at a time.'
+                state['admission_error'] = 'Too many pending clicks; wait, then tap this row to retry.'
+                self.message = 'Too many pending clicks; wait before retrying.'
         # push -> _emit takes stdin then bridge; never call it under bridge.
         self.push()
         if not queued:
@@ -821,18 +860,31 @@ class OverlayBridge:
                     raise  # Programming/test failures are not admission rejections.
                 except Exception as exc:
                     request_id = None
-                    admission_error = type(exc).__name__
+                    admission_error = exc
                 if not isinstance(request_id, str) or not request_id:
-                    self.request_by_row.pop(row_id, None)
-                    self.reserved_generation.pop(row_id, None)
-                    if row_id in self.answers:
+                    # An injected transport can re-enter and retire this tap.
+                    # Never replace a newer reservation, answer, or revision.
+                    if (self.request_by_row.get(row_id) is True
+                            and self.reserved_generation.get(row_id, click_generation) == click_generation
+                            and click_generation == self.paused_generation
+                            and self.questions.get(row_id) == question and row_id in self.answers):
+                        self.request_by_row.pop(row_id, None)
+                        self.reserved_generation.pop(row_id, None)
                         self.answers[row_id] = {'answer': None, 'busy': False,
-                                                'streaming': False, 'completed_only': True}
-                    self.message = 'Answer request failed: request was not accepted.'
-                    if admission_error:
-                        self.message += f' Transport error: {admission_error}.'
-                    if admission_error == 'TypeError':
-                        self.message += ' Transport must accept expected_generation; no unsafe legacy retry.'
+                                                'streaming': False, 'completed_only': True,
+                                                'admission_error': _admission_failure_message(transport, admission_error)}
+                        if isinstance(admission_error, TypeError) and not isinstance(transport, BackendTransport):
+                            # Compatibility status for an injected legacy transport
+                            # that cannot accept the safety precondition. Never retry it.
+                            import inspect
+                            try:
+                                inspect.signature(transport.assist).bind(
+                                    question, dict(self.scope), row_id,
+                                    expected_generation=self._last_generation)
+                            except TypeError:
+                                self.message = 'Answer not accepted: transport lacks expected_generation safety support; check the pane.'
+                            except (ValueError, AttributeError):
+                                pass
                     request_id = None
                 elif (self.request_by_row.get(row_id) is not True
                       or click_generation != self.paused_generation):
@@ -925,7 +977,9 @@ class OverlayBridge:
                                                     'warnings': warnings, 'source_titles': titles,
                                                     'completed': entry.get('status') == 'done'}
                             if entry.get('status') == 'error':
-                                self.message = f"Answer failed for this row: {str(entry.get('error') or 'unknown')[:160]}"
+                                self.answers[row_id]['admission_error'] = (
+                                    'Answer failed; tap this row to retry or check the Meeting Copilot pane.'
+                                    + (' The text above may be partial.' if seen else ''))
                     self.push()
                     return
                 time.sleep(self.poll_interval)

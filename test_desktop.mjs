@@ -566,6 +566,50 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
     unmount: () => { for (const effect of effects) effect?.cleanup?.(); },
     replayEffects: () => { for (const effect of effects) effect?.cleanup?.(); effects.length = 0; return render(); } };
 }
+test('settings use a short heading and disclose answer data at the action', () => {
+  const { tree } = pane('', true, false);
+  const summary = nodes(tree).find(n => n.type === 'summary' && JSON.stringify(n.children).includes('Answer setup'));
+  assert.match(JSON.stringify(summary.children), /Answer setup/);
+  assert.doesNotMatch(JSON.stringify(summary.children), /scope, models, overlay, web/);
+  assert.deepEqual(nodes(tree).find(n => n.props.id === 'mc-backend-label').children, ['Capture source']);
+  const visible = JSON.stringify(disclosedNodes(tree));
+  assert.match(visible, /question.*part of.*transcript.*selected source snippets.*may be sent.*answer model/i);
+  assert.match(visible, /permission.*capture\/read.*meeting/i);
+});
+
+test('web settings explain opt-in and public queries where used', () => {
+  const ui = pane('', true, false);
+  assert.equal(disclosedNodes(ui.tree).some(n => n.props['data-web-fallback-disclosure']), false);
+  const setup = nodes(ui.tree).find(n => n.type === 'details' && nodes(n).some(x => x.type === 'summary' && JSON.stringify(x.children).includes('Answer setup')));
+  setup.props.onToggle({ currentTarget: { open: true } });
+  let tree = ui.rerender();
+  const toggle = nodes(tree).find(n => n.type === 'input' && n.props['aria-label'] === 'Automatic web fallback');
+  assert.equal(toggle.props.checked, false);
+  const toggleLabel = nodes(tree).find(n => n.type === 'label' && nodes(n).includes(toggle));
+  assert.match(JSON.stringify(toggleLabel), /Automatic web fallback.*off/i);
+  toggle.props.onChange({ target: { checked: true } });
+  tree = ui.rerender();
+  const fallbackWarning = disclosedNodes(tree).find(n => n.props['data-web-fallback-disclosure']);
+  assert.ok(fallbackWarning, 'fallback warning stays visible at the answer action');
+  assert.match(JSON.stringify(fallbackWarning.children), /automatic web fallback.*on.*public query.*filtering.*not.*guarantee/i);
+  const webDetails = nodes(tree).find(n => n.type === 'details' && nodes(n).some(x => x.props['aria-label'] === 'Specific public web query'));
+  const queryNotice = nodes(webDetails).find(n => n.props['data-web-query-disclosure']);
+  assert.ok(queryNotice, 'public query disclosure appears beside its action');
+  assert.match(JSON.stringify(queryNotice.children), /query.*sent.*web/i);
+  assert.match(JSON.stringify(queryNotice.children), /overrides automatic fallback/i);
+  assert.match(JSON.stringify(queryNotice.children), /private/i);
+  const openSetup = nodes(tree).find(n => n.type === 'details' && n.props.open && n.props.onToggle);
+  openSetup.props.onToggle({ currentTarget: { open: false } });
+  assert.ok(disclosedNodes(ui.rerender()).some(n => n.props['data-web-fallback-disclosure']), 'warning remains visible when settings are closed');
+});
+
+test('overlay web query warning remains visible with settings closed', () => {
+  const { tree } = pane('', true, false, 'public query');
+  const notice = disclosedNodes(tree).find(n => n.props['data-overlay-web-disclosure']);
+  assert.ok(notice);
+  assert.match(JSON.stringify(notice.children), /overlay.*query.*sent.*web.*clear/i);
+});
+
 test('legacy automatic Meta preference migrates to local without proof', async () => {
   const store = new Map([['meeting-copilot.scope.v2', JSON.stringify({ backend: 'macos', transcriptionProvider: 'meta' })]]);
   const ui = pane('', true, false, '', {}, {}, { capabilities: { macos_transcription: true, meta_asr: true } }, { localStorage: { getItem: k => store.get(k), setItem: (k,v) => store.set(k,v) } });
@@ -1549,7 +1593,7 @@ test('overlay section shows explicitly, syncs current scope, and warns about scr
   const text = JSON.stringify(tree);
   assert.match(text, /Meeting overlay/);
   assert.match(text, /Show overlay/);
-  assert.match(text, /may be visible in screen shares/);
+  assert.match(text, /may appear in screen shares/);
   const buttons = nodes(tree).filter(n => n.type === 'button');
   const show = buttons.find(n => (Array.isArray(n.children) ? n.children.join('') : String(n.children || '')) === 'Show overlay');
   assert.ok(show, 'explicit Show overlay action must exist');
