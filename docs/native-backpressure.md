@@ -16,6 +16,21 @@ writer scheduling pressure from loss-counter duplication. They do not identify
 the cause of the live writer stall. Native queue bounds and loss reporting
 remain unchanged.
 
+Run `python verify_native_backpressure.py` with a Swift toolchain for the
+device-free regression probe. It extracts the writer functions verbatim from
+the current production source, compiles them with Foundation only in a temporary
+directory, and supplies synthetic zero PCM. No audio frameworks or Capture
+class are included. Its five experiments assert packet conservation and force
+the loss path; exact counts are scheduling-dependent. It is a development
+check, not installed by `install.py`.
+
+In the subsequent probe run, unstalled transport received all 169 packets;
+100ms/200ms writer stalls reported six/fifteen drops. A 500ms initial reader
+stall had no loss, while a 1.5s reader stall reported 73 drops. All totals
+balanced exactly. A drop count alone therefore cannot distinguish writer
+scheduling delay from a sufficiently long downstream read stall. Identifying
+which caused the physical test still requires timing evidence from that path.
+
 The investigation separately found avoidable allocation in the Python silence
 detector: every small frame after four seconds concatenated the entire growing
 utterance to inspect only its last 6,400 samples. It now copies at most those
