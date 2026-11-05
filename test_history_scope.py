@@ -44,6 +44,11 @@ class HistoryScopeTests(unittest.TestCase):
             time.sleep(.01)
         self.fail('answer did not finish')
 
+    def test_status_advertises_the_scope_contract(self):
+        response = self.client.get('/status')
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(response.json()['capabilities']['history_opt_out'], True)
+
     def test_history_off_route_uses_selected_project_without_calling_host_sessions(self):
         entry = self.ask(include_history=False)
         self.assertEqual(entry['status'], 'done', entry)
