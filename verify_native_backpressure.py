@@ -28,7 +28,9 @@ DRIVER = r'''
         }
         writer.sync {}
         let pending = dropCounter.sync { droppedFrames }
-        FileHandle.standardError.write(Data("{\"attempted\":\(attempted),\"pending\":\(pending)}\n".utf8))
+        let metadata: [String: Any] = ["attempted": attempted, "pending": pending,
+                                      "timing_ms": writer.sync { writerTiming() }]
+        FileHandle.standardError.write(try! JSONSerialization.data(withJSONObject: metadata))
     }
 }
 '''
@@ -84,6 +86,7 @@ def main():
         # A forced scheduling pause must exercise the loss path. Exact counts
         # depend on OS scheduling and are deliberately not asserted.
         assert results[2]['reported_drops'] + results[2]['pending'] > 0
+        assert results[2]['timing_ms']['max_queue_ms'] >= 100
         print(json.dumps({'physical_capture': False, 'results': results}, indent=2))
 
 

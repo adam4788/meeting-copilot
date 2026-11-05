@@ -120,7 +120,7 @@ class CoreAcceptanceTests(NoHermesTestCase):
         import hermes_adapters
         with self.assertRaisesRegex(RuntimeError, 'ctx.llm'):
             hermes_adapters.default_completion()([])
-        with self.assertRaisesRegex(RuntimeError, 'tools.web_tools'):
+        with self.assertRaisesRegex(RuntimeError, 'ctx.dispatch_tool'):
             hermes_adapters.default_search()('q')
         # Missing state.db is simply no history.
         self.assertEqual(hermes_adapters.default_history('/nonexistent-home')(['x']), [])

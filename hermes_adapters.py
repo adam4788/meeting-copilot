@@ -55,21 +55,27 @@ def completion_supports_streaming(complete):
         return False
 
 
-def default_search():
-    """Web-search callable using the host search tool (lazy import)."""
+def default_search(dispatch_tool=None):
+    """Adapt an explicitly supplied public ``ctx.dispatch_tool`` callable.
+
+    No implicit host context lookup. Dashboard callers must supply a dispatcher
+    bound to their authenticated profile; this optional embedding helper cannot
+    manufacture one. The current dashboard's legacy search path is separate.
+    """
     def search(query):
+        if not callable(dispatch_tool):
+            raise RuntimeError('Hermes web search requires explicit public ctx.dispatch_tool; inject a SearchProvider or disable search.')
         try:
-            from tools.web_tools import web_search_tool
-        except ImportError as exc:
-            raise RuntimeError(
-                'Hermes web search is unavailable: tools.web_tools cannot '
-                f'be imported ({exc}). Inject a SearchProvider or disable '
-                'search instead.') from exc
-        import json as _json
-        data = _json.loads(web_search_tool(query, limit=3))
-        if not data.get('success', True):
-            raise RuntimeError('Configured web search unavailable')
-        return data.get('data', {}).get('web', [])
+            import json as _json
+            data = _json.loads(dispatch_tool('web_search', {'query': query, 'limit': 3}))
+            if not data.get('success', True):
+                raise ValueError('dispatch failed')
+            rows = data.get('data', {}).get('web', [])
+            if not isinstance(rows, list):
+                raise ValueError('invalid web results')
+            return rows[:3]
+        except Exception:
+            raise RuntimeError('Hermes public web search failed') from None
     return search
 
 

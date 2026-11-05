@@ -85,6 +85,12 @@ mutation and backpressure probes are reviewable source and are not installed
 runtime entrypoints. See [security boundaries](SECURITY.md) and
 [native backpressure evidence](docs/native-backpressure.md).
 
+`python export_catalog_runtime.py /new/output/directory` creates an allowlisted
+runtime source release from a clean committed checkout without publishing it.
+It retains source provenance and does not change the scanner; development
+mutators/tests stay in the source commit. The release must independently pass
+doctor/validation, and its own full commit must be the catalog pin.
+
 ## Offline checks and development
 
 ```sh

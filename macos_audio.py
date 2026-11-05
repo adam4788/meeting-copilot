@@ -118,6 +118,15 @@ def _model_api_key():
         return ''  # never bypass a failed profile-scope resolver
 
 
+def clean_writer_timing(value):
+    """Allowlisted, finite timing-only diagnostics; never reflect helper prose."""
+    if not isinstance(value, dict):
+        return {}
+    return {k: float(value[k]) for k in ('max_queue_ms', 'max_encode_ms', 'max_write_ms')
+            if isinstance(value.get(k), (int, float)) and not isinstance(value[k], bool)
+            and 0 <= value[k] <= 60000 and math.isfinite(value[k])}
+
+
 def worker_env(provider='local'):
     """Hermetic env for the isolated worker: never inherit the launcher's
     PYTHONPATH/PYTHONHOME (e.g. Hermes's own 3.14 site-packages), which would
@@ -252,6 +261,9 @@ class MacOSAudioCapture:
                                                        'worker_dropped_chunks', 'sub_second_dropped_chunks',
                                                        'reader_incomplete', 'partial_tail')
                              if event.get(k) is not None}
+                    timing = clean_writer_timing(event.get('native_writer_timing_ms'))
+                    if timing:
+                        extra['native_writer_timing_ms'] = timing
                     self._notify(event['state'], None)
                     if extra:
                         with self._lock:

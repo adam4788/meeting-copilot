@@ -31,6 +31,26 @@ balanced exactly. A drop count alone therefore cannot distinguish writer
 scheduling delay from a sufficiently long downstream read stall. Identifying
 which caused the physical test still requires timing evidence from that path.
 
+The native writer now measures monotonic maximum queue-wait, JSON-encoding and
+write durations. A serial-queue snapshot is emitted only in the terminal helper
+status. Local Whisper forwards only these three finite numeric millisecond
+fields, capped at 60,000ms, through its stop summary/controller. Pause retains
+them alongside the original loss counts. Unknown text/keys and invalid numbers
+are discarded; these diagnostics include no PCM, transcript, wall-clock
+timestamps, paths or credentials. The optional Meta transcription path is not
+extended with these diagnostics yet. Forced termination can prevent a terminal
+summary, so missing timings mean unknown, not zero delay.
+
+Device-free experiments with the instrumented production writer separated the
+injected signatures: a 200ms writer stall yielded about 205ms maximum queue wait
+and 0.21ms write duration; a 1.5s reader stall yielded about 802ms queue wait and
+810ms write duration. Packet conservation held in all five runs. Long writes
+are consistent with downstream I/O blockage, but elapsed wall time can also
+include descheduling. Queue delay can include preceding writes/encoding, not
+only scheduler delay. These are useful timing evidence, not a causal verdict
+about the physical run or a guarantee of loss-free capture. Queue capacity and
+loss accounting remain unchanged. No instrumented physical capture occurred.
+
 The investigation separately found avoidable allocation in the Python silence
 detector: every small frame after four seconds concatenated the entire growing
 utterance to inspect only its last 6,400 samples. It now copies at most those

@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 
-from macos_audio import MODELS, SOURCES, validate, error_message
+from macos_audio import MODELS, SOURCES, validate, error_message, clean_writer_timing
 
 MAX_FRAME = 100000
 CHUNK_SAMPLES = 64000  # Earliest utterance boundary, separately per source.
@@ -129,6 +129,7 @@ def run_capture(model, source, language, helper=None, stop=None):
     failure = []
     dropped = {'count': 0}
     native_lost = {'count': 0}
+    native_timing = {}
     tail_items = []
     sub_second_lost = {'count': 0}
     # faster-whisper inference is not guaranteed thread-safe: the reader's
@@ -179,6 +180,8 @@ def run_capture(model, source, language, helper=None, stop=None):
                 if len(line) > MAX_FRAME or not line.endswith(b'\n'):
                     raise ValueError('frame bounds')
                 header = json.loads(line)
+                if header.get('type') == 'status' and header.get('state') == 'stopped':
+                    native_timing.update(clean_writer_timing(header.get('native_writer_timing_ms')))
                 # Loss accounting comes first: status and error frames carry
                 # pending native drops that must not be lost with the frame.
                 # PCM frames account their own drops via decode_frame below,
@@ -317,19 +320,22 @@ def run_capture(model, source, language, helper=None, stop=None):
                     dropped['count'] += 1
                     continue
             total_lost = dropped['count'] + native_lost['count']
-            if total_lost or sub_second_lost['count'] or reader_incomplete:
+            if total_lost or sub_second_lost['count'] or reader_incomplete or native_timing:
                 try:
                     warning = (f"Stopped with worker {dropped['count']} dropped chunk(s), "
                                f"native {native_lost['count']} dropped frame(s), "
                                f"{sub_second_lost['count']} sub-second tail(s); some words may be missing.")
                     if reader_incomplete:
                         warning += ' Reader had not finished; tail accounting may be incomplete.'
-                    emit({'type': 'status', 'state': 'stopped', 'dropped_chunks': total_lost,
+                    summary = {'type': 'status', 'state': 'stopped', 'dropped_chunks': total_lost,
                           'native_dropped_chunks': native_lost['count'],
                           'worker_dropped_chunks': dropped['count'],
                           'sub_second_dropped_chunks': sub_second_lost['count'],
                           'reader_incomplete': bool(reader_incomplete),
-                          'warning': warning})
+                          **({'native_writer_timing_ms': dict(native_timing)} if native_timing else {})}
+                    if total_lost or sub_second_lost['count'] or reader_incomplete:
+                        summary['warning'] = warning
+                    emit(summary)
                 except Exception:
                     pass
         except Exception:

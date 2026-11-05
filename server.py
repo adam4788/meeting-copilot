@@ -623,7 +623,7 @@ class MeetingState:
                 previous = self.capture_info if isinstance(self.capture_info, dict) else {}
                 latched = {'state': 'stopped', 'backend': self.backend, 'message': 'Paused / detached',
                            'error': previous.get('error') if error_before else None}
-                for key in ('warning', 'dropped_chunks', 'native_dropped_chunks', 'worker_dropped_chunks',
+                for key in ('warning', 'dropped_chunks', 'native_dropped_chunks', 'worker_dropped_chunks', 'native_writer_timing_ms',
                             'sub_second_dropped_chunks', 'reader_incomplete', 'partial_tail'):
                     if previous.get(key) is not None:
                         latched[key] = previous[key]

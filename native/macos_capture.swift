@@ -11,6 +11,16 @@ private let writer = DispatchQueue(label: "meeting.audio.stdout")
 private let slots = DispatchSemaphore(value: 4)
 private let dropCounter = DispatchQueue(label: "meeting.audio.drops")
 private var droppedFrames = 0
+// Written only by the serial writer; read only after its shutdown barrier.
+// Timings contain no audio, timestamps, paths, or credentials.
+private var maxQueueNs: UInt64 = 0
+private var maxEncodeNs: UInt64 = 0
+private var maxWriteNs: UInt64 = 0
+private func writerTiming() -> [String: Double] {
+    return ["max_queue_ms": Double(maxQueueNs) / 1_000_000,
+            "max_encode_ms": Double(maxEncodeNs) / 1_000_000,
+            "max_write_ms": Double(maxWriteNs) / 1_000_000]
+}
 
 // A slow reader drops audio rather than blocking real-time capture or growing memory.
 // Drops are counted and the cumulative total rides on the next successful frame
@@ -27,7 +37,10 @@ private func emit(_ object: [String: Any], critical: Bool = false) {
         payload["native_dropped_chunks"] = pending
         payload["warning"] = "Native capture dropped \(pending) frame(s) under backpressure; some audio may be missing."
     }
-    writer.async { [payload, pending] in
+    let enqueuedAt = DispatchTime.now().uptimeNanoseconds
+    writer.async { [payload, pending, enqueuedAt] in
+        let beganAt = DispatchTime.now().uptimeNanoseconds
+        maxQueueNs = max(maxQueueNs, beganAt - enqueuedAt)
         defer { slots.signal() }
         guard let data = try? JSONSerialization.data(withJSONObject: payload), data.count < 100000 else {
             // Never silently discard a loss report: re-queue it for the next frame.
@@ -36,7 +49,12 @@ private func emit(_ object: [String: Any], critical: Bool = false) {
         }
         var line = data
         line.append(10)
-        do { try FileHandle.standardOutput.write(contentsOf: line) }
+        let beforeWrite = DispatchTime.now().uptimeNanoseconds
+        maxEncodeNs = max(maxEncodeNs, beforeWrite - beganAt)
+        do {
+            try FileHandle.standardOutput.write(contentsOf: line)
+            maxWriteNs = max(maxWriteNs, DispatchTime.now().uptimeNanoseconds - beforeWrite)
+        }
         catch { exit(0) }
     }
 }
@@ -247,6 +265,7 @@ struct Main {
             // so the terminal line accounts for all audio observed to this
             // point. The only uncounted window is the direct write below.
             var payload: [String: Any] = ["type": "status", "state": "stopped"]
+            payload["native_writer_timing_ms"] = writer.sync { writerTiming() }
             let pending = dropCounter.sync { () -> Int in let n = droppedFrames; droppedFrames = 0; return n }
             if pending > 0 {
                 payload["native_dropped_chunks"] = pending
