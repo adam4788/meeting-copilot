@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sys
 
 FILES = ('server.py', 'credentials.py', 'byok.py', 'knowledge.py', 'web_policy.py', 'audio.py', 'meetily.py',
          'macos_audio.py', 'audio_worker.py', 'model_selection.py', 'meta_models.py', 'meta_asr.py',
@@ -64,10 +65,22 @@ router = import_module(name + '.server').router
     return {'backend': str(target), 'desktop': str(desktop), 'backup': str(backup) if backup.exists() else None}
 
 
+def default_home():
+    """Standalone fallback matching native Hermes; --home selects a named profile."""
+    override = os.environ.get('HERMES_HOME', '').strip()
+    if override:
+        return Path(os.path.expandvars(override)).expanduser()
+    suffix = os.environ.get('HERMES_DATA_DIR_SUFFIX', '')
+    if sys.platform == 'win32':
+        local = os.environ.get('LOCALAPPDATA', '').strip()
+        return (Path(local) if local else Path.home() / 'AppData' / 'Local') / ('hermes' + suffix)
+    return Path.home() / ('.hermes' + suffix)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--home', default=os.environ.get('HERMES_HOME', str(Path.home() / '.hermes')),
-                        help='Active profile home. Defaults to HERMES_HOME or ~/.hermes.')
+    parser.add_argument('--home', default=default_home(),
+                        help='Active profile home. Defaults to HERMES_HOME, otherwise the native Hermes data directory (LOCALAPPDATA/hermes on Windows).')
     args = parser.parse_args()
     print(json.dumps(install(Path(__file__).parent, args.home), indent=2))
     print('Next: hermes plugins enable meeting-copilot-live --no-allow-tool-override')

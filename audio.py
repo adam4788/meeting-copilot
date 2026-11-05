@@ -2,11 +2,35 @@
 import queue
 import threading
 import time
+import importlib.util
+import sys
+
+
+def windows_readiness():
+    """Metadata only: never imports native libraries, downloads weights or opens devices."""
+    if sys.platform != 'win32':
+        return {'ready': False, 'detail': 'Windows capture requires Windows.'}
+    missing = []
+    for name, label in [('numpy', 'NumPy'), ('soundcard', 'SoundCard'), ('faster_whisper', 'faster-whisper')]:
+        try:
+            available = importlib.util.find_spec(name) is not None
+        except (ImportError, ValueError):
+            available = False
+        if not available:
+            missing.append(label)
+    if missing:
+        return {'ready': False, 'detail': 'Windows capture needs optional audio dependencies in the gateway interpreter: '
+                + ', '.join(missing) + '. See the Windows setup guide. Capture remains unavailable.'}
+    return {'ready': True, 'detail': 'Experimental Windows capture: dependencies found; hardware unverified. '
+            'First Start may download local Whisper weights. System capture includes all audio on the default output.'}
 
 
 class AudioCapture:
     def __init__(self, *, input_id=None, output_id=None, model_size='base.en',
-                 chunk_seconds=5.0, queue_size=4, model_factory=None, backend=None):
+                 chunk_seconds=5.0, queue_size=4, model_factory=None, backend=None, source='both'):
+        if source not in ('microphone', 'system', 'both'):
+            raise ValueError('source must be microphone, system, or both')
+        self.source = source
         if not isinstance(queue_size, int) or isinstance(queue_size, bool) or not 1 <= queue_size <= 32:
             raise ValueError('queue_size must be an integer from 1 to 32')
         if not isinstance(chunk_seconds, (int, float)) or not .2 <= chunk_seconds <= 30:
@@ -59,18 +83,24 @@ class AudioCapture:
             return {'state': self._state,
                     'running': any(t.is_alive() for t in self._threads),
                     'callback_error': self._callback_error,
-                    'error': self._error, 'queued': self._queue.qsize(), 'dropped': self._dropped}
+                    'error': self._error, 'queued': self._queue.qsize(), 'dropped': self._dropped,
+                    'worker_dropped_chunks': self._dropped,
+                    'warning': (f'Transcription queue dropped {self._dropped} chunk(s). Some words may be missing.'
+                                if self._dropped else None)}
+
+    def _publish_status(self):
+        try:
+            self._on_status(self.status())
+        except Exception as exc:
+            with self._lock:
+                self._callback_error = f'{type(exc).__name__}: {exc}'
 
     def _notify(self, state, error=None):
         with self._lock:
             if state == 'running' and self._stop.is_set():
                 return
             self._state, self._error = state, error
-        try:
-            self._on_status(self.status())
-        except Exception as exc:
-            with self._lock:
-                self._callback_error = f'{type(exc).__name__}: {exc}'
+        self._publish_status()
 
     def start(self, on_segment, on_status=None):
         """Explicit opt-in; model loading is asynchronous. Callbacks are worker-thread calls."""
@@ -95,13 +125,20 @@ class AudioCapture:
             if self._stop.is_set():
                 return
             backend = self._audio_backend()
-            input_id = self.input_id or backend.default_microphone().id
-            output_id = self.output_id or backend.default_speaker().id
-            sources = [('you', backend.get_microphone(id=input_id)),
-                       ('remote', backend.get_microphone(id=output_id, include_loopback=True))]
-            for (speaker, device), expected in zip(sources, (input_id, output_id)):
+            sources = []
+            for speaker, chosen, default, loopback in [
+                    ('you', self.input_id, 'default_microphone', False),
+                    ('remote', self.output_id, 'default_speaker', True)]:
+                if (self.source == 'microphone' and loopback) or (self.source == 'system' and not loopback):
+                    continue
+                device_default = getattr(backend, default)() if not chosen else None
+                expected = chosen or (device_default.id if device_default else None)
+                if not expected:
+                    raise ValueError(f'{speaker}: no default audio device available')
+                device = backend.get_microphone(id=expected, include_loopback=True) if loopback else backend.get_microphone(id=expected)
                 if device is None or device.id != expected:
                     raise ValueError(f'{speaker}: exact device ID unavailable: {expected}')
+                sources.append((speaker, device))
             for speaker, device in sources:
                 thread = threading.Thread(target=self._capture, args=(speaker, device),
                                           name='meeting-audio-' + speaker, daemon=True)
@@ -128,6 +165,7 @@ class AudioCapture:
             self._discard_pending()
 
     def _enqueue(self, item):
+        report_loss = False
         with self._lock:
             if self._stop.is_set():
                 return
@@ -135,9 +173,12 @@ class AudioCapture:
                 try:
                     self._queue.get_nowait()
                     self._dropped += 1
+                    report_loss = self._dropped == 1 or self._dropped % 4 == 0
                 except queue.Empty:
                     pass
             self._queue.put_nowait(item)
+        if report_loss:
+            self._publish_status()
 
     def _capture(self, speaker, device):
         import numpy as np

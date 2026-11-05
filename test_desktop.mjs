@@ -569,6 +569,51 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
     unmount: () => { for (const effect of effects) effect?.cleanup?.(); },
     replayEffects: () => { for (const effect of effects) effect?.cleanup?.(); effects.length = 0; return render(); } };
 }
+test('Windows capture explains missing dependencies and blocks Start without blocking answers', async () => {
+  const ui = pane('/projects/alpha', true, false, '', { 3: true, 4: 'native' }, {}, {
+    capabilities: { all_projects: true, independent_models: true, history_opt_out: true,
+      windows_transcription: false, windows_detail: 'Install optional SoundCard and faster-whisper dependencies.' },
+  });
+  assert.equal(button(ui.tree, 'Start listening').props.disabled, true);
+  assert.match(JSON.stringify(ui.tree), /optional SoundCard/);
+  assert.equal(!!button(ui.tree, 'Suggest answer').props.disabled, false);
+  await button(ui.tree, 'Start listening').props.onClick();
+  assert.equal(ui.requests.some(r => r.path === '/start'), false);
+});
+
+test('Windows capture exposes source and model, and never sends a hidden cloud transcription choice', async () => {
+  const store = new Map([['meeting-copilot.scope.v2', JSON.stringify({ backend: 'native', transcriptionProvider: 'meta', transcriptionChoiceVersion: 1 })]]);
+  const ui = pane('/projects/alpha', true, false, '', { 3: true, 4: 'native' }, {}, {
+    capabilities: { all_projects: true, independent_models: true, history_opt_out: true,
+      windows_transcription: true, windows_detail: 'Experimental; hardware unverified.' },
+  }, { localStorage: { getItem: key => store.get(key), setItem: (key, value) => store.set(key, value) } });
+  nodes(ui.tree).find(n => n.props?.['aria-label'] === 'Audio source').props.onChange({ target: { value: 'system' } });
+  nodes(ui.tree).find(n => n.props?.['aria-label'] === 'Local transcription model').props.onChange({ target: { value: 'tiny.en' } });
+  const tree = ui.rerender();
+  assert.match(JSON.stringify(tree), /all audio on the default output/);
+  await button(tree, 'Start listening').props.onClick();
+  const request = ui.requests.find(r => r.path === '/start');
+  assert.equal(request.body.backend, 'native');
+  assert.equal(request.body.audio_source, 'system');
+  assert.equal(request.body.transcription_model, 'tiny.en');
+  assert.equal(request.body.transcription_provider, 'local');
+  assert.doesNotMatch(JSON.stringify(tree), /Cloud transcription: meeting audio is sent/);
+});
+
+test('Windows resume ignores the hidden macOS provider and ASR settings', async () => {
+  const store = new Map([['meeting-copilot.scope.v2', JSON.stringify({ backend: 'native', transcriptionProvider: 'meta', transcriptionChoiceVersion: 1, asrMode: 'DIARIZATION' })]]);
+  const ui = pane('/projects/alpha', true, false, '', { 3: true, 4: 'native' }, {}, {
+    segments: [{ text: 'Synthetic retained question' }],
+    last_session: { backend: 'native', audio_source: 'microphone', transcription_model: 'base.en', transcription_provider: 'local', asr_mode: 'ENDPOINTING' },
+    capabilities: { windows_transcription: true },
+  }, { localStorage: { getItem: key => store.get(key), setItem() {} }, window: { confirm() { assert.fail('same native settings must resume without clearing'); } } });
+  await button(ui.tree, 'Resume listening').props.onClick();
+  const request = ui.requests.find(r => r.path === '/start');
+  assert.equal(request.body.transcription_provider, 'local');
+  assert.equal(request.body.asr_mode, 'ENDPOINTING');
+  assert.equal(request.body.new_meeting, false);
+});
+
 test('project-only mode sends a request-scoped history opt-out and fails closed on old backends', async () => {
   for (const supported of [true, false]) {
     const ui = pane('/projects/alpha', true, false, '', {}, {}, {capabilities:{all_projects:true, independent_models:true, history_opt_out:supported}});
