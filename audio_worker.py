@@ -35,7 +35,16 @@ def utterance_boundary(buffers, count):
     if count < CHUNK_SAMPLES:
         return False
     import numpy as np
-    tail = np.concatenate(buffers)[-SILENCE_SAMPLES:]
+    # Microphone frames can be only ~171 samples. Never copy the entire
+    # growing utterance on every callback just to inspect its trailing 400ms.
+    parts, remaining = [], SILENCE_SAMPLES
+    for samples in reversed(buffers):
+        if remaining <= 0:
+            break
+        part = samples[-remaining:]
+        parts.append(part)
+        remaining -= len(part)
+    tail = np.concatenate(parts[::-1]) if parts else np.empty(0, dtype=np.float32)
     return len(tail) >= SILENCE_SAMPLES and float(np.sqrt(np.mean(tail.astype(np.float64) ** 2))) < 0.008
 
 _OUTPUT_LOCK = threading.Lock()

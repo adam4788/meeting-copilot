@@ -49,3 +49,8 @@ gain adjustment and cannot guarantee word boundaries in noise. The synthetic
 PCM/real tiny.en inference comparison retained the price, annual minimum,
 Monday, Carol and finance facts that the fixed-cut baseline split. OS microphone
 and system-audio capture still need an explicit consented device check.
+
+Subsequent fictional native checks exercised system audio and microphone input,
+but the microphone run reported native backpressure. See the
+[loss investigation and remaining limits](native-backpressure.md). The bounded
+silence-window optimization does not establish loss-free device capture.
