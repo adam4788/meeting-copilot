@@ -113,7 +113,7 @@ class ServerTests(unittest.TestCase):
                 folder = projects / name
                 folder.mkdir()
                 (folder / 'notes.md').write_text(f'Orchid approval for {name}.', encoding='utf-8')
-            engine = KnowledgeEngine(projects, home)
+            engine = KnowledgeEngine(projects, home, _completion=lambda messages: 'Both projects require approval [1] [2].')
             state = server.MeetingState(engine_factory=lambda: engine)
             app = FastAPI()
             app.include_router(server.make_router(state))

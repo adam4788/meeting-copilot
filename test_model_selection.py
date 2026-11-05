@@ -19,95 +19,37 @@ class ModelSelectionTests(unittest.TestCase):
             pass
         return mod
 
-    def test_catalog_lists_only_authenticated_concrete_providers_and_safe_fields(self):
-        models = SimpleNamespace(
-            list_available_providers=lambda: [
-                {'id': 'openai-codex', 'label': 'Codex', 'authenticated': True, 'api_key': 'hidden'},
-                {'id': 'anthropic', 'label': 'Anthropic', 'authenticated': False},
-                {'id': 'auto', 'label': 'Automatic', 'authenticated': True},
-                {'id': 'custom', 'label': 'Custom', 'authenticated': True},
-                {'id': 'lmstudio', 'label': 'Local alias', 'authenticated': True},
-                {'id': 'moa', 'label': 'Mixture', 'authenticated': True},
-                {'id': 'openai-codex', 'label': 'Duplicate', 'authenticated': True}],
-            cached_provider_model_ids=Mock(return_value=['gpt-public', 'gpt-public', 'https://secret', 'sk-credentialvalue123456789']))
-        with patch.dict(sys.modules, {'hermes_cli.models': models}):
-            result = self.module().available_models()
-        self.assertEqual(result, {'providers': [{'id': 'openai-codex', 'label': 'Codex',
-                                                'models': [{'id': 'gpt-public', 'label': 'gpt-public'}]}]})
-        models.cached_provider_model_ids.assert_called_once_with('openai-codex')
-        self.assertNotIn('hidden', json.dumps(result))
+    def test_catalog_lists_fixed_routes_without_oauth_or_secret_values(self):
+        with patch('byok.secret',return_value='synthetic-secret'), patch.dict(sys.modules, {'hermes_cli.models':None,'agent.auxiliary_client':None}):
+            result=self.module().available_models()
+        self.assertEqual({p['id'] for p in result['providers']},{'openai','openrouter'})
+        self.assertTrue(all(p['custom_model'] and p['configured'] for p in result['providers']))
+        self.assertNotIn('synthetic-secret',json.dumps(result))
 
-    def test_validation_requires_exact_catalog_pair_and_rejects_unsafe_before_lookup(self):
-        module = self.module()
-        catalog = {'providers': [{'id': 'openai-codex', 'models': [{'id': 'gpt-public'}]}]}
-        with patch.object(module, 'available_models', return_value=catalog) as lookup:
-            self.assertEqual(module.validate_selection(None, None), (None, None))
-            lookup.assert_not_called()
-            invalid = [('', ''), ('openai-codex', None), (None, 'gpt-public'),
-                       ('auto', 'gpt-public'), ('https://host', 'gpt-public'),
-                       ('openai-codex', 'sk-' + 'x' * 30), ('openai-codex', 'eyJ' + 'x' * 50),
-                       ('openai-codex', 'x' * 201), ([], 'gpt-public'),
-                       ('openai-codex', {'base_url': 'https://host'}),
-                       ('openai-codex', ' gpt-public'), ('openai-codex', 'gpt-public\n')]
-            for provider, model in invalid:
-                with self.subTest(provider=provider, model=model), self.assertRaises(ValueError) as error:
-                    module.validate_selection(provider, model)
-                self.assertEqual(str(error.exception), 'Invalid answer model selection')
-            lookup.assert_not_called()
-            self.assertEqual(module.validate_selection('openai-codex', 'gpt-public'), ('openai-codex', 'gpt-public'))
-            for pair in [('openai-codex', 'unknown'), ('unknown', 'gpt-public')]:
-                with self.assertRaisesRegex(ValueError, '^Answer model selection is unavailable$'):
-                    module.validate_selection(*pair)
+    def test_validation_accepts_exact_user_id_without_catalog_or_aliases(self):
+        module=self.module()
+        with patch.object(module,'available_models',side_effect=AssertionError('model discovery forbidden')):
+            self.assertEqual(module.validate_selection('openrouter','vendor/exact:model-1'),('openrouter','vendor/exact:model-1'))
+            for pair in [(None,None),('auto','model'),([], 'model'),({},'model'),('openai','auto'),('openai','https://host'),('openai','sk-private'),('openai','x'*201),('openai',None)]:
+                with self.subTest(pair=pair),self.assertRaises(ValueError):module.validate_selection(*pair)
 
-    def test_catalog_failures_are_empty_and_sanitized(self):
-        models = SimpleNamespace(list_available_providers=Mock(side_effect=RuntimeError('sk-private https://private')),
-                                 cached_provider_model_ids=Mock(return_value=[]))
-        with patch.dict(sys.modules, {'hermes_cli.models': models}):
-            self.assertEqual(self.module().available_models(), {'providers': []})
-        models.list_available_providers = lambda: [{'id': 'openai-codex', 'authenticated': True}]
-        models.cached_provider_model_ids = Mock(side_effect=RuntimeError('sk-private https://private'))
-        with patch.dict(sys.modules, {'hermes_cli.models': models}):
-            self.assertEqual(self.module().available_models(), {'providers': []})
+    def test_missing_scoped_keys_are_reported_unconfigured_without_secret_details(self):
+        with patch('byok.secret',return_value=''):
+            result=self.module().available_models()
+        self.assertTrue(all(not p['configured'] for p in result['providers']))
+        self.assertTrue(all('Hermes Settings' in p['status'] for p in result['providers']))
 
-    def test_empty_selected_response_is_a_failure_not_a_blank_answer(self):
-        module = self.module()
-        for text in [None, '', '   ', []]:
-            create = Mock(return_value=SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))]))
-            auxiliary = SimpleNamespace(resolve_provider_client=lambda **kwargs: (SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))), 'gpt-public'),
-                                        _build_call_kwargs=lambda *args, **kwargs: {})
-            with patch.dict(sys.modules, {'agent.auxiliary_client': auxiliary}), patch.object(module, 'validate_selection', return_value=('openai-codex', 'gpt-public')):
-                with self.subTest(text=text), self.assertRaisesRegex(RuntimeError, '^Selected answer model failed$'):
-                    module.selected_completion('openai-codex', 'gpt-public')([])
+    def test_missing_credentials_fail_before_transport(self):
+        with patch('byok.secret',return_value=''),patch('urllib.request.build_opener',side_effect=AssertionError('no transport')):
+            with self.assertRaises(ValueError):self.module().selected_completion('openai','exact-model')
 
-    def test_explicit_completion_uses_resolver_and_wire_builder_without_fallback(self):
-        module = self.module()
-        response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=' selected answer '))])
-        create = Mock(return_value=response)
-        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)), base_url='https://configured.private')
-        auxiliary = SimpleNamespace(resolve_provider_client=Mock(return_value=(client, 'gpt-public')),
-                                    _build_call_kwargs=Mock(return_value={'model': 'gpt-public', 'messages': [], 'max_completion_tokens': 600}),
-                                    call_llm=Mock(side_effect=AssertionError('fallback forbidden')))
-        with patch.dict(sys.modules, {'agent.auxiliary_client': auxiliary}), patch.object(module, 'validate_selection', return_value=('openai-codex', 'gpt-public')):
-            complete = module.selected_completion('openai-codex', 'gpt-public')
-            self.assertEqual(complete([{'role': 'user', 'content': 'public prompt'}]), 'selected answer')
-            auxiliary.resolve_provider_client.assert_called_once_with(provider='openai-codex', model='gpt-public')
-            wire = auxiliary._build_call_kwargs.call_args
-            self.assertEqual(wire.args[0:2], ('openai-codex', 'gpt-public'))
-            self.assertEqual(wire.kwargs['max_tokens'], 600)
-            self.assertEqual(wire.kwargs['timeout'], 30)
-            create.assert_called_once_with(model='gpt-public', messages=[], max_completion_tokens=600)
-            auxiliary.call_llm.assert_not_called()
-            create.side_effect = RuntimeError('sk-private https://private.endpoint')
-            with self.assertRaisesRegex(RuntimeError, '^Selected answer model failed$'):
-                complete([])
-            auxiliary.resolve_provider_client.return_value = (client, 'different-model')
-            with self.assertRaisesRegex(RuntimeError, '^Selected answer model failed$'):
-                complete([])
-            auxiliary.resolve_provider_client.return_value = (None, None)
-            with self.assertRaisesRegex(RuntimeError, '^Selected answer model failed$'):
-                complete([])
-            self.assertEqual(create.call_count, 2)
-            auxiliary.call_llm.assert_not_called()
+    def test_explicit_completion_delegates_only_to_bounded_byok_route(self):
+        route=Mock(return_value='synthetic answer')
+        with patch('byok.completion',return_value=route) as build,patch.dict(sys.modules,{'agent.auxiliary_client':None}):
+            complete=self.module().selected_completion('openai','exact-model')
+            self.assertEqual(complete([{'role':'user','content':'synthetic'}]),'synthetic answer')
+        build.assert_called_once_with('openai','exact-model')
+        self.assertEqual(route.call_count,1)
 
 
 class KnowledgeSelectionTests(unittest.TestCase):
@@ -117,6 +59,7 @@ class KnowledgeSelectionTests(unittest.TestCase):
         engine.search = Mock(return_value=[])
         engine.projects = Mock(return_value=[])
         engine._complete = Mock(return_value='default answer')
+        engine._completion_override = engine._complete
         return engine
 
     def test_default_keeps_one_argument_injected_completion_for_planner_and_answer(self):
@@ -134,44 +77,25 @@ class KnowledgeSelectionTests(unittest.TestCase):
     _aux = None
     _calls = None
 
-    def test_concurrent_selected_and_default_requests_never_share_routes(self):
+    def test_concurrent_selected_and_injected_routes_never_share_state(self):
         from concurrent.futures import ThreadPoolExecutor
         import threading
-        engine = self.engine()
-        original = engine._complete
-        barrier = threading.Barrier(3)
-        calls = []
-        lock = threading.Lock()
-        def resolver(provider, model):
-            def create(**kwargs):
-                with lock:
-                    calls.append((provider, model, kwargs['model'], kwargs['messages'][0]['content']))
-                text = f'{provider}/{model}'
-                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))])
-            return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))), model
-        def builder(provider, model, messages, **kwargs):
-            return {'model': model, 'messages': messages}
-        def planner(question, transcript, sources, projects, complete):
-            barrier.wait(timeout=5)
-            complete([{'role': 'user', 'content': 'planner:' + question}])
-            barrier.wait(timeout=5)
-            return {'needed': False, 'reason': 'not_needed'}
-        auxiliary = SimpleNamespace(resolve_provider_client=resolver, _build_call_kwargs=builder,
-                                    call_llm=Mock(side_effect=AssertionError('no default routing')))
-        with patch.dict(sys.modules, {'agent.auxiliary_client': auxiliary}), patch('model_selection.validate_selection', side_effect=lambda p, m: (p, m)), patch('knowledge.plan_web', side_effect=planner):
+        engine=self.engine()
+        original=engine._complete
+        barrier=threading.Barrier(3)
+        def selected(provider,model):
+            return lambda messages:f'{provider}/{model}'
+        def planner(question,transcript,sources,projects,complete):
+            barrier.wait(timeout=2)
+            return {'needed':False,'reason':'not_needed'}
+        with patch('model_selection.selected_completion',side_effect=selected),patch('knowledge.plan_web',side_effect=planner):
             with ThreadPoolExecutor(max_workers=3) as pool:
-                futures = [pool.submit(engine.answer, model, web_fallback=True, answer_provider=provider, answer_model=model)
-                           for provider, model in [('provider-one', 'model-one'), ('provider-two', 'model-two')]]
-                futures.append(pool.submit(engine.answer, 'default', web_fallback=True))
-                results = [future.result(timeout=10) for future in futures]
-        self.assertEqual([r['answer'] for r in results], ['provider-one/model-one', 'provider-two/model-two', 'default answer'])
-        self.assertIs(engine._complete, original)
-        self.assertEqual(original.call_count, 2)
-        self.assertEqual(len(calls), 4)
-        for provider, model, wire_model, prompt in calls:
-            self.assertEqual(model, wire_model)
-            self.assertEqual(provider[-3:], model[-3:])
-        self.assertEqual({row[3] for row in calls if row[3].startswith('planner:')}, {'planner:model-one', 'planner:model-two'})
+                a=pool.submit(engine.answer,'a',web_fallback=True,answer_provider='openai',answer_model='exact-a')
+                b=pool.submit(engine.answer,'b',web_fallback=True,answer_provider='openrouter',answer_model='vendor/exact-b')
+                c=pool.submit(engine.answer,'c',web_fallback=True)
+                answers=[f.result(timeout=5)['answer'] for f in (a,b,c)]
+        self.assertEqual(answers,['openai/exact-a','openrouter/vendor/exact-b','default answer'])
+        self.assertIs(engine._complete,original)
 
     def test_invalid_selection_is_rejected_before_retrieval_and_failure_never_uses_default(self):
         engine = self.engine()
@@ -224,39 +148,22 @@ class StreamingSelectionTests(ModelSelectionTests):
         return auxiliary
 
     def test_sse_frames_yield_distinct_ordered_deltas(self):
-        import sys
-        frames = ['data: {"choices":[{"delta":{"content":"Two "}}]}\n\n',
-                  'data: {"choices":[{"delta":{"content":"reviewers."}}]}\n\n', 'data: [DONE]\n\n']
-        aux = self._hermes(frames=frames)
-        module = self.module()
-        self._catalog(module)
-        with patch.dict(sys.modules, {'agent.auxiliary_client': aux}):
-            complete = module.selected_completion('provider-one', 'model-one')
-            deltas = list(complete.stream_chunks([{'role': 'user', 'content': 'hi'}]))
-        self.assertEqual(deltas, ['Two ', 'reviewers.'])
-        self.assertTrue(self._calls[0]['stream'])
-        self.assertEqual(self._calls[0]['model'], 'model-one')
+        # BYOK deliberately exposes completed-only; it cannot probe or retry a stream.
+        with patch('byok.secret',return_value='synthetic-key'), patch('urllib.request.build_opener',side_effect=AssertionError('construction must not submit')):
+            complete=self.module().selected_completion('openai','exact-model')
+        self.assertFalse(hasattr(complete,'stream_chunks'))
 
     def test_completed_only_response_reports_honestly(self):
-        import sys
-        from types import SimpleNamespace
-        aux = self._hermes(completed={'text': 'Final answer.'})
-        module = self.module()
-        self._catalog(module)
-        with patch.dict(sys.modules, {'agent.auxiliary_client': aux}):
-            complete = module.selected_completion('provider-one', 'model-one')
-            with self.assertRaisesRegex(NotImplementedError, 'streaming_unsupported'):
-                list(complete.stream_chunks([{'role': 'user', 'content': 'hi'}]))
+        # BYOK deliberately exposes completed-only; it cannot probe or retry a stream.
+        with patch('byok.secret',return_value='synthetic-key'), patch('urllib.request.build_opener',side_effect=AssertionError('construction must not submit')):
+            complete=self.module().selected_completion('openai','exact-model')
+        self.assertFalse(hasattr(complete,'stream_chunks'))
 
     def test_stream_rejecting_signature_reports_honestly(self):
-        import sys
-        aux = self._hermes(frames=[], reject_stream=True)
-        module = self.module()
-        self._catalog(module)
-        with patch.dict(sys.modules, {'agent.auxiliary_client': aux}):
-            complete = module.selected_completion('provider-one', 'model-one')
-            with self.assertRaisesRegex(NotImplementedError, 'streaming_unsupported'):
-                list(complete.stream_chunks([{'role': 'user', 'content': 'hi'}]))
+        # BYOK deliberately exposes completed-only; it cannot probe or retry a stream.
+        with patch('byok.secret',return_value='synthetic-key'), patch('urllib.request.build_opener',side_effect=AssertionError('construction must not submit')):
+            complete=self.module().selected_completion('openai','exact-model')
+        self.assertFalse(hasattr(complete,'stream_chunks'))
 
     def test_extract_rejects_malformed_and_chunked_completed_strings(self):
         from types import SimpleNamespace
@@ -343,6 +250,7 @@ class StreamingSelectionTests(ModelSelectionTests):
         def finish_chunk():
             return SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(), finish_reason='stop')])
         def gated_stream():
+            calls.append({'synthetic_stream':True})
             entered.set()
             yield delta_chunk('first ')
             release.wait(5)  # stay unfinished until the consumer proves arrival
@@ -362,8 +270,7 @@ class StreamingSelectionTests(ModelSelectionTests):
         received = _queue.Queue()
         errors = _queue.Queue()
         with patch.dict(sys.modules, {'agent.auxiliary_client': auxiliary}):
-            complete = module.selected_completion('provider-one', 'model-one')
-            stream = complete.stream_chunks([{'role': 'user', 'content': 'hi'}])
+            stream = module.iter_openai_sse_deltas(gated_stream())
             first_holder = {}
             def consume():
                 try:
@@ -624,61 +531,27 @@ class StreamingSelectionTests(ModelSelectionTests):
             list(module.iter_openai_sse_deltas(BrokenSource()))
 
     def test_sdk_object_stream_yields_incremental_deltas_without_double_paid_call(self):
-        import sys
-        from types import SimpleNamespace
-        module = self.module()
-        self._catalog(module)
-        calls = []
-
-        def delta_chunk(text):
-            return SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=text))])
-
-        def resolver(provider, model):
-            def create(**kwargs):
-                calls.append(dict(kwargs))
-                if kwargs.get('stream'):
-                    return iter([delta_chunk('Two '), delta_chunk('reviewers.'),
-                                   SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(), finish_reason='stop')])])
-                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='unused'))])
-            return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))), model
-        def builder(provider, model, messages, **kwargs):
-            return {'model': model, 'messages': messages}
-        auxiliary = SimpleNamespace(resolve_provider_client=resolver, _build_call_kwargs=builder,
-                                    call_llm=Mock(side_effect=AssertionError('no default routing')))
-        with patch.dict(sys.modules, {'agent.auxiliary_client': auxiliary}):
-            complete = module.selected_completion('provider-one', 'model-one')
-            deltas = list(complete.stream_chunks([{'role': 'user', 'content': 'hi'}]))
-        self.assertEqual(deltas, ['Two ', 'reviewers.'])
-        self.assertEqual(len(calls), 1)  # exactly one paid streaming call
-        self.assertTrue(calls[0]['stream'])
+        # BYOK deliberately exposes completed-only; it cannot probe or retry a stream.
+        with patch('byok.secret',return_value='synthetic-key'), patch('urllib.request.build_opener',side_effect=AssertionError('construction must not submit')):
+            complete=self.module().selected_completion('openai','exact-model')
+        self.assertFalse(hasattr(complete,'stream_chunks'))
 
 
 class CatalogSingleFlightTests(unittest.TestCase):
-    def test_concurrent_misses_share_one_discovery(self):
-        import importlib
-        import sys
-        import threading
-        import time
-        from types import SimpleNamespace
-        from unittest.mock import Mock, patch
-        module = importlib.import_module('model_selection')
-        module.clear_catalog_cache()
-        calls = []
-        def slow_ids(provider):
-            time.sleep(0.2)
-            calls.append(provider)
-            return ['gpt-public']
-        models = SimpleNamespace(
-            list_available_providers=lambda: [{'id': 'openai-codex', 'label': 'Codex', 'authenticated': True}],
-            cached_provider_model_ids=slow_ids)
-        with patch.dict(sys.modules, {'hermes_cli.models': models}):
-            threads = [threading.Thread(target=module.available_models) for _ in range(8)]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(10)
-        self.assertEqual(calls, ['openai-codex'])
-        module.clear_catalog_cache()
+    def test_readiness_is_request_local_instead_of_singleflight_cached(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import contextvars
+        flag=contextvars.ContextVar('synthetic_readiness',default='')
+        def catalog():
+            import model_selection
+            return model_selection.available_models()
+        contexts=[]
+        for value in ('synthetic-key',''):
+            token=flag.set(value);contexts.append(contextvars.copy_context());flag.reset(token)
+        with patch('byok.secret',side_effect=lambda name:flag.get()),ThreadPoolExecutor(max_workers=2) as pool:
+            rows=[f.result(timeout=2) for f in [pool.submit(c.run,catalog) for c in contexts]]
+        self.assertTrue(all(p['configured'] for p in rows[0]['providers']))
+        self.assertTrue(all(not p['configured'] for p in rows[1]['providers']))
 
 
 class TruncatedStreamTests(unittest.TestCase):

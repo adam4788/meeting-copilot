@@ -1,18 +1,17 @@
-"""Direct Meta Model API route (Muse Spark) for the meeting copilot.
-
-The hackathon requires the app to actually use Meta models. This module calls
-the Meta Model API's OpenAI-compatible Chat Completions endpoint directly, so
-Meta usage never depends on Hermes provider configuration. MODEL_API_KEY comes
-from Hermes' trusted secret scope, or the standalone process environment. The
-launch owner's startup bridge may seed its saved dotenv value when the process
-key is empty; routed scopes never borrow that key. No request body supplies keys
-and nothing here writes Hermes configuration or credential files.
-"""
+"""Optional explicit Meta API route. Hermes owns all plugin secrets."""
 import codecs
 import json
 import os
 from pathlib import Path
 import urllib.request
+
+
+def _urlopen(request, timeout):
+    try:
+        from .byok import _NoRedirect
+    except ImportError:
+        from byok import _NoRedirect
+    return urllib.request.build_opener(_NoRedirect()).open(request, timeout=timeout)
 
 
 def _secret_scope():
@@ -26,68 +25,14 @@ def _secret_scope():
         raise
 
 
-def _load_dotenv_key_once():
-    """Seed the launch owner's key once; never publish routed profile secrets.
-
-    A genuinely nonempty service environment wins. Empty/whitespace inherited
-    placeholders do not block a saved key. Startup requires agreement on every
-    target assignment (last assignment wins, no expansion); editing is stricter.
-    This is startup/unscoped precedence ONLY; a host-built request scope can prefer its saved file.
-    """
-    if os.environ.get('MODEL_API_KEY', '').strip():
-        return
-    if not os.environ.get('HERMES_LAUNCHD_LABEL', '').startswith('ai.hermes.gateway'):
-        return
+def resolve_model_api_key(*, standalone=False):
     try:
-        if __package__:
-            from .credential_env import startup_value, TOKENIZER_UNAVAILABLE
-        else:
-            from credential_env import startup_value, TOKENIZER_UNAVAILABLE
-        scope = _secret_scope()
-        if scope is None:
-            return TOKENIZER_UNAVAILABLE
-        if scope.serves_routed_profile():
-            return
-        # No standalone approximation: require the actual installed tokenizer.
-        host_parser = getattr(scope, '_parse_env_text', None)
-        if not callable(host_parser):
-            return TOKENIZER_UNAVAILABLE
-        home = Path(os.environ.get('HERMES_HOME') or Path.home() / '.hermes')
-        with (home / '.env').open('rb') as file:
-            raw = file.read(1024 * 1024 + 1)
-        if len(raw) > 1024 * 1024:
-            return
-        value = startup_value(raw, host_parser).strip()
-        if value and not os.environ.get('MODEL_API_KEY', '').strip():
-            os.environ['MODEL_API_KEY'] = value
-    except Exception:
-        # No secret, file content or host exception may escape startup.
-        return
+        from .byok import secret
+    except ImportError:
+        from byok import secret
+    return secret('MODEL_API_KEY', standalone=standalone)
 
-
-_startup_key_error = _load_dotenv_key_once()
-
-
-def resolve_model_api_key():
-    """Use the host's snapshot, never a foreign launch key.
-
-    New host-scoped requests may see file edits immediately and prefer the file
-    over inherited keys. Existing closures/workers keep their captured value.
-    Unscoped owner code reads its process key; edits do not mutate that key.
-    """
-    try:
-        scope = _secret_scope()
-        if scope is None:
-            key = os.environ.get('MODEL_API_KEY', '')
-        else:
-            # get_secret on some hosts still falls back to the launch env for
-            # an unbound home override outside multiplex mode. Close that gap.
-            if scope.serves_routed_profile() and scope.current_secret_scope() is None:
-                return ''
-            key = scope.get_secret('MODEL_API_KEY', '')
-        return key.strip() if isinstance(key, str) else ''
-    except Exception:
-        return ''
+_startup_key_error = None
 
 META_BASE_URL = 'https://api.meta.ai/v1'
 META_MODELS = ('muse-spark-1.3', 'muse-spark-1.2', 'muse-spark-1.1')
@@ -108,20 +53,20 @@ def validate_meta_model(model):
     return model
 
 
-def meta_completion(model=None):
+def meta_completion(model=None, *, standalone=False):
     """Request-local completion closure over the Meta Model API."""
     model = validate_meta_model(model)
-    key = resolve_model_api_key()
+    key = resolve_model_api_key(standalone=standalone)
     if len(key) < 8:
         raise ValueError(_startup_key_error or 'Meta Model API key is not configured')
 
     def complete(messages):
-        body = json.dumps({'model': model, 'messages': messages, 'max_tokens': 600}).encode('utf-8')
+        body = json.dumps({'model': model, 'messages': messages, 'max_tokens': 2048, 'reasoning_effort': 'low'}).encode('utf-8')
         request = urllib.request.Request(
             META_BASE_URL + '/chat/completions', data=body,
             headers={'Authorization': 'Bearer ' + key.strip(), 'Content-Type': 'application/json'})
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with _urlopen(request, timeout=30) as response:
                 raw = response.read(262144 + 1)
         except Exception as exc:
             raise RuntimeError(f'Meta Model API request failed ({type(exc).__name__})') from None
@@ -135,6 +80,8 @@ def meta_completion(model=None):
             text = payload['choices'][0]['message']['content']
         except (KeyError, IndexError, TypeError):
             raise RuntimeError('Meta Model API returned no text answer') from None
+        if payload['choices'][0].get('finish_reason') in ('length', 'content_filter'):
+            raise RuntimeError('Meta Model API returned an incomplete answer')
         if not isinstance(text, str) or not text.strip():
             raise RuntimeError('Meta Model API returned no text answer')
         return text.strip()
@@ -147,14 +94,14 @@ def meta_completion(model=None):
         NotImplementedError('streaming_unsupported...') so callers show
         completed-only honestly instead of faking streaming.
         """
-        body = json.dumps({'model': model, 'messages': messages, 'max_tokens': 600,
+        body = json.dumps({'model': model, 'messages': messages, 'max_tokens': 2048, 'reasoning_effort': 'low',
                            'stream': True}).encode('utf-8')
         request = urllib.request.Request(
             META_BASE_URL + '/chat/completions', data=body,
             headers={'Authorization': 'Bearer ' + key.strip(), 'Content-Type': 'application/json',
                      'Accept': 'text/event-stream'})
         try:
-            response = urllib.request.urlopen(request, timeout=30)
+            response = _urlopen(request, timeout=30)
         except Exception as exc:
             raise RuntimeError(f'Meta Model API request failed ({type(exc).__name__})') from None
         deltas = []

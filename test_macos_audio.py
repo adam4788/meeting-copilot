@@ -8,7 +8,8 @@ from unittest.mock import patch
 
 
 def _scratch_dir():
-    scratch = Path.home() / '.hermes/cache/scratch'
+    import tempfile
+    scratch = Path(tempfile.gettempdir()) / 'meeting-copilot-test-scratch'
     scratch.mkdir(parents=True, exist_ok=True)
     return scratch
 
@@ -57,7 +58,7 @@ class GatewayTests(unittest.TestCase):
         command = calls[0]
         self.assertEqual(command[command.index('--provider') + 1], 'meta')
         self.assertEqual(command[command.index('--asr-mode') + 1], 'DIARIZATION')
-        with patch.dict(os.environ, {'MODEL_API_KEY': 'k'}, clear=False):
+        with patch('macos_audio._model_api_key', return_value='synthetic-scoped-key'):
             self.assertTrue(module.MacOSAudioCapture().devices()['meta_asr_available'])
         import tempfile
         with patch.dict(os.environ, {'HERMES_HOME': tempfile.mkdtemp(prefix='mc-no-key-')}, clear=True):

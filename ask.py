@@ -2,16 +2,17 @@
 
 Reads a transcript file plus a project-docs directory, answers one
 question with numbered citations, and prints sources, warnings, and
-timing. Offline by default (fake provider); Meta provider via
-MODEL_API_KEY for real answers. Web research and session history are
+timing. Offline by default (fake provider); explicit OpenAI/OpenRouter BYOK
+uses OPENAI_API_KEY/OPENROUTER_API_KEY and an exact model ID. Optional Meta uses
+MODEL_API_KEY. Web research and session history are
 unavailable standalone — the tool says so instead of failing obscurely.
 
 Usage:
   python ask.py --question "..." --docs ./sample-docs \
-      [--transcript meeting.json] [--project NAME] [--provider fake|meta] \
-      [--model meta-...] [--json]
-  The default provider is fake (fully offline). Use --provider meta with a
-  real MODEL_API_KEY for live answers.
+      [--transcript meeting.json] [--project NAME] [--provider fake|openai|openrouter|meta] \
+      [--model EXACT_ID] [--json]
+  The default provider is fake (fully offline). Standalone API keys are read
+  only from the calling process environment; no credential files are loaded.
 """
 
 import argparse
@@ -327,16 +328,22 @@ def load_transcript(path):
 def build_completion(provider, model):
     if provider == 'fake':
         return fake_completion_factory()
+    if provider in ('openai', 'openrouter'):
+        try:
+            from .byok import completion
+        except ImportError:
+            from byok import completion
+        return completion(provider, model, standalone=True)
     if provider == 'meta':
         try:
             from .meta_models import api_key_present, meta_completion
         except ImportError:
             from meta_models import api_key_present, meta_completion
-        if not api_key_present():
+        if len(os.environ.get('MODEL_API_KEY', '').strip()) < 8:
             raise SystemExit(
                 'Meta provider needs MODEL_API_KEY (min 8 chars) in the '
                 'environment. Use --provider fake for an offline smoke test.')
-        return meta_completion(model)
+        return meta_completion(model, standalone=True)
     raise SystemExit(f'Unknown provider {provider!r}: use fake|meta')
 
 
@@ -386,9 +393,9 @@ def main(argv=None):
     parser.add_argument('--project', default=None, help='Project subfolder under --docs '
                         '(default: the only subfolder, if exactly one).')
     parser.add_argument('--all', action='store_true', help='Search all projects under --docs.')
-    parser.add_argument('--provider', default='fake', choices=('meta', 'fake'),
+    parser.add_argument('--provider', default='fake', choices=('openai', 'openrouter', 'meta', 'fake'),
                         help='Completion backend (default fake: fully offline).')
-    parser.add_argument('--model', default=None, help='Meta model override (meta provider only).')
+    parser.add_argument('--model', default=None, help='Exact model ID for the selected API provider.')
     parser.add_argument('--web-query', default=None,
                         help='NOT YET SUPPORTED standalone: exits with guidance.')
     parser.add_argument('--search', default=None, metavar='TERMS',
@@ -540,10 +547,22 @@ def main(argv=None):
                 from .meta_models import api_key_present
             except ImportError:
                 from meta_models import api_key_present
-            provider_ready = api_key_present()
+            provider_ready = len(os.environ.get('MODEL_API_KEY', '').strip()) >= 8
             if not provider_ready:
                 problems.append('provider meta: MODEL_API_KEY must be at least 8 characters after trimming whitespace')
-        provider_report = {'provider': args.provider, 'ready': provider_ready}
+        if args.provider in ('openai', 'openrouter'):
+            try:
+                from .byok import secret, PROVIDERS, validate
+            except ImportError:
+                from byok import secret, PROVIDERS, validate
+            provider_ready = bool(secret(PROVIDERS[args.provider][1], standalone=True))
+            try:
+                validate(args.provider, args.model)
+            except ValueError:
+                provider_ready = False
+            if not provider_ready:
+                problems.append('Provider needs its environment key and an exact --model ID; connection unverified.')
+        provider_report = {'provider': args.provider, 'ready': provider_ready, 'connection_verified': False}
         if args.provider == 'meta':
             provider_report['connection_verified'] = False
             warn('Meta provider credentials, network access, and model availability are not verified; '

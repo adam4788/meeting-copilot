@@ -57,6 +57,7 @@ class _PrivateValidationRoute(APIRoute):
 
 
 class AssistRequest(BaseModel):
+    model_config = {'extra': 'forbid'}
     response_contract: str | None = Field(default=None, max_length=40)
     question: str = Field(default='', max_length=4000)
     request_id: str | None = Field(default=None, max_length=100)
@@ -126,8 +127,7 @@ def _meta_key_present():
         module = importlib.import_module(f'{__package__}.meta_models' if __package__ else 'meta_models')
         return module.api_key_present()
     except Exception:
-        import os
-        return bool(os.environ.get('MODEL_API_KEY'))
+        return False
 
 
 class MeetingState:
@@ -650,6 +650,13 @@ class MeetingState:
             raise _AnswerRejected(400, 'Choose a valid history setting.')
         if not include_history and (not project or all_projects or web_fallback or (web_query and web_query.strip())):
             raise _AnswerRejected(400, 'History off requires one project and web search off.')
+        if answer_provider is not None or answer_model is not None:
+            try:
+                import importlib
+                selection = importlib.import_module(f'{__package__}.model_selection' if __package__ else 'model_selection')
+                selection.validate_selection(answer_provider, answer_model)
+            except ValueError:
+                raise _AnswerRejected(400, 'Choose a supported provider and exact model ID.') from None
         with self.lock:
             # Overlay questions belong to the snapshot the user clicked, not
             # whichever meeting is current when its worker finally arrives.

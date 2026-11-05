@@ -19,7 +19,25 @@ import time
 from macos_audio import MODELS, SOURCES, validate, error_message
 
 MAX_FRAME = 100000
-CHUNK_SAMPLES = 64000  # Four seconds, separately buffered per source.
+CHUNK_SAMPLES = 64000  # Earliest utterance boundary, separately per source.
+MAX_CHUNK_SAMPLES = 192000  # Twelve-second bound for continuous speech.
+SILENCE_SAMPLES = 6400  # 400ms trailing silence; avoid cutting words at four seconds.
+
+
+def utterance_boundary(buffers, count):
+    """Bounded energy endpointing, not speaker detection or a semantic VAD.
+
+    Quiet microphones may need system gain adjustment. Continuous/noisy input
+    still flushes at the hard bound; no claim that every word boundary is safe.
+    """
+    if count >= MAX_CHUNK_SAMPLES:
+        return True
+    if count < CHUNK_SAMPLES:
+        return False
+    import numpy as np
+    tail = np.concatenate(buffers)[-SILENCE_SAMPLES:]
+    return len(tail) >= SILENCE_SAMPLES and float(np.sqrt(np.mean(tail.astype(np.float64) ** 2))) < 0.008
+
 _OUTPUT_LOCK = threading.Lock()
 
 
@@ -193,7 +211,7 @@ def run_capture(model, source, language, helper=None, stop=None):
                     stamps[speaker] = stamp
                 buffers[speaker].append(samples)
                 counts[speaker] += len(samples)
-                if counts[speaker] >= CHUNK_SAMPLES:
+                if utterance_boundary(buffers[speaker], counts[speaker]):
                     enqueue((speaker, np.concatenate(buffers[speaker]), stamps[speaker]))
                     buffers[speaker], counts[speaker] = [], 0
         except Exception:
@@ -447,7 +465,7 @@ def main(argv=None):
         import meta_asr
         try:
             import meta_models
-            api_key = meta_models.resolve_model_api_key()
+            api_key = meta_models.resolve_model_api_key(standalone=True)
         except Exception:
             api_key = ''  # scope failures must not expose a launch-profile key
         if not api_key:

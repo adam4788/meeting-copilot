@@ -1,3 +1,7 @@
+# BYOK foundation
+
+Start with [BYOK setup and boundaries](docs/byok.md). OpenAI and OpenRouter are the explicit answer routes; local transcription remains independent. Older Meta-first instructions below describe the previous demo.
+
 # Meeting Copilot
 
 A source-grounded meeting assistant for Hermes Desktop by **Adam Nugroho**.

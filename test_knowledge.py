@@ -6,7 +6,21 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from knowledge import KnowledgeEngine
+from knowledge import KnowledgeEngine as RuntimeKnowledgeEngine
+
+# These retrieval/stream tests inject a provider explicitly. Their historical
+# _complete patches are synthetic transport fixtures, never a host-model route.
+class _InjectedFixture:
+    def __init__(self, owner): self.owner=owner
+    @property
+    def complete(self): return self.owner._complete
+    @property
+    def stream_chunks(self): return getattr(self.owner._complete, 'stream_chunks', None)
+
+class KnowledgeEngine(RuntimeKnowledgeEngine):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._completion_override=_InjectedFixture(self)
 
 
 class KnowledgeTests(unittest.TestCase):
@@ -125,15 +139,14 @@ class KnowledgeTests(unittest.TestCase):
                 KnowledgeEngine(self.projects, self.home)
 
     def test_model_adapter_does_not_offer_tools(self):
-        import sys
-        from types import SimpleNamespace
-        from unittest.mock import Mock
-        call = Mock(return_value=SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='Grounded [1].'))]))
-        fake = SimpleNamespace(call_llm=call)
-        with patch.dict(sys.modules, {'agent': SimpleNamespace(), 'agent.auxiliary_client': fake}):
-            self.assertEqual(self.engine._complete([]), 'Grounded [1].')
-        self.assertIsNone(call.call_args.kwargs['tools'])
-        self.assertEqual(call.call_args.kwargs['timeout'], 30)
+        import io,byok
+        response=io.BytesIO(json.dumps({'choices':[{'finish_reason':'stop','message':{'content':'Grounded [1].'}}]}).encode())
+        opener=Mock();opener.open.return_value=response
+        with patch('byok.secret',return_value='synthetic-key'),patch('urllib.request.build_opener',return_value=opener):
+            self.assertEqual(byok.completion('openai','exact-model')([]),'Grounded [1].')
+        request=opener.open.call_args.args[0]
+        self.assertNotIn('tools',json.loads(request.data))
+        self.assertEqual(opener.open.call_args.kwargs['timeout'],30)
 
     def test_all_scope_discloses_cross_project_context_and_limits(self):
         (self.project / 'notes.md').write_text('Orchid approval.', encoding='utf-8')
@@ -243,7 +256,7 @@ class AnswerStreamTests(KnowledgeTests):
             out_header, chunks = self.engine.answer_stream('What does Orchid require?', project='alpha')
             received = list(chunks)
         self.assertEqual(received, ['Orchid ', 'requires review [1].'])
-        self.assertEqual(out_header['model_route'], 'hermes-configured')
+        self.assertEqual(out_header['model_route'], 'injected')
 
     def test_answer_stream_completed_only_route_raises_honestly(self):
         def plain(messages):
@@ -265,7 +278,7 @@ class AnswerStreamTests(KnowledgeTests):
                 'What does Orchid require?', project='alpha', web_fallback=True)
             received = list(chunks)
         self.assertEqual(received, ['Orchid ', 'requires review [1].'])
-        self.assertEqual(out_header['model_route'], 'hermes-configured')
+        self.assertEqual(out_header['model_route'], 'injected')
         self.assertTrue(out_header['streaming'])
         self.assertFalse(out_header['completed_only'])
         self.assertTrue(out_header['sources'], 'streaming must carry retrieval citations')
@@ -454,19 +467,11 @@ class LargeCorpusBoundTests(KnowledgeTests):
 
 
 class DefaultMetaStreamFallbackTests(KnowledgeTests):
-    def test_default_meta_stream_failure_before_output_falls_back(self):
-        import os
-        from unittest.mock import Mock, patch
-        (self.project / 'notes.md').write_text('Orchid approval.', encoding='utf-8')
-        def failing_stream(messages):
-            raise RuntimeError('meta stream down')
-        meta_complete = Mock(side_effect=AssertionError('must not complete'))
-        meta_complete.stream_chunks = failing_stream
-        with patch.dict(os.environ, {'MODEL_API_KEY': 'test-key-12345'}):
-            with patch('meta_models.meta_completion', return_value=meta_complete):
-                with self.assertRaises(NotImplementedError) as ctx:
-                    self.engine.answer_stream('What does Orchid require?', project='alpha', web_fallback=False)
-        self.assertIn('streaming_unsupported', str(ctx.exception))
+    def test_default_meta_never_submits_or_falls_back(self):
+        engine=RuntimeKnowledgeEngine(self.projects,self.home)
+        with patch('meta_models.meta_completion',side_effect=AssertionError('automatic Meta forbidden')), patch.object(engine,'_complete',side_effect=AssertionError('host model forbidden')):
+            with self.assertRaises(ValueError):engine.answer_stream('synthetic question',project='alpha')
+            with self.assertRaises(ValueError):engine.answer('synthetic question',project='alpha')
 
     def test_explicit_provider_stream_failure_stays_an_error(self):
         import model_selection
@@ -503,8 +508,11 @@ class ProviderBoundaryAbortTests(unittest.TestCase):
         with patch('meta_models.api_key_present', return_value=True), \
              patch('meta_models.meta_completion', return_value=failing_meta), \
              patch.object(engine, '_complete', hermes_spy):
+            result=engine.answer('q?', transcript='hello there', answer_provider='meta', answer_model='muse-spark-1.3', should_abort=lambda: flag[0])
+            self.assertTrue(flag[0])
+            self.assertIn('unavailable',result['answer'])
             with self.assertRaises(_Aborted):
-                engine.answer('q?', transcript='hello there', should_abort=lambda: flag[0])
+                engine.answer('q?', transcript='hello there', answer_provider='meta', answer_model='muse-spark-1.3', should_abort=lambda: flag[0])
         hermes_spy.assert_not_called()
 
     def test_cancel_between_stream_setup_and_consumption_never_submits(self):
@@ -570,7 +578,6 @@ class PreparedReuseTests(unittest.TestCase):
         self.home.mkdir()
 
     def test_prepared_web_search_provenance_survives_fallback(self):
-        from knowledge import KnowledgeEngine
         engine = KnowledgeEngine(self.projects, self.home)
         with patch.object(engine, '_complete', Mock(return_value='done [1].')):
             result = engine.answer('q?', transcript='hello',
@@ -579,7 +586,6 @@ class PreparedReuseTests(unittest.TestCase):
         self.assertEqual(result['web_search']['used'], True)
 
     def test_sync_stream_setup_failure_carries_prepared_retrieval(self):
-        from knowledge import KnowledgeEngine
         engine = KnowledgeEngine(self.projects, self.home)
         search_spy = Mock(side_effect=engine.search)
         with patch.object(engine, 'search', search_spy), \
@@ -676,7 +682,6 @@ class SyncSetupPreparedRouteTests(unittest.TestCase):
         self.home.mkdir()
 
     def test_sync_setup_failure_carries_model_route(self):
-        from knowledge import KnowledgeEngine
         engine = KnowledgeEngine(self.projects, self.home)
         with patch.object(engine, '_complete', object()):
             with self.assertRaises(NotImplementedError) as ctx:
@@ -698,7 +703,6 @@ class WebPlannedReuseTests(unittest.TestCase):
         self.home.mkdir()
 
     def test_planned_but_unused_web_is_not_replanned(self):
-        from knowledge import KnowledgeEngine
         engine = KnowledgeEngine(self.projects, self.home)
         with patch.object(engine, '_complete', Mock(return_value='done [1].')), \
              patch('knowledge.plan_web') as plan_spy:

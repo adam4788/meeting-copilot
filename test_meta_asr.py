@@ -149,30 +149,15 @@ class FileTranscribeTests(unittest.TestCase):
 
 
 class KeyResolutionTests(unittest.TestCase):
-    def test_dotenv_seeds_env_once_and_env_wins(self):
-        import importlib.util
-        if importlib.util.find_spec('agent') is None:
-            self.skipTest('Startup bridge requires the installed host tokenizer')
+    def test_plugin_never_loads_dotenv_and_standalone_is_explicit(self):
         import os
-        import tempfile
-        import unittest.mock
         import meta_models
-        with tempfile.TemporaryDirectory() as home:
-            with open(os.path.join(home, '.env'), 'w') as handle:
-                handle.write('OTHER=1\nMODEL_API_KEY="filekey123456"\n')
-            with unittest.mock.patch.dict(os.environ, {'HERMES_HOME': home, 'HERMES_LAUNCHD_LABEL': 'ai.hermes.gateway'}, clear=False):
-                os.environ.pop('MODEL_API_KEY', None)
-                meta_models._load_dotenv_key_once()
-                self.assertEqual(meta_models.resolve_model_api_key(), 'filekey123456')
-                self.assertTrue(meta_models.api_key_present())
-                os.environ['MODEL_API_KEY'] = 'envkey999'
-                meta_models._load_dotenv_key_once()
-                self.assertEqual(meta_models.resolve_model_api_key(), 'envkey999',
-                                 'a real environment value always wins over .env')
-            with unittest.mock.patch.dict(os.environ, {'HERMES_HOME': home + '-missing'}, clear=False):
-                os.environ.pop('MODEL_API_KEY', None)
-                meta_models._load_dotenv_key_once()
-                self.assertEqual(meta_models.resolve_model_api_key(), '')
+        from unittest.mock import patch
+        with patch.dict(os.environ, {'MODEL_API_KEY':'synthetic-cli'}), patch('byok.secret',return_value=''):
+            self.assertEqual(meta_models.resolve_model_api_key(),'')
+        with patch.dict(os.environ, {'MODEL_API_KEY':'synthetic-cli'}):
+            self.assertEqual(meta_models.resolve_model_api_key(standalone=True),'synthetic-cli')
+        self.assertFalse(hasattr(meta_models,'_load_dotenv_key_once'))
 
 
 class WorkerProviderTests(unittest.TestCase):

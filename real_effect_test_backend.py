@@ -1,3 +1,6 @@
+# OBSOLETE DEVELOPMENT FIXTURE: exercises the retired plugin-owned credential
+# editor. Not installed and not part of current CI/runtime validation. Use
+# test_byok_setup.py, test_credential_host_scope.py and test_desktop.mjs instead.
 """Offline review bridge, production router/secret scopes; no network/hardware."""
 import sys, os, json, socket, threading
 from pathlib import Path

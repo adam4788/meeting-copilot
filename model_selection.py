@@ -37,209 +37,47 @@ def _safe_id(value):
 
 
 def available_models():
-    """JSON-only authenticated, concrete Hermes providers and authoritative catalogs.
-
-    Generic custom/auto/MoA routes are omitted: they can auto-select another backend,
-    or represent an endpoint without established authentication. Model availability
-    remains subject to the provider/account at invocation time.
-    """
-    import time as _time
-    try:
-        if _CATALOG_CACHE['value'] is not None and (_time.monotonic() - _CATALOG_CACHE['at']) < _CATALOG_TTL_S:
-            return _CATALOG_CACHE['value']
-    except Exception:
-        pass
-    # Single-flight the slow discovery: concurrent misses share one result
-    # instead of repeating provider catalog lookups.
-    if _CATALOG_LOCK is not None:
-        with _CATALOG_LOCK:
-            try:
-                if _CATALOG_CACHE['value'] is not None and (_time.monotonic() - _CATALOG_CACHE['at']) < _CATALOG_TTL_S:
-                    return _CATALOG_CACHE['value']
-            except Exception:
-                pass
-            return _discover_models()
+    # Readiness is scoped to this request; never cache another profile's status.
     return _discover_models()
 
 
 def _discover_models():
-    """Run provider catalog discovery and cache the result."""
-    import time as _time2
     try:
-        from hermes_cli.models import list_available_providers, cached_provider_model_ids
-        rows = list_available_providers()
-    except Exception:
-        return {'providers': []}
-    providers = []
-    seen = set()
-    for row in rows:
-        provider = row.get('id')
-        if not row.get('authenticated') or not _safe_id(provider) or provider in _VIRTUAL or provider in seen:
-            continue
-        seen.add(provider)
-        try:
-            catalog = cached_provider_model_ids(provider)
-        except Exception:
-            continue
-        models = []
-        for model in dict.fromkeys(catalog):
-            if _safe_id(model) and model.lower() != 'auto':
-                models.append({'id': model, 'label': model})
-        if models:
-            label = row.get('label')
-            label = label if isinstance(label, str) and len(label) <= 100 and not _SECRET.search(label) and '://' not in label else provider
-            providers.append({'id': provider, 'label': label, 'models': models})
-    try:
-        from .meta_models import META_MODELS, META_PROVIDER_ID, api_key_present
-    except ImportError:  # top-level use (tests, scripts)
-        try:
-            from meta_models import META_MODELS, META_PROVIDER_ID, api_key_present
-        except ImportError:
-            META_MODELS, META_PROVIDER_ID, api_key_present = (), 'meta', lambda: False
-    if api_key_present():
-        providers.append({'id': META_PROVIDER_ID, 'label': 'Meta Model API',
-                          'models': [{'id': m, 'label': m} for m in META_MODELS]})
-    result = {'providers': providers}
-    try:
-        _CATALOG_CACHE['value'] = result
-        _CATALOG_CACHE['at'] = _time2.monotonic()
-    except Exception:
-        pass
-    return result
+        from .byok import catalog
+    except ImportError:
+        from byok import catalog
+    return catalog()
 
 
 def validate_selection(provider, model):
-    """Return an exact allowed pair; None/None preserves the legacy default.
-
-    Invalid/incomplete input and unavailable pairs raise sanitized ValueError.
-    No aliases, endpoint overrides, credentials, or implicit provider inference.
-    """
-    if provider is None and model is None:
-        return None, None
+    try:
+        from .byok import validate
+    except ImportError:
+        from byok import validate
     if provider == 'meta':
         try:
             from .meta_models import validate_meta_model
-        except ImportError:  # top-level use (tests, scripts)
+        except ImportError:
             from meta_models import validate_meta_model
-        return 'meta', validate_meta_model(model)
-    if not _safe_id(provider) or not _safe_id(model) or provider in _VIRTUAL or model.lower() == 'auto':
-        raise ValueError('Invalid answer model selection')
-    catalog = available_models()
-    if any(row['id'] == provider and any(item['id'] == model for item in row['models'])
-           for row in catalog['providers']):
-        return provider, model
-    raise ValueError('Answer model selection is unavailable')
+        if model is None:
+            raise ValueError('Choose an exact Meta model ID')
+        return provider, validate_meta_model(model)
+    return validate(provider, model)
 
 
 def selected_completion(provider, model):
-    """Build a request-local completion function, never using Hermes fallback routing.
-
-    call_llm has a recovery ladder (including first-resolution fallback), so explicit
-    selections instead use its authoritative resolver and provider wire builder.
-    Credentials/endpoints are resolved only by Hermes, never accepted from a request.
-
-    Streaming: `stream_chunks(messages)` yields provider-native incremental text
-    deltas where supported (SSE `stream=True` on OpenAI-compatible chat routes,
-    SSE content deltas on the Meta Model API). Completed-only providers raise
-    NotImplementedError with `streaming_unsupported` so callers can report
-    completed-only honestly instead of faking streaming.
-    """
     provider, model = validate_selection(provider, model)
     if provider == 'meta':
         try:
             from .meta_models import meta_completion
-        except ImportError:  # top-level use (tests, scripts)
+        except ImportError:
             from meta_models import meta_completion
         return meta_completion(model)
-    if provider is None or model is None:
-        raise ValueError('Invalid answer model selection')
-
-    def complete(messages):
-        try:
-            from agent.auxiliary_client import resolve_provider_client, _build_call_kwargs
-            client, resolved_model = resolve_provider_client(provider=provider, model=model)
-            if client is None or resolved_model != model:
-                raise RuntimeError('Unavailable exact route')
-            kwargs = _build_call_kwargs(
-                provider, model, messages, max_tokens=600, tools=None, timeout=30,
-                reasoning_config={'effort': 'low'},
-                base_url=str(getattr(client, 'base_url', '') or ''),
-            )
-            response = client.chat.completions.create(**kwargs)
-            text = response.choices[0].message.content
-            if not isinstance(text, str) or not text.strip():
-                raise RuntimeError('No text answer returned')
-            return text.strip()
-        except Exception:
-            raise RuntimeError('Selected answer model failed') from None
-
-    def stream_chunks(messages):
-        """Yield provider-native incremental deltas as they arrive.
-
-        Responses are provider OpenAI-compatible SSE frames (`stream=True`)
-        parsed lazily: the first delta is yielded before the provider
-        finishes, in arrival order, with only a partial trailing line
-        buffered. A response that only contains a completed payload raises
-        NotImplementedError('streaming_unsupported...') so the caller
-        renders completed-only honestly instead of chunking a finished string.
-        Exactly one provider call is made, on first consumption.
-        """
-        try:
-            from agent.auxiliary_client import resolve_provider_client, _build_call_kwargs
-            client, resolved_model = resolve_provider_client(provider=provider, model=model)
-            if client is None or resolved_model != model:
-                raise RuntimeError('Unavailable exact route')
-            kwargs = _build_call_kwargs(
-                provider, model, messages, max_tokens=600, tools=None, timeout=30,
-                reasoning_config={'effort': 'low'},
-                base_url=str(getattr(client, 'base_url', '') or ''),
-            )
-            kwargs['stream'] = True
-            try:
-                response = client.chat.completions.create(**kwargs)
-            except TypeError as exc:
-                # Explicit no-silent-fallback: kwargs shape is Hermes-owned; a
-                # stream-rejecting signature is completed-only, not an error.
-                raise NotImplementedError('streaming_unsupported:provider-rejects-stream') from exc
-        except NotImplementedError:
-            raise
-        except Exception:
-            raise RuntimeError('Selected answer model failed') from None
-        yielded = False
-        iterator = None
-        try:
-            iterator = iter_openai_sse_deltas(response)
-            for delta in iterator:
-                yielded = True
-                yield delta
-        except NotImplementedError:
-            raise
-        except RuntimeError:
-            raise RuntimeError('Selected answer model failed') from None
-        except GeneratorExit:
-            raise
-        except Exception:
-            raise RuntimeError('Selected answer model failed') from None
-        finally:
-            # Release the provider stream whether it finished, failed, or the
-            # consumer moved on (cancellation / retired row).
-            try:
-                close_iter = getattr(iterator, 'close', None)
-                if callable(close_iter):
-                    close_iter()
-            except Exception:
-                pass
-            try:
-                close = getattr(response, 'close', None)
-                if callable(close):
-                    close()
-            except Exception:
-                pass
-        if not yielded:
-            raise NotImplementedError('streaming_unsupported:completed-only-response')
-
-    complete.stream_chunks = stream_chunks  # type: ignore[attr-defined]
-    return complete
+    try:
+        from .byok import completion
+    except ImportError:
+        from byok import completion
+    return completion(provider, model)
 
 
 def _delta_text(choice):

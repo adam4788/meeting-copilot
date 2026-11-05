@@ -13,7 +13,7 @@ class RetrievalRegressionTests(TestCase):
             project = root / 'demo'
             project.mkdir()
             (project / 'README.md').write_text('The Quasar rollout requires two independent reviewer approvals.', encoding='utf-8')
-            engine = KnowledgeEngine(project_root=root, hermes_home=root / 'profile')
+            engine = KnowledgeEngine(project_root=root, hermes_home=root / 'profile', _completion=lambda messages: 'Two reviewers must approve the Quasar rollout [1].')
             with patch.object(engine, '_complete', return_value='Two reviewers must approve the Quasar rollout [1].'), patch.object(engine, 'search', wraps=engine.search) as lookup:
                 result = engine.answer('Suggest a concise answer to the most recent question in this transcript.',
                                        transcript='meeting: What approval does the Quasar rollout need?', project='demo')

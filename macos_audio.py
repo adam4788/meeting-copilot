@@ -118,15 +118,15 @@ def _model_api_key():
         return ''  # never bypass a failed profile-scope resolver
 
 
-def worker_env():
+def worker_env(provider='local'):
     """Hermetic env for the isolated worker: never inherit the launcher's
     PYTHONPATH/PYTHONHOME (e.g. Hermes's own 3.14 site-packages), which would
     shadow the audio-runtime's 3.12 packages and break model loading."""
     env = {k: v for k, v in os.environ.items()
-           if k not in ('PYTHONPATH', 'PYTHONHOME', 'MODEL_API_KEY', 'HERMES_LAUNCHD_LABEL')}
+           if k not in ('PYTHONPATH', 'PYTHONHOME', 'MODEL_API_KEY', 'HERMES_LAUNCHD_LABEL') and not k.endswith(('_API_KEY', '_ACCESS_TOKEN', '_AUTH_TOKEN', '_SECRET_KEY'))}
     # Snapshot the trusted request key, not the launch profile's environment.
     # The child is not a gateway and must never reseed from the launch .env.
-    key = _model_api_key()
+    key = _model_api_key() if provider == 'meta' else ''
     if key:
         env['MODEL_API_KEY'] = key
     return env
@@ -214,7 +214,7 @@ class MacOSAudioCapture:
             self._state, self._error, self._callback_error = 'starting', None, None
             self._last_loss = {}
             self._process = None
-            self._thread = threading.Thread(target=self._run, args=(worker_env(),),
+            self._thread = threading.Thread(target=self._run, args=(worker_env(self.provider),),
                                             daemon=True, name='macos-audio-worker')
             self._thread.start()
 

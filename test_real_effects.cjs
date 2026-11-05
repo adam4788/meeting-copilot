@@ -1,3 +1,6 @@
+// OBSOLETE DEVELOPMENT FIXTURE for the retired plugin-owned credential editor.
+// Not part of current CI/runtime validation. Current lifecycle and setup checks
+// are test_desktop.mjs, test_byok_setup.py and test_credential_host_scope.py.
 const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
 const {spawn}=require('node:child_process'),{createInterface}=require('node:readline');
 const dep=process.env.MEETING_REACT_TEST_MODULES;

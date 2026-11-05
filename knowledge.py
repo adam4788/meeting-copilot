@@ -639,15 +639,7 @@ class KnowledgeEngine:
             if not isinstance(text, str) or not text.strip():
                 raise RuntimeError('No text answer returned')
             return text.strip()
-        # Lazy import: pure retrieval and injected tests need only the stdlib.
-        from agent.auxiliary_client import call_llm
-        response = call_llm(task='meeting_copilot', messages=messages, tools=None,
-                            max_tokens=600, timeout=30, reasoning_config={'effort': 'low'})
-        message = response.choices[0].message
-        text = message.content
-        if not isinstance(text, str) or not text.strip():
-            raise RuntimeError('No text answer returned')
-        return text.strip()
+        raise ValueError('Choose an answer provider and exact model ID.')
 
     def supports_streaming(self, answer_provider=None, answer_model=None):
         """Retrieval-free streaming probe so callers avoid double retrieval."""
@@ -659,19 +651,7 @@ class KnowledgeEngine:
                     from model_selection import selected_completion
                 complete = selected_completion(answer_provider, answer_model)
             else:
-                try:
-                    from .meta_models import api_key_present, meta_completion
-                except ImportError:
-                    from meta_models import api_key_present, meta_completion
-                if self._completion_override is not None:
-                    complete = _resolve_override(self._completion_override)
-                elif api_key_present():
-                    try:
-                        complete = meta_completion()
-                    except ValueError:
-                        return False
-                else:
-                    complete = self._complete
+                complete = _resolve_override(self._completion_override) if self._completion_override is not None else self._complete
             return _completion_supports_streaming(complete)
         except Exception:
             return False
@@ -697,15 +677,9 @@ class KnowledgeEngine:
         # Keep routing request-local: shared engines and injected one-argument mocks
         # retain their default behavior, even during concurrent selected requests.
         complete = self._complete
-        # An explicitly injected completion is an explicit provider choice:
-        # the env-keyed Meta default must not hijack it (standalone data
-        # could otherwise leave the machine despite the injection contract).
+        # An injected completion is an explicit standalone/test provider choice.
         injected = self._completion_override is not None
         model_route = 'injected' if injected else 'hermes-configured'
-        meta_warnings = []
-        _fallback_marks = []
-        _route_is_meta_default = False
-        meta_default = None
         if answer_provider is not None or answer_model is not None:
             try:
                 from .model_selection import selected_completion
@@ -713,58 +687,8 @@ class KnowledgeEngine:
                 from model_selection import selected_completion
             complete = selected_completion(answer_provider, answer_model)
             model_route = 'meta/muse-spark-1.3' if answer_provider == 'meta' and not answer_model else f'{answer_provider}/{answer_model}'
-        else:
-            # Hackathon default: Meta Muse Spark answers when a key is configured.
-            # Falls back to the Hermes configured model with a visible warning.
-            # A default-route stream failure already proved Meta unusable for
-            # this request: skip straight to the configured model instead of
-            # retrying the failed endpoint in completed mode.
-            try:
-                from .meta_models import DEFAULT_META_MODEL, api_key_present, meta_completion
-            except ImportError:  # top-level use (tests, scripts)
-                from meta_models import DEFAULT_META_MODEL, api_key_present, meta_completion
-            if not injected and api_key_present() and not skip_meta_default:
-                hermes_complete = complete
-                try:
-                    meta_default = meta_completion()
-                except ValueError:
-                    meta_default = None
-                    meta_warnings.append('Meta default model unavailable; using the configured model.')
-                if meta_default is not None:
-                    _meta = meta_default
-                    _hermes = hermes_complete
-                    _fallback_marks = []
-                    def complete(messages):
-                        if aborted():
-                            raise _Aborted('cancelled before provider submission')
-                        try:
-                            return _meta(messages)
-                        except _Aborted:
-                            raise
-                        except Exception:
-                            if aborted():
-                                raise _Aborted('cancelled before fallback submission')
-                            _fallback_marks.append(1)
-                            meta_warnings.append('Meta Model API unavailable; used the configured model.')
-                            return _hermes(messages)
-                    model_route = f'meta/{DEFAULT_META_MODEL}'
-                    _route_is_meta_default = True
-                else:
-                    _route_is_meta_default = False
-                    _fallback_marks = []
-            else:
-                _route_is_meta_default = False
-                _fallback_marks = []
-                if skip_meta_default:
-                    meta_warnings.append('Meta stream failed for this request; used the configured model instead of retrying Meta.')
-        # If the Meta default was unavailable at construction, report honestly.
-        if _route_is_meta_default:
-            try:
-                _probe_meta = meta_default is not None
-            except Exception:
-                _probe_meta = True
-            if not _probe_meta:
-                model_route = 'hermes-configured'
+        elif not injected:
+            raise ValueError('Choose an answer provider and exact model ID.')
         # Blank-button assistance must retrieve the actual conversation topic, not just the UI's generic instruction.
         # A stream-to-completed fallback reuses the already prepared retrieval
         # instead of repeating search, planning, and external web calls.
@@ -831,7 +755,6 @@ class KnowledgeEngine:
         payload = {'question': _clean(question)[:2000], 'transcript': _clean(transcript)[-6000:],
                    'evidence': [{'citation': i, 'title': s['title'], 'text': s['text'][:2050]} for i, s in enumerate(sources, 1)]}
         try:
-            _marks_before_final = len(_fallback_marks)
             provider_error = None
             if aborted():
                 raise _Aborted('cancelled before provider submission')
@@ -839,17 +762,12 @@ class KnowledgeEngine:
             citations = [int(n) for n in re.findall(r'\[(\d+)\]', text)]
             if sources and (not citations or any(n < 1 or n > len(sources) for n in citations)):
                 warnings.append('Answer citations are missing or invalid; verify against the listed evidence.')
-            if len(_fallback_marks) > _marks_before_final and model_route.startswith('meta/'):
-                # Only the final answer call fell back; planner-only fallbacks
-                # keep the Meta route that actually served this answer.
-                model_route = 'hermes-configured'
         except _Aborted:
             raise
         except Exception as exc:
             text = 'A model answer is unavailable. Review the retrieved sources; no actions were performed.'
             warnings.append('Model request failed.')
             provider_error = 'Model request failed.'
-        warnings.extend(meta_warnings)
         if not sources:
             warnings.append('No matching local/session evidence found; transcript alone is not independent verification.')
         # A fallback answer arrived completed, even on a streaming-capable
@@ -891,18 +809,8 @@ class KnowledgeEngine:
                 from model_selection import selected_completion
             complete = selected_completion(answer_provider, answer_model)
             model_route = 'meta/muse-spark-1.3' if answer_provider == 'meta' and not answer_model else f'{answer_provider}/{answer_model}'
-        else:
-            try:
-                from .meta_models import DEFAULT_META_MODEL, api_key_present, meta_completion
-            except ImportError:  # top-level use (tests, scripts)
-                from meta_models import DEFAULT_META_MODEL, api_key_present, meta_completion
-            if not injected and api_key_present():
-                try:
-                    complete = meta_completion()
-                except ValueError:
-                    pass
-                else:
-                    model_route = f'meta/{DEFAULT_META_MODEL}'
+        if answer_provider is None and answer_model is None and not injected:
+            raise ValueError('Choose an answer provider and exact model ID.')
         stream_fn = getattr(complete, 'stream_chunks', None)
         if not callable(stream_fn):
             err = NotImplementedError('streaming_unsupported:default-route-completed-only')

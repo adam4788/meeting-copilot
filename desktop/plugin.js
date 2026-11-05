@@ -12,120 +12,9 @@ export default {
   description: 'Live answers grounded in your projects, prior sessions, and optional web research.',
   version: '0.2.0',
   register(ctx) {
-    function MetaKeySettings({ api: paneApi, life, onOverlayTransition }) {
-      // Bind callbacks to this exact effect lifecycle, not a mutable ref that
-      // could authorize an old password-field callback after a pane remount.
-      const api = (path, body) => life.mounted ? paneApi(path, body)
-        : Promise.reject(new Error('This pane is retired. Close and reopen it.'));
-      // Secret stays only in this uncontrolled password field and one POST.
-      // Never send it through React Query, plugin storage, chat or notifications.
-      const input = useRef(null);
-      const inFlight = useRef(false);
-      const [hasDraft, setHasDraft] = useState(false);
-      const [info, setInfo] = useState(null);
-      const [working, setWorking] = useState(false);
-      const [notice, setNotice] = useState('');
-      const [overlayNotice, setOverlayNotice] = useState('');
-      const currentTransition = target => target && life.mounted && target.life === life
-        && target.pane === life.pane && target.owner === life.owner && target.overlayGeneration === life.overlayGeneration;
-      function reflectOverlay(written, target) {
-        if (!currentTransition(target) || !written) return;
-        if (written.overlay_credentials === 'retired') {
-          if (onOverlayTransition?.(written, target) === false) return;
-          setOverlayNotice({ kind: 'retired', target });
-        } else if (written.overlay_credentials === 'refreshed') {
-          setOverlayNotice({ kind: 'refreshed', target });
-        }
-      }
-      const tokenizerNotice = error => typeof error?.message === 'string' && error.message.includes('credential_tokenizer_unavailable')
-        ? 'Key settings unavailable: the Hermes host tokenizer is unavailable. The saved file is not loaded by the startup bridge. Upgrade Hermes and safely restart after active sessions finish, or ask your administrator to supply MODEL_API_KEY through the service environment. Never paste keys in chat.' : '';
-      const erase = () => { if (input.current) input.current.value = ''; setHasDraft(false); };
-      async function recheck() {
-        if (inFlight.current) return;
-        inFlight.current = true; setWorking(true);
-        try {
-          const current = await api('/credentials/meta');
-          if (!current || typeof current.revision !== 'string') throw new Error('unsupported');
-          setInfo(current); setNotice('');
-        } catch (error) {
-          setInfo(null);
-          setNotice(tokenizerNotice(error) || 'Key settings unavailable: this connection, host, file permissions or credential syntax may be unsupported. Multiline or ambiguous files need manual host-administrator review; this editor will not repair them. Use the local Desktop owner connection.');
-        } finally { inFlight.current = false; setWorking(false); }
-      }
-      useEffect(() => { recheck(); return () => { if (input.current) input.current.value = ''; }; }, []);
-      async function change(action) {
-        if (inFlight.current || !info?.revision) return;
-        if (action === 'remove' && (typeof window === 'undefined' || !window.confirm || !window.confirm('Remove the saved Meta key from this profile? New scoped requests can change immediately or fall back to an inherited key. Existing requests and workers may retain their loaded key. Pause capture first.'))) return;
-        if (action === 'save' && info.saved && (typeof window === 'undefined' || !window.confirm || !window.confirm('Replace this profile’s saved Meta key? New scoped requests, including other tools using MODEL_API_KEY, can change immediately. Existing requests and workers may retain their loaded key. Pause capture first.'))) return;
-        const body = { action, revision: info.revision };
-        if (action === 'save') {
-          const value = input.current?.value || '';
-          if (!/^[A-Za-z0-9._~+/=-]{8,4096}$/.test(value)) { setNotice('Enter an 8–4096 character API key using letters, digits or . _ ~ + / = - only; no spaces, quotes or line breaks.'); return; }
-          body.key = value;
-        }
-        // A delayed edit/readback may describe an overlay the user replaced.
-        const target = { life, pane: life.pane, owner: life.owner, overlayGeneration: life.overlayGeneration };
-        erase(); inFlight.current = true; setWorking(true); setNotice('');
-        try {
-          const written = await api('/credentials/meta', body);
-          delete body.key;
-          reflectOverlay(written, target); // lifecycle outcome must survive failed readback
-          // Read the exact target back; a successful POST is not readiness.
-          const current = await api('/credentials/meta');
-          if (!current || typeof current.revision !== 'string' || current.saved !== (action === 'save')) throw new Error('unconfirmed');
-          if (!written || current.revision !== written.revision) {
-            setInfo(null);
-            setNotice('Key settings changed after this write. Another settings edit may have replaced it; recheck key status before trying again.');
-            return;
-          }
-          setInfo(current);
-          // Key readback and helper shutdown are independent outcomes.
-          setNotice((action === 'save' ? 'Saved — new scoped requests can use the key immediately; existing requests and workers may retain their loaded key. Not verified with Meta.' : 'Saved key removed — new scoped requests may fall back to an inherited key. Existing requests and workers may retain their loaded key. Removal is not revocation.'));
-        } catch (error) {
-          setInfo(null);
-          setNotice(tokenizerNotice(error) || 'The key change could not be confirmed. Recheck key status before trying again; another settings edit or an unsupported host may have blocked it.');
-          // Only recognize a fixed server code, never render transport text.
-          if (typeof error?.message === 'string' && error.message.includes('overlay_shutdown_unconfirmed')) {
-            reflectOverlay({ overlay_credentials: 'retired', overlay_stop_confirmed: false }, target);
-          }
-          try {
-            const current = await api('/status');
-            if (current?.overlay_cleanup_error) reflectOverlay({ overlay_credentials: 'retired', overlay_stop_confirmed: false }, target);
-            else if (current?.overlay_shown === false && (life.owner || life.credentialShutdownUnconfirmed)) reflectOverlay({ overlay_credentials: 'retired', overlay_stop_confirmed: true }, target);
-          } catch (_) { /* retain the already confirmed lifecycle warning */ }
-        } finally { delete body.key; inFlight.current = false; setWorking(false); }
-      }
-      const overlayNoticeKind = currentTransition(overlayNotice?.target) ? overlayNotice.kind : '';
-      const overlayNoticeText = overlayNoticeKind === 'retired'
-        ? (life.credentialShutdownUnconfirmed
-          ? 'Overlay credential refresh failed; new overlay questions are disabled but shutdown is not confirmed. Retry hide overlay and verify the old window is gone before sharing.'
-          : 'Overlay credential refresh failed; the overlay was closed. Show overlay to reopen with current credentials.')
-        : overlayNoticeKind === 'refreshed' ? 'New overlay questions use a fresh credential snapshot.' : '';
-      return h('section', { style: card, 'aria-label': 'Meta API key settings' },
-        h('strong', null, 'Meta API key'),
-        h('p', { style: muted, role: 'status' }, info
-          ? `${info.saved ? 'Saved in this profile' : 'No saved key'} · ${info.request_configured ? 'Configured for this status request' : 'Not configured for this status request'} · Not verified with Meta`
-          : 'Key status not checked'),
-        h('label', { style: { display: 'grid', gap: 6 } }, 'Meta API key',
-          h('input', { ref: input, type: 'password', autoComplete: 'new-password', spellCheck: false,
-            autoCapitalize: 'none', maxLength: 4096, 'aria-label': 'Meta API key', style: selectStyle,
-            placeholder: info?.saved ? 'Enter a replacement key' : 'Paste key here — never in chat', disabled: working,
-            onChange: e => setHasDraft(!!e.target.value),
-            onKeyDown: e => { if (e.key === 'Enter') e.preventDefault(); } })),
-        h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 10 } },
-          h(Button, { disabled: working || !info || !hasDraft, onClick: () => change('save') }, 'Save key'),
-          h(Button, { variant: 'secondary', disabled: working || !info?.saved, onClick: () => change('remove') }, 'Remove saved key'),
-          h(Button, { variant: 'secondary', disabled: working, onClick: recheck }, 'Recheck key status')),
-        notice && h('p', { role: 'status', style: muted }, notice),
-        overlayNoticeText && h('p', { role: 'status', style: muted }, overlayNoticeText),
-        info?.process_differs_from_saved && h('p', { role: 'status', style: muted }, 'A different process-environment key remains available as fallback after removal, or to unscoped code. Update its service or secret-manager source too; restarting alone may retain it.'),
-        info && h('p', { style: muted }, info.activation === 'host-scoped' ? 'This status used a host-scoped credential snapshot, not every running worker.' : 'This status used the process environment; process-based code may need a safe gateway restart to load file changes.'),
-        h('p', { style: muted }, 'New scoped requests can change immediately: the saved file takes precedence over inherited keys in the supported single-profile host. Existing requests and workers may retain old keys. Other host secret sources may override the file. Pause capture before editing; removal is not revocation.'),
-        h('details', null,
-          h('summary', { style: { ...muted, cursor: 'pointer', marginTop: 8 } }, 'Safe transition & verification'),
-          h('p', { style: muted }, 'Wait for existing answers to finish, then start capture again to take a fresh credential snapshot. For process-based code, wait for all gateway sessions to finish before using Hermes’ gateway restart control for this connection. Reopen this pane and Recheck key status. Do not restart while another session is working.'),
-          h('p', { style: muted }, 'Saving is configuration only, not a Meta authentication test. Select Meta for answers and try a non-sensitive question; test Muse Voice separately with consent. An answer fallback or configured badge does not verify Meta or audio permissions.')),
-        h('p', { style: { ...muted, marginBottom: 0 } }, 'Used for Muse Voice and Meta answers. Stored only in this backend’s active HERMES_HOME/.env; never returned by this editor. Saving does not reload the gateway or change a running capture.'));
+    function MetaKeySettings() {
+      return h('section', { style: card }, h('strong', null, 'Bring your own API key'),
+        h('p', { style: muted }, 'Configure OpenAI or OpenRouter in Hermes Settings → Plugins → Meeting Copilot. Keys stay in Hermes-managed secret settings. Never enter keys in chat or model fields. Reopen this pane after setup. Local transcription does not use an answer key.'));
     }
     const request = (path, body) => ctx.rest(path, body === undefined ? {} : { method: 'POST', body });
     // Survives plugin unregister/re-register in the SAME renderer. Neither a
@@ -181,6 +70,7 @@ export default {
             if (typeof parsed[k] === 'string') out[k] = parsed[k].slice(0, 500);
           }
           if (typeof parsed.webFallback === 'boolean') out.webFallback = parsed.webFallback;
+          if (typeof parsed.excludeHistory === 'boolean') out.excludeHistory = parsed.excludeHistory;
           if (parsed.project && typeof parsed.project !== 'string') delete out.project;
           if (!current && legacy) {
             try {
@@ -224,8 +114,8 @@ export default {
       const [overlayMsg, setOverlayMsg] = useState('');
       const [copied, setCopied] = useState(false);
       const [persistWarning, setPersistWarning] = useState('');
-      // Deliberately resets to the existing history-on default on each mount.
-      const [excludeHistory, setExcludeHistory] = useState(false);
+      // New users start with project-only evidence; saved explicit choices persist.
+      const [excludeHistory, setExcludeHistory] = useState(saved.excludeHistory !== undefined ? saved.excludeHistory : !(saved.webFallback || saved.web));
 
       const status = useQuery({ queryKey: [ID, 'status'], queryFn: () => api('/status'), refetchInterval: 2500, retry: 1 });
       // Keep the overlay lease alive while the pane is visible; overlay helper
@@ -265,7 +155,7 @@ export default {
       const unsupportedReasons = [
         allProjects && !data.capabilities?.all_projects ? 'All-projects search needs the updated backend (restart the gateway when other sessions are idle).' : null,
         webFallback && !data.capabilities?.automatic_web_fallback ? 'Automatic web fallback needs the updated backend.' : null,
-        answerProvider && (!answerModel || !data.capabilities?.independent_models) ? 'Answer model selection needs the updated backend and a chosen model.' : null,
+        (!answerProvider || !answerModel || !data.capabilities?.independent_models) ? 'Answer model selection needs the updated backend and a chosen model.' : null,
         excludeHistory && !data.capabilities?.history_opt_out ? 'Excluding past sessions needs the updated backend. Restart the gateway when other work is idle.' : null,
         excludeHistory && (!project || allProjects || webFallback || web.trim()) ? 'To exclude past sessions, choose one project and turn off web search.' : null,
       ].filter(Boolean);
@@ -430,9 +320,9 @@ export default {
       const [progressPaused, setProgressPaused] = useState(false);
       useEffect(() => {
         try {
-          if (typeof localStorage !== 'undefined') localStorage.setItem(SCOPE_KEY, JSON.stringify({ project, backend, webFallback, transcriptionModel, audioSource, answerProvider, answerModel, transcriptionProvider, transcriptionChoiceVersion: 1, asrMode }));
+          if (typeof localStorage !== 'undefined') localStorage.setItem(SCOPE_KEY, JSON.stringify({ project, backend, excludeHistory, webFallback, transcriptionModel, audioSource, answerProvider, answerModel, transcriptionProvider, transcriptionChoiceVersion: 1, asrMode }));
         } catch (e) { setPersistWarning('Preferences could not be saved in this browser (storage unavailable). Settings still apply for this session.'); }
-      }, [project, backend, webFallback, transcriptionModel, audioSource, answerProvider, answerModel, transcriptionProvider, asrMode]);
+      }, [project, backend, excludeHistory, webFallback, transcriptionModel, audioSource, answerProvider, answerModel, transcriptionProvider, asrMode]);
       // Capability discovery never opts a meeting into cloud audio. Only an
       // explicit selection or persisted provider choice may select Meta.
       function resetMeetingInputs() {
@@ -963,11 +853,11 @@ export default {
           h('div', { style: { display: 'grid', gap: 8 } },
             h('label', { style: { display: 'grid', gap: 6 } }, h('span', { id: 'mc-provider-label' }, 'Answer provider'),
               h('select', { style: selectStyle, value: answerProvider, disabled: busy || !data.capabilities?.independent_models, onChange: e => { setAnswerProvider(e.target.value); setAnswerModel(''); }, 'aria-labelledby': 'mc-provider-label' },
-                h('option', { value: '' }, providers.some(p => p.id === 'meta') ? 'Use Meta Muse Spark (default)' : 'Use Hermes configured model'), ...providers.map(p => h('option', { value: p.id, key: p.id }, p.label || p.id)))),
+                h('option', { value: '' }, 'Choose provider…'), ...providers.map(p => h('option', { value: p.id, key: p.id }, p.label || p.id)))),
             answerProvider && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Answer model'),
-              h('select', { style: selectStyle, value: answerModel, disabled: busy, onChange: e => setAnswerModel(e.target.value), 'aria-label': 'Answer model' },
-                h('option', { value: '' }, 'Choose answer model…'), ...answerModels.map(m => h('option', { value: m.id, key: m.id }, m.label || m.id))))),
-          modelCatalog.error && h('p', { role: 'alert', style: { ...muted, margin: 0 } }, 'Model catalog unavailable. Use the configured model or check provider setup.'),
+              h('input', { style: selectStyle, value: answerModel, disabled: busy, maxLength: 200, placeholder: 'Exact model ID from your provider', onChange: e => setAnswerModel(e.target.value), 'aria-label': 'Answer model', autoComplete: 'off' }))),
+          answerProvider && h('p', { role: 'status', style: muted }, providers.find(p => p.id === answerProvider)?.status || 'Provider unavailable; choose OpenAI or OpenRouter.'),
+          modelCatalog.error && h('p', { role: 'alert', style: { ...muted, margin: 0 } }, 'Provider readiness unavailable. Check Hermes plugin secret settings.'),
           h('p', { style: { ...muted, margin: 0 } }, 'This choice is only for Copilot answers, not chat or transcription.')),
         h('label', { style: { ...muted, display: 'flex', gap: 8, alignItems: 'flex-start', border: '1px solid var(--ui-stroke-secondary)', borderRadius: 10, padding: '10px 12px', background: 'var(--ui-bg-card)', cursor: 'pointer' } },
           h('input', { type: 'checkbox', checked: webFallback, onChange: e => setWebFallback(e.target.checked), 'aria-label': 'Automatic web fallback' }),

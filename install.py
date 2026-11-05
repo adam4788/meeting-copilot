@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import shutil
 
-FILES = ('server.py', 'credentials.py', 'credential_env.py', 'knowledge.py', 'web_policy.py', 'audio.py', 'meetily.py',
+FILES = ('server.py', 'credentials.py', 'byok.py', 'knowledge.py', 'web_policy.py', 'audio.py', 'meetily.py',
          'macos_audio.py', 'audio_worker.py', 'model_selection.py', 'meta_models.py', 'meta_asr.py',
          'overlay_bridge.py', 'answer_core.py', 'hermes_adapters.py', 'ask.py', 'eval_retrieval.py',
          'demo_standalone.py',
@@ -16,7 +16,7 @@ FILES = ('server.py', 'credentials.py', 'credential_env.py', 'knowledge.py', 'we
 
 def install(source, home):
     source, home = Path(source).resolve(), Path(home).expanduser().resolve()
-    for name in (*FILES, 'desktop/plugin.js'):
+    for name in (*FILES, 'desktop/plugin.js', 'plugin.yaml'):
         if not (source / name).is_file():
             raise FileNotFoundError(f'Required source missing: {name}')
     build = hashlib.sha256(b''.join((source / name).read_bytes() for name in FILES)).hexdigest()[:16]
@@ -36,21 +36,7 @@ def install(source, home):
         shutil.copy2(source / name, core / name)
     (core / '__init__.py').write_text('', encoding='utf-8')
     (target / '__init__.py').write_text('def register(ctx):\n    pass\n', encoding='utf-8')
-    (target / 'plugin.yaml').write_text('''name: meeting-copilot-live
-label: Meeting Copilot
-version: 0.1.0
-author: Adam Nugroho
-description: Read-only live meeting answers grounded in project files and past sessions.
-requires_hermes: ">=0.22.0"
-provides_tools: []
-provides_hooks: []
-config_schema:
-  meta_api_key:
-    type: secret
-    env: MODEL_API_KEY
-    label: Meta API key
-    description: Used for Muse Voice and Meta answers. Never paste into chat. Pause capture before editing; new scoped requests can change immediately, while existing requests and workers retain loaded keys. Process-based code may need a safe restart. Configuration is not provider verification.
-''', encoding='utf-8')
+    shutil.copy2(source / 'plugin.yaml', target / 'plugin.yaml')
     dashboard = target / 'dashboard'
     (dashboard / 'manifest.json').write_text(json.dumps({
         'name': 'meeting-copilot-live', 'label': 'Meeting Copilot', 'version': '0.1.0',

@@ -528,11 +528,11 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
     useState: initial => {
       const i = stateIndex++;
       if (!(i in values)) {
-        const overrides = { 0: scope, 2: web, ...settings };
+        const overrides = { 0: scope, 2: web, ...(qcBehavior.freshDefaults ? {} : {12:'openai',13:'gpt-test'}), ...settings };
         // The history toggle is a new hook at index 18; preserve legacy test
         // fixture indexes for the hooks that follow it.
         const legacyIndex = i > 18 ? i - 1 : i;
-        values[i] = i === 18 ? initial : Object.hasOwn(overrides, legacyIndex) ? overrides[legacyIndex] : initial === true ? fallback : initial;
+        values[i] = i === 18 ? (qcBehavior.freshDefaults ? initial : false) : Object.hasOwn(overrides, legacyIndex) ? overrides[legacyIndex] : initial === true ? fallback : initial;
       }
       return [values[i], v => { values[i] = typeof v === 'function' ? v(values[i]) : v; }];
     },
@@ -551,9 +551,9 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
     },
     useQueryClient: () => ({ invalidateQueries: qcBehavior.failInvalidate ? async () => { throw new Error('invalidate failed'); } : async () => {} }),
     useQuery: options => { if (options.queryKey[1] === 'status') statusQuery = options; return ({ error: options.queryKey[1] === 'status' ? qcBehavior.statusError : null, data: options.queryKey[1] === 'status'
-      ? { capabilities: supported ? { all_projects: true, automatic_web_fallback: true, independent_models: true, macos_transcription: true, overlay: true, overlay_stream: true, overlay_cancel: true } : undefined, ...statusExtra }
+      ? { capabilities: supported ? { all_projects: true, automatic_web_fallback: true, independent_models: true, history_opt_out: true, macos_transcription: true, overlay: true, overlay_stream: true, overlay_cancel: true } : undefined, ...statusExtra }
       : options.queryKey[1] === 'projects' ? [{ name: 'alpha', path: '/projects/alpha' }]
-      : options.queryKey[1] === 'models' ? { providers: [{ id: 'openai-codex', label: 'Codex', models: [{ id: 'gpt-test', label: 'Test model' }] }] } : [] }); },
+      : options.queryKey[1] === 'models' ? { providers: [{ id: 'openai', label: 'OpenAI API', models: [], custom_model: true, configured: true, status: 'Key available; connection and model unverified' }] } : [] }); },
     useValue: atom => atom.get(),
     host: { notify: notice => notices.push(notice), paneVisibility: () => visibility, revealPane: id => { revealed.push(id); visible = true; } }, Button: 'button', Input: 'input', Textarea: 'textarea', Badge: 'badge', PALETTE_AREA: 'palette',
     ...browserGlobals,
@@ -681,281 +681,26 @@ for (const path of ['/overlay/lifecycle', '/overlay/claim']) test(`initial lifec
   ui.unregister();
 });
 
-for (const confirmed of [true, false]) test(`retirement survives failed key readback and updates quick control (${confirmed})`, async () => {
-  let written = false;
-  const ui = pane('', true, false, '', {}, { '/credentials/meta': (_path, opts) => {
-    if (opts.method === 'POST') { written = true; return { saved: true, revision: 'r'.repeat(64), overlay_credentials: 'retired', overlay_stop_confirmed: confirmed }; }
-    if (written) throw new Error('fake-sensitive-readback');
-    return { saved: false, revision: 'r'.repeat(64) };
-  }});
-  await button(ui.tree, 'Show overlay').props.onClick();
-  await button(ui.rerender(), 'Recheck key status').props.onClick();
-  const field = nodes(ui.rerender()).find(n => n.props['aria-label'] === 'Meta API key');
-  field.props.ref.current = { value: 'fake-ui-key-only' }; field.props.onChange({ target: field.props.ref.current });
-  await button(ui.rerender(), 'Save key').props.onClick();
-  const tree = ui.rerender();
-  assert.ok(button(tree, confirmed ? 'Show overlay' : 'Retry hide overlay'));
-  assert.match(JSON.stringify(tree), confirmed ? /overlay was closed/i : /shutdown is not confirmed/i);
-  assert.match(JSON.stringify(tree), /could not be confirmed/);
-  assert.doesNotMatch(JSON.stringify(tree), /fake-sensitive/);
-  if (!confirmed) {
-    await button(tree, 'Retry hide overlay').props.onClick();
-    assert.ok(button(ui.rerender(), 'Show overlay'));
-    assert.doesNotMatch(JSON.stringify(ui.rerender()), /shutdown is not confirmed/);
-  }
+// The plugin-owned credential editor was retired for Hermes catalog rule 11.
+// Setup must be read-only, including across all pane lifecycle boundaries.
+test('BYOK setup points to Hermes and never renders credential entry or makes credential calls', () => {
+  const ui=pane('alpha',true,false);
+  const tree=ui.tree;
+  assert.match(JSON.stringify(tree), /Hermes Settings.*Plugins.*Meeting Copilot/);
+  assert.match(JSON.stringify(tree), /Never enter keys in chat or model fields/);
+  assert.ok(!nodes(tree).some(n=>n.props?.type==='password'));
+  assert.ok(!ui.requests.some(r=>r.path.startsWith('/credentials')));
+  ui.unmount();ui.unregister();
+  assert.ok(!ui.requests.some(r=>r.path.startsWith('/credentials')));
 });
-
-test('Meta key form saves explicitly, clears input, reads back, and never caches secrets', async () => {
-  let saved = false;
-  const info = () => ({ saved, request_configured: false, verified: false, activation: 'host-scoped', revision: 'r'.repeat(64) });
-  const ui = pane('', true, false, '', {}, {
-    '/credentials/meta': (_path, opts) => {
-      if (opts.method === 'POST') {
-        assert.equal(opts.body.action, 'save');
-        assert.equal(opts.body.key, 'fake-ui-key-only');
-        saved = true;
-      }
-      return info();
-    },
-  });
-  const button = (tree, text) => nodes(tree).find(n => n.type === 'button' && n.children.includes(text));
-  let tree = ui.tree;
-  const field = nodes(tree).find(n => n.props['aria-label'] === 'Meta API key');
-  assert.ok(field, 'masked key field exists inside the pane');
-  assert.equal(field.props.type, 'password');
-  assert.equal(field.props.autoComplete, 'new-password');
-  assert.equal(button(tree, 'Save key').props.disabled, true, 'unknown status cannot overwrite');
-  await button(tree, 'Recheck key status').props.onClick();
-  tree = ui.rerender();
-  const input = nodes(tree).find(n => n.props['aria-label'] === 'Meta API key');
-  input.props.ref.current = { value: 'fake-ui-key-only' };
-  input.props.onChange({ target: input.props.ref.current });
-  assert.equal(ui.requests.filter(r => r.method === 'POST').length, 0, 'typing never saves');
-  tree = ui.rerender();
-  await button(tree, 'Save key').props.onClick();
-  assert.equal(input.props.ref.current.value, '', 'erase draft immediately after submission');
-  tree = ui.rerender();
-  assert.ok(saved, 'save changed the backend fixture');
-  assert.equal(ui.requests.at(-1).method, undefined, 'separate exact-target readback');
-  assert.match(JSON.stringify(tree), /Saved — new scoped requests can use the key immediately/i);
-  assert.match(JSON.stringify(tree), /Not verified/i);
-  assert.ok(!JSON.stringify(tree).includes('fake-ui-key-only'));
-});
-
-for (const retirement of ['unmount', 'unregister', 'supersede', 'effect-remount', 'failed-restart']) test(`retired Meta key callbacks cannot read or write credentials (${retirement})`, async () => {
-  const globals = { globalThis: { crypto: webcrypto }, setInterval: () => 0, clearInterval: () => {} };
-  let saved = false;
-  const ui = pane('', true, false, '', {}, {
-    '/credentials/meta': (_path, options) => {
-      if (options.method === 'POST') saved = true;
-      return { saved, revision: 'r'.repeat(64) };
-    },
-    '/overlay/release': () => { throw new Error('synthetic release failure'); },
-  }, {}, globals, { effects: true });
-  await settle();
-  let tree = ui.rerender();
-  const field = nodes(tree).find(n => n.props['aria-label'] === 'Meta API key');
-  field.props.ref.current = { value: 'fake-retired-key-only' };
-  field.props.onChange({ target: field.props.ref.current });
-  tree = ui.rerender();
-  const save = button(tree, 'Save key').props.onClick;
-  const recheck = button(tree, 'Recheck key status').props.onClick;
-  let newer;
-  if (retirement === 'unmount') ui.unmount();
-  if (retirement === 'unregister') ui.unregister();
-  if (retirement === 'supersede') newer = pane('', true, false, '', {}, {}, {}, globals);
-  if (retirement === 'effect-remount') ui.replayEffects();
-  if (retirement === 'failed-restart') await command(ui, 'Restart Meeting Copilot')();
-  await settle();
-  // Supply a synthetic stale DOM value so validation cannot mask a missing fence.
-  field.props.ref.current.value = 'fake-retired-key-only';
-  const before = ui.requests.length;
-  await save();
-  await recheck();
-  assert.equal(ui.requests.length, before, 'retired key callbacks must never reach ctx.rest');
-  assert.equal(field.props.ref.current.value, '', 'attempted stale submission erases the secret');
-  assert.equal(saved, false);
-  if (retirement === 'effect-remount') {
-    await button(ui.rerender(), 'Recheck key status').props.onClick();
-    const current = nodes(ui.rerender()).find(n => n.props['aria-label'] === 'Meta API key');
-    current.props.ref.current = { value: 'fake-current-key-only' };
-    current.props.onChange({ target: current.props.ref.current });
-    await button(ui.rerender(), 'Save key').props.onClick();
-    assert.equal(saved, true, 'fresh lifecycle remains authorized');
-    assert.match(JSON.stringify(ui.rerender()), /Saved — new scoped requests/);
-  }
-  ui.unregister(); newer?.unregister();
-  await settle();
-});
-
-for (const confirmed of [true, false]) test(`key write reports overlay rebind failure honestly (closed=${confirmed})`, async () => {
-  let saved = false;
-  const ui = pane('', true, false, '', {}, {
-    '/credentials/meta': (_path, opts) => {
-      if (opts.method === 'POST') {
-        saved = true;
-        return { saved, revision: 'r'.repeat(64), overlay_credentials: 'retired', overlay_stop_confirmed: confirmed };
-      }
-      return { saved, revision: 'r'.repeat(64) };
-    },
-  });
-  await button(ui.tree, 'Recheck key status').props.onClick();
-  const field = nodes(ui.rerender()).find(n => n.props['aria-label'] === 'Meta API key');
-  field.props.ref.current = { value: 'fake-ui-key-only' };
-  field.props.onChange({ target: field.props.ref.current });
-  await button(ui.rerender(), 'Save key').props.onClick();
-  const text = JSON.stringify(ui.rerender());
-  assert.match(text, /Saved —/);
-  assert.match(text, /Overlay.*credential.*refresh.*failed/i);
-  assert.match(text, confirmed ? /Show overlay to reopen/ : /shutdown.*not confirmed.*Retry hide/i);
-});
-
-test('Meta key missing tokenizer guidance is actionable without reflecting errors', async () => {
-  const ui = pane('', true, false, '', {}, {
-    '/credentials/meta': () => { throw new Error('credential_tokenizer_unavailable fake-secret-do-not-reflect'); },
-  });
-  await nodes(ui.tree).find(n => n.type === 'button' && n.children.includes('Recheck key status')).props.onClick();
-  const text = JSON.stringify(ui.rerender());
-  assert.match(text, /Upgrade Hermes/);
-  assert.match(text, /service environment/);
-  assert.match(text, /saved file.*not loaded/i);
-  assert.doesNotMatch(text, /fake-secret/);
-});
-
-test('Meta key never claims a status source before or after a failed check', async () => {
-  const ui = pane('', true, false, '', {}, {
-    '/credentials/meta': () => { throw new Error('unavailable'); },
-  });
-  const verifyUnknown = tree => {
-    const text = JSON.stringify(tree);
-    assert.match(text, /Key status not checked/);
-    assert.doesNotMatch(text, /This status used/);
-  };
-  verifyUnknown(ui.tree);
-  await nodes(ui.tree).find(n => n.type === 'button' && n.children.includes('Recheck key status')).props.onClick();
-  const after = ui.rerender();
-  verifyUnknown(after);
-  assert.match(JSON.stringify(after), /Key settings unavailable/);
-});
-
-test('Meta key explains scoped activation, process fallback and snapshot limits', async () => {
-  for (const activation of ['host-scoped', 'process']) {
-    const ui = pane('', true, false, '', {}, { '/credentials/meta': () => ({
-      saved: true, request_configured: true, process_configured: true,
-      process_differs_from_saved: true, activation, verified: false, revision: 'r'.repeat(64),
-    }) });
-    await nodes(ui.tree).find(n => n.type === 'button' && n.children.includes('Recheck key status')).props.onClick();
-    const text = JSON.stringify(ui.rerender());
-    assert.match(text, /Configured for this status request/);
-    assert.match(text, activation === 'host-scoped' ? /This status used a host-scoped credential snapshot/ : /This status used the process environment/);
-    assert.match(text, /new scoped requests.*immediately/i);
-    assert.match(text, /saved file.*precedence.*inherited/i);
-    assert.match(text, /existing requests.*workers.*retain/i);
-    assert.match(text, /process.environment.*fallback/i);
-    assert.match(text, /Not verified with Meta/);
-    assert.doesNotMatch(text, /does not override it|before using the new key|Configured in running backend/);
-  }
-});
-
-test('Meta key save errors do not echo transport secrets or claim readiness', async () => {
-  const ui = pane('', true, false, '', {}, {
-    '/credentials/meta': (_path, opts) => {
-      if (opts.method === 'POST') throw new Error('fake-ui-key-only');
-      return { saved: false, request_configured: false, verified: false, revision: 'r'.repeat(64) };
-    },
-  });
-  const button = (tree, text) => nodes(tree).find(n => n.type === 'button' && n.children.includes(text));
-  await button(ui.tree, 'Recheck key status').props.onClick();
-  const input = nodes(ui.rerender()).find(n => n.props['aria-label'] === 'Meta API key');
-  input.props.ref.current = { value: 'fake-ui-key-only' };
-  input.props.onChange({ target: input.props.ref.current });
-  await button(ui.rerender(), 'Save key').props.onClick();
-  const tree = ui.rerender();
-  assert.equal(input.props.ref.current.value, '');
-  assert.ok(!JSON.stringify(tree).includes('fake-ui-key-only'));
-  assert.match(JSON.stringify(tree), /could not be confirmed/i);
-});
-
-test('Meta key label matches accessible name and invalid lengths explain bounds', async () => {
-  const ui = pane('', true, false, '', {}, { '/credentials/meta': () => ({ saved: false, revision: 'r'.repeat(64) }) });
-  const button = (tree, text) => nodes(tree).find(n => n.type === 'button' && n.children.includes(text));
-  await button(ui.tree, 'Recheck key status').props.onClick();
-  const field = nodes(ui.rerender()).find(n => n.props['aria-label'] === 'Meta API key');
-
-  // Rerenders create new nodes; locate the nested input by its accessible name.
-  const visibleLabel = nodes(ui.rerender()).find(n => n.type === 'label' && nodes(n).some(x => x.props['aria-label'] === 'Meta API key'));
-  assert.ok(visibleLabel.children.includes(field.props['aria-label']));
-  for (const value of ['short', 'x'.repeat(4097)]) {
-    field.props.ref.current = { value };
-    field.props.onChange({ target: field.props.ref.current });
-    await button(ui.rerender(), 'Save key').props.onClick();
-    assert.match(JSON.stringify(ui.rerender()), /8–4096/);
-    assert.equal(ui.requests.filter(r => r.method === 'POST').length, 0);
-  }
-});
-
-for (const realHost of [false, true]) for (const race of [false, true]) test(`Meta key pane effects reach isolated backend (host=${realHost}, interleaving=${race})`, {
-  // Real credential writes require production POSIX permission/ACL inspection.
-  // Mocked pane authorization/validation/error tests above still run everywhere.
-  skip: !['darwin', 'linux'].includes(process.platform),
-}, async t => {
-  const { spawn, spawnSync } = await import('node:child_process');
-  if (realHost && spawnSync(process.env.PYTHON || 'python', ['-c', "import agent.secret_scope, hermes_cli.web_server_profiles"]).status !== 0) {
-    t.skip('Installed Hermes host unavailable'); return;
-  }
-  const { createInterface } = await import('node:readline');
-  const child = spawn(process.env.PYTHON || 'python', ['-u', realHost ? 'test_credential_host_scope.py' : 'test_credentials.py', '--ui-bridge'], { stdio: ['pipe', 'pipe', 'pipe'] });
-  const lines = createInterface({ input: child.stdout });
-  const pending = [];
-  let stderr = '';
-  child.stderr.on('data', chunk => { stderr += chunk.toString(); });
-  lines.on('line', line => {
-    const slot = pending.shift();
-    const response = JSON.parse(line);
-    if (response.status >= 400) slot.reject(new Error('Backend refused request'));
-    else slot.resolve(response.body);
-  });
-  child.on('exit', () => { for (const slot of pending.splice(0)) slot.reject(new Error('Backend exited')); });
-  const call = (path, opts = {}) => new Promise((resolve, reject) => {
-    pending.push({ resolve, reject });
-    child.stdin.write(JSON.stringify({ path, opts }) + '\n');
-  });
-  t.after(async () => {
-    child.stdin.end();
-    await new Promise(resolve => { if (child.exitCode !== null) resolve(); else child.once('exit', resolve); });
-    assert.ok(!stderr.includes('fake-ui-key-only'), 'stderr contains no synthetic key');
-  });
-  const routedCall = async (path, opts = {}) => {
-    const result = await call(path, opts);
-    if (race && opts.method === 'POST' && opts.body.action === 'save') {
-      // Real second writer commits between this pane's POST and GET.
-      const second = await call(path);
-      await call(path, { method: 'POST', body: { action: 'save', key: 'fake-other-writer-key', revision: second.revision } });
-    }
-    return result;
-  };
-  const ui = pane('', true, false, '', {}, { '/credentials/meta': routedCall }, {}, { window: { confirm: () => true } });
-  const button = (tree, text) => nodes(tree).find(n => n.type === 'button' && n.children.includes(text));
-  await button(ui.tree, 'Recheck key status').props.onClick();
-  const field = nodes(ui.rerender()).find(n => n.props['aria-label'] === 'Meta API key');
-  field.props.ref.current = { value: 'fake-ui-key-only' };
-  field.props.onChange({ target: field.props.ref.current });
-  assert.equal((await call('/test/saved-effect')).saved, false);
-  await button(ui.rerender(), 'Save key').props.onClick();
-  if (race) {
-    assert.deepEqual(await call('/test/saved-effect'), { saved: false, mode_private: true, runtime_unchanged: true });
-    const rendered = JSON.stringify(ui.rerender());
-    assert.match(rendered, /changed.*after|another.*edit/i);
-    assert.doesNotMatch(rendered, /Saved — new scoped requests can use the key immediately/);
-    assert.doesNotMatch(rendered, /fake-other-writer-key|fake-ui-key-only/);
-    return;
-  }
-  assert.deepEqual(await call('/test/saved-effect'), { saved: true, mode_private: true, runtime_unchanged: true });
-  assert.equal(field.props.ref.current.value, '');
-  assert.match(JSON.stringify(ui.rerender()), /Not verified/);
-  await button(ui.rerender(), 'Remove saved key').props.onClick();
-  assert.deepEqual(await call('/test/saved-effect'), { saved: false, mode_private: true, runtime_unchanged: true });
-  assert.match(JSON.stringify(ui.rerender()), /No saved key/);
+test('fresh panes require explicit BYOK selection and default to history excluded', async () => {
+  const ui=pane('alpha',true,false,'',{}, {}, {}, {}, {freshDefaults:true});
+  const toggle=nodes(ui.tree).find(n=>n.props['aria-label']==='Exclude past sessions');
+  assert.equal(toggle.props.checked,true);
+  const suggest=button(ui.tree,'Suggest answer');
+  assert.equal(suggest.props.disabled,true);
+  await suggest.props.onClick();
+  assert.ok(!ui.requests.some(r=>r.path==='/assist'));
 });
 
 // Effect-capable lifecycle tests use deterministic timers (no React package).
@@ -1477,7 +1222,7 @@ test('independent transcription sends explicit local model/source and consent', 
 });
 
 test('meta cloud transcription is opt-in, warns, and sends provider/mode', async () => {
-  const caps = { capabilities: { all_projects: true, automatic_web_fallback: true, independent_models: true, macos_transcription: true, meta_asr: true, overlay: true, overlay_stream: true, overlay_cancel: true } };
+  const caps = { capabilities: { all_projects: true, automatic_web_fallback: true, independent_models: true, history_opt_out: true, macos_transcription: true, meta_asr: true, overlay: true, overlay_stream: true, overlay_cancel: true } };
   const { tree, requests } = pane('', true, false, '',
     { 3: true, 4: 'macos', 25: 'meta', 26: 'DIARIZATION' }, {}, caps);
   const provider = nodes(tree).find(n => n.type === 'select' && n.props['aria-label'] === 'Transcription provider');
@@ -1583,11 +1328,11 @@ test('meta provider option is disabled without a configured key', async () => {
 });
 
 test('answer model selection is explicit and separate from transcription', async () => {
-  const { tree, requests } = pane('', true, false, '', { 12: 'openai-codex', 13: 'gpt-test' });
-  assert.ok(nodes(tree).find(n => n.type === 'option' && n.props.value === 'gpt-test'));
+  const { tree, requests } = pane('', true, false, '', { 12: 'openai', 13: 'gpt-test' });
+  assert.ok(nodes(tree).find(n => n.type === 'input' && n.props['aria-label'] === 'Answer model' && n.props.value === 'gpt-test'));
   await nodes(tree).find(n => n.type === 'button' && n.children.includes('Suggest answer')).props.onClick();
   const body = requests.find(r => r.path === '/assist').body;
-  assert.equal(body.answer_provider, 'openai-codex');
+  assert.equal(body.answer_provider, 'openai');
   assert.equal(body.answer_model, 'gpt-test');
 });
 

@@ -28,6 +28,7 @@ class InstallerTests(unittest.TestCase):
                 (source / name).parent.mkdir(parents=True, exist_ok=True)
                 (source / name).write_text('# Synthetic fixture\n', encoding='utf-8')
             (source / 'desktop/plugin.js').write_text('export default {};\n', encoding='utf-8')
+            (source / 'plugin.yaml').write_text((Path(__file__).parent / 'plugin.yaml').read_text())
             original = (home / 'config.yaml').read_bytes()
             first = install.install(source, home)
             self.assertIsNone(first['backup'])

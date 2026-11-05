@@ -19,17 +19,16 @@ class IndependentServerTests(unittest.TestCase):
         app = FastAPI()
         app.include_router(server.make_router(state))
         with TestClient(app) as client:
-            result = client.post('/assist', json={'question': 'Public test', 'answer_provider': 'openai-codex', 'answer_model': 'gpt-test'})
+            result = client.post('/assist', json={'question': 'Public test', 'answer_provider': 'openai', 'answer_model': 'gpt-test'})
             self.assertEqual(result.status_code, 200)
             self.assertTrue(done.wait(2))
-            self.assertEqual(seen[0].get('answer_provider'), 'openai-codex')
+            self.assertEqual(seen[0].get('answer_provider'), 'openai')
             self.assertEqual(seen[0].get('answer_model'), 'gpt-test')
             done.clear()
             other = server.MeetingState(engine_factory=Engine)
-            other.assist('Public test', answer_provider='', answer_model='')
-            self.assertTrue(done.wait(2))
-            self.assertIn('answer_provider', seen[-1])
-            self.assertEqual(seen[-1]['answer_provider'], '')
+            with self.assertRaises(server._AnswerRejected):
+                other.assist('Public test', answer_provider='', answer_model='')
+            self.assertFalse(done.is_set())
 
     def test_stopped_capture_callbacks_cannot_leak_into_new_meeting(self):
         import server
