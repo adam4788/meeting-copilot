@@ -691,7 +691,7 @@ class KnowledgeEngine:
                      updated_at=None) for row in rows[:3]]
 
     def answer(self, question, transcript='', project=None, web_query=None, all_projects=False, web_fallback=False,
-               answer_provider=None, answer_model=None, should_abort=None, prepared=None, skip_meta_default=False):
+               answer_provider=None, answer_model=None, should_abort=None, prepared=None, skip_meta_default=False, include_history=True):
         started = time.monotonic()
         aborted = should_abort if callable(should_abort) else lambda: False
         # Keep routing request-local: shared engines and injected one-argument mocks
@@ -812,13 +812,13 @@ class KnowledgeEngine:
                 _run_web_phase()
         else:
             retrieval_query = f'{question} {transcript[-2000:]}' if transcript else question
-            sources = self.search(retrieval_query, project=project, limit=6, all_projects=all_projects)
+            sources = self.search(retrieval_query, project=project, limit=6, all_projects=all_projects, **({} if include_history else {'include_history': False}))
             if aborted():
                 raise _Aborted('cancelled after retrieval, before provider submission')
             warnings = ['Selected snippets and bounded transcript may be sent to the configured model provider.']
             if all_projects:
                 warnings.append('All-project scope searches up to 100 eligible project folders with per-project limits; evidence may include unrelated projects. Review sources before sharing.')
-            if project and not all_projects:
+            if project and not all_projects and include_history:
                 warnings.append('Single-project scope still includes prior-session snippets, which may reference other projects. Review session sources before sharing.')
             web = {'used': False}
             _run_web_phase()
@@ -859,7 +859,7 @@ class KnowledgeEngine:
                 'streaming': streaming, 'completed_only': not streaming, 'provider_error': provider_error}
 
     def answer_stream(self, question, transcript='', project=None, web_query=None, all_projects=False, web_fallback=False,
-                      answer_provider=None, answer_model=None, should_abort=None):
+                      answer_provider=None, answer_model=None, should_abort=None, include_history=True):
         """Yield provider-native incremental chunks for one request, in order.
 
         Retrieval, planner, and prompt assembly are identical to answer(); only
@@ -875,7 +875,7 @@ class KnowledgeEngine:
         started = time.monotonic()
         aborted = should_abort if callable(should_abort) else lambda: False
         retrieval_query = f'{question} {transcript[-2000:]}' if transcript else question
-        sources = self.search(retrieval_query, project=project, limit=6, all_projects=all_projects)
+        sources = self.search(retrieval_query, project=project, limit=6, all_projects=all_projects, **({} if include_history else {'include_history': False}))
         if aborted():
             raise _Aborted('cancelled before provider submission')
         complete = (_resolve_override(self._completion_override)
@@ -922,7 +922,7 @@ class KnowledgeEngine:
         warnings = ['Selected snippets and bounded transcript may be sent to the configured model provider.']
         if all_projects:
             warnings.append('All-project scope searches up to 100 eligible project folders with per-project limits; evidence may include unrelated projects. Review sources before sharing.')
-        if project and not all_projects:
+        if project and not all_projects and include_history:
             warnings.append('Single-project scope still includes prior-session snippets, which may reference other projects. Review session sources before sharing.')
         web = {'used': False}
         web_planned = False
@@ -1178,7 +1178,7 @@ class KnowledgeEngine:
             rows = index.execute('SELECT rowid FROM docs WHERE docs MATCH ? ORDER BY bm25(docs) LIMIT ?', (query, limit)).fetchall()
         return [docs[row[0] - 1].copy() for row in rows]
 
-    def search(self, question, project=None, limit=6, all_projects=False):
+    def search(self, question, project=None, limit=6, all_projects=False, include_history=True):
         if all_projects and project:
             raise ValueError('Choose all projects or one project, not both')
         limit = max(0, min(int(limit), 20))
@@ -1221,5 +1221,14 @@ class KnowledgeEngine:
                 if folder.parent != self.project_root or selected.is_symlink() or selected.name.startswith('.') or _DENIED.search(selected.name) or selected.name.lower() in _SKIP_DIRS:
                     raise ValueError('Select one direct child project')
                 docs.extend(self._files(folder))
-            docs.extend(self._sessions(terms))
+            if include_history:
+                docs.extend(self._sessions(terms))
+            else:
+                # Use the standalone core's explicit, request-local opt-out;
+                # never mutate a shared engine or call the host history path.
+                try:
+                    from .answer_core import NoHistory
+                except ImportError:
+                    from answer_core import NoHistory
+                docs.extend(NoHistory().search(terms))
             return self._rank(docs, terms, limit)

@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 from starlette.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 
 def _is_engine_abort(exc):
@@ -64,6 +64,7 @@ class AssistRequest(BaseModel):
     project: str | None = Field(default=None, max_length=1000)
     all_projects: bool = False
     web_fallback: bool = False
+    include_history: StrictBool = True
     web_query: str | None = Field(default=None, max_length=300)
     answer_provider: str | None = Field(default=None, max_length=100)
     answer_model: str | None = Field(default=None, max_length=200)
@@ -640,11 +641,15 @@ class MeetingState:
                     self.engine = module.KnowledgeEngine()
             return self.engine
 
-    def assist(self, question, project=None, web_query=None, all_projects=False, web_fallback=False, answer_provider=None, answer_model=None, request_id=None, row_id=None, transcript=None, expected_generation=None, expected_capture_generation=None):
+    def assist(self, question, project=None, web_query=None, all_projects=False, web_fallback=False, answer_provider=None, answer_model=None, request_id=None, row_id=None, transcript=None, expected_generation=None, expected_capture_generation=None, include_history=True):
         from fastapi import HTTPException
         import secrets
         if all_projects and project:
             raise _AnswerRejected(400, 'Choose all projects or one project, not both.')
+        if not isinstance(include_history, bool):
+            raise _AnswerRejected(400, 'Choose a valid history setting.')
+        if not include_history and (not project or all_projects or web_fallback or (web_query and web_query.strip())):
+            raise _AnswerRejected(400, 'History off requires one project and web search off.')
         with self.lock:
             # Overlay questions belong to the snapshot the user clicked, not
             # whichever meeting is current when its worker finally arrives.
@@ -705,7 +710,7 @@ class MeetingState:
                      'request': {'question': question[:4000], 'transcript': transcript,
                                  'project': project, 'web_query': web_query, 'all_projects': all_projects,
                                  'web_fallback': web_fallback, 'answer_provider': answer_provider,
-                                 'answer_model': answer_model, 'row_id': row_id}}
+                                 'answer_model': answer_model, 'row_id': row_id, 'include_history': include_history}}
             self.requests[request_id] = entry
             self.busy, self.error, self.result = True, None, None
             self.error_request = None
@@ -726,6 +731,8 @@ class MeetingState:
                 options = {}
                 if answer_provider is not None or answer_model is not None:
                     options = {'answer_provider': answer_provider, 'answer_model': answer_model}
+                if not include_history:
+                    options['include_history'] = False
                 engine = self.get_engine()
                 # Prefer a retrieval-free streaming probe so completed-only routes
                 # never pay for double retrieval + ranking on fallback.
@@ -734,7 +741,7 @@ class MeetingState:
                 use_stream = False
                 try:
                     probe_fn = getattr(engine, 'supports_streaming', None)
-                    probe = probe_fn(**options) if callable(probe_fn) else True
+                    probe = probe_fn(**{k: v for k, v in options.items() if k != 'include_history'}) if callable(probe_fn) else True
                 except Exception:
                     probe = True
                 stream_header, chunks = None, None
@@ -990,6 +997,10 @@ class MeetingState:
         """Keep only pane-owned keys; drop anything the pane never sets."""
         scope = scope if isinstance(scope, dict) else {}
         cleaned = {}
+        if 'include_history' in scope:
+            if not isinstance(scope['include_history'], bool):
+                raise HTTPException(422, 'Invalid history setting.')
+            cleaned['include_history'] = scope['include_history']
         seq = scope.get('seq')
         if isinstance(seq, int):
             cleaned['seq'] = seq
@@ -1687,7 +1698,7 @@ class MeetingState:
                     'generation': self.generation, 'status_seq': self.status_seq,
                     'capture_generation': self.capture_generation, 'pane_seen': self.pane_seen,
                     'overlay_shown': None if uncertain_overlay else overlay is not None,
-                    'capabilities': {'all_projects': True, 'automatic_web_fallback': True, 'independent_models': True,
+                    'capabilities': {'all_projects': True, 'automatic_web_fallback': True, 'independent_models': True, 'history_opt_out': True,
                                      'meta_asr': _meta_key_present(),
                                      'macos_transcription': bool(macos_ready),
                                      'overlay': overlay_available, 'overlay_stream': True, 'overlay_cancel': True,
@@ -1790,7 +1801,7 @@ def make_router(state):
     def assist(body: AssistRequest):
         try:
             return state.assist(body.question, body.project, body.web_query, body.all_projects, body.web_fallback, body.answer_provider, body.answer_model,
-                                request_id=body.request_id, row_id=body.row_id, transcript=body.transcript)
+                                request_id=body.request_id, row_id=body.row_id, transcript=body.transcript, include_history=body.include_history)
         except _AnswerRejected as exc:
             if body.response_contract != 'answer-admission-v1':
                 raise

@@ -446,7 +446,8 @@ class BackendTransport:
                 bool(scope.get('web_fallback', False)),
                 scope.get('answer_provider'), scope.get('answer_model'),
                 row_id=row_id, expected_generation=expected_generation,
-                expected_capture_generation=expected_capture_generation)
+                expected_capture_generation=expected_capture_generation,
+                **({'include_history': False} if scope.get('include_history') is False else {}))
 
         caller_context.run(_call)
         result = result_holder.get('result')
