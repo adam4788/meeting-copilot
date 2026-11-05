@@ -21,11 +21,11 @@ These are complete CLI JSON records, not truncated terminal previews:
 
 | Label | Complete local evidence | Actual REA evidence ID |
 |---|---|---|
-| M | [macho.json]($HOME/.hermes/cache/scratch/meeting-rea/macho.json) | `ev_7c20de66d37b39290d7be226eab1866cdec4b32092ef45072b18f10f2933ea15` |
-| R | [rust.json]($HOME/.hermes/cache/scratch/meeting-rea/rust.json) | `ev_fcde7c9039487b2aaa90372ce35f2dd274003368356ae813dc5d0ab17e49e534` |
-| P | [plist.json]($HOME/.hermes/cache/scratch/meeting-rea/plist.json) | `ev_300c649e9724425fa92f21e137ea070a55525b16f83586cdddb3f4def70fb112` |
+| M | `macho.json` (local scratch) | `ev_7c20de66d37b39290d7be226eab1866cdec4b32092ef45072b18f10f2933ea15` |
+| R | `rust.json` (local scratch) | `ev_fcde7c9039487b2aaa90372ce35f2dd274003368356ae813dc5d0ab17e49e534` |
+| P | `plist.json` (local scratch) | `ev_300c649e9724425fa92f21e137ea070a55525b16f83586cdddb3f4def70fb112` |
 
-[manifest.json]($HOME/.hermes/cache/scratch/meeting-rea/manifest.json) records evidence-file digests, sizes, subjects, limitations, and downloaded source-file digests. [artifact-first-findings.json]($HOME/.hermes/cache/scratch/meeting-rea/artifact-first-findings.json) was saved **before** fetching upstream source. It is a selected-symbol summary, not a new REA record or exhaustive symbol list. Scratch evidence is local and subject to cache pruning; archive it separately if durable audit retention is required.
+`manifest.json` (local scratch) records evidence-file digests, sizes, subjects, limitations, and downloaded source-file digests. `artifact-first-findings.json` (local scratch) was saved **before** fetching upstream source. It is a selected-symbol summary, not a new REA record or exhaustive symbol list. Scratch evidence is local and subject to cache pruning; archive it separately if durable audit retention is required.
 
 ### Artifact identity
 
@@ -53,7 +53,7 @@ M imports/exports explicitly report `exhaustive=false` and unknown totals. REA c
 
 ## Matching public source: corroboration, not binary equivalence
 
-After recording artifact findings, the public GitHub tag was fetched. [Tag API response]($HOME/.hermes/cache/scratch/meeting-rea/upstream-tag.json) identifies `v0.4.1` directly as commit `a2cb62e827da7ef59f65064c97233efb2313878e`. The [recursive tree]($HOME/.hermes/cache/scratch/meeting-rea/upstream-tree.json) reports `truncated=false`. Downloaded files are under [upstream/]($HOME/.hermes/cache/scratch/meeting-rea/upstream/). This establishes matching declared version, **not a reproducible-build match** to the installed executable.
+After recording artifact findings, the public GitHub tag was fetched. `Tag API response` (local scratch) identifies `v0.4.1` directly as commit `a2cb62e827da7ef59f65064c97233efb2313878e`. The `recursive tree` (local scratch) reports `truncated=false`. Downloaded files are under `upstream/` (local scratch). This establishes matching declared version, **not a reproducible-build match** to the installed executable.
 
 All source URLs below pin that commit. Details in this section are source observations unless explicitly tied to M/P above.
 

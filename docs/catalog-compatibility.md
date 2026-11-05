@@ -56,26 +56,18 @@ No core functions or registries are patched by the production plugin. An
 upstream public fresh-copy authenticated scope API would let the private seam
 be removed; no issue or PR has been submitted by this work.
 
-Development-only scan cautions remain visible in the full checkout. `verify_overlay_eof.py`
-compiles and executes locally inspected method source for in-memory mutation
-checks, and patches objects only inside those isolated tests. It is not copied
-by `install.py` or imported by runtime entrypoints. The explicitly obsolete
-`real_effect_test_backend.py`/`test_real_effects.cjs` fixtures describe the retired
-credential editor and are not current validation evidence or installed files.
-Their old private imports are not runtime integrations. These files remain
-reviewable source and the development checkout is still scanned honestly.
+Development-only scan cautions remain visible in the full checkout.
+`tests/verify_overlay_eof.py` compiles and executes locally inspected method
+source for in-memory mutation checks. It is neither installed nor imported by
+runtime entrypoints. The retired credential-editor harness is available in Git
+history; it is not current validation evidence.
 
-`export_catalog_runtime.py` creates a distinct, allowlisted runtime source tree
-outside the checkout. It copies the runtime modules, native source, entrypoints,
-setup scripts and documentation, preserving runtime bytes. Development tests and
-mutation/probe scripts are omitted because they are not runtime dependencies;
-no scanner exclusions or finding suppressions are added. `SOURCE_REVISION` ties
-the artifact to the complete development commit, whose history retains every
-test. Export tests enforce completeness, byte identity, secret/untracked-file
-exclusion and refusal to overwrite existing destinations. Run the unchanged
-doctor/validator against both the full source and actual release tree, and
-report their warnings separately. A catalog pin must identify the release tree
-that was actually validated, not pretend that an unpublished export is public.
+`scripts/export_catalog_runtime.py` creates a distinct allowlisted runtime tree
+outside the checkout, preserving runtime bytes and the exact README hero asset.
+Tests and probes are omitted as non-runtime dependencies; no scanner exclusions
+are added. `SOURCE_REVISION` ties the artifact to the complete development
+commit. Validate both the full source and actual export, reporting warnings
+separately. A catalog pin must identify the release tree actually validated.
 
 Focused regression coverage includes the public facade's exact call signature,
 no implicit host lookup, sanitized failures and no retries; actual synthetic

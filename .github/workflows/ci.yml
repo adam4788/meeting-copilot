@@ -23,7 +23,7 @@ jobs:
       - run: python -m pip install -r requirements-dev.txt
       - run: python -m unittest discover -v
       - run: node --check desktop/plugin.js
-      - run: node --test test_desktop.mjs
+      - run: node --test tests/test_desktop.mjs
   macos-build:
     # macos_capture.swift uses AVAudioSinkNode (macOS 26 SDK). macos-latest
     # resolved to an older image whose toolchain rejects it, so pin the
@@ -41,4 +41,4 @@ jobs:
           swiftc -parse-as-library native/macos_overlay.swift -o /tmp/meeting-copilot-overlay
           /tmp/meeting-copilot-overlay --self-test
       - run: node --check desktop/plugin.js
-      - run: node --test test_desktop.mjs
+      - run: node --test tests/test_desktop.mjs

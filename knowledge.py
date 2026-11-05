@@ -1119,7 +1119,7 @@ class KnowledgeEngine:
                         docs.extend(files)
                 else:
                     # Very large corpora: per-project FTS candidates as a
-                    # bounded approximation (see KNOWLEDGE.md).
+                    # bounded approximation (see docs/knowledge.md).
                     for files in per_project:
                         docs.extend(self._rank(files, terms,
                                                min(100, max(limit * 10, 30))))

@@ -55,7 +55,7 @@ Projects/
     launch.md
 ```
 
-Use a fictional file first, as shown in the [demo](../DEMO.md). Supported formats
+Use a fictional file first, as shown in the [demo](demo.md). Supported formats
 are UTF-8 `.md`, `.txt`, and `.rst`; PDF, DOCX, and XLSX extraction is unavailable.
 Hidden paths, symlinks, dependency trees, and common credential filenames are
 excluded. Filtering is best effort, so keep secrets out of searchable material.
@@ -78,8 +78,8 @@ have permission from participants and have checked the chosen source.
 | Source | Preparation and limits |
 | --- | --- |
 | macOS native | From a source checkout, `python prepare_macos.py --home /path/to/profile` prepares an isolated Python 3.12 audio runtime and compiles/signs Swift helpers. It requires uv and Apple Command Line Tools. It supports managed catalog checkout and custom installer layouts; it does not start capture or request recording permission. Native loss is unresolved. |
-| Windows native | Experimental SoundCard/WASAPI capture, with optional dependencies in `requirements-audio.txt`. Consult [Windows audio](../AUDIO.md). Desktop setup is being verified separately; prior standalone synthetic checks do not prove the complete Desktop flow. |
-| Meetily | Optional, unofficial attachment to an explicitly chosen active JSON recording. Meetily owns its recording files and retention. See [adapter setup](../MEETILY.md). |
+| Windows native | Experimental SoundCard/WASAPI capture, with optional dependencies in `requirements-audio.txt`. Consult [Windows audio](audio.md). Desktop setup is being verified separately; prior standalone synthetic checks do not prove the complete Desktop flow. |
+| Meetily | Optional, unofficial attachment to an explicitly chosen active JSON recording. Meetily owns its recording files and retention. See [adapter setup](meetily.md). |
 
 In **Transcript source**, choose the capture source and available audio settings.
 The current pane defaults to Meetily; select your intended source explicitly.
@@ -113,7 +113,7 @@ source files. A retry explicitly resends saved context.
 | --- | --- |
 | Pane will not open | Hermes version, plugin enablement, and doctor output |
 | Provider unavailable | Matching Hermes secret setting, reopened pane, exact model ID, account access and credits |
-| No project evidence | Project root, direct child layout, supported text format, and [scan limits](../KNOWLEDGE.md) |
+| No project evidence | Project root, direct child layout, supported text format, and [scan limits](knowledge.md) |
 | Capture unavailable | Platform preparation and the selected transcript source; do not infer readiness from CI |
 | Stop or answer status uncertain | Recheck status before restarting or asking again; duplicate requests may incur billing |
 
