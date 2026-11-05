@@ -22,11 +22,10 @@ constraints. Doctor checks registration and setup. It does not test your API
 account, audio devices, or meeting accuracy. Catalog admission is a separate
 process; see [catalog preflight](catalog-readiness.md).
 
-At the 2026-11-05 checkpoint, the Windows host has an older enabled custom installation. Hermes
-stopped the managed pinned upgrade for scanner review, including development
-mutation tests and process/dependency operations; no override or upgrade
-occurred. Review the complete findings before proceeding. This source revision
-must not be described as installed or working on that Desktop yet.
+The full source checkout includes development mutation tests and operations
+that launch processes or install dependencies. Review the complete scanner
+findings for the selected revision. An installed or reloaded plugin does not
+verify the Desktop pane, a provider account, or native audio on your machine.
 
 ## Configure answers
 

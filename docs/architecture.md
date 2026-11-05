@@ -6,6 +6,8 @@ registering the plugin does not start recording.
 
 ```mermaid
 flowchart TD
+    accTitle: Meeting Copilot components and data flow
+    accDescr: The authenticated plugin API controls capture and retrieval. Bounded transcript and evidence feed an explicit provider request. Optional history and web search add evidence only when enabled. Answers return to the pane for review.
     UI[Desktop pane] --> API[Hermes authenticated plugin API]
     API --> C[Consent-gated capture or Meetily attachment]
     C --> T[Bounded transcript in process memory]
@@ -14,10 +16,10 @@ flowchart TD
     T --> A[Explicit answer request]
     R --> A
     A --> P[Selected HTTPS answer provider]
-    P --> V[Answer plus source mapping]
-    V --> UI
-    A -. Web opt-in .-> W[Hermes search dispatcher]
+    P --> V[Answer and source mapping in pane]
+    R -. Web opt-in .-> W[Hermes search dispatcher]
     W --> A
+    classDef default fill:#F2F2F2,stroke:#0000F2,color:#181818,stroke-width:1px
 ```
 
 ## Components

@@ -7,9 +7,9 @@ Capture a consented meeting, choose a project, and explicitly ask for a short
 answer with numbered evidence sources. Read the suggestion and decide how to use
 it. Nothing is spoken, posted, or submitted for you.
 
-<!-- Visual integration pending: supplied generated conceptual hero art.
-     Inspect the image and verify local bytes before adding its image reference.
-     It must be labelled as generated artwork, not a product screenshot. -->
+![Cobalt audio waveform crossing layered document shapes on an off-white halftone background with fine blue guide lines.](docs/assets/meeting-copilot-hero.png)
+
+*Generated conceptual artwork; not a product screenshot.*
 
 [Get started](docs/getting-started.md) · [Try the offline demo](DEMO.md) ·
 [Privacy](SECURITY.md) · [Documentation](docs/README.md)
@@ -19,11 +19,11 @@ it. Nothing is spoken, posted, or submitted for you.
 **Early developer preview.** The published source includes OpenAI/OpenRouter
 bring-your-own-key setup. Live responses from those accounts remain unverified.
 Native audio is experimental; macOS fictional-audio checks found dropped frames.
-Windows Desktop installation is still being checked separately from CI.
+Windows Desktop pane and runtime verification is still in progress.
 
 | Platform | Automated checks at the pinned revision | Desktop and native audio status |
 | --- | --- | --- |
-| Windows | Python 3.11/3.12 suite and JavaScript checks passed in CI | Desktop setup under verification; SoundCard/WASAPI capture remains experimental |
+| Windows | Python 3.11/3.12 suite and JavaScript checks passed in CI | Desktop pane/runtime under verification; SoundCard/WASAPI capture remains experimental |
 | macOS | Python 3.12 suite, JavaScript checks, and overlay helper build/self-test passed in CI | Microphone/system-audio checks used fictional content; native frame loss remains unresolved |
 | Linux | Python 3.11/3.12 suite and JavaScript checks passed in CI | Native audio and Desktop use are not established by these checks |
 
@@ -47,7 +47,9 @@ CI and plugin validation do not prove a complete meeting works on your computer.
 - Offers a macOS meeting overlay. It may appear in screen shares.
 
 ```mermaid
-flowchart LR
+flowchart TD
+    accTitle: Meeting Copilot answer workflow
+    accDescr: Consented capture is transcribed into meeting context. Project retrieval supplies evidence. You request an answer from your selected model and review the numbered sources.
     A[Consented capture] --> B[Transcription]
     B --> C[Meeting context]
     P[Selected project files] --> R[Read-only retrieval]
@@ -56,6 +58,7 @@ flowchart LR
     Q --> M[Selected provider and exact model]
     M --> E[Suggested answer and numbered sources]
     E --> U[You review and decide]
+    classDef default fill:#F2F2F2,stroke:#0000F2,color:#181818,stroke-width:1px
 ```
 
 Capture, transcription, retrieval, and answer generation are separate steps.
@@ -76,9 +79,9 @@ or verify a live provider. See [the setup guide](docs/getting-started.md) before
 enabling capture. Catalog admission has not been established; this is a managed
 Git installation of a community project.
 
-At the 2026-11-05 Windows checkpoint, Hermes stopped the pinned upgrade for scanner
-review; this revision has not been installed there. Review findings before
-continuing. Do not treat an older enabled custom installation as this build.
+Review scanner findings for the pinned source before continuing installation.
+An installed or reloaded plugin does not establish Desktop pane, provider, or
+audio readiness. Windows capture remains experimental.
 
 ## Ask your first question
 

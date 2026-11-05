@@ -17,10 +17,10 @@ Keep experimental status visible. Avoid promises of perfect recall, instant
 answers, lossless recording, universal compatibility, or guaranteed privacy.
 Use synthetic information in examples and visuals.
 
-The proposed project mark is a framed **MC** monogram drawn independently from
-plain letterforms, paired with the full name. It is a direction pending artwork,
-not an existing verified asset. Do not copy Nous's seal, marks, illustrations,
-or proprietary fonts.
+Use a plain text wordmark with the full project name. The documentation does
+not need a separate emblem. Do not copy Nous's seal, marks, illustrations,
+or proprietary fonts. Keep the community-project attribution beside product
+descriptions where an affiliation could otherwise be inferred.
 
 ## Palette
 
@@ -52,15 +52,27 @@ palette and editorial spacing over glow effects or fabricated dashboards.
 
 ## Image roles and evidence
 
-The supplied GPT-generated hero is conceptual artwork. Its caption must say
-**Generated conceptual artwork; not a product screenshot.** Inspect its actual
-pixels before writing alt text or selecting a crop.
+The supplied GPT-generated hero uses an audio waveform, layered document forms,
+fine blue guide lines, and a halftone texture on off-white. Its left side has
+generous open space; the visual focus sits on the right. This is conceptual
+artwork. Its caption must say **Generated conceptual artwork; not a product
+screenshot.**
+
+![Cobalt audio waveform crossing layered document shapes on an off-white halftone background with fine blue guide lines.](assets/meeting-copilot-hero.png)
+
+*Generated conceptual artwork; not a product screenshot.*
+
+Preserve the full 3:1 composition in the README and use responsive width with
+proportional height. Keep the title, description, instructions, and status as
+real Markdown text outside the image. Reuse this source for an optional future
+background rather than creating a second, visually inconsistent illustration.
+Any crop needs a fresh review of waveform and document visibility.
 
 Real UI images must show an observed interface with synthetic data and identify
 platform/revision. Never label generated UI as a screenshot or show fabricated
 test results. Exclude private meetings, client details, keys, and personal paths.
 Add no success badge without a real linked result.
 
-See [asset notes](assets/README.md) for planned filenames, dimensions, and
+See [asset notes](assets/README.md) for the supplied filename, dimensions, and
 provenance. Preserve the source Library item; repository assets are copies.
 No additional image generation is needed for the current documentation scope.
