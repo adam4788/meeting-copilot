@@ -103,7 +103,7 @@ Installation copies only this plugin into the active `HERMES_HOME`, backing up a
 
 1. Open the **Meeting Copilot** pane in the desktop layout.
 2. Start recording in Meetily, then choose that active recording in the pane.
-3. Choose **Search scope**: one project, **All projects + sessions**, or **Past sessions only**.
+3. Choose **Search scope**: one project, **All projects + sessions**, or **Past sessions only**. To search only one project and exclude past sessions, open **Answer setup**, select that project, and check **Exclude past sessions**. Turn off automatic web fallback and clear any specific web query; the backend rejects history-off requests without one project or with web search enabled. This choice resets when the pane is reopened. Hide the overlay and finish any answer before changing it.
 4. Confirm permission and click **Attach to Meetily**.
 5. Click **Suggest answer** for the latest question, or type a specific question.
 6. **Automatic web fallback** is unchecked by default; check it to allow automatically planned searches for this meeting. To override it, expand **Search online with a specific query** and enter a public query explicitly.

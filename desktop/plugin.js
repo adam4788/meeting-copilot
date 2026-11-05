@@ -224,6 +224,8 @@ export default {
       const [overlayMsg, setOverlayMsg] = useState('');
       const [copied, setCopied] = useState(false);
       const [persistWarning, setPersistWarning] = useState('');
+      // Deliberately resets to the existing history-on default on each mount.
+      const [excludeHistory, setExcludeHistory] = useState(false);
 
       const status = useQuery({ queryKey: [ID, 'status'], queryFn: () => api('/status'), refetchInterval: 2500, retry: 1 });
       // Keep the overlay lease alive while the pane is visible; overlay helper
@@ -257,13 +259,15 @@ export default {
       // only to the explicit web button and to the overlay, never silently
       // into Suggest. Overlay sync tracks the query separately (scopeKey)
       // so editing or clearing it re-syncs instead of leaving stale state.
-      const scope = { project: allProjects ? null : project || null, all_projects: allProjects, web_fallback: webFallback, ...(answerProvider && answerModel ? { answer_provider: answerProvider, answer_model: answerModel } : {}) };
+      const scope = { project: allProjects ? null : project || null, all_projects: allProjects, web_fallback: webFallback, ...(excludeHistory ? { include_history: false } : {}), ...(answerProvider && answerModel ? { answer_provider: answerProvider, answer_model: answerModel } : {}) };
       const overlayQuery = web.trim() ? { web_query: web.trim() } : {};
       const overlayScopeKey = JSON.stringify({ ...scope, web_query: web.trim() || null });
       const unsupportedReasons = [
         allProjects && !data.capabilities?.all_projects ? 'All-projects search needs the updated backend (restart the gateway when other sessions are idle).' : null,
         webFallback && !data.capabilities?.automatic_web_fallback ? 'Automatic web fallback needs the updated backend.' : null,
         answerProvider && (!answerModel || !data.capabilities?.independent_models) ? 'Answer model selection needs the updated backend and a chosen model.' : null,
+        excludeHistory && !data.capabilities?.history_opt_out ? 'Excluding past sessions needs the updated backend. Restart the gateway when other work is idle.' : null,
+        excludeHistory && (!project || allProjects || webFallback || web.trim()) ? 'To exclude past sessions, choose one project and turn off web search.' : null,
       ].filter(Boolean);
       const unsupported = unsupportedReasons.length > 0;
       // Closing the pane pauses capture: the overlay is hidden and the
@@ -463,6 +467,10 @@ export default {
       async function toggleOverlay() {
         const life = overlayActionAt.current;
         if (!life.mounted) return;
+        if (!overlayOn && !overlayNeedsHide && excludeHistory && unsupported) {
+          setOverlayMsg('Choose one project, turn off web search, and use the updated backend before showing the overlay.');
+          return;
+        }
         setPending(true); setOverlayMsg('');
         life.at = Date.now();
         try {
@@ -553,7 +561,7 @@ export default {
         setLiveEntry(null); setTrackedRequest(res.request_id);
       };
       async function assistNow(extra = {}, questionOverride, scopeOverride) {
-        if (!usable() || !overlayActionAt.current.mounted || answerBlocked || answerSubmitting.current) return;
+        if (!usable() || !overlayActionAt.current.mounted || answerBlocked || answerSubmitting.current || unsupported) return;
         const asked = questionOverride !== undefined ? questionOverride : question;
         const scopeUsed = scopeOverride || scope;
         const body = boundedAnswer({ question: asked, ...scopeUsed, ...extra, response_contract: 'answer-admission-v1' });
@@ -579,8 +587,17 @@ export default {
       // transcript snapshot) instead of whatever the pane currently shows.
       async function replayRequest(req) {
         if (!usable() || !overlayActionAt.current.mounted || !req || answerBlocked || answerSubmitting.current) return;
+        if (excludeHistory && req.include_history !== false) {
+          setError('This saved answer used past sessions. Ask a new question to keep past sessions excluded.');
+          return;
+        }
+        if (req.include_history === false && !data.capabilities?.history_opt_out) {
+          setError('History exclusion needs the updated backend. Restart the gateway when other work is idle.');
+          return;
+        }
         const body = boundedAnswer({ response_contract: 'answer-admission-v1', question: req.question || '', project: req.project ?? null,
           all_projects: !!req.all_projects, web_fallback: !!req.web_fallback,
+          ...(req.include_history === false ? { include_history: false } : {}),
           ...(req.web_query ? { web_query: req.web_query } : {}),
           ...(req.answer_provider ? { answer_provider: req.answer_provider, answer_model: req.answer_model } : {}),
           ...(typeof req.transcript === 'string' ? { transcript: req.transcript } : {}),
@@ -849,6 +866,7 @@ export default {
         h('label', { ref: composerRef, style: { display: 'grid', gap: 6 } }, h('strong', { id: 'mc-q-label' }, 'What should I say?'),
           h(Textarea, { value: question, maxLength: 4000, onChange: e => setQuestion(e.target.value.slice(0, 4000)), placeholder: 'Leave blank to answer the latest question, or type a question… (⌘/Ctrl+Enter to send)', rows: 3, 'aria-labelledby': 'mc-q-label', onKeyDown: e => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !e.repeat && !e.nativeEvent?.isComposing && !busy && !unsupported) { e.preventDefault(); assistNow(); } } })),
         ...(unsupported ? [h('p', { role: 'alert', style: muted }, `Suggest is unavailable: ${unsupportedReasons.join(' ')} See Answer setup below, then restart the gateway when other sessions are idle.`)] : []),
+        excludeHistory && !unsupported && h('p', { role: 'status', style: muted, 'data-history-excluded': true }, 'Past sessions and web search are excluded. Only the selected project is searched.'),
         h('p', { style: { ...muted, margin: 0 } }, 'Your question, part of the transcript and selected source snippets may be sent to the answer model.'),
         webFallback && h('p', { 'data-web-fallback-disclosure': true, role: 'status', style: { ...muted, margin: 0 } }, 'Automatic web fallback is on: if local evidence is insufficient, a public query may be drafted. Filtering is not a privacy guarantee; turn it off for sensitive calls.'),
         h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
@@ -937,6 +955,9 @@ export default {
             ...entries.map(p => { const value = typeof p === 'string' ? p : (p.path || p.name); return h('option', { value, key: value }, typeof p === 'string' ? p.split(/[\\/]/).pop() : (p.name || value)); }))),
         projects.error && h('div', { role: 'alert', style: muted }, `Project lookup unavailable: ${projects.error.message}`),
         allProjects && h('p', { style: { ...muted, margin: 0 } }, 'Searches supported text files across up to 100 eligible project folders plus past sessions, not your whole computer. Evidence can include unrelated projects; review it before sharing.'),
+        h('label', { style: { ...muted, display: 'flex', gap: 8, alignItems: 'flex-start' } },
+          h('input', { type: 'checkbox', checked: excludeHistory, disabled: answerBlocked || overlayOn || data.overlay_shown === true || data.overlay_shown === null || overlayNeedsHide, onChange: e => setExcludeHistory(e.target.checked), 'aria-label': 'Exclude past sessions' }),
+          h('span', null, 'Exclude past sessions. Choose one project and turn off web search. Hide the overlay and finish any answer before changing this setting.')),
         h('section', { style: { ...card, display: 'grid', gap: 10 } },
           h('span', { id: 'mc-model-label', style: { fontWeight: 700 } }, 'Answer model'),
           h('div', { style: { display: 'grid', gap: 8 } },

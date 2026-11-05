@@ -529,7 +529,10 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
       const i = stateIndex++;
       if (!(i in values)) {
         const overrides = { 0: scope, 2: web, ...settings };
-        values[i] = Object.hasOwn(overrides, i) ? overrides[i] : initial === true ? fallback : initial;
+        // The history toggle is a new hook at index 18; preserve legacy test
+        // fixture indexes for the hooks that follow it.
+        const legacyIndex = i > 18 ? i - 1 : i;
+        values[i] = i === 18 ? initial : Object.hasOwn(overrides, legacyIndex) ? overrides[legacyIndex] : initial === true ? fallback : initial;
       }
       return [values[i], v => { values[i] = typeof v === 'function' ? v(values[i]) : v; }];
     },
@@ -566,6 +569,51 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
     unmount: () => { for (const effect of effects) effect?.cleanup?.(); },
     replayEffects: () => { for (const effect of effects) effect?.cleanup?.(); effects.length = 0; return render(); } };
 }
+test('project-only mode sends a request-scoped history opt-out and fails closed on old backends', async () => {
+  for (const supported of [true, false]) {
+    const ui = pane('/projects/alpha', true, false, '', {}, {}, {capabilities:{all_projects:true, independent_models:true, history_opt_out:supported}});
+    const toggle = nodes(ui.tree).find(n => n.type === 'input' && n.props['aria-label'] === 'Exclude past sessions');
+    assert.ok(toggle, 'explicit history opt-out is available');
+    assert.equal(toggle.props.checked, false, 'existing users retain history by default');
+    toggle.props.onChange({target:{checked:true}});
+    const tree = ui.rerender();
+    const ask = nodes(tree).find(n => n.type === 'button' && n.children.includes('Suggest answer'));
+    assert.equal(!!ask.props.disabled, !supported, 'old backends cannot silently ignore opt-out');
+    if (supported) {
+      await ask.props.onClick();
+      assert.equal(ui.requests.find(r => r.path === '/assist').body.include_history, false);
+    }
+  }
+});
+
+test('history exclusion blocks replay of older history-on requests', async () => {
+  const ui = pane('/projects/alpha', true, false, '', {}, {}, {
+    capabilities:{all_projects:true, independent_models:true, history_opt_out:true},
+    recent:[{request_id:'old',status:'done',question:'Old question?',answer:'Old answer',request:{question:'Old question?',project:'/projects/alpha'}}]
+  });
+  nodes(ui.tree).find(n => n.type === 'input' && n.props['aria-label'] === 'Exclude past sessions').props.onChange({target:{checked:true}});
+  const tree = ui.rerender();
+  await nodes(tree).find(n => n.type === 'button' && n.children.includes('Ask again')).props.onClick();
+  assert.equal(ui.requests.some(r => r.path === '/assist'), false);
+  assert.match(JSON.stringify(ui.rerender()), /saved answer used past sessions/i);
+});
+
+test('history-off replay preserves the original request scope', async () => {
+  const ui = pane('/projects/alpha', true, false, '', {}, {}, {
+    capabilities:{all_projects:true, independent_models:true, history_opt_out:true},
+    recent:[{request_id:'old',status:'done',question:'Synthetic question?',answer:'Synthetic answer',request:{question:'Synthetic question?',project:'/projects/alpha',include_history:false}}]
+  });
+  nodes(ui.tree).find(n => n.type === 'input' && n.props['aria-label'] === 'Exclude past sessions').props.onChange({target:{checked:true}});
+  await nodes(ui.rerender()).find(n => n.type === 'button' && n.children.includes('Ask again')).props.onClick();
+  assert.equal(ui.requests.find(r => r.path === '/assist').body.include_history, false);
+});
+
+test('history setting cannot be changed while the overlay is shown', () => {
+  const ui = pane('/projects/alpha', true, false, '', {}, {}, {overlay_shown:true});
+  const toggle = nodes(ui.tree).find(n => n.type === 'input' && n.props['aria-label'] === 'Exclude past sessions');
+  assert.equal(toggle.props.disabled, true);
+});
+
 test('settings use a short heading and disclose answer data at the action', () => {
   const { tree } = pane('', true, false);
   const summary = nodes(tree).find(n => n.type === 'summary' && JSON.stringify(n.children).includes('Answer setup'));
@@ -2111,9 +2159,9 @@ test('idle setup exposes exactly one primary start action and one consent contro
   const all = nodes(tree);
   const starts = all.filter(n => n.type === 'button' && (n.children.includes('Start listening') || n.children.includes('Attach to Meetily')));
   assert.equal(starts.length, 1);
-  // Consent, web fallback: no duplicated permission/start controls on the idle path.
+  // Consent, history exclusion, and web fallback: no duplicate controls.
   const boxes = all.filter(n => n.type === 'input' && n.props.type === 'checkbox');
-  assert.ok(boxes.length <= 2, `expected at most consent + web-fallback checkboxes, found ${boxes.length}`);
+  assert.ok(boxes.length <= 3, `expected at most consent, history and web controls, found ${boxes.length}`);
 });
 
 test('paused meeting offers resume and explicit new meeting', () => {
