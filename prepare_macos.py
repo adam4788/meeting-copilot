@@ -15,7 +15,12 @@ def prepare(home, run=subprocess.run):
     swiftc = shutil.which('swiftc')
     if not uv or not swiftc:
         raise RuntimeError('Install uv and Apple Command Line Tools before preparing audio.')
-    core = Path(home).expanduser().resolve() / 'plugins/meeting-copilot-live/dashboard/core'
+    plugin = Path(home).expanduser().resolve() / 'plugins/meeting-copilot-live'
+    core = plugin / 'dashboard/core'
+    # Catalog installs load the pinned tree directly, without install.py's
+    # generated dashboard/core layout. Build beside the actual runtime modules.
+    if not (core / 'audio_worker.py').is_file() and (plugin / 'plugin.yaml').is_file():
+        core = plugin
     for name in ('audio_worker.py', 'overlay_bridge.py', 'native/macos_capture.swift',
                  'native/macos_overlay.swift', 'requirements-macos-audio.txt'):
         if not (core / name).is_file():

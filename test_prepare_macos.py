@@ -39,3 +39,20 @@ class PreparationTests(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 prepare_macos.prepare(tmp, run=lambda *args, **kwargs: calls.append(args))
         self.assertEqual(calls, [])
+
+    def test_catalog_tree_builds_beside_loaded_modules_without_installer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin = Path(tmp) / 'plugins/meeting-copilot-live'
+            (plugin / 'native').mkdir(parents=True)
+            for name in ('plugin.yaml', 'audio_worker.py', 'overlay_bridge.py',
+                         'native/macos_capture.swift', 'native/macos_overlay.swift',
+                         'requirements-macos-audio.txt'):
+                (plugin / name).write_text('synthetic')
+            calls=[]
+            with patch('prepare_macos.sys.platform', 'darwin'), patch('prepare_macos.shutil.which', return_value='/tools/tool'):
+                result=prepare_macos.prepare(tmp,run=lambda argv,**kw:calls.append(argv))
+            self.assertEqual(Path(result['helper']).parent,plugin.resolve())
+            self.assertEqual(Path(result['runtime']).parent.parent,plugin.resolve() / 'audio-runtime')
+            self.assertFalse((plugin / 'dashboard/core').exists())
+            self.assertFalse(result['capture_started'])
+            self.assertFalse(any('--start' in argv for argv in calls))
