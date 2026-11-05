@@ -118,7 +118,7 @@ class CoreAcceptanceTests(NoHermesTestCase):
 
     def test_host_imports_fail_loudly_not_silently(self):
         import hermes_adapters
-        with self.assertRaisesRegex(RuntimeError, 'agent.auxiliary_client'):
+        with self.assertRaisesRegex(RuntimeError, 'ctx.llm'):
             hermes_adapters.default_completion()([])
         with self.assertRaisesRegex(RuntimeError, 'tools.web_tools'):
             hermes_adapters.default_search()('q')

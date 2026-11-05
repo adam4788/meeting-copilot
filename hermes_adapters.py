@@ -6,28 +6,32 @@ real Hermes home. Anything that needs the host goes through one of the
 factory functions below, which raise a clear error naming the missing
 capability instead of failing deep inside answer assembly.
 
-The plugin compatibility path (KnowledgeEngine defaults) delegates to these
-factories, so host behavior stays identical while the core can run with
-injected fakes, real third-party providers, or no history/search at all.
+Meeting Copilot's explicit BYOK runtime does not use these completion/search
+factories. Embedders may inject the public ctx.llm facade or provide their own
+completion, search and history implementations.
 """
 
 _MISSING = object()
 
 
-def default_completion():
-    """Completion callable using the host model route (lazy import)."""
+def default_completion(llm=None):
+    """Adapt an explicitly supplied public ``ctx.llm`` sync facade.
+
+    This optional embedding helper follows the host's configured route and
+    fallback policy. It is not used for Copilot's fixed-route BYOK answers.
+    No host lookup, private resolver, model override or credential extraction.
+    """
     def complete(messages):
-        try:
-            from agent.auxiliary_client import call_llm
-        except ImportError as exc:
+        if not callable(getattr(llm, 'complete', None)):
             raise RuntimeError(
-                'Hermes completion is unavailable: agent.auxiliary_client '
-                f'cannot be imported ({exc}). Inject a CompletionProvider '
-                'or configure a standalone provider instead.') from exc
-        response = call_llm(task='meeting_copilot', messages=messages, tools=None,
-                            max_tokens=600, timeout=30, reasoning_config={'effort': 'low'})
-        message = response.choices[0].message
-        text = message.content
+                'Hermes completion is unavailable: explicitly supply public '
+                'ctx.llm or inject a standalone completion provider.')
+        try:
+            response = llm.complete(messages=messages, max_tokens=2048,
+                                    timeout=30, purpose='meeting_copilot')
+            text = response.text
+        except Exception:
+            raise RuntimeError('Hermes public completion failed') from None
         if not isinstance(text, str) or not text.strip():
             raise RuntimeError('No text answer returned')
         return text.strip()
