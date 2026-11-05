@@ -176,7 +176,8 @@ struct OverlayView: View {
                 }
             }
         }.padding(14).frame(minWidth: 380, minHeight: 180).foregroundColor(.primary)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+        .background(Color.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 14))
+        .preferredColorScheme(.dark)
     }
 }
 
@@ -200,23 +201,8 @@ final class Controller: NSObject {
         window.isMovableByWindowBackground = true
         window.ignoresMouseEvents = true
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        let material = NSVisualEffectView(frame: window.contentView!.bounds)
-        material.material = .hudWindow
-        material.blendingMode = .behindWindow
-        material.state = .active
-        material.wantsLayer = true
-        material.layer?.cornerRadius = 12
-        material.layer?.masksToBounds = true
         let hosting = NSHostingView(rootView: OverlayView(model: model))
-        hosting.translatesAutoresizingMaskIntoConstraints = false
-        material.addSubview(hosting)
-        NSLayoutConstraint.activate([
-            hosting.leadingAnchor.constraint(equalTo: material.leadingAnchor),
-            hosting.trailingAnchor.constraint(equalTo: material.trailingAnchor),
-            hosting.topAnchor.constraint(equalTo: material.topAnchor),
-            hosting.bottomAnchor.constraint(equalTo: material.bottomAnchor)
-        ])
-        window.contentView = material
+        window.contentView = hosting
         window.orderFrontRegardless()
         registerHotkey()
         // stdin EOF (bridge stop/hide/disconnect) terminates the app: no orphan

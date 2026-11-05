@@ -34,6 +34,14 @@ class MacOverlayStateTests(unittest.TestCase):
 class OverlayProtocolTests(unittest.TestCase):
     """Source-level protocol contract; runs on all platforms without compiling."""
 
+    def test_overlay_background_is_translucent_without_dimming_text(self):
+        source = (Path(__file__).parent / 'native' / 'macos_overlay.swift').read_text()
+        self.assertIn('.background(Color.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 14))', source)
+        self.assertNotIn('NSVisualEffectView(', source, 'a material underlay obscures the desktop')
+        self.assertNotIn('window.alphaValue', source, 'window opacity also fades text and controls')
+        self.assertIn('window.backgroundColor = .clear', source)
+        self.assertIn('.preferredColorScheme(.dark)', source)
+
     def test_snapshot_protocol_carries_streaming_identity_and_share_warning(self):
         source = (Path(__file__).parent / 'native' / 'macos_overlay.swift').read_text()
         for token in ('"completed_only"', 'share_warning', 'shareWarning', 'Streaming answer',
