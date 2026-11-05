@@ -1,5 +1,7 @@
 # BYOK foundation
 
+[Catalog preflight and disclosures](docs/catalog-readiness.md).
+
 [Catalog compatibility and remaining warnings](docs/catalog-compatibility.md).
 
 Start with [BYOK setup and boundaries](docs/byok.md). OpenAI and OpenRouter are the explicit answer routes; local transcription remains independent. Older Meta-first instructions below describe the previous demo.
