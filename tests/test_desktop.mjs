@@ -668,6 +668,8 @@ test('saved explicit unavailable Meta disables capture with actionable guidance'
   const ui = pane('', true, false, '', { 3: true }, {}, { capabilities: { macos_transcription: true, meta_asr: false } }, { localStorage: { getItem: k => store.get(k), setItem: (k,v) => store.set(k,v) } });
   assert.equal(button(ui.tree, 'Start listening').props.disabled, true);
   assert.match(JSON.stringify(ui.tree), /Meta.*unavailable.*local.*key/i);
+  const metaOption = nodes(ui.tree).find(n => n.type === 'option' && n.props.value === 'meta');
+  assert.match(metaOption.props.title, /Hermes Settings.*Plugins.*meeting-copilot-live/);
   await button(ui.tree, 'Start listening').props.onClick();
   assert.equal(ui.requests.some(r => r.path === '/start'), false, 'stale callback is also guarded');
 });

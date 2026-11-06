@@ -21,7 +21,7 @@ ERRORS = {
     'capture': 'Native audio capture failed. Check the selected source and macOS permissions.',
     'protocol': 'Invalid or oversized audio worker frame.',
     'worker': 'Audio worker exited unexpectedly.',
-    'asr_auth': 'Meta cloud transcription is not configured: set MODEL_API_KEY, then prepare macOS capture again.',
+    'asr_auth': 'Meta cloud transcription is unavailable. Set the Meta API key in Hermes plugin settings and reopen the pane.',
     'asr': 'Meta cloud transcription failed. Check the network connection and MODEL_API_KEY, then restart capture.',
 }
 
