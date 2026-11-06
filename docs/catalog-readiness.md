@@ -1,9 +1,10 @@
 # Catalog preflight
 
-Validated against Hermes Agent 0.22.7. The manifest uses that tested SemVer
-floor and declares the dashboard's required FastAPI dependency with an upper
-bound. Hermes must resolve it under its own core constraints. The plugin's
-manifest, dashboard, desktop and proposed entry version are all 0.1.0.
+The manifest declares Hermes Agent `>=0.22.7` and the dashboard's FastAPI
+dependency with an upper bound. The compatibility floor has not been rechecked
+against its oldest supported host in the current guide audit. Hermes must resolve
+dependencies under its own core constraints. The plugin's manifest, dashboard,
+desktop and proposed entry version are all 0.1.0.
 
 Run in an isolated Hermes validation environment:
 
@@ -44,16 +45,15 @@ A repository's own catalog folder does not list the plugin.
   separate runtime. No capture starts at import, registration or validation.
 - API secrets are declared in Hermes-managed plugin settings and obtained via
   its scoped secret API. The plugin does not edit credential stores. The
-  separate standalone CLI explicitly accepts process environment credentials;
-  it is not the hosted credential path.
+  standalone CLI is offline-only and does not accept provider credentials.
 - The initially proposed catalog platform is macOS, the device-tested path.
   Windows native capture remains experimental and needs its documented audio
   dependencies and hardware verification; they are not silently installed into
   Hermes by this macOS catalog manifest. Meetily attachment is optional.
 
-See [compatibility cautions](catalog-compatibility.md): active private scope and
-search imports remain version-sensitive, and development mutation/probe helpers
-remain visible to scanners. Passing validation does not constitute maintainer
+See [compatibility cautions](catalog-compatibility.md): isolated host mode lacks
+the request credential scope in the inspected version, and development
+mutation/probe helpers remain visible to scanners. Passing validation does not constitute maintainer
 approval. No telemetry, self-update, credential changes or unattended recording
 are introduced by this preflight.
 

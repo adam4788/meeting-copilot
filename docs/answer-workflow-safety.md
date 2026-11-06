@@ -41,41 +41,7 @@ replay response can reattach to the active slot from status even when the pane
 still has a terminal entry from the preceding answer. Explicit retry clicks keep
 the original request snapshot; status checks never replay a transcript.
 
-## Verification receipt
-
-Against the combined worktree based on `300e848`:
-
-- RED reproductions: actual-router missing-slot polling with plain Desktop-shaped
-  Errors; status tooltip/alert leak; engine exception leak; failed Cancel leak;
-  enabled conflicting history replay; missing rejection guidance; unhandled
-  status-retry rejection; lost replay response hiding an active stream.
-- Baseline partial-stream exception-class disclosure was independently exercised
-  using `git show 300e848:server.py`; the privacy assertion failed as expected.
-- Final `npm test`: **720 Python tests, OK (3 platform/hardware skips)**;
-  **134 Node tests passed**, JavaScript syntax check passed.
-- Real React/ReactDOM + jsdom, production router, normal effects and StrictMode:
-  **84 scenarios passed, 0 failed**. Includes real missing slots, legacy HTTP
-  404/400 behavior, definite admission conflict, lost accepted replay, failed
-  follow-up refresh, successful and failed engines, explicit retry, live-stream
-  preservation, status errors, and cancellation transport failure.
-- Scratch-only Swift compile/self-test: `overlay state tests passed`;
-  protocol: `meeting-overlay/2`. No window opened.
-- `git diff --check`: passed.
-
-Reproduce the effect suite with existing dependencies only:
-
-```sh
-MEETING_REACT_TEST_MODULES=/path/to/existing/node_modules/ node test_real_effects_matrix.cjs
-```
-
-The effect bridge isolates HOME/HERMES_HOME, uses synthetic fixtures and fake
-hardware, forbids socket connections, and throws plain Errors for HTTP failures.
-Legacy compatibility scenarios strip the opt-in fields and use the router's
-legacy behavior; they do not run a separately installed historical backend.
-No live Desktop, real credentials, providers, audio, installation, push, or merge
-was exercised. This is not a claim of live end-to-end verification.
-
-## Follow-up blocker fixes (base `29777f5`)
+## Follow-up blocker fixes
 
 - Recheck resets submission-failure and progress-pause flags independently and
   restarts GET polling even after failed Cancel. It never replays a POST.
@@ -96,30 +62,12 @@ was exercised. This is not a claim of live end-to-end verification.
 - Status identifies the displayed error source and omits stale answer retry
   context when capture/stop/overlay errors own the alert. Capture recovery cannot
   accidentally replay that old context.
-- Verified terminal progress stays visible when status refetch fails. Tests use
-  real TanStack QueryClient 5.104.1 (with React/ReactDOM 19.3.0, jsdom 29.1.1),
-  confirm its default invalidate-on-error resolution, and inspect HTML attributes
-  as well as text for synthetic diagnostic leaks. Successful reconciliation
-  relinquishes the fallback to newer canonical results; Clear removes it.
-- The offline bridge rejects outstanding RPCs on child exit. The matrix also
-  requires an explicit assertion/cleanup completion marker, preventing an
-  unresolved Promise and crashed child from falsely passing with exit zero.
+- Terminal progress stays visible when status refetch fails. Successful
+  reconciliation relinquishes the fallback to newer canonical results; Clear
+  removes it. Historical real-React and QueryClient checks are in the record
+  below; the current desktop suite uses stand-ins.
+- The current offline bridge rejects outstanding RPCs on child exit.
 
-Verification of these changes:
 
-- Deterministic RED cases reproduced Cancel/Recheck, ambiguous second click,
-  missing legacy reset, wrong capture retry, unbounded question/422 reflection,
-  and terminal invisibility. Running the real QueryClient case against the
-  original `29777f5` UI failed the terminal-visibility assertion; current UI passed.
-- `python -m unittest test_answer_safety test_answer_core test_knowledge test_model_selection`:
-  **292 tests passed**, including redaction and actual engine/router checks.
-- `MEETING_REACT_TEST_MODULES=/path/to/existing/node_modules/ node test_real_effects_matrix.cjs`:
-  **104 scenarios passed**, normal effects and StrictMode, retaining the prior
-  lifecycle, credential, overlay, cancellation and exact-replay scenarios.
-- Full `npm test`: **724 Python tests, OK (3 existing skips); 134 Node tests
-  passed**, JavaScript syntax check passed.
-- Scratch-only Swift compilation followed by `--self-test`: **overlay state
-  tests passed**; `--protocol-version`: **meeting-overlay/2**.
-- `git diff --check`: passed. No dependency installation, live Desktop/provider,
-  real secrets/audio, push, or merge. Legacy cases use the current router's
-  real legacy HTTP paths with opt-ins stripped, not an installed old backend.
+Historical test receipts, including the retired credential-editor harness, are
+available in the [original record](https://github.com/adam4788/meeting-copilot/blob/73a1ddc1fe30b766cd51a1b3e784dd65a8d005ba/docs/answer-workflow-safety.md).

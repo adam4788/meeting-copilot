@@ -27,13 +27,10 @@ Use meaningful alt text describing the waveform and layered document forms,
 and include the visible caption **Generated conceptual artwork; not a product
 screenshot.** Keep any future background derivative separate from this source.
 
-## Packaging caveat
+## Packaging
 
-The repository README uses a relative image path. The current runtime exporter
-copies text documentation but omits PNG/SVG assets; its exported README will
-therefore have a missing image unless packaging is updated separately. This
-documentation branch does not change the runtime exporter. See
-[development notes](../development.md#runtime-source-export).
+The runtime exporter explicitly includes this image so its README and brand
+guide retain working relative references. See [development](../development.md#runtime-source-export).
 
 Follow the [brand guide](../brand-guide.md). Inspiration:
 [Nous Research](https://nousresearch.com/). No Nous seal, logo, illustration,

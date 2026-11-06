@@ -16,7 +16,7 @@ writer scheduling pressure from loss-counter duplication. They do not identify
 the cause of the live writer stall. Native queue bounds and loss reporting
 remain unchanged.
 
-Run `python verify_native_backpressure.py` with a Swift toolchain for the
+Run `python -m tests.verify_native_backpressure` with a Swift toolchain for the
 device-free regression probe. It extracts the writer functions verbatim from
 the current production source, compiles them with Foundation only in a temporary
 directory, and supplies synthetic zero PCM. No audio frameworks or Capture

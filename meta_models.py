@@ -1,7 +1,6 @@
 """Optional explicit Meta API route. Hermes owns all plugin secrets."""
 import codecs
 import json
-import os
 from pathlib import Path
 import urllib.request
 
@@ -12,17 +11,6 @@ def _urlopen(request, timeout):
     except ImportError:
         from byok import _NoRedirect
     return urllib.request.build_opener(_NoRedirect()).open(request, timeout=timeout)
-
-
-def _secret_scope():
-    """Only standalone installs without Hermes may use the plain environment."""
-    try:
-        from agent import secret_scope
-        return secret_scope
-    except ModuleNotFoundError as exc:
-        if exc.name == 'agent':
-            return None
-        raise
 
 
 def resolve_model_api_key(*, standalone=False):

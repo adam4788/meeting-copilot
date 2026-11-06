@@ -11,12 +11,11 @@ project documents, fake completion, no history, and disabled search:
 6. out-of-scope paths and symlinks stay rejected
 
 Exits nonzero on the first failed expectation. Uses only the stdlib plus
-this repository; MODEL_API_KEY is scrubbed so nothing can reach the network.
+this repository and an injected offline completion.
 Run: python demo_standalone.py
 """
 
 import json
-import os
 import sys
 import tempfile
 import traceback
@@ -156,17 +155,7 @@ def _run():
 
 
 def main():
-    # Scrub any real key only while scenarios run, then restore the
-    # caller's environment exactly as found.
-    present = 'MODEL_API_KEY' in os.environ
-    saved = os.environ.pop('MODEL_API_KEY', None)
-    try:
-        return _run()
-    finally:
-        if present and saved is not None:
-            os.environ['MODEL_API_KEY'] = saved
-        else:
-            os.environ.pop('MODEL_API_KEY', None)
+    return _run()
 
 
 if __name__ == '__main__':

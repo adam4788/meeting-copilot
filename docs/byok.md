@@ -6,6 +6,12 @@ plugin obtains them only through `agent.secret_scope.get_secret` in a bound
 Hermes scope. An unavailable scope fails closed. Reopen the pane after changing
 settings. Never paste a key into chat, a model field, or an answer request.
 
+The inspected Hermes isolated plugin-host child route did not receive its
+parent's request-bound scope in an offline synthetic probe. BYOK may therefore
+be unavailable in host-isolation or secondary-profile routes; it does not fall
+back to the child process environment. Live Desktop/provider behavior remains
+unverified. See [compatibility](catalog-compatibility.md).
+
 Choose your provider and enter its exact model ID. Model access, credits and
 Chat Completions compatibility depend on your account. A configured key is not
 a successful connection test. The app does not infer models, discover account
@@ -25,10 +31,9 @@ submissions; a provider request already sent cannot be recalled. Retry explicitl
 resends the saved question and context.
 
 For an offline demonstration use `python ask.py --docs sample-docs --provider
-fake ...`. For standalone BYOK, set `OPENAI_API_KEY` or `OPENROUTER_API_KEY` in the
-calling process environment and use `--provider openai|openrouter --model EXACT_ID`.
-Only this explicit standalone CLI path reads process credentials. It does not
-read or create credential files. `--doctor` checks local setup only.
+fake ...`. The standalone CLI does not support live providers or read API keys;
+configure Hermes Settings and ask in the Desktop pane for a live answer.
+`--doctor` checks local setup only.
 
 Meta remains an optional explicit API route for existing integrations. Its
 `MODEL_API_KEY` is also Hermes-managed in plugin mode; it is never selected

@@ -31,11 +31,13 @@ struct Snapshot: Decodable {
     var listening: Bool? = nil
     var truncated: Bool? = nil
     var snapshotID: String? = nil
-    init(transcript: [TranscriptLine] = [], questions: [QuestionRow] = [], message: String? = nil, shareWarning: String? = nil, listening: Bool? = nil, truncated: Bool? = nil, snapshotID: String? = nil) {
+    var answerActions: Bool? = nil
+    init(transcript: [TranscriptLine] = [], questions: [QuestionRow] = [], message: String? = nil, shareWarning: String? = nil, listening: Bool? = nil, truncated: Bool? = nil, snapshotID: String? = nil, answerActions: Bool? = nil) {
         self.snapshotID = snapshotID
+        self.answerActions = answerActions
         self.transcript = transcript; self.questions = questions; self.message = message; self.shareWarning = shareWarning; self.listening = listening; self.truncated = truncated
     }
-    enum CodingKeys: String, CodingKey { case transcript, questions, message, shareWarning = "share_warning", listening, truncated, snapshotID = "snapshot_id" }
+    enum CodingKeys: String, CodingKey { case transcript, questions, message, shareWarning = "share_warning", listening, truncated, snapshotID = "snapshot_id", answerActions = "answer_actions" }
     init(from decoder: Decoder) throws {
         let box = try decoder.container(keyedBy: CodingKeys.self)
         transcript = (try? box.decode([TranscriptLine].self, forKey: .transcript)) ?? []
@@ -45,6 +47,7 @@ struct Snapshot: Decodable {
         listening = try? box.decode(Bool.self, forKey: .listening)
         truncated = try? box.decode(Bool.self, forKey: .truncated)
         snapshotID = try? box.decode(String.self, forKey: .snapshotID)
+        answerActions = try? box.decode(Bool.self, forKey: .answerActions)
     }
 }
 
@@ -57,8 +60,10 @@ struct OverlayState {
     private(set) var listening: Bool = true
     private(set) var truncated: Bool = false
     private(set) var snapshotID: String? = nil
+    private(set) var answerActions: Bool = false
     mutating func update(_ snapshot: Snapshot) {
         snapshotID = snapshot.snapshotID
+        answerActions = snapshot.answerActions ?? false
         transcript = Array(snapshot.transcript.suffix(6))
         questions = Array(snapshot.questions.suffix(20))
         message = snapshot.message
@@ -67,7 +72,7 @@ struct OverlayState {
         if let truncated = snapshot.truncated { self.truncated = truncated }
     }
     func clickable(_ id: String) -> Bool {
-        guard listening else { return false }
+        guard answerActions && listening else { return false }
         return questions.contains { $0.id == id && $0.busy != true }
     }
 }
@@ -128,7 +133,7 @@ struct OverlayView: View {
             }
             Divider()
             if model.state.questions.isEmpty {
-                Text(model.state.listening ? "Listening — questions you ask will appear here. Tap one to get its answer." : "Paused — resume capture in the Meeting Copilot pane to detect questions.")
+                Text(model.state.listening ? "Listening - detected questions appear here. Ask in the Meeting Copilot pane." : "Paused - resume capture in the Meeting Copilot pane to detect questions.")
                     .font(.caption).foregroundColor(.secondary)
                     .accessibilityLabel(model.state.listening ? "Listening, no questions detected yet" : "Paused, resume capture in the pane")
             }
@@ -158,9 +163,9 @@ struct OverlayView: View {
                                 }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
                                 .background(Color.primary.opacity(0.05))
                                 .cornerRadius(8)
-                            }.buttonStyle(.plain).disabled(!model.interactive || !model.state.listening || row.busy == true)
-                            .accessibilityLabel("Ask: \(row.question)")
-                            .accessibilityHint(model.state.listening ? "Gets an answer for this question" : "Resume capture in the pane to enable")
+                            }.buttonStyle(.plain).disabled(!model.state.answerActions || !model.interactive || !model.state.listening || row.busy == true)
+                            .accessibilityLabel("Question: \(row.question)")
+                            .accessibilityHint("Read-only overlay. Ask in the Meeting Copilot pane.")
                             if row.answer != nil {
                                 Button(action: {
                                     NSPasteboard.general.clearContents()
@@ -259,7 +264,7 @@ func selfTest() -> Bool {
     let lines = (0..<8).map { TranscriptLine(id: String($0), speaker: "s", text: String($0)) }
     let rows = (0..<22).map { QuestionRow(id: String($0), question: "q", answer: nil, busy: $0 == 21) }
     var state = OverlayState()
-    state.update(Snapshot(transcript: lines, questions: rows, message: nil, snapshotID: "meeting:1"))
+    state.update(Snapshot(transcript: lines, questions: rows, message: nil, snapshotID: "meeting:1", answerActions: true))
     guard state.transcript.count == 6, state.transcript.first?.id == "2",
           state.questions.count == 20, state.questions.first?.id == "2",
           state.clickable("20"), !state.clickable("21"), !state.clickable("missing"),
@@ -269,6 +274,8 @@ func selfTest() -> Bool {
           let eventData = event.data(using: .utf8),
           let decoded = try? JSONSerialization.jsonObject(with: eventData) as? [String: String],
           decoded["type"] == "click", decoded["id"] == "20", decoded["snapshot_id"] == "meeting:1" else { return false }
+    state.update(Snapshot(transcript: lines, questions: rows, snapshotID: "meeting:readonly", answerActions: false))
+    guard !state.clickable("20"), clickEvent(id: "20", interactive: true, state: state) == nil else { return false }
     let wire = #"{"type":"snapshot","snapshot_id":"meeting:2","transcript":[{"id":"a","speaker":"remote","text":"hello"}],"questions":[{"id":"q","question":"Why?","answer":"Because","busy":true,"streaming":true,"completed_only":false}],"share_warning":"Overlay may be visible."}"#
     guard let decodedSnapshot = try? JSONDecoder().decode(Snapshot.self, from: Data(wire.utf8)),
           decodedSnapshot.questions.first?.answer == "Because",

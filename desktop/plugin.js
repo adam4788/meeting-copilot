@@ -2,6 +2,7 @@ import { createElement as h, useState, useEffect, useRef } from 'react';
 import { host, useValue, useQuery, useQueryClient, Button, Input, Textarea, Badge, PALETTE_AREA } from '@hermes/plugin-sdk';
 
 const ID = 'meeting-copilot-live';
+const speakerPalette = ['var(--ui-accent)', 'var(--ui-green, var(--ui-accent))', 'var(--ui-orange, var(--ui-accent))', 'var(--ui-red, var(--ui-accent))', 'var(--ui-cyan, var(--ui-accent))', 'var(--ui-purple, var(--ui-accent))'];
 const muted = { color: 'var(--ui-text-secondary)', fontSize: 12, lineHeight: 1.5 };
 const card = { border: '1px solid var(--ui-stroke-secondary)', borderRadius: 10, padding: 14, minWidth: 0, boxSizing: 'border-box', background: 'var(--ui-bg-card)' };
 const selectStyle = { padding: 8, borderRadius: 6, width: '100%', maxWidth: '100%', minWidth: 0, color: 'var(--ui-text-primary)', background: 'var(--ui-bg-card)', border: '1px solid var(--ui-stroke-secondary)' };
@@ -10,7 +11,7 @@ export default {
   id: ID,
   name: 'Meeting Copilot',
   description: 'Live answers grounded in your projects, prior sessions, and optional web research.',
-  version: '0.2.0',
+  version: '0.1.0',
   register(ctx) {
     function MetaKeySettings() {
       return h('section', { style: card }, h('strong', null, 'Bring your own API key'),
@@ -150,13 +151,9 @@ export default {
       const answerProviderAvailable = ['openai', 'openrouter'].includes(answerProvider) && providers.some(p => p.id === answerProvider);
       const busy = pending || data.busy;
       const allProjects = project === '__all_projects__';
-      // Suggest answers stay local-first: the explicit web query travels
-      // only to the explicit web button and to the overlay, never silently
-      // into Suggest. Overlay sync tracks the query separately (scopeKey)
-      // so editing or clearing it re-syncs instead of leaving stale state.
+      // Suggest answers stay local-first; explicit web queries stay in the pane.
       const scope = { project: allProjects ? null : project || null, all_projects: allProjects, web_fallback: webFallback, ...(excludeHistory ? { include_history: false } : {}), ...(answerProvider && answerModel ? { answer_provider: answerProvider, answer_model: answerModel } : {}) };
-      const overlayQuery = web.trim() ? { web_query: web.trim() } : {};
-      const overlayScopeKey = JSON.stringify({ ...scope, web_query: web.trim() || null });
+      const overlayScopeKey = JSON.stringify(scope);
       const unsupportedReasons = [
         allProjects && !data.capabilities?.all_projects ? 'All-projects search needs the updated backend (restart the gateway when other sessions are idle).' : null,
         webFallback && !data.capabilities?.automatic_web_fallback ? 'Automatic web fallback needs the updated backend.' : null,
@@ -231,10 +228,6 @@ export default {
       }
       useEffect(() => { if (overlayOn) { scopeSeq.current += 1; overlayActionAt.current.syncedKey = null; setScopeStale(true); } }, [scopeKey]);
       async function syncOverlayScope(seq) {
-        if (!answerProviderAvailable) {
-          setScopeStale(true); setOverlayMsg('Choose an available answer provider and model before syncing the overlay.');
-          return;
-        }
         const life = overlayActionAt.current;
         const owner = life.owner;
         const current = () => life.mounted && scopeSeq.current === seq && life.owner === owner;
@@ -242,11 +235,11 @@ export default {
         // intervening write, including manual and still-pending requests.
         life.syncedKey = null;
         try {
-          const res = await api('/overlay/scope', { scope: { ...scope, ...overlayQuery, seq, owner } });
+          const res = await api('/overlay/scope', { scope: { ...scope, seq, owner } });
           if (!current()) return;
           if (res?.accepted === false) throw new Error('Overlay scope was rejected.');
           life.syncedKey = scopeKey; setScopeStale(false);
-          setOverlayMsg('Overlay scope updated to current settings.');
+          setOverlayMsg('Read-only overlay updated. Ask questions in the pane.');
         } catch (e) {
           if (!current()) return;
           // Ordered hide fails closed without closing a newer pane or Show.
@@ -366,10 +359,6 @@ export default {
       async function toggleOverlay() {
         const life = overlayActionAt.current;
         if (!life.mounted) return;
-        if (!overlayOn && !overlayNeedsHide && (!answerProviderAvailable || (excludeHistory && unsupported))) {
-          setOverlayMsg('Choose an available answer provider and model; for history exclusion choose one project and turn off web search before showing the overlay.');
-          return;
-        }
         setPending(true); setOverlayMsg('');
         life.at = Date.now();
         try {
@@ -386,12 +375,12 @@ export default {
             // Fence even a lost/in-flight Show response: it may create a new
             // owner before a delayed credential response reaches this pane.
             life.overlayGeneration += 1;
-            const shown = await api('/overlay/show', { pane, action, scope: { ...scope, ...overlayQuery, seq: scopeSeq.current } });
+            const shown = await api('/overlay/show', { pane, action, scope: { ...scope, seq: scopeSeq.current } });
             if (!life.mounted || life.action !== action) return;
             if (shown?.accepted === false || !shown?.owner) throw new Error('This pane no longer owns the overlay. Reopen the pane to take ownership.');
             life.owner = shown.owner; life.syncedKey = scopeKey;
             setOverlayOn(true); setScopeStale(false);
-            setOverlayMsg('Overlay shown. It returns to click-through after ~10s — press the shortcut to interact, then tap a row for a streamed answer.');
+            setOverlayMsg('Read-only overlay shown. Ask questions in the Meeting Copilot pane.');
           }
           await qc.invalidateQueries({ queryKey: [ID, 'status'] });
         } catch (e) { if (life.mounted) {
@@ -597,7 +586,7 @@ export default {
       useEffect(() => {
         if (!liveEntry || !['done', 'error', 'cancelled'].includes(liveEntry.status)) return;
         // Once status has actually observed this terminal slot, the canonical
-        // result owns the view again (including later answers from the overlay).
+        // result owns the view again.
         const reconciled = !status.error && (data.recent || []).some(entry => entry.request_id === liveEntry.request_id && ['done', 'error', 'cancelled'].includes(entry.status));
         if (!currentLive || reconciled) setLiveEntry(null);
       }, [liveEntry, data.generation, data.recent, !!status.error]);
@@ -682,9 +671,9 @@ export default {
               : h(Button, { disabled: pending || overlayNeedsHide || cloudUnavailable || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), onClick: () => startCapture() }, ((data.segments || []).length || result || (data.recent || []).length) ? (backend === 'meetily' ? 'Resume' : 'Resume listening') : (backend === 'meetily' ? 'Attach to Meetily' : 'Start listening')),
             !data.listening && !data.stopping && ((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending || overlayNeedsHide || cloudUnavailable || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), title: 'Starts a fresh meeting; the earlier transcript, answers, and retry data are cleared', onClick: () => startCapture(true) }, 'New meeting'),
             (data.overlay_cleanup_error || (data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending, title: 'Clears past Q&A, transcript segments, and cached snippets for this meeting', onClick: async () => { if (typeof window !== 'undefined' && window.confirm && !window.confirm('Clear this meeting? Past questions, answers, and transcript segments are removed from the pane.')) return; if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } } }, 'Clear meeting'),
-            h(Button, { variant: 'secondary', disabled: pending || (!data.capabilities?.overlay && !overlayNeedsHide) || (!overlayOn && !overlayNeedsHide && !answerProviderAvailable), title: 'Show or hide the floating meeting overlay (macOS)', onClick: toggleOverlay }, overlayNeedsHide ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay')),
+            h(Button, { variant: 'secondary', disabled: pending || (!data.capabilities?.overlay && !overlayNeedsHide), title: 'Show or hide the read-only meeting overlay (macOS)', onClick: toggleOverlay }, overlayNeedsHide ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay')),
           h('p', { style: { ...muted, margin: 0 } }, 'Screen-share privacy: the overlay may be visible in screenshots or screen sharing. Hide it before sharing; capture exclusion is best-effort, not a guarantee.'),
-          web.trim() && h('p', { 'data-overlay-web-disclosure': true, role: 'status', style: { ...muted, margin: 0 } }, `Overlay questions use the public query “${web.trim().slice(0, 120)}”; it is sent to the web when you ask, until you clear it.`),
+          h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'The overlay is read-only. Ask questions in the Meeting Copilot pane.'),
           (data.overlay_cleanup_error || overlayMsg) && h('p', { role: 'status', style: { ...muted, margin: 0 } }, data.overlay_cleanup_error || overlayMsg),
           overlayNeedsHide && h('p', { role: 'alert', style: { ...muted, margin: 0 } }, 'Overlay shutdown is not confirmed. Retry hide overlay and verify the window is gone before screen-sharing.'),
           !data.capabilities?.overlay && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'Overlay helper unavailable. Check the macOS helper build and restart the gateway when other sessions are idle.'),
@@ -745,7 +734,7 @@ export default {
               h('option', { value: 'microphone' }, 'Microphone'), h('option', { value: 'system' }, 'System audio'), h('option', { value: 'both' }, 'Microphone + system audio'))),
             h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Transcription provider'), h('select', { style: selectStyle, value: transcriptionProvider, disabled: data.listening, onChange: e => setTranscriptionProvider(e.target.value), 'aria-label': 'Transcription provider' },
               h('option', { value: 'local' }, 'Local — faster-whisper on this Mac'),
-              h('option', { value: 'meta', disabled: !data.capabilities?.meta_asr, title: data.capabilities?.meta_asr ? '' : 'Set MODEL_API_KEY for the gateway, then prepare macOS capture again' }, 'Meta Muse Voice — cloud transcription'))),
+              h('option', { value: 'meta', disabled: !data.capabilities?.meta_asr, title: data.capabilities?.meta_asr ? '' : 'Set the Meta API key in Hermes Settings → Plugins → meeting-copilot-live, then reopen this pane.' }, 'Meta Muse Voice — cloud transcription'))),
             transcriptionProvider === 'local' && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Local transcription model'), h('select', { style: selectStyle, value: transcriptionModel, disabled: data.listening, onChange: e => setTranscriptionModel(e.target.value), 'aria-label': 'Local transcription model' },
               h('option', { value: 'tiny.en' }, 'Whisper tiny.en — fastest'), h('option', { value: 'base.en' }, 'Whisper base.en — balanced'), h('option', { value: 'small.en' }, 'Whisper small.en — higher accuracy'))),
             transcriptionProvider === 'local' && h('span', { style: muted }, 'Runs on this Mac without Meetily. First use may download the model. Microphone or screen and system audio permission is required.'),
@@ -808,11 +797,10 @@ export default {
         h('details', { open: showTranscript, onToggle: e => setShowTranscript(e.currentTarget.open) },
           h('summary', { style: { cursor: 'pointer', ...muted } }, `Live transcript · ${transcript.length} segments`),
           ...(() => {
-            const palette = ['var(--ui-accent)', '#16a34a', '#ea8600', '#db2777', '#0284c7', '#9333ea'];
             const assigned = {};
             for (const seg of transcript) {
               const name = String(seg.speaker || 'Speaker');
-              if (!(name in assigned)) assigned[name] = palette[Object.keys(assigned).length % palette.length];
+              if (!(name in assigned)) assigned[name] = speakerPalette[Object.keys(assigned).length % speakerPalette.length];
             }
             return Object.keys(assigned).length > 1 ? [h('div', { key: 'speakers', style: { display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 } },
               ...Object.entries(assigned).map(([name, color]) => h('span', { key: name, style: { border: '1px solid var(--ui-stroke-secondary)', borderRadius: 999, padding: '2px 9px', fontSize: 12 } },
@@ -820,10 +808,9 @@ export default {
           })(),
           h('div', { style: { maxHeight: 280, overflowY: 'auto', marginTop: 8, padding: 10, display: 'flex', flexDirection: 'column', gap: 8, border: '1px solid var(--ui-stroke-secondary)', borderRadius: 10, background: 'var(--ui-bg-card)' } },
             ...(transcript.length ? transcript.slice(-30).map((s, i) => {
-              const palette = ['var(--ui-accent)', '#16a34a', '#ea8600', '#db2777', '#0284c7', '#9333ea'];
               const order = [];
               for (const seg of transcript) { const n = String(seg.speaker || 'Speaker'); if (!order.includes(n)) order.push(n); }
-              const color = palette[Math.max(0, order.indexOf(String(s.speaker || 'Speaker'))) % palette.length];
+              const color = speakerPalette[Math.max(0, order.indexOf(String(s.speaker || 'Speaker'))) % speakerPalette.length];
               return h('p', { key: `${i}-${s.timestamp}`, style: { margin: 0, padding: '8px 10px', borderRadius: 8, border: '1px solid var(--ui-stroke-secondary)', borderLeft: `3px solid ${color}`, background: `color-mix(in srgb, ${color} 7%, transparent)`, lineHeight: 1.5 } },
               h('strong', { style: { color } }, `${s.speaker}: `), s.text,
               s.partial_tail && h('span', { title: 'Transcribed from trailing audio captured during shutdown' }, ' \u00b7 trailing audio'));
@@ -873,13 +860,13 @@ export default {
           h('span', null, webFallback ? 'Automatic web fallback: on. A public query may be drafted if local evidence is insufficient. Filtering is best-effort, not a privacy guarantee; turn off for sensitive calls.' : 'Automatic web fallback: off. Turn on to search the web when local evidence is insufficient.')),
         h('section', { style: { ...card, display: 'grid', gap: 10 } },
           h('strong', null, 'Meeting overlay (macOS)'),
-          h('p', { style: { ...muted, marginBottom: 0 } }, 'Tap a question to stream its answer; nothing is sent until you tap. Use Ctrl+Option+Cmd+O (default) to interact. It returns to click-through after about 10 seconds, or press the shortcut again. The overlay may appear in screen shares.'),
+          h('p', { style: { ...muted, marginBottom: 0 } }, 'The overlay displays the transcript and detected questions. Ask and view answers in the Meeting Copilot pane. The overlay may appear in screen shares.'),
 
           scopeStale && overlayOn && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'Settings changed — syncing overlay scope…'),
           (data.overlay_cleanup_error || overlayMsg) && h('p', { role: 'status', style: { ...muted, margin: 0 } }, data.overlay_cleanup_error || overlayMsg),
           !data.capabilities?.overlay && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'Overlay helper unavailable. Check the macOS helper build and restart the gateway, then try Show overlay again.'),
           h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
-            h(Button, { variant: overlayOn ? 'secondary' : undefined, disabled: pending || (!data.capabilities?.overlay && !overlayNeedsHide) || (!overlayOn && !overlayNeedsHide && !answerProviderAvailable), onClick: toggleOverlay }, overlayNeedsHide ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay'),
+            h(Button, { variant: overlayOn ? 'secondary' : undefined, disabled: pending || (!data.capabilities?.overlay && !overlayNeedsHide), onClick: toggleOverlay }, overlayNeedsHide ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay'),
             h(Button, { variant: 'secondary', disabled: pending || !overlayOn, onClick: async () => {
               setPending(true); setOverlayMsg('');
               scopeSeq.current += 1;
@@ -979,7 +966,7 @@ export default {
         if (typeof window === 'undefined') return { position: 'fixed', left: pos.x, top: pos.y };
         const w = 230, h = 120;
         // Position the menu's top-left corner directly; no translate offset.
-        return { position: 'fixed', left: Math.max(8, Math.min(pos.x, window.innerWidth - w)), top: Math.max(8, Math.min(pos.y, window.innerHeight - h)), zIndex: 9999, minWidth: 210, maxWidth: w, background: 'var(--ui-bg-elevated)', border: '1px solid var(--ui-stroke-secondary)', borderRadius: 8, padding: 4, boxShadow: '0 8px 24px rgba(0,0,0,0.25)' };
+        return { position: 'fixed', left: Math.max(8, Math.min(pos.x, window.innerWidth - w)), top: Math.max(8, Math.min(pos.y, window.innerHeight - h)), zIndex: 9999, minWidth: 210, maxWidth: w, background: 'var(--ui-bg-elevated)', border: '1px solid var(--ui-stroke-secondary)', borderRadius: 8, padding: 4, boxShadow: '0 8px 24px color-mix(in srgb, var(--ui-text-primary) 25%, transparent)' };
       };
       const focusToggle = () => {
         try {

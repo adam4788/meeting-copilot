@@ -11,7 +11,7 @@ it. Nothing is spoken, posted, or submitted for you.
 
 *Generated conceptual artwork; not a product screenshot.*
 
-[Get started](docs/getting-started.md) · [Try the offline demo](DEMO.md) ·
+[Get started](docs/getting-started.md) · [Try the offline demo](docs/demo.md) ·
 [Privacy](SECURITY.md) · [Documentation](docs/README.md)
 
 ## Current status
@@ -44,7 +44,8 @@ CI and plugin validation do not prove a complete meeting works on your computer.
   **Answer setup**. OpenAI and OpenRouter are the main Desktop answer routes.
 - Keeps past sessions excluded and web search off by default in new panes.
   Broader scopes are explicit choices; saved choices persist.
-- Offers a macOS meeting overlay. It may appear in screen shares.
+- Offers a read-only macOS overlay for the transcript and detected questions.
+  Ask questions in the Desktop pane. The overlay may appear in screen shares.
 
 ```mermaid
 flowchart TD
@@ -98,7 +99,7 @@ audio readiness. Windows capture remains experimental.
    participant permission, and explicitly start capture. Pause when finished
    and check that stopping is confirmed.
 
-Start with [the synthetic walkthrough](DEMO.md). It also includes an offline CLI
+Start with [the synthetic walkthrough](docs/demo.md). It also includes an offline CLI
 demo that needs no API key, audio device, or Hermes installation.
 
 ## Privacy and control
@@ -131,17 +132,18 @@ Read [security and privacy](SECURITY.md) and the
   Missing or adversarial evidence can still produce an incorrect answer.
 - PDF, DOCX, and XLSX extraction is not implemented. Project scans and session
   reads are bounded; this is not a search of the whole computer.
-- Two dashboard search/scope integrations still depend on private Hermes APIs.
-  Review the [version compatibility cautions](docs/catalog-compatibility.md).
+- Optional web search depends on a registered, profile-scoped Hermes tool and
+  may be unavailable. The inspected isolated plugin-host route did not pass
+  the request scope needed for BYOK; see [compatibility cautions](docs/catalog-compatibility.md).
 
 ## Explore the repository
 
 | Goal | Guide |
 | --- | --- |
 | Set up providers, project scope, and audio | [Getting started](docs/getting-started.md) |
-| Run a synthetic demonstration | [Demo guide](DEMO.md) |
+| Run a synthetic demonstration | [Demo guide](docs/demo.md) |
 | Understand keys and model boundaries | [BYOK](docs/byok.md) |
-| Understand retrieval and source limits | [Knowledge engine](KNOWLEDGE.md) |
+| Understand retrieval and source limits | [Knowledge engine](docs/knowledge.md) |
 | Work on the code or run tests | [Development](docs/development.md) and [contributing](CONTRIBUTING.md) |
 | Review catalog packaging and disclosures | [Catalog preflight](docs/catalog-readiness.md) |
 | Use the visual direction and assets | [Project brand guide](docs/brand-guide.md) |

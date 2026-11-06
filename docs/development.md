@@ -1,74 +1,66 @@
 # Development
 
-Use a source checkout and a separate development environment. Keep real meeting
-data out of fixtures and do not work in an installed plugin directory.
+These commands require the full source checkout; runtime exports omit `tests/`
+and `scripts/`. Work in a separate environment. Use synthetic fixtures and
+keep real meetings, credentials, databases, and personal paths out of Git.
 
-## Deterministic checks
+## Offline checks
 
-Python 3.11/3.12 and Node.js 22 match Windows/Linux CI. macOS CI uses Python 3.12
-and builds the overlay with the macOS 26 toolchain.
+Python 3.11/3.12 and Node 22 match Windows/Linux CI. macOS CI uses Python 3.12
+and the macOS 26 Swift toolchain.
 
 ```sh
 python -m pip install -r requirements-dev.txt
 python -m unittest discover -v
 node --check desktop/plugin.js
-node --test test_desktop.mjs
+node --test tests/test_desktop.mjs
 ```
 
-`npm test` runs those three checks; `npm run check` runs JavaScript syntax only.
-These synthetic checks do not establish live provider access, visual acceptance,
-or hardware readiness. Some platform/hardware checks skip unless explicitly enabled.
+`npm test` runs the same checks. Run one Python module with, for example,
+`python -m unittest tests.test_catalog_export -v`. These checks use fixtures;
+platform-dependent tests may skip. They do not establish provider, hardware, or
+visual readiness.
 
-For an offline source-mapping smoke check:
+For an offline source-mapping demonstration:
 
 ```sh
 python ask.py --docs sample-docs --project acme --provider fake --question "When is finance sign-off needed?"
 python demo_standalone.py
 ```
 
-With Swift installed, `python verify_native_backpressure.py` runs a device-free
-synthetic writer probe. It opens no audio device and does not establish loss-free
-capture. See [the investigation](native-backpressure.md).
+`python -m tests.verify_native_backpressure` uses Swift for a device-free writer
+probe; it does not establish loss-free capture. The `tests.verify_overlay_*`
+modules are development mutation checks. See [native backpressure](native-backpressure.md)
+and [overlay lifecycle](overlay-lifecycle.md).
 
-## Source-checkout plugin validation
+## Plugin validation
 
-Run in an isolated Hermes validation environment, using your real checkout path:
+Use an isolated Hermes validation environment; these commands do not test a live
+provider or device:
 
 ```sh
 hermes plugins doctor /path/to/meeting-copilot --ci
 hermes plugins validate /path/to/meeting-copilot --install-deps
 ```
 
-The manifest declares `fastapi>=0.115,<1`, resolved under Hermes constraints.
-Keep complete scanner output, including private API and development findings.
-Passing registration is not a device/provider acceptance claim. See
-[catalog preflight](catalog-readiness.md) and [compatibility](catalog-compatibility.md).
+Review the complete scanner output, including private API and development
+findings. See [catalog preflight](catalog-readiness.md) and
+[compatibility](catalog-compatibility.md).
 
 ## Runtime source export
 
 From a clean, committed checkout:
 
 ```sh
-python export_catalog_runtime.py /new/output/directory
+python -m scripts.export_catalog_runtime /new/output/directory
 ```
 
-The exporter creates a distinct allowlisted source tree without publishing it,
-preserving provenance and runtime bytes. Tests/mutation probes remain in the full
-source commit. Export is a packaging boundary, not scanner suppression. Validate
-the actual export separately; any catalog pin must identify that published tree.
+The distinct allowlisted tree includes runtime files, text guides, sample
+documents, Windows audio requirements, the license, and the README hero image.
+Tests and mutation probes stay in the source commit. Export is a packaging
+boundary, not scanner suppression or publication; validate the actual export
+independently. A catalog pin must identify the published tree that was validated.
 
-The current export allowlist includes text documentation but excludes image/SVG
-assets. A later packaging change must account for local image references before
-exporting a README that uses them. This docs branch does not change packaging code.
-
-## Manual verification
-
-Keep device/provider/network checks explicit and separate. Obtain permission
-before recording. Use fictional speech and synthetic files; never commit
-recordings, transcripts, keys, session databases, or personal local paths. Short
-synthetic runs do not establish long-call reliability.
-
-Standalone BYOK requires `--provider openai|openrouter --model EXACT_ID` and the
-matching process environment key; it reads no credential files. `--doctor` checks
-local setup only. See [BYOK](byok.md), [contributing](../CONTRIBUTING.md), and
-[the demo](../DEMO.md).
+For manual checks obtain permission before recording and use fictional content.
+Short synthetic runs cannot establish long-call reliability. See [BYOK](byok.md),
+[contributing](../CONTRIBUTING.md), and the [demo](demo.md).

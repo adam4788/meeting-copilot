@@ -942,9 +942,8 @@ class MeetingState:
                     # after a newer request has already completed.
                     self._recompute_busy_locked()
                     self.live_workers = max(0, self.live_workers - 1)
-        # Provider credentials are request/profile scoped; propagate that scope into the worker.
-        # Native click handlers run on overlay threads, so the bridge snapshot
-        # also carries the originating context with it (see BackendTransport).
+        # Provider credentials are request/profile scoped; propagate the host's
+        # authenticated pane scope into this already-admitted answer worker.
         import contextvars
         context = contextvars.copy_context()
         with self.lock:
@@ -1066,9 +1065,8 @@ class MeetingState:
                              name='meeting-overlay-lease', daemon=True).start()
 
     def _refresh_overlay_token_locked(self, force=False):
-        # Re-bind the transport to this explicit pane action. Must run under
-        # overlay_lock on the pane's request thread so the captured context
-        # (and token) belong to the authenticated action, not a worker.
+        # Retire the display generation when pane authorization may have changed.
+        # The read-only transport retains no authenticated request context.
         import secrets
         bridge = self.overlay
         transport = getattr(bridge, 'transport', None)
@@ -1202,8 +1200,8 @@ class MeetingState:
         # waiting for startup. A reserved pending bridge fences new admission.
         try:
             job['worker'].start()
-        except RuntimeError as exc:
-            job['error'] = f'Overlay startup worker could not start: {exc}'
+        except RuntimeError:
+            job['error'] = 'Overlay startup worker could not start. Retry Show.'
             job['done'].set()
         job['done'].wait(3)
         # Observe startup liveness off the lifecycle/publication locks. A hung
@@ -1434,13 +1432,13 @@ class MeetingState:
             self.overlay_cleanup_error = 'Overlay startup is pending; shutdown is not confirmed.'
             self._overlay_startup_job = job
             import contextvars
-            context = contextvars.copy_context()
+            context = contextvars.Context()  # helper startup does not need pane secrets
             def launch():
                 try:
                     result = context.run(bridge.show_overlay)
                     job['result'] = result if isinstance(result, dict) else {'shown': bool(result)}
-                except Exception as exc:
-                    job['error'] = f'Overlay startup failed: {type(exc).__name__}: {str(exc)[:200]}'
+                except Exception:
+                    job['error'] = 'Overlay startup failed. Check the helper and retry.'
                 finally:
                     job['done'].set()
             job['worker'] = threading.Thread(target=launch, name='meeting-overlay-startup', daemon=True)
@@ -1708,7 +1706,8 @@ class MeetingState:
                     'capabilities': {'all_projects': True, 'automatic_web_fallback': True, 'independent_models': True, 'history_opt_out': True,
                                      'meta_asr': _meta_key_present(),
                                      'macos_transcription': bool(macos_ready),
-                                     'overlay': overlay_available, 'overlay_stream': True, 'overlay_cancel': True,
+                                     'overlay': overlay_available, 'overlay_answers': False,
+                                     'overlay_stream': False, 'overlay_cancel': False,
                                      'macos_detail': self._macos_capability_detail(macos_ready)}}
 
     def _overlay_capability_available(self, overlay, overlay_status):

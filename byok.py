@@ -1,14 +1,15 @@
 """Explicit fixed-origin Chat Completions routes. No credential files or fallback."""
 import json
-import os
 import re
 import urllib.request
 import urllib.error
+from pathlib import Path
 
 PROVIDERS = {
     'openai': ('OpenAI API', 'OPENAI_API_KEY', 'https://api.openai.com/v1/chat/completions'),
     'openrouter': ('OpenRouter', 'OPENROUTER_API_KEY', 'https://openrouter.ai/api/v1/chat/completions'),
 }
+_SECRET_NAMES = frozenset({'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'MODEL_API_KEY'})
 _ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._/:@+\-]{0,199}\Z')
 
 def validate(provider, model):
@@ -16,18 +17,47 @@ def validate(provider, model):
         raise ValueError('Choose a supported provider and exact model ID; never enter a key here.')
     return provider, model
 
+def _host_scope():
+    """Use only a host-stamped scope for the currently served profile."""
+    from agent import secret_scope
+    from hermes_constants import get_hermes_home
+    scope = secret_scope.current_secret_scope()
+    home = secret_scope.current_secret_scope_home()
+    if scope is None or not home or Path(home).resolve() != get_hermes_home().resolve():
+        return None, None
+    return scope, home
+
+
 def secret(name, *, standalone=False):
+    # get_secret treats some deployment variables as global, so accept only
+    # the declared profile-secret names before asking the host for a value.
+    if name not in _SECRET_NAMES:
+        return ''
     if standalone:
-        value = os.environ.get(name, '')
-    else:
-        try:
-            from agent import secret_scope
-            if secret_scope.current_secret_scope() is None:
-                return ''
-            value = secret_scope.get_secret(name, '')
-        except Exception:
+        return ''  # standalone execution has no authenticated host scope
+    try:
+        from agent import secret_scope
+        scope, _ = _host_scope()
+        if scope is None:
             return ''
+        # Force strict scope semantics without replacing the host-issued
+        # mapping. A concurrent change must never fall back to process env.
+        token = secret_scope.set_multiplex_context(True)
+        try:
+            value = secret_scope.get_secret(name, '')
+        finally:
+            secret_scope.reset_multiplex_context(token)
+    except Exception:
+        return ''
     return value.strip() if isinstance(value, str) else ''
+
+
+def _scope_available():
+    try:
+        scope, _ = _host_scope()
+        return scope is not None
+    except Exception:
+        return False
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -35,10 +65,14 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def catalog():
     providers=[]
+    scoped = _scope_available()
     for provider, (label, name, _) in PROVIDERS.items():
         configured=bool(secret(name))
+        status = ('Key available; connection and model unverified' if configured else
+                  'Set key in Hermes Settings → Plugins → meeting-copilot-live (default profile)' if scoped else
+                  'Hermes did not provide a profile-scoped credential context. BYOK is unavailable in this host mode.')
         providers.append(dict(id=provider, label=label, models=[], custom_model=True,
-            configured=configured, status='Key available; connection and model unverified' if configured else 'Set key in Hermes Settings → Plugins → meeting-copilot-live (default profile)'))
+            configured=configured, status=status))
     return {'providers': providers}
 
 
