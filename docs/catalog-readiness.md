@@ -45,8 +45,7 @@ A repository's own catalog folder does not list the plugin.
   separate runtime. No capture starts at import, registration or validation.
 - API secrets are declared in Hermes-managed plugin settings and obtained via
   its scoped secret API. The plugin does not edit credential stores. The
-  separate standalone CLI explicitly accepts process environment credentials;
-  it is not the hosted credential path.
+  standalone CLI is offline-only and does not accept provider credentials.
 - The initially proposed catalog platform is macOS, the device-tested path.
   Windows native capture remains experimental and needs its documented audio
   dependencies and hardware verification; they are not silently installed into

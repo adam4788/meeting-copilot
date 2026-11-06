@@ -133,12 +133,17 @@ def worker_env(provider='local'):
     shadow the audio-runtime's 3.12 packages and break model loading."""
     env = {k: v for k, v in os.environ.items()
            if k not in ('PYTHONPATH', 'PYTHONHOME', 'MODEL_API_KEY', 'HERMES_LAUNCHD_LABEL') and not k.endswith(('_API_KEY', '_ACCESS_TOKEN', '_AUTH_TOKEN', '_SECRET_KEY'))}
-    # Snapshot the trusted request key, not the launch profile's environment.
-    # The child is not a gateway and must never reseed from the launch .env.
-    key = _model_api_key() if provider == 'meta' else ''
-    if key:
-        env['MODEL_API_KEY'] = key
     return env
+
+
+def _meta_worker_frame(key):
+    """Bounded one-shot private handoff of a host-scoped key to the worker."""
+    if not isinstance(key, str) or not key.strip() or '\n' in key or '\r' in key:
+        raise RuntimeError('Meta transcription needs a profile-scoped Hermes key.')
+    frame = json.dumps({'type': 'scoped_meta_key', 'key': key}, ensure_ascii=True).encode('ascii') + b'\n'
+    if len(frame) > 4096:
+        raise RuntimeError('Meta transcription needs a valid profile-scoped Hermes key.')
+    return frame
 
 
 class MacOSAudioCapture:
@@ -212,6 +217,7 @@ class MacOSAudioCapture:
         """
         if not callable(on_segment) or (on_status is not None and not callable(on_status)):
             raise TypeError('on_segment and on_status must be callable')
+        credential_frame = _meta_worker_frame(_model_api_key()) if self.provider == 'meta' else None
         with self._lock:
             if not self.status()['stop_confirmed']:
                 raise RuntimeError('Audio capture is active or its cleanup is unconfirmed')
@@ -223,11 +229,11 @@ class MacOSAudioCapture:
             self._state, self._error, self._callback_error = 'starting', None, None
             self._last_loss = {}
             self._process = None
-            self._thread = threading.Thread(target=self._run, args=(worker_env(self.provider),),
+            self._thread = threading.Thread(target=self._run, args=(worker_env(self.provider), credential_frame),
                                             daemon=True, name='macos-audio-worker')
             self._thread.start()
 
-    def _run(self, environment):
+    def _run(self, environment, credential_frame=None):
         process = None
         try:
             root = Path(__file__).resolve().parent
@@ -236,11 +242,18 @@ class MacOSAudioCapture:
                        '--provider', self.provider, '--asr-mode', self.asr_mode]
             if self._cancel.is_set():
                 return
-            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            process = subprocess.Popen(command, stdin=subprocess.PIPE if credential_frame else subprocess.DEVNULL, stdout=subprocess.PIPE,
                                        stderr=subprocess.DEVNULL, start_new_session=True,
                                        env=environment)
             with self._lock:
                 self._process = process
+            if credential_frame:
+                try:
+                    process.stdin.write(credential_frame)
+                    process.stdin.flush()
+                finally:
+                    process.stdin.close()
+                    credential_frame = None
             assert process.stdout is not None
             while not self._cancel.is_set():
                 line = process.stdout.readline(MAX_EVENT + 1)

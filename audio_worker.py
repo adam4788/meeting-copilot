@@ -453,6 +453,25 @@ def run_capture_meta(source, mode, api_key, model_id, helper=None, stop=None):
               'warning': f"Stopped with native {native_lost['count']} dropped frame(s); some words may be missing."})
 
 
+def _read_meta_worker_key(stream):
+    """Read only the parent worker pipe, never the process environment."""
+    try:
+        if stream.isatty():
+            return ''
+        frame = stream.readline(4097)
+        if not frame.endswith(b'\n') or len(frame) > 4096:
+            return ''
+        payload = json.loads(frame)
+        if not isinstance(payload, dict) or set(payload) != {'type', 'key'} or payload['type'] != 'scoped_meta_key':
+            return ''
+        key = payload['key']
+        if not isinstance(key, str) or not key.strip() or '\n' in key or '\r' in key:
+            return ''
+        return key
+    except (OSError, ValueError, TypeError, AttributeError):
+        return ''
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Explicit local CPU int8 transcription; starting may download model weights.')
     parser.add_argument('--model', choices=MODELS, default='base.en')
@@ -476,13 +495,8 @@ def main(argv=None):
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     emit({'type': 'status', 'state': 'loading'})
     if args.provider == 'meta':
-        import os
         import meta_asr
-        try:
-            import meta_models
-            api_key = meta_models.resolve_model_api_key(standalone=True)
-        except Exception:
-            api_key = ''  # scope failures must not expose a launch-profile key
+        api_key = _read_meta_worker_key(sys.stdin.buffer)
         if not api_key:
             emit({'type': 'error', 'code': 'asr_auth', 'message': error_message('asr_auth')})
             return 1

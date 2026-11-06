@@ -1,6 +1,5 @@
 """Explicit fixed-origin Chat Completions routes. No credential files or fallback."""
 import json
-import os
 import re
 import urllib.request
 import urllib.error
@@ -35,22 +34,21 @@ def secret(name, *, standalone=False):
     if name not in _SECRET_NAMES:
         return ''
     if standalone:
-        value = os.environ.get(name, '')
-    else:
-        try:
-            from agent import secret_scope
-            scope, _ = _host_scope()
-            if scope is None:
-                return ''
-            # Force strict scope semantics without replacing the host-issued
-            # mapping. A concurrent change must never fall back to process env.
-            token = secret_scope.set_multiplex_context(True)
-            try:
-                value = secret_scope.get_secret(name, '')
-            finally:
-                secret_scope.reset_multiplex_context(token)
-        except Exception:
+        return ''  # standalone execution has no authenticated host scope
+    try:
+        from agent import secret_scope
+        scope, _ = _host_scope()
+        if scope is None:
             return ''
+        # Force strict scope semantics without replacing the host-issued
+        # mapping. A concurrent change must never fall back to process env.
+        token = secret_scope.set_multiplex_context(True)
+        try:
+            value = secret_scope.get_secret(name, '')
+        finally:
+            secret_scope.reset_multiplex_context(token)
+    except Exception:
+        return ''
     return value.strip() if isinstance(value, str) else ''
 
 

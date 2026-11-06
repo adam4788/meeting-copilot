@@ -2,22 +2,17 @@
 
 Reads a transcript file plus a project-docs directory, answers one
 question with numbered citations, and prints sources, warnings, and
-timing. Offline by default (fake provider); explicit OpenAI/OpenRouter BYOK
-uses OPENAI_API_KEY/OPENROUTER_API_KEY and an exact model ID. Optional Meta uses
-MODEL_API_KEY. Web research and session history are
-unavailable standalone — the tool says so instead of failing obscurely.
+timing. The standalone CLI uses an offline fake provider. Live providers,
+web research, and session history require the authenticated Hermes pane.
 
 Usage:
   python ask.py --question "..." --docs ./sample-docs \
-      [--transcript meeting.json] [--project NAME] [--provider fake|openai|openrouter|meta] \
-      [--model EXACT_ID] [--json]
-  The default provider is fake (fully offline). Standalone API keys are read
-  only from the calling process environment; no credential files are loaded.
+      [--transcript meeting.json] [--project NAME] [--provider fake] [--json]
+  The default provider is fake (fully offline). Ask live questions in the pane.
 """
 
 import argparse
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -260,8 +255,8 @@ def fake_completion_factory():
                 redacted = ' (searched snippet redacted)' if 'REDACTED' in snippet else ''
                 from_line = f' From {title}:' if title else ''
                 return (f'Offline extractive answer (fake provider — no model was '
-                        f'called){redacted}.{from_line} "{snippet}" [{citation}]. Configure '
-                        f'MODEL_API_KEY with --provider meta for a synthesized answer.')
+                        f'called){redacted}.{from_line} "{snippet}" [{citation}]. '
+                        f'Use the Meeting Copilot pane for a synthesized answer.')
         transcript_required = 1 if len(terms) <= 1 else 2
         if best_line and len(best_hits) >= transcript_required and len(best_hits) > len(passage_hits):
             quote = _passage(best_line, terms)
@@ -275,14 +270,12 @@ def fake_completion_factory():
                     if evidence else 'no documents matched; ')
             return ('Offline extractive answer (fake provider — no model was '
                     f'called): {lead}the transcript itself says: "{quote}" '
-                    '(transcript, uncited). Configure MODEL_API_KEY with '
-                    '--provider meta for a synthesized answer.')
+                    '(transcript, uncited). Use the Meeting Copilot pane for a synthesized answer.')
         if evidence:
             return ('Offline extractive answer (fake provider — no model was '
                     'called): retrieved evidence does not directly answer this '
                     'question, so no snippet is presented as an answer. See the '
-                    'sources below, or configure MODEL_API_KEY with --provider '
-                    'meta for a synthesized answer.')
+                    'sources below, or use the Meeting Copilot pane for a synthesized answer.')
         return ('Offline demo answer (fake provider). No local evidence '
                 'matched, so nothing is cited.')
     return complete
@@ -325,25 +318,15 @@ def load_transcript(path):
     return _transcript_from_text(Path(path).read_text(encoding='utf-8-sig'))
 
 
+_STANDALONE_PROVIDER_UNAVAILABLE = ('Live providers are unavailable in standalone mode. '
+                                    'Configure a provider in Hermes Settings and ask in the Meeting Copilot pane.')
+
+
 def build_completion(provider, model):
     if provider == 'fake':
         return fake_completion_factory()
-    if provider in ('openai', 'openrouter'):
-        try:
-            from .byok import completion
-        except ImportError:
-            from byok import completion
-        return completion(provider, model, standalone=True)
-    if provider == 'meta':
-        try:
-            from .meta_models import api_key_present, meta_completion
-        except ImportError:
-            from meta_models import api_key_present, meta_completion
-        if len(os.environ.get('MODEL_API_KEY', '').strip()) < 8:
-            raise SystemExit(
-                'Meta provider needs MODEL_API_KEY (min 8 chars) in the '
-                'environment. Use --provider fake for an offline smoke test.')
-        return meta_completion(model, standalone=True)
+    if provider in ('openai', 'openrouter', 'meta'):
+        raise SystemExit(_STANDALONE_PROVIDER_UNAVAILABLE)
     raise SystemExit(f'Unknown provider {provider!r}: use fake|meta')
 
 
@@ -394,8 +377,8 @@ def main(argv=None):
                         '(default: the only subfolder, if exactly one).')
     parser.add_argument('--all', action='store_true', help='Search all projects under --docs.')
     parser.add_argument('--provider', default='fake', choices=('openai', 'openrouter', 'meta', 'fake'),
-                        help='Completion backend (default fake: fully offline).')
-    parser.add_argument('--model', default=None, help='Exact model ID for the selected API provider.')
+                        help='Standalone supports fake only; live providers use the Hermes pane.')
+    parser.add_argument('--model', default=None, help='Ignored for the offline fake provider.')
     parser.add_argument('--web-query', default=None,
                         help='NOT YET SUPPORTED standalone: exits with guidance.')
     parser.add_argument('--search', default=None, metavar='TERMS',
@@ -541,32 +524,10 @@ def main(argv=None):
             except (OSError, ValueError) as exc:
                 transcript_report = {'ok': False, 'error': str(exc)}
                 problems.append(f'transcript: {exc}')
-        provider_ready = True
-        if args.provider == 'meta':
-            try:
-                from .meta_models import api_key_present
-            except ImportError:
-                from meta_models import api_key_present
-            provider_ready = len(os.environ.get('MODEL_API_KEY', '').strip()) >= 8
-            if not provider_ready:
-                problems.append('provider meta: MODEL_API_KEY must be at least 8 characters after trimming whitespace')
-        if args.provider in ('openai', 'openrouter'):
-            try:
-                from .byok import secret, PROVIDERS, validate
-            except ImportError:
-                from byok import secret, PROVIDERS, validate
-            provider_ready = bool(secret(PROVIDERS[args.provider][1], standalone=True))
-            try:
-                validate(args.provider, args.model)
-            except ValueError:
-                provider_ready = False
-            if not provider_ready:
-                problems.append('Provider needs its environment key and an exact --model ID; connection unverified.')
+        provider_ready = args.provider == 'fake'
+        if not provider_ready:
+            problems.append(_STANDALONE_PROVIDER_UNAVAILABLE)
         provider_report = {'provider': args.provider, 'ready': provider_ready, 'connection_verified': False}
-        if args.provider == 'meta':
-            provider_report['connection_verified'] = False
-            warn('Meta provider credentials, network access, and model availability are not verified; '
-                 'doctor only checks MODEL_API_KEY length.')
         ok = bool(project_reports) and all(r['chunks'] for r in project_reports) and not problems
         payload = {'docs': str(docs), 'projects': project_reports,
                    'provider': provider_report, 'problems': problems, 'ok': ok}
@@ -582,17 +543,13 @@ def main(argv=None):
                 print(f"  - {report['name']}: {report['files']} file(s), {report['chunks']} searchable chunk(s)")
             if not project_reports:
                 print('  - no project folders found (expected <docs>/<project>/*.md|txt|rst)')
-            provider_status = ('MODEL_API_KEY length accepted; connection not verified' if provider_report['ready']
-                               else 'MODEL_API_KEY missing or too short; connection not verified') if args.provider == 'meta' else 'ready (offline)'
+            provider_status = 'ready (offline)' if provider_ready else 'unavailable standalone'
             print(f'Provider: {args.provider} ({provider_status})')
             if transcript_report is not None:
                 print(f"Transcript: {'ok, ' + str(transcript_report['characters']) + ' characters' if transcript_report['ok'] else 'failed: ' + transcript_report['error']}")
             for problem in problems:
                 print(f'Problem: {problem}')
-            if ok and args.provider == 'meta':
-                print('Ready for a connection attempt; Meta connection not verified.')
-            else:
-                print('Ready.' if ok else 'Not ready: fix the problems above, then run --list-projects.')
+            print('Ready.' if ok else 'Not ready: fix the problems above, then run --list-projects.')
         return 0 if ok else 2
     if args.list_projects:
         if args.json:
@@ -659,14 +616,6 @@ def main(argv=None):
         fail(f'Cannot read transcript: {exc}')
     if transcript is None:
         transcript = ''
-    saved_model_key = None
-    model_key_present = False
-    if args.provider == 'fake':
-        # Fake means fully offline: the engine would otherwise try the Meta
-        # default route whenever a key happens to be configured. Scrub it
-        # only for the answer call and restore the caller's environment.
-        model_key_present = 'MODEL_API_KEY' in os.environ
-        saved_model_key = os.environ.pop('MODEL_API_KEY', None)
     started = time.monotonic()
     try:
         core = AnswerCore(project_root=docs, completion=build_completion(args.provider, args.model),
@@ -677,11 +626,6 @@ def main(argv=None):
         fail(str(exc.code))
     except (ValueError, OSError) as exc:
         fail(f'Invalid request: {exc}')
-    finally:
-        if model_key_present and saved_model_key is not None:
-            os.environ['MODEL_API_KEY'] = saved_model_key
-        elif saved_model_key is not None:
-            os.environ.pop('MODEL_API_KEY', None)
     if args.provider == 'fake':
         # The static engine warnings assume a real provider and host
         # history; with a fake completion and no history they mislead.

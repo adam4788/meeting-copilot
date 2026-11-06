@@ -149,14 +149,14 @@ class FileTranscribeTests(unittest.TestCase):
 
 
 class KeyResolutionTests(unittest.TestCase):
-    def test_plugin_never_loads_dotenv_and_standalone_is_explicit(self):
+    def test_plugin_never_loads_dotenv_or_standalone_environment_keys(self):
         import os
         import meta_models
         from unittest.mock import patch
         with patch.dict(os.environ, {'MODEL_API_KEY':'synthetic-cli'}), patch('byok.secret',return_value=''):
             self.assertEqual(meta_models.resolve_model_api_key(),'')
         with patch.dict(os.environ, {'MODEL_API_KEY':'synthetic-cli'}):
-            self.assertEqual(meta_models.resolve_model_api_key(standalone=True),'synthetic-cli')
+            self.assertEqual(meta_models.resolve_model_api_key(standalone=True),'')
         self.assertFalse(hasattr(meta_models,'_load_dotenv_key_once'))
 
 

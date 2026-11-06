@@ -47,7 +47,7 @@ class GatewayTests(unittest.TestCase):
         capture = module.MacOSAudioCapture(provider='meta', asr_mode='DIARIZATION')
         self.assertEqual(capture.status()['provider'], 'meta')
         self.assertEqual(capture.status()['asr_mode'], 'DIARIZATION')
-        with patch.dict(os.environ, {'MEETING_COPILOT_AUDIO_PYTHON': sys.executable}), patch('subprocess.Popen', factory):
+        with patch.dict(os.environ, {'MEETING_COPILOT_AUDIO_PYTHON': sys.executable}), patch('macos_audio._model_api_key', return_value='synthetic-profile-key'), patch('subprocess.Popen', factory):
             capture.start(lambda s: None)
             import time as _time
             deadline = _time.time() + 3
@@ -95,7 +95,7 @@ class GatewayTests(unittest.TestCase):
             return real_popen([sys.executable, '-u', '-c', script], **kwargs)
         capture = module.MacOSAudioCapture(provider='meta', asr_mode='DIARIZATION')
         segments, seen = [], threading.Event()
-        with patch.dict(os.environ, {'MEETING_COPILOT_AUDIO_PYTHON': sys.executable}), patch('subprocess.Popen', factory):
+        with patch.dict(os.environ, {'MEETING_COPILOT_AUDIO_PYTHON': sys.executable}), patch('macos_audio._model_api_key', return_value='synthetic-profile-key'), patch('subprocess.Popen', factory):
             capture.start(lambda s: (segments.append(s), seen.set()))
             self.assertTrue(seen.wait(3), capture.status())
             capture.stop(timeout=1)

@@ -28,9 +28,10 @@ generic host-model fallback. Reopen the pane after settings changes, after
 finishing requests and pausing capture. Already admitted workers retain their
 credential snapshots; a submitted request cannot be recalled by changing keys.
 
-Standalone CLI BYOK is a separate explicit mode using process environment
-credentials; it reads no credential files. See [BYOK boundaries](docs/byok.md)
-and the [optional Meta route](docs/meta-api-key.md).
+The standalone CLI is offline-only and does not read provider credentials.
+For optional Meta transcription, the authenticated parent passes the scoped
+key once over a private worker pipe, not through the worker environment. See
+[BYOK boundaries](docs/byok.md) and the [optional Meta route](docs/meta-api-key.md).
 
 ## Limitations
 

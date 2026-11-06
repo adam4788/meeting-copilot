@@ -71,7 +71,7 @@ class WireTests(unittest.TestCase):
         scope=types.SimpleNamespace(current_secret_scope=lambda:None,get_secret=lambda *a: self.fail('must not read'))
         with patch.dict(sys.modules,{'agent':types.SimpleNamespace(secret_scope=scope)}),patch.dict('os.environ',{'OPENAI_API_KEY':'synthetic-key'}):
             self.assertEqual(byok.secret('OPENAI_API_KEY'),'')
-            self.assertEqual(byok.secret('OPENAI_API_KEY',standalone=True),'synthetic-key')
+            self.assertEqual(byok.secret('OPENAI_API_KEY',standalone=True),'')
     def test_invalid_routes_rejected_before_network(self):
         for provider,model in [('auto','model'),('openai','https://bad'),('openai','sk-secret'),('openrouter','auto'),('openai',None)]:
             with self.assertRaises(ValueError):byok.completion(provider,model)

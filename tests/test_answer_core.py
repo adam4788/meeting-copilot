@@ -1078,6 +1078,13 @@ class AskCliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertNotIn('[1]', buf.getvalue())
 
+    def test_fake_answer_does_not_advertise_live_standalone_providers(self):
+        code, out, _ = self._capture(['--question', 'When does Acme renew?', '--docs', self.docs,
+                                      '--provider', 'fake'])
+        self.assertEqual(code, 0)
+        self.assertIn('Meeting Copilot pane', out)
+        self.assertNotIn('--provider meta', out)
+
     def test_provider_failure_exits_nonzero_without_leaking(self):
         import ask
         import io
@@ -1088,7 +1095,7 @@ class AskCliTests(unittest.TestCase):
         with unittest.mock.patch.object(ask, 'build_completion', return_value=boom):
             with redirect_stdout(out), redirect_stderr(err):
                 code = ask.main(['--question', 'Q?', '--docs', self.docs,
-                                 '--provider', 'meta'])
+                                 '--provider', 'fake'])
         self.assertEqual(code, 2)
         self.assertNotIn('sekret-token', out.getvalue() + err.getvalue())
 
@@ -1100,7 +1107,7 @@ class AskCliTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as ctx:
                 ask.main(['--question', 'Q?', '--docs', self.docs, '--provider', 'meta'])
         self.assertNotEqual(ctx.exception.code, 0)
-        self.assertIn('MODEL_API_KEY', str(ctx.exception.code))
+        self.assertIn('unavailable in standalone mode', str(ctx.exception.code))
 
     def _capture(self, argv):
         import ask
@@ -1171,7 +1178,7 @@ class AskCliTests(unittest.TestCase):
         with unittest.mock.patch.object(ask, 'build_completion', return_value=boom):
             with redirect_stdout(out), redirect_stderr(err):
                 code = ask.main(['--question', 'Q?', '--docs', self.docs,
-                                 '--provider', 'meta', '--json'])
+                                 '--provider', 'fake', '--json'])
         self.assertEqual(code, 2)
         self.assertNotIn('sekret-token', out.getvalue() + err.getvalue())
 
@@ -1207,7 +1214,7 @@ class AskCliTests(unittest.TestCase):
                     ask.main(['--question', 'hi', '--docs', self.docs,
                               '--provider', 'meta', '--json'])
         self.assertNotEqual(ctx.exception.code, 0)
-        self.assertIn('MODEL_API_KEY', _json.loads(out.getvalue())['error'])
+        self.assertIn('unavailable in standalone mode', _json.loads(out.getvalue())['error'])
 
     def test_search_warns_transcript_is_ignored(self):
         code, _, err = self._capture(['--docs', self.docs, '--search', 'Acme renews',
@@ -1235,6 +1242,24 @@ class AskCliTests(unittest.TestCase):
                                  '--provider', 'fake'])
             self.assertEqual(code, 0)
             self.assertEqual(os.environ.get('MODEL_API_KEY'), 'sentinel-value')
+
+    def test_fake_mode_does_not_resolve_a_host_scope(self):
+        try:
+            from agent import secret_scope
+            from hermes_constants import get_hermes_home
+        except ImportError:
+            self.skipTest('requires Hermes scope API')
+        token = secret_scope.set_secret_scope({'MODEL_API_KEY': 'synthetic-scoped'},
+                                              profile_home=str(get_hermes_home().resolve()))
+        try:
+            with unittest.mock.patch.object(secret_scope, 'get_secret', side_effect=AssertionError('offline demo must not read keys')), \
+                 unittest.mock.patch('urllib.request.build_opener', side_effect=AssertionError('offline demo must not use network')):
+                code, out, _ = self._capture(['--question', 'When does Acme renew?', '--docs', self.docs,
+                                               '--provider', 'fake'])
+            self.assertEqual(code, 0)
+            self.assertIn('Offline extractive', out)
+        finally:
+            secret_scope.reset_secret_scope(token)
 
     def test_parser_errors_are_json_when_requested(self):
         import ask
@@ -1266,39 +1291,22 @@ class AskCliTests(unittest.TestCase):
         self.assertTrue(payload['ok'])
         self.assertEqual(payload['projects'][0]['chunks'], 1)
 
-    def test_doctor_meta_key_is_not_mistaken_for_verified_connectivity(self):
-        with unittest.mock.patch.dict('os.environ', {'MODEL_API_KEY': 'private-sentinel'}):
-            code, out, _ = self._capture(['--docs', self.docs, '--doctor', '--provider', 'meta', '--json'])
-            self.assertEqual(code, 0)
-            payload = json.loads(out)
-            self.assertTrue(payload['provider']['ready'])
-            self.assertFalse(payload['provider']['connection_verified'])
-            self.assertIn('not verified', ' '.join(payload['warnings']).lower())
-            self.assertNotIn('private-sentinel', out)
-            code, out, _ = self._capture(['--docs', self.docs, '--doctor', '--provider', 'meta'])
-            self.assertEqual(code, 0)
-            self.assertIn('not verified', out.lower())
-            self.assertNotIn('private-sentinel', out)
-
-    def test_doctor_meta_key_length_matches_answer_preflight(self):
+    def test_live_standalone_providers_fail_closed_even_with_environment_keys(self):
         import ask
-        for key, ready in [('', False), ('   ', False), (' abcdefg ', False),
-                           (' abcdefgh ', True)]:
-            with self.subTest(key=repr(key)), unittest.mock.patch.dict('os.environ', {'MODEL_API_KEY': key}):
-                for json_mode in (False, True):
-                    argv = ['--docs', self.docs, '--doctor', '--provider', 'meta']
-                    code, out, err = self._capture(argv + (['--json'] if json_mode else []))
-                    self.assertEqual(code, 0 if ready else 2)
-                    self.assertNotIn(key.strip() or 'unprintable-secret', out + err)
-                    if json_mode:
-                        payload = json.loads(out)
-                        self.assertEqual(payload['provider']['ready'], ready)
-                        self.assertFalse(payload['provider']['connection_verified'])
-                        if not ready:
-                            self.assertIn('8', ' '.join(payload['problems']))
-                if not ready:
-                    with self.assertRaises(SystemExit):
-                        ask.build_completion('meta', None)
+        keys = {'MODEL_API_KEY': 'private-meta', 'OPENAI_API_KEY': 'private-openai',
+                'OPENROUTER_API_KEY': 'private-router'}
+        with unittest.mock.patch.dict('os.environ', keys), \
+             unittest.mock.patch('urllib.request.build_opener', side_effect=AssertionError('network forbidden')):
+            for provider in ('meta', 'openai', 'openrouter'):
+                with self.subTest(provider=provider):
+                    code, out, err = self._capture(['--docs', self.docs, '--doctor', '--provider', provider, '--json'])
+                    self.assertEqual(code, 2)
+                    payload = json.loads(out)
+                    self.assertFalse(payload['provider']['ready'])
+                    self.assertIn('unavailable in standalone mode', ' '.join(payload['problems']))
+                    self.assertNotIn('private-', out + err)
+                    with self.assertRaisesRegex(SystemExit, 'Meeting Copilot pane'):
+                        ask.build_completion(provider, 'synthetic-model')
 
     def test_doctor_empty_docs_is_actionable_failure(self):
         empty = Path(self.docs) / 'elsewhere'

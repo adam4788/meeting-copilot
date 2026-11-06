@@ -31,10 +31,9 @@ submissions; a provider request already sent cannot be recalled. Retry explicitl
 resends the saved question and context.
 
 For an offline demonstration use `python ask.py --docs sample-docs --provider
-fake ...`. For standalone BYOK, set `OPENAI_API_KEY` or `OPENROUTER_API_KEY` in the
-calling process environment and use `--provider openai|openrouter --model EXACT_ID`.
-Only this explicit standalone CLI path reads process credentials. It does not
-read or create credential files. `--doctor` checks local setup only.
+fake ...`. The standalone CLI does not support live providers or read API keys;
+configure Hermes Settings and ask in the Desktop pane for a live answer.
+`--doctor` checks local setup only.
 
 Meta remains an optional explicit API route for existing integrations. Its
 `MODEL_API_KEY` is also Hermes-managed in plugin mode; it is never selected
