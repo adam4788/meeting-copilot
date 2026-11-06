@@ -56,10 +56,10 @@ python -m scripts.export_catalog_runtime /new/output/directory
 ```
 
 The distinct allowlisted tree includes runtime files, text guides, sample
-documents, the license, and the specific README hero image. Tests and mutation
-probes stay in the source commit. Export is a packaging boundary, not scanner
-suppression or publication; validate the actual export independently. A catalog
-pin must identify the published tree that was validated.
+documents, Windows audio requirements, the license, and the README hero image.
+Tests and mutation probes stay in the source commit. Export is a packaging
+boundary, not scanner suppression or publication; validate the actual export
+independently. A catalog pin must identify the published tree that was validated.
 
 For manual checks obtain permission before recording and use fictional content.
 Short synthetic runs cannot establish long-call reliability. See [BYOK](byok.md),

@@ -4,6 +4,14 @@ The catalog validator reports warnings as well as failures. A passing run does
 not mean this plugin has no version-sensitive dependencies. Review the exact
 pinned commit and its complete validator output before submission.
 
+## Public API audit (2026-11-06)
+
+The [current public API list](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins/public-api)
+does not include either private import below. The catalog validator warns about
+them without failing, but the [catalog rules](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins/catalog-submission)
+require public extension surfaces. A passing validator is therefore not a claim
+of full public-API conformance or catalog readiness.
+
 The optional `hermes_adapters.default_completion(llm)` helper now accepts only an
 explicitly supplied public `ctx.llm` facade. It calls the documented synchronous
 `complete(messages=..., max_tokens=..., timeout=..., purpose=...)` API and reads
@@ -27,6 +35,15 @@ Two active compatibility seams remain:
   Public `ctx.dispatch_tool` exists for registered callbacks; this is specifically
   a dashboard handoff gap, not a claim that Hermes lacks tool dispatch.
   Explicit web opt-in, query filtering and failure reporting are unchanged.
+  The documented `agent.web_search_provider.WebSearchProvider` is an interface
+  for implementing and registering a provider; it does not select or dispatch
+  the configured provider for a dashboard route. The selection registry named
+  in the [provider guide](https://hermes-agent.nousresearch.com/docs/developer-guide/web-search-provider-plugin)
+  is not in the public API list.
+  A read-only check with the installed Hermes libraries and a fresh temporary
+  profile found no `web_search` entry in the public tool registry after importing
+  this dashboard API. Direct registry dispatch is therefore not a verified
+  substitute for the existing search path in a fresh plugin host.
 - `overlay_bridge.BackendTransport._fresh_action_context()` uses the private
   `hermes_cli.web_server_profiles._config_profile_scope('current')` helper.
   It refreshes a **copy** of the authenticated pane action context, verifies
@@ -35,8 +52,16 @@ Two active compatibility seams remain:
   Missing/incompatible host APIs fail closed with reopen guidance. This private
   helper can change between Hermes versions. There is no documented equivalent
   public fresh-copy scope API in the reviewed docs. The host's
-  `refresh_installed_secret_scope` mutates the installed mapping in place and
-  would change existing workers' snapshots, so it is not a safe replacement.
+  `refresh_installed_secret_scope` mutates its installed mapping in place, so
+  calling it on a shared context could change admitted workers' snapshots.
+  `build_profile_secret_scope(home)` does return a fresh file/external/managed
+  mapping, and rebinding that mapping avoids mutating the original. However,
+  it does not itself perform the host's external-source hydration or use its
+  launch-profile resolver. In the inspected host, `_config_profile_scope` does
+  both where applicable. A synthetic comparison against the installed host
+  showed a launch-injected key in the host scope but not the direct builder's
+  mapping. Equivalence for injected credentials and routed profiles is therefore
+  unproven, so neither approach is a safe replacement yet.
 
 The needed scope API must refresh host-owned secret sources into a **new**
 authenticated-profile snapshot inside the action admission boundary, preserve

@@ -2,6 +2,7 @@ import { createElement as h, useState, useEffect, useRef } from 'react';
 import { host, useValue, useQuery, useQueryClient, Button, Input, Textarea, Badge, PALETTE_AREA } from '@hermes/plugin-sdk';
 
 const ID = 'meeting-copilot-live';
+const speakerPalette = ['var(--ui-accent)', 'var(--ui-green, var(--ui-accent))', 'var(--ui-orange, var(--ui-accent))', 'var(--ui-red, var(--ui-accent))', 'var(--ui-cyan, var(--ui-accent))', 'var(--ui-purple, var(--ui-accent))'];
 const muted = { color: 'var(--ui-text-secondary)', fontSize: 12, lineHeight: 1.5 };
 const card = { border: '1px solid var(--ui-stroke-secondary)', borderRadius: 10, padding: 14, minWidth: 0, boxSizing: 'border-box', background: 'var(--ui-bg-card)' };
 const selectStyle = { padding: 8, borderRadius: 6, width: '100%', maxWidth: '100%', minWidth: 0, color: 'var(--ui-text-primary)', background: 'var(--ui-bg-card)', border: '1px solid var(--ui-stroke-secondary)' };
@@ -10,7 +11,7 @@ export default {
   id: ID,
   name: 'Meeting Copilot',
   description: 'Live answers grounded in your projects, prior sessions, and optional web research.',
-  version: '0.2.0',
+  version: '0.1.0',
   register(ctx) {
     function MetaKeySettings() {
       return h('section', { style: card }, h('strong', null, 'Bring your own API key'),
@@ -808,11 +809,10 @@ export default {
         h('details', { open: showTranscript, onToggle: e => setShowTranscript(e.currentTarget.open) },
           h('summary', { style: { cursor: 'pointer', ...muted } }, `Live transcript · ${transcript.length} segments`),
           ...(() => {
-            const palette = ['var(--ui-accent)', '#16a34a', '#ea8600', '#db2777', '#0284c7', '#9333ea'];
             const assigned = {};
             for (const seg of transcript) {
               const name = String(seg.speaker || 'Speaker');
-              if (!(name in assigned)) assigned[name] = palette[Object.keys(assigned).length % palette.length];
+              if (!(name in assigned)) assigned[name] = speakerPalette[Object.keys(assigned).length % speakerPalette.length];
             }
             return Object.keys(assigned).length > 1 ? [h('div', { key: 'speakers', style: { display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 } },
               ...Object.entries(assigned).map(([name, color]) => h('span', { key: name, style: { border: '1px solid var(--ui-stroke-secondary)', borderRadius: 999, padding: '2px 9px', fontSize: 12 } },
@@ -820,10 +820,9 @@ export default {
           })(),
           h('div', { style: { maxHeight: 280, overflowY: 'auto', marginTop: 8, padding: 10, display: 'flex', flexDirection: 'column', gap: 8, border: '1px solid var(--ui-stroke-secondary)', borderRadius: 10, background: 'var(--ui-bg-card)' } },
             ...(transcript.length ? transcript.slice(-30).map((s, i) => {
-              const palette = ['var(--ui-accent)', '#16a34a', '#ea8600', '#db2777', '#0284c7', '#9333ea'];
               const order = [];
               for (const seg of transcript) { const n = String(seg.speaker || 'Speaker'); if (!order.includes(n)) order.push(n); }
-              const color = palette[Math.max(0, order.indexOf(String(s.speaker || 'Speaker'))) % palette.length];
+              const color = speakerPalette[Math.max(0, order.indexOf(String(s.speaker || 'Speaker'))) % speakerPalette.length];
               return h('p', { key: `${i}-${s.timestamp}`, style: { margin: 0, padding: '8px 10px', borderRadius: 8, border: '1px solid var(--ui-stroke-secondary)', borderLeft: `3px solid ${color}`, background: `color-mix(in srgb, ${color} 7%, transparent)`, lineHeight: 1.5 } },
               h('strong', { style: { color } }, `${s.speaker}: `), s.text,
               s.partial_tail && h('span', { title: 'Transcribed from trailing audio captured during shutdown' }, ' \u00b7 trailing audio'));
@@ -979,7 +978,7 @@ export default {
         if (typeof window === 'undefined') return { position: 'fixed', left: pos.x, top: pos.y };
         const w = 230, h = 120;
         // Position the menu's top-left corner directly; no translate offset.
-        return { position: 'fixed', left: Math.max(8, Math.min(pos.x, window.innerWidth - w)), top: Math.max(8, Math.min(pos.y, window.innerHeight - h)), zIndex: 9999, minWidth: 210, maxWidth: w, background: 'var(--ui-bg-elevated)', border: '1px solid var(--ui-stroke-secondary)', borderRadius: 8, padding: 4, boxShadow: '0 8px 24px rgba(0,0,0,0.25)' };
+        return { position: 'fixed', left: Math.max(8, Math.min(pos.x, window.innerWidth - w)), top: Math.max(8, Math.min(pos.y, window.innerHeight - h)), zIndex: 9999, minWidth: 210, maxWidth: w, background: 'var(--ui-bg-elevated)', border: '1px solid var(--ui-stroke-secondary)', borderRadius: 8, padding: 4, boxShadow: '0 8px 24px color-mix(in srgb, var(--ui-text-primary) 25%, transparent)' };
       };
       const focusToggle = () => {
         try {

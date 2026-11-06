@@ -94,7 +94,8 @@ class ExportTests(unittest.TestCase):
             root = Path(tmp)
             source = root / 'source'
             tracked = self.fixture(source)
-            for missing in ('server.py', 'docs/assets/meeting-copilot-hero.png', 'LICENSE'):
+            for missing in ('server.py', 'docs/assets/meeting-copilot-hero.png', 'LICENSE',
+                            'requirements-audio.txt'):
                 with self.subTest(missing=missing), self.assertRaises(ValueError):
                     export_runtime(source, root / 'bad', 'a' * 40, tracked - {missing})
                 self.assertFalse((root / 'bad').exists())

@@ -9,13 +9,15 @@ output**, not just the meeting application.
 
 ## Dependencies
 
-Install into the interpreter that runs the application:
+For standalone Windows capture, use a separate Python environment and install
+the bounded optional dependencies from the source checkout or runtime export:
 
 ```bash
-uv pip install --python "$(python -c 'import sys; print(sys.executable)')" soundcard numpy faster-whisper
+python -m pip install -r requirements-audio.txt
 ```
 
-The implementation was exercised on Windows with Python 3.14 and SoundCard 0.4.6.
+Do not modify the Hermes-managed Python environment with this command. The
+implementation was exercised on Windows with Python 3.14 and SoundCard 0.4.6.
 SoundCard uses CFFI/WASAPI on Windows; it does not require PyAudioWPatch wheels.
 Default model: faster-whisper `base.en`, CPU, int8, four CPU threads. Set
 `model_size='small.en'` for the larger English model, or provide an existing local

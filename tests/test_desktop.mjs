@@ -1789,6 +1789,7 @@ test('each speaker keeps one distinct color across tiles, with a legend', async 
   const colors = tiles.map(t => t.props.style.borderLeft);
   assert.equal(colors[0], colors[2], 'same speaker, same color');
   assert.notEqual(colors[0], colors[1], 'different speakers, different colors');
+  assert.ok(colors.every(color => color.includes('var(--ui-')), 'speaker colors follow the active theme');
   const speakerNames = tiles.map(t => t.children[0]);
   assert.ok(speakerNames.every((s, i) => s && s.props.style
     && s.props.style.color === colors[i].replace('3px solid ', '')),
@@ -1796,6 +1797,18 @@ test('each speaker keeps one distinct color across tiles, with a legend', async 
   const legend = nodes(tree).filter(n => n.type === 'span'
     && (n.children || []).some(c => typeof c === 'string' && (c === 'Alice' || c === 'Bob')));
   assert.equal(legend.length, 2, 'legend chips name each speaker');
+});
+
+test('desktop plugin uses theme colors and matches package versions', () => {
+  const source = readFileSync(new URL('../desktop/plugin.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /#[0-9a-f]{3,8}\b|\brgba?\(/i, 'plugin colors must use the host theme');
+  const plugin = vm.runInNewContext(source.replace(/^import .*;\r?\n/gm, '').replace('export default', 'const plugin =') + '\nplugin;');
+  const manifest = readFileSync(new URL('../plugin.yaml', import.meta.url), 'utf8');
+  const match = /^version:\s*["']?([^"'\s]+)["']?\s*$/m.exec(manifest);
+  assert.ok(match, 'Python plugin declares a version');
+  const dashboard = JSON.parse(readFileSync(new URL('../dashboard/manifest.json', import.meta.url), 'utf8'));
+  assert.equal(plugin.version, match[1]);
+  assert.equal(dashboard.version, match[1]);
 });
 
 test('composer shortcut sends once without inserting a newline or interrupting composition', () => {

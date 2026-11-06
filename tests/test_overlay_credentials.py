@@ -4,6 +4,11 @@ The pane no longer edits keys or promises immediate publication. Explicit pane
 show/scope actions retain context checks; workers keep admitted snapshots.
 """
 import contextvars
+from contextlib import contextmanager
+from pathlib import Path
+import sys
+import tempfile
+import types
 import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
@@ -33,3 +38,61 @@ class OverlayCredentialTests(unittest.TestCase):
         with patch.object(BackendTransport,'_fresh_action_context',side_effect=RuntimeError('synthetic')):
             with self.assertRaises(RuntimeError):transport.refresh_pane_token('new-pane')
         self.assertIsNone(transport._poll_context)
+
+
+class FreshHostScopeTests(unittest.TestCase):
+    """Exercise the current host boundary with synthetic, isolated mappings."""
+
+    def setUp(self):
+        self.scope = contextvars.ContextVar('synthetic_scope', default=None)
+        self.bound_home = contextvars.ContextVar('synthetic_scope_home', default=None)
+        self.home = Path(tempfile.gettempdir()) / 'synthetic-hermes-profile'
+        self.old = {'OPENAI_API_KEY': 'synthetic-old'}
+        self.fresh = {'OPENAI_API_KEY': 'synthetic-new'}
+        self.addCleanup(self.scope.reset, self.scope.set(self.old))
+        self.addCleanup(self.bound_home.reset, self.bound_home.set(str(self.home)))
+
+        @contextmanager
+        def host_scope(profile):
+            self.assertEqual(profile, 'current')
+            token = self.scope.set(self.fresh)
+            try:
+                yield
+            finally:
+                self.scope.reset(token)
+
+        agent = types.ModuleType('agent')
+        agent.__path__ = []
+        secrets = types.ModuleType('agent.secret_scope')
+        secrets.current_secret_scope = self.scope.get
+        secrets.current_secret_scope_home = self.bound_home.get
+        agent.secret_scope = secrets
+        cli = types.ModuleType('hermes_cli')
+        cli.__path__ = []
+        profiles = types.ModuleType('hermes_cli.web_server_profiles')
+        profiles._config_profile_scope = host_scope
+        constants = types.ModuleType('hermes_constants')
+        constants.get_hermes_home = lambda: self.home
+        self.modules = patch.dict(sys.modules, {
+            'agent': agent, 'agent.secret_scope': secrets,
+            'hermes_cli': cli, 'hermes_cli.web_server_profiles': profiles,
+            'hermes_constants': constants,
+        })
+        self.modules.start()
+        self.addCleanup(self.modules.stop)
+
+    def test_refresh_is_a_distinct_host_scope_and_preserves_admitted_snapshot(self):
+        captured = BackendTransport._fresh_action_context(expected_home=self.home)
+        self.assertIs(self.scope.get(), self.old)
+        self.assertIs(captured.run(self.scope.get), self.fresh)
+        self.assertEqual(self.old['OPENAI_API_KEY'], 'synthetic-old')
+
+    def test_wrong_profile_or_reused_host_scope_fails_closed(self):
+        with self.assertRaises(HTTPException) as mismatch:
+            BackendTransport._fresh_action_context(expected_home=self.home / 'other')
+        self.assertEqual(mismatch.exception.status_code, 503)
+        self.fresh = self.old
+        with self.assertRaises(HTTPException) as reused:
+            BackendTransport._fresh_action_context(expected_home=self.home)
+        self.assertEqual(reused.exception.status_code, 503)
+        self.assertIs(self.scope.get(), self.old)

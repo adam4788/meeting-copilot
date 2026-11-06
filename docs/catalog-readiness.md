@@ -1,9 +1,10 @@
 # Catalog preflight
 
-Validated against Hermes Agent 0.22.7. The manifest uses that tested SemVer
-floor and declares the dashboard's required FastAPI dependency with an upper
-bound. Hermes must resolve it under its own core constraints. The plugin's
-manifest, dashboard, desktop and proposed entry version are all 0.1.0.
+The manifest declares Hermes Agent `>=0.22.7` and the dashboard's FastAPI
+dependency with an upper bound. The compatibility floor has not been rechecked
+against its oldest supported host in the current guide audit. Hermes must resolve
+dependencies under its own core constraints. The plugin's manifest, dashboard,
+desktop and proposed entry version are all 0.1.0.
 
 Run in an isolated Hermes validation environment:
 

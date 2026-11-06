@@ -35,7 +35,12 @@ class InstallerTests(unittest.TestCase):
             backend = home / 'plugins/meeting-copilot-live/dashboard'
             self.assertEqual((backend.parent / 'plugin.yaml').read_bytes(),
                              (source / 'plugin.yaml').read_bytes())
-            api_file = json.loads((backend / 'manifest.json').read_text())['api']
+            dashboard_manifest = json.loads((backend / 'manifest.json').read_text())
+            declared_version = next(line.split(':', 1)[1].strip().strip('"\'')
+                                    for line in (source / 'plugin.yaml').read_text().splitlines()
+                                    if line.startswith('version:'))
+            self.assertEqual(dashboard_manifest['version'], declared_version)
+            api_file = dashboard_manifest['api']
             self.assertRegex(api_file, r'^plugin_api_[0-9a-f]{16}\.py$')
             self.assertTrue((backend / api_file).is_file())
             for name in install.FILES:
