@@ -86,6 +86,31 @@ class InstalledHostScopeTests(unittest.TestCase):
                  patch.object(secret_scope, 'get_secret', side_effect=refresh_during_get):
                 self.assertEqual(byok.secret('OPENAI_API_KEY'), '')
                 self.assertEqual(byok.secret('OPENAI_API_KEY'), '')
-                self.assertEqual(observed, [(True, True)])
+                self.assertEqual(observed, [(True, True), (True, True)])
+        finally:
+            secret_scope.reset_secret_scope(token)
+
+    def test_only_host_get_secret_reads_values_and_global_names_are_rejected(self):
+        from agent import secret_scope
+        reading = [False]
+        class GuardedScope(dict):
+            def get(self, name, default=None):
+                if not reading[0]:
+                    raise AssertionError('plugin read a secret outside get_secret')
+                return super().get(name, default)
+        scope = GuardedScope(OPENAI_API_KEY='synthetic-bound')
+        token = secret_scope.set_secret_scope(scope, profile_home=self.home)
+        real_get = secret_scope.get_secret
+        def host_get(name, default):
+            reading[0] = True
+            try:
+                return real_get(name, default)
+            finally:
+                reading[0] = False
+        try:
+            with patch.object(secret_scope, 'get_secret', side_effect=host_get) as getter:
+                self.assertEqual(byok.secret('OPENAI_API_KEY'), 'synthetic-bound')
+                self.assertEqual(byok.secret('PATH'), '')
+                self.assertEqual(getter.call_count, 1)
         finally:
             secret_scope.reset_secret_scope(token)

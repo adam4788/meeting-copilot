@@ -10,6 +10,7 @@ PROVIDERS = {
     'openai': ('OpenAI API', 'OPENAI_API_KEY', 'https://api.openai.com/v1/chat/completions'),
     'openrouter': ('OpenRouter', 'OPENROUTER_API_KEY', 'https://openrouter.ai/api/v1/chat/completions'),
 }
+_SECRET_NAMES = frozenset({'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'MODEL_API_KEY'})
 _ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._/:@+\-]{0,199}\Z')
 
 def validate(provider, model):
@@ -29,6 +30,10 @@ def _host_scope():
 
 
 def secret(name, *, standalone=False):
+    # get_secret treats some deployment variables as global, so accept only
+    # the declared profile-secret names before asking the host for a value.
+    if name not in _SECRET_NAMES:
+        return ''
     if standalone:
         value = os.environ.get(name, '')
     else:
@@ -41,14 +46,9 @@ def secret(name, *, standalone=False):
             # mapping. A concurrent change must never fall back to process env.
             token = secret_scope.set_multiplex_context(True)
             try:
-                expected = scope.get(name)
-                if not isinstance(expected, str) or not expected:
-                    return ''
                 value = secret_scope.get_secret(name, '')
             finally:
                 secret_scope.reset_multiplex_context(token)
-            if value != expected:
-                return ''
         except Exception:
             return ''
     return value.strip() if isinstance(value, str) else ''
