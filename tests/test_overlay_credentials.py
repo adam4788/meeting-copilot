@@ -124,3 +124,14 @@ class ReadOnlyOverlayTests(unittest.TestCase):
             self.assertEqual(seen, ['absent'])
         finally:
             secret.reset(token)
+
+    def test_helper_startup_exception_does_not_reflect_sensitive_text(self):
+        from fastapi import HTTPException
+        import server
+        state = server.MeetingState()
+        with patch.object(bridge.OverlayBridge, 'show_overlay', autospec=True,
+                          side_effect=RuntimeError('synthetic-provider-key')):
+            with self.assertRaises(HTTPException) as failure:
+                state.overlay_show({})
+        self.assertIn('Overlay startup failed', failure.exception.detail)
+        self.assertNotIn('synthetic-provider-key', failure.exception.detail)

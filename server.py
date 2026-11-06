@@ -942,9 +942,8 @@ class MeetingState:
                     # after a newer request has already completed.
                     self._recompute_busy_locked()
                     self.live_workers = max(0, self.live_workers - 1)
-        # Provider credentials are request/profile scoped; propagate that scope into the worker.
-        # Native click handlers run on overlay threads, so the bridge snapshot
-        # also carries the originating context with it (see BackendTransport).
+        # Provider credentials are request/profile scoped; propagate the host's
+        # authenticated pane scope into this already-admitted answer worker.
         import contextvars
         context = contextvars.copy_context()
         with self.lock:
@@ -1201,8 +1200,8 @@ class MeetingState:
         # waiting for startup. A reserved pending bridge fences new admission.
         try:
             job['worker'].start()
-        except RuntimeError as exc:
-            job['error'] = f'Overlay startup worker could not start: {exc}'
+        except RuntimeError:
+            job['error'] = 'Overlay startup worker could not start. Retry Show.'
             job['done'].set()
         job['done'].wait(3)
         # Observe startup liveness off the lifecycle/publication locks. A hung
@@ -1438,8 +1437,8 @@ class MeetingState:
                 try:
                     result = context.run(bridge.show_overlay)
                     job['result'] = result if isinstance(result, dict) else {'shown': bool(result)}
-                except Exception as exc:
-                    job['error'] = f'Overlay startup failed: {type(exc).__name__}: {str(exc)[:200]}'
+                except Exception:
+                    job['error'] = 'Overlay startup failed. Check the helper and retry.'
                 finally:
                     job['done'].set()
             job['worker'] = threading.Thread(target=launch, name='meeting-overlay-startup', daemon=True)

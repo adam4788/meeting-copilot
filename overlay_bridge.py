@@ -324,7 +324,7 @@ class BackendTransport:
             return self._state.status()
 
 class OverlayBridge:
-    """Owns one helper subprocess; backend truth in, snapshots out, clicks back.
+    """Owns one helper subprocess; backend truth in and snapshots out.
 
     Lifecycle: the backend creates this bridge on the explicit pane
     Show-overlay action (`show_overlay`) and tears it down on Hide/unmount
@@ -602,7 +602,7 @@ class OverlayBridge:
         return f'{self._instance_id}:{self.paused_generation}'
 
     def on_click_line(self, line):
-        """The single path that may request an answer: an explicit overlay click."""
+        """Handle legacy click messages; production transports reject them."""
         row_id = parse_click(line)
         if row_id is None:
             return False
