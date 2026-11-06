@@ -43,32 +43,7 @@ class BlockerTests(CheckedThreads):
             worker.join(2)
             self.assertFalse(worker.is_alive(), 'worker did not exit')
 
-    def test_buffered_native_click_cannot_rebind_identical_question(self):
-        state, overlay, engine = self.backend()
-        old_click = click(overlay)
-        state.generation += 1
-        overlay.update(state.status(touch=False))
-        self.assertFalse(overlay.on_click_line(old_click))
-        self.assertFalse(overlay.on_click_line(json.dumps({'type': 'click', 'id': 'row'})))
-        self.assertTrue(overlay.on_click_line(click(overlay)))
-        self.join(overlay)
-        engine.answer.assert_called_once()
-        self.assertEqual(overlay.answers['row']['answer'], 'Safe answer')
 
-    def test_same_scope_authorization_refresh_retires_pending_tap(self):
-        state, overlay, engine = self.backend()
-        with patch.object(threading.Thread, 'start'):
-            self.assertTrue(overlay.on_click_line(click(overlay)))
-        queued = overlay._click_queue.get_nowait()
-        import contextvars
-        principal = contextvars.ContextVar('changed-principal')
-        token = principal.set('new-principal')
-        try:
-            state.overlay_scope({'owner': state.overlay_owner, 'seq': 1})
-        finally:
-            principal.reset(token)
-        overlay.ask(*queued)
-        engine.answer.assert_not_called()
 
     def test_previous_owner_scope_is_rejected_even_with_higher_sequence(self):
         state, overlay, engine = self.backend()
@@ -77,6 +52,15 @@ class BlockerTests(CheckedThreads):
                                       'all_projects': True, 'web_fallback': True})
         self.assertFalse(result['accepted'])
         self.assertEqual(state.overlay_scope_value, {})
+
+    def test_same_scope_update_retires_unverifiable_pane_identity(self):
+        state, overlay, engine = self.backend()
+        old_generation = overlay.paused_generation
+        result = state.overlay_scope({'owner': 'test-owner', 'seq': 1})
+        self.assertTrue(result['accepted'])
+        self.assertGreater(overlay.paused_generation, old_generation)
+        self.assertFalse(overlay.on_click_line(click(overlay)))
+        engine.answer.assert_not_called()
 
     def test_reused_show_rotates_owner_and_resets_sequence(self):
         state, overlay, engine = self.backend()
@@ -104,30 +88,6 @@ class BlockerTests(CheckedThreads):
         self.assertEqual(overlay.segments, [])
         self.assertEqual(overlay.answers, {})
 
-    def test_pause_preserves_completed_but_retires_pending(self):
-        state, overlay, engine = self.backend()
-        state.add_segment({'id': 'pending', 'speaker': 'remote', 'text': 'When is launch?'})
-        overlay.update(state.status(touch=False))
-        engine.answer.return_value = {'answer': 'Completed'}
-        self.assertTrue(overlay.on_click_line(click(overlay)))
-        self.join(overlay)
-        self.assertTrue(overlay.answers['row']['completed'])
-        overlay.answers['pending'].update(answer='Partial', busy=True)
-        overlay.request_by_row['pending'] = 'pending-request'
-        overlay.row_by_request['pending-request'] = 'pending'
-        old_id = overlay.snapshot_id
-        state.pause()
-        overlay.update(state.status(touch=False))
-        self.assertEqual(overlay.answers['row']['answer'], 'Completed')
-        self.assertIsNone(overlay.answers['pending']['answer'])
-        self.assertFalse(overlay.answers['pending']['busy'])
-        self.assertEqual(overlay.request_by_row, {})
-        self.assertNotEqual(overlay.snapshot_id, old_id)
-        # Resume the same meeting without touching real capture hardware.
-        state.listening = True
-        state.capture_generation += 1
-        overlay.update(state.status(touch=False))
-        self.assertEqual(overlay.answers['row']['answer'], 'Completed')
 
     def test_stale_non_dict_poller_result_does_not_change_state(self):
         state, overlay, engine = self.backend()
@@ -204,34 +164,6 @@ class BlockerTests(CheckedThreads):
             stream.close()
             os.close(reader)
 
-    def test_hide_during_provider_preflight_prevents_provider_call(self):
-        state, overlay, engine = self.backend()
-        entered, release, passed = (threading.Event() for _ in range(3))
-        def supports():
-            entered.set()
-            if not release.wait(2):
-                raise AssertionError('preflight gate timed out')
-            passed.set()
-            return False
-        engine.supports_streaming.side_effect = self.checked_callback(supports)
-        self.assertTrue(overlay.on_click_line(click(overlay)))
-        try:
-            self.assertTrue(entered.wait(2))
-            self.assertFalse(passed.is_set())
-            state.overlay_hide()
-            self.assertFalse(passed.is_set(), 'Hide must return before releasing preflight')
-        finally:
-            release.set()
-        self.join(overlay)
-        import time
-        deadline = time.monotonic() + 2
-        while state.live_workers and time.monotonic() < deadline:
-            time.sleep(0.001)
-        self.assertEqual(state.live_workers, 0)
-        self.assertEqual(self.worker_errors, [], 'provider callback exceptions must not be swallowed')
-        self.assertTrue(passed.is_set(), 'preflight must finish only after Hide and explicit release')
-        engine.supports_streaming.assert_called_once()
-        engine.answer.assert_not_called()
 
     def test_admission_assertions_are_not_swallowed_as_rejection(self):
         transport = Mock()
@@ -260,35 +192,6 @@ class BlockerTests(CheckedThreads):
         self.assertIn('expected_generation', overlay.message)
         self.assertFalse(overlay.answers['row']['busy'])
 
-    def test_hide_at_admission_exit_cancels_before_provider_start(self):
-        state, overlay, engine = self.backend()
-        pending_workers = []
-        mapped = []
-        real_lock = state.overlay_lock
-        class HideOnExit:
-            def __enter__(self):
-                return real_lock.__enter__()
-            def __exit__(guard, *args):
-                mapped.append(bool(overlay.row_by_request))
-                real_lock.__exit__(*args)
-                state.overlay_lock = real_lock
-                state.overlay_hide()
-                # Execute the real backend worker at the exact former gap:
-                # admitted slot exists; bridge hasn't resumed after admission.
-                for worker in pending_workers:
-                    worker.run()
-        state.overlay_lock = HideOnExit()
-        overlay.request_by_row['row'] = True
-        overlay.reserved_generation['row'] = overlay.paused_generation
-        overlay.answers['row']['busy'] = True
-        original_start = threading.Thread.start
-        with patch.object(threading.Thread, 'start', lambda worker: original_start(worker)
-                          if worker.name == 'meeting-overlay-cleanup' else pending_workers.append(worker)):
-            overlay.ask('row', overlay.questions['row'], overlay.paused_generation)
-        self.assertEqual(mapped, [True])
-        self.assertEqual(len(pending_workers), 1)
-        engine.answer.assert_not_called()
-        self.assertEqual(next(iter(state.requests.values()))['status'], 'cancelled')
 
     def test_inflight_emission_is_fenced_by_clear(self):
         state, overlay, engine = self.backend()
@@ -356,16 +259,3 @@ class BlockerTests(CheckedThreads):
         count = len(overlay.pushed)
         self.assertFalse(overlay._emit(frame))
         self.assertEqual(len(overlay.pushed), count)
-
-    def test_nonreentrant_publication_lock_is_supported(self):
-        state, overlay, engine = self.backend()
-        state.overlay_lock = threading.Lock()
-        self.assertTrue(overlay.on_click_line(click(overlay)))
-        worker = overlay.threads[-1]
-        worker.join(1)
-        deadlocked = worker.is_alive()
-        if deadlocked:
-            state.overlay_lock.release()  # Rescue the buggy nested acquisition.
-            worker.join(1)
-        self.assertFalse(deadlocked, 'nested acquisition of a plain publication Lock')
-        engine.answer.assert_called_once()

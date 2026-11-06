@@ -89,23 +89,17 @@ class HistoryScopeTests(unittest.TestCase):
         self.assertTrue(any(str(s.get('source','')).startswith('session:') for s in on_sources))
         self.assertEqual(len(self.calls), 1)
 
-    def test_overlay_click_routes_opt_out_to_same_engine(self):
+    def test_overlay_click_cannot_start_history_or_answer_work(self):
         import overlay_bridge
         scope = {'project':'fictional', 'include_history':False, 'web_fallback':False}
         self.state.overlay_scope_value = self.state._clean_overlay_scope(scope)
         marker = overlay_bridge._PANE_ACTION.set('synthetic-pane')
         self.addCleanup(overlay_bridge._PANE_ACTION.reset, marker)
         transport = overlay_bridge.BackendTransport(self.state, pane_token='synthetic-pane')
-        rid = transport.assist('How many moonlight lanterns?', scope, 'synthetic-row')
-        for _ in range(300):
-            entry = self.state.assist_request(rid)
-            if entry['status'] in ('done','error','cancelled'):
-                break
-            time.sleep(.01)
-        self.assertEqual(entry['status'], 'done', entry)
-        self.assertEqual(entry['request']['include_history'], False)
+        with self.assertRaisesRegex(RuntimeError, 'Overlay answers are unavailable'):
+            transport.assist('How many moonlight lanterns?', scope, 'synthetic-row')
         self.assertEqual(self.calls, [])
-        self.assertTrue(any('plan.txt' in s.get('title','') for s in entry['sources']))
+        self.assertEqual(self.state.requests, {})
 
     def test_overlay_rejects_non_boolean_history_setting(self):
         from fastapi import HTTPException

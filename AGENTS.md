@@ -34,10 +34,10 @@ node --test tests/test_desktop.mjs
 - Capture requires explicit consent; do not send, speak, or post automatically.
   Preserve scoped credentials, explicit provider/model selection, bounded data,
   read-only retrieval, and visible opt-in web behavior.
-- `overlay_bridge.py` uses a private Hermes scope seam; see
-  [compatibility](docs/catalog-compatibility.md). Do not replace or widen it
-  without equivalent safety and compatibility tests. Web search uses a
-  profile-bound public registry and fails visibly when it is unavailable.
+- The overlay is read-only and must not retain pane credentials or initiate
+  answers. Pane answers require a host-bound scope. See
+  [compatibility](docs/catalog-compatibility.md) before changing either path.
+  Web search uses a profile-bound public registry and fails visibly when absent.
 - Keep test fixtures synthetic. Do not commit credentials, recordings,
   transcripts, databases, private project data, or personal paths.
 - `install.FILES` defines the legacy installer payload. The catalog exporter

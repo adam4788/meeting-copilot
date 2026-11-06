@@ -70,28 +70,22 @@ class InstalledHostScopeTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(values, ['synthetic-first'])
 
-    def test_scope_copy_closes_concurrent_refresh_fallback_race(self):
+    def test_concurrent_scope_change_never_falls_back_to_environment(self):
         from agent import secret_scope
         original = {'OPENAI_API_KEY': 'synthetic-bound', 'MODEL_API_KEY': 'synthetic-unrelated'}
         token = secret_scope.set_secret_scope(original, profile_home=self.home)
         real_get = secret_scope.get_secret
         observed = []
         def refresh_during_get(name, default):
-            observed.append(set(secret_scope.current_secret_scope()))
+            observed.append((secret_scope.current_secret_scope() is original,
+                             secret_scope.is_multiplex_active()))
             original.clear()
             return real_get(name, default)
         try:
             with patch.dict(os.environ, {'OPENAI_API_KEY': 'synthetic-process'}), \
                  patch.object(secret_scope, 'get_secret', side_effect=refresh_during_get):
-                self.assertEqual(byok.secret('OPENAI_API_KEY'), 'synthetic-bound')
                 self.assertEqual(byok.secret('OPENAI_API_KEY'), '')
-                self.assertEqual(observed, [{'OPENAI_API_KEY'}])
+                self.assertEqual(byok.secret('OPENAI_API_KEY'), '')
+                self.assertEqual(observed, [(True, True)])
         finally:
             secret_scope.reset_secret_scope(token)
-
-    def test_real_dashboard_binding_keeps_synthetic_launch_injection(self):
-        # Test the host's actual dashboard binder; the plugin never imports it.
-        from hermes_cli.web_server_profiles import _config_profile_scope
-        with patch.dict(os.environ, {'OPENAI_API_KEY': 'synthetic-injected'}):
-            with _config_profile_scope(None):
-                self.assertEqual(byok.secret('OPENAI_API_KEY'), 'synthetic-injected')

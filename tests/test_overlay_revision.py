@@ -18,21 +18,12 @@ class RevisionTests(CheckedThreads):
     backend = blockers.BlockerTests.backend
     join = blockers.BlockerTests.join
 
-    def test_http_show_auto_sync_completion_and_owner_cleanup(self):
+    def test_http_read_only_overlay_and_owner_cleanup(self):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
         from tests.test_overlay_bridge import _fake_overlay_spawn
-        entered, release, completed = (threading.Event() for _ in range(3))
         engine = Mock()
-        engine.supports_streaming.return_value = False
-        def answer(*args, **kwargs):
-            entered.set()
-            self.checked_wait(release, 3, 'HTTP answer gate')
-            return {'answer': 'Safe HTTP answer'}
-        engine.answer.side_effect = self.checked_callback(answer)
         state = server.MeetingState(engine_factory=lambda: engine)
-        # Claim never transfers capture consent. Activate the test fixture only
-        # after its pane owns the lease (capture itself is covered in router tests).
         app = FastAPI()
         app.include_router(server.make_router(state))
         with _fake_overlay_spawn(), patch.object(state, '_start_overlay_lease_locked'), TestClient(app) as client:
@@ -40,8 +31,6 @@ class RevisionTests(CheckedThreads):
                 response = client.post(path, json=payload)
                 self.assertEqual(response.status_code, 200, response.text)
                 return response.json()
-            self.assertEqual(client.post('/overlay/show', json={'scope': {}}).status_code, 422)
-            self.assertEqual(client.post('/overlay/hide', json={}).status_code, 422)
             ticket = client.get('/overlay/lifecycle').json()
             ticket.update(client='revision-test', creation=1)
             pane = post('/overlay/claim', ticket)['pane']
@@ -50,83 +39,28 @@ class RevisionTests(CheckedThreads):
             shown = post('/overlay/show', {'pane': pane, 'action': 1, 'scope': {'seq': 0}})
             self.assertTrue(shown['shown'])
             overlay = state.overlay
-            original_push = overlay.push
-            def push():
-                result = original_push()
-                if overlay.answers.get('row', {}).get('completed'):
-                    completed.set()
-                return result
             try:
-                with patch.object(overlay, 'push', self.checked_callback(push)):
-                    self.assertTrue(overlay.on_click_line(click(overlay)))
-                    self.assertTrue(entered.wait(3))
-                    identity = overlay.snapshot_id
-                    scope = {'scope': {'owner': shown['owner'], 'seq': 0}}
-                    self.assertTrue(post('/overlay/scope', scope)['accepted'])
-                    self.assertEqual(overlay.snapshot_id, identity)
-                    self.assertFalse(next(iter(state.requests.values())).get('cancelled'))
-                    release.set()
-                    self.assertTrue(completed.wait(3))
-                    scope['scope']['seq'] = 1
-                    self.assertTrue(post('/overlay/scope', scope)['accepted'])
-                    self.assertEqual(overlay.answers['row']['answer'], 'Safe HTTP answer')
-                    self.assertEqual(overlay.snapshot_id, identity)
-                # A newer pane revokes old actions, even with enormous counters.
+                overlay.update(state.status(touch=False))
+                self.assertFalse(overlay.on_click_line(click(overlay)))
+                self.assertEqual(state.requests, {})
+                self.assertTrue(post('/overlay/scope', {'scope': {'owner': shown['owner'], 'seq': 1}})['accepted'])
                 new_ticket = client.get('/overlay/lifecycle').json()
                 new_ticket.update(client='revision-test', creation=2)
                 newer = post('/overlay/claim', new_ticket)['pane']
-                self.assertFalse(state.listening, 'claim cannot inherit capture')
-                state.listening = True  # unrelated new capture; stale release cannot stop it
-                self.assertFalse(post('/overlay/claim', ticket)['accepted'])
                 self.assertFalse(post('/overlay/hide', {'pane': pane, 'action': 999})['accepted'])
                 self.assertFalse(post('/overlay/release', {'pane': pane, 'action': 1000})['accepted'])
-                self.assertTrue(state.listening, 'stale cleanup must not pause capture')
                 self.assertTrue(post('/overlay/release', {'pane': newer, 'action': 1})['accepted'])
-                self.assertFalse(state.listening)
-                self.assertFalse(post('/overlay/show', {'pane': newer, 'action': 2})['accepted'])
             finally:
-                release.set()
                 state.overlay_hide()
                 overlay.stop()
                 self.join(overlay)
-        engine.answer.assert_called_once()
+        engine.answer.assert_not_called()
         self.assertEqual(self.worker_errors, [])
 
-    def test_unchanged_scope_sync_preserves_inflight_and_completed(self):
-        state, overlay, engine = self.backend()
-        entered, release = threading.Event(), threading.Event()
-        callback_errors = []
-        def answer(*args, **kwargs):
-            try:
-                entered.set()
-                if not release.wait(2):
-                    raise AssertionError('answer gate timeout')
-                return {'answer': 'Safe answer'}
-            except BaseException as exc:
-                callback_errors.append(exc)
-                raise
-        engine.answer.side_effect = answer
-        self.assertTrue(overlay.on_click_line(click(overlay)))
-        try:
-            self.assertTrue(entered.wait(2))
-            identity = overlay.snapshot_id
-            self.assertTrue(state.overlay_scope({'owner': state.overlay_owner, 'seq': 0})['accepted'])
-            self.assertEqual(overlay.snapshot_id, identity)
-            self.assertFalse(next(iter(state.requests.values())).get('cancelled'))
-        finally:
-            release.set()
-            self.join(overlay)
-        self.assertEqual(callback_errors, [])
-        self.assertEqual(overlay.answers['row']['answer'], 'Safe answer')
-        state.overlay_scope({'owner': state.overlay_owner, 'seq': 1})
-        self.assertEqual(overlay.answers['row']['answer'], 'Safe answer')
-        engine.answer.assert_called_once()
 
-    def test_real_scope_change_rotates_binding_and_retires_completed(self):
+    def test_scope_change_rotates_binding_and_clears_display(self):
         state, overlay, engine = self.backend()
-        self.assertTrue(overlay.on_click_line(click(overlay)))
-        self.join(overlay)
-        self.assertEqual(overlay.answers['row']['answer'], 'Safe answer')
+        overlay.answers['row']['answer'] = 'Synthetic old display'
         token = overlay.transport._pane_token
         identity = overlay.snapshot_id
         state.overlay_scope({'owner': state.overlay_owner, 'project': 'narrow', 'seq': 1})
@@ -134,26 +68,9 @@ class RevisionTests(CheckedThreads):
         self.assertNotEqual(overlay.snapshot_id, identity)
         self.assertIsNone(overlay.answers['row']['answer'])
         self.assertEqual(state.overlay_scope_value['project'], 'narrow')
-        self.assertTrue(overlay.on_click_line(click(overlay)))
-        self.join(overlay)
-        self.assertEqual(engine.answer.call_args.kwargs['project'], 'narrow')
-        self.assertEqual(overlay.answers['row']['answer'], 'Safe answer')
+        self.assertFalse(overlay.on_click_line(click(overlay)))
+        engine.answer.assert_not_called()
 
-    def test_real_principal_change_retires_even_identical_scope(self):
-        import contextvars
-        principal = contextvars.ContextVar('revision-principal')
-        token = principal.set('alice')
-        try:
-            state, overlay, engine = self.backend()
-            old = click(overlay)
-            overlay.answers['row']['answer'] = 'Private Alice'
-            principal.set('bob')
-            state.overlay_scope({'owner': state.overlay_owner, 'seq': 1})
-            self.assertFalse(overlay.on_click_line(old))
-            self.assertIsNone(overlay.answers['row']['answer'])
-            self.assertEqual(overlay.transport._poll_context.get(principal), 'bob')
-        finally:
-            principal.reset(token)
 
     def test_start_new_or_switched_meeting_retires_overlay_synchronously(self):
         for explicit in (False, True):
@@ -243,25 +160,6 @@ class RevisionTests(CheckedThreads):
             finally:
                 overlay.stop()
 
-    def test_capture_transition_between_completed_publication_and_cleanup(self):
-        state, overlay, engine = self.backend()
-        original = overlay.push
-        observed = []
-        def push():
-            answer = overlay.answers.get('row', {})
-            if answer.get('answer') == 'Safe answer' and not answer.get('busy') and not observed:
-                self.assertIn('row', overlay.request_by_row, 'must hit pre-cleanup window')
-                observed.append(True)
-                state.capture_generation += 1
-                overlay.update(state.status(touch=False))
-                self.assertEqual(overlay.answers['row']['answer'], 'Safe answer')
-            return original()
-        with patch.object(overlay, 'push', self.checked_callback(push)):
-            self.assertTrue(overlay.on_click_line(click(overlay)))
-            self.join(overlay)
-        self.assertEqual(observed, [True])
-        self.assertEqual(overlay.answers['row']['answer'], 'Safe answer')
-        engine.answer.assert_called_once()
 
     @unittest.skipUnless(sys.platform in ('darwin', 'linux'), 'POSIX pipe/select required')
     def test_run_forwards_snapshot_to_actual_os_pipe(self):

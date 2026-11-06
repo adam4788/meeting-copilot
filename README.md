@@ -44,9 +44,8 @@ CI and plugin validation do not prove a complete meeting works on your computer.
   **Answer setup**. OpenAI and OpenRouter are the main Desktop answer routes.
 - Keeps past sessions excluded and web search off by default in new panes.
   Broader scopes are explicit choices; saved choices persist.
-- Offers a macOS meeting overlay, which may appear in screen shares. Avoid
-  overlay answers until its credential-refresh defect is fixed: a click can
-  use a key that was rotated or removed after the overlay opened.
+- Offers a read-only macOS overlay for the transcript and detected questions.
+  Ask questions in the Desktop pane. The overlay may appear in screen shares.
 
 ```mermaid
 flowchart TD
@@ -134,9 +133,8 @@ Read [security and privacy](SECURITY.md) and the
 - PDF, DOCX, and XLSX extraction is not implemented. Project scans and session
   reads are bounded; this is not a search of the whole computer.
 - Optional web search depends on a registered, profile-scoped Hermes tool and
-  may be unavailable. The overlay still uses a private Hermes scope API. The
-  inspected isolated plugin-host route did not pass the request scope needed
-  for BYOK; see [compatibility cautions](docs/catalog-compatibility.md).
+  may be unavailable. The inspected isolated plugin-host route did not pass
+  the request scope needed for BYOK; see [compatibility cautions](docs/catalog-compatibility.md).
 
 ## Explore the repository
 

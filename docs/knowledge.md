@@ -133,10 +133,9 @@ leaking exception text; missing evidence is never replaced with invented facts.
 - Official architecture: https://hermes-agent.nousresearch.com/docs/developer-guide/architecture/
 - The public tool registry dispatches `web_search` with a JSON result containing
   `success` and `data.web` metadata when the host has registered the tool.
-- The optional public-facade embedding helpers and remaining private scope seam
+- The optional public-facade embedding helpers and host-mode credential limits
   are described in [compatibility review](catalog-compatibility.md).
 
-Private Hermes APIs may change between releases; retrieval tests are independent
-of them, while live Desktop/web integration requires an installed, configured
+Retrieval tests are independent of live Desktop/web integration, which requires an installed, configured
 Hermes environment. No additional pip packages are needed for this
 module's deterministic tests or text/session retrieval.

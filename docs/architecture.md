@@ -32,7 +32,7 @@ flowchart TD
 | Answers | `byok.py`, `model_selection.py` | Explicit provider/model routing; optional Meta integration is separate |
 | Capture | `audio.py`, `macos_audio.py`, `audio_worker.py`, `native/` | Platform capture, transcription workers, macOS helpers |
 | Meetily | `meetily.py` | Read-only attachment to a selected recording's JSON snapshots |
-| Overlay | `overlay_bridge.py`, `native/macos_overlay.swift` | Optional macOS display and explicit question actions |
+| Overlay | `overlay_bridge.py`, `native/macos_overlay.swift` | Optional read-only macOS transcript and question display |
 
 `AnswerCore` can run independently with an injected completion function, disabled
 search, and no history. The synthetic CLI demo uses that boundary, separately
@@ -70,6 +70,6 @@ See [security](../SECURITY.md), [BYOK](byok.md), and
 [audio backpressure](native-backpressure.md).
 
 Dashboard web search uses the public scoped tool registry and reports when it is
-unavailable. Fresh copied overlay action scopes still use a version-sensitive
-private Hermes API. Missing/incompatible scopes fail closed. See the
-[compatibility review](catalog-compatibility.md) for the remaining seam.
+unavailable. The overlay is read-only; answers use the pane's authenticated
+request scope. Missing or incompatible scopes fail closed. See the
+[compatibility review](catalog-compatibility.md) for host-mode limits.

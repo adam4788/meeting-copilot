@@ -651,11 +651,10 @@ test('web settings explain opt-in and public queries where used', () => {
   assert.ok(disclosedNodes(ui.rerender()).some(n => n.props['data-web-fallback-disclosure']), 'warning remains visible when settings are closed');
 });
 
-test('overlay web query warning remains visible with settings closed', () => {
+test('read-only overlay notice remains visible with settings closed', () => {
   const { tree } = pane('', true, false, 'public query');
-  const notice = disclosedNodes(tree).find(n => n.props['data-overlay-web-disclosure']);
-  assert.ok(notice);
-  assert.match(JSON.stringify(notice.children), /overlay.*query.*sent.*web.*clear/i);
+  assert.match(JSON.stringify(disclosedNodes(tree)), /overlay is read-only.*ask questions in the meeting copilot pane/i);
+  assert.doesNotMatch(JSON.stringify(tree), /tap a question to stream/i);
 });
 
 test('legacy automatic Meta preference migrates to local without proof', async () => {
@@ -710,10 +709,9 @@ for (const storageKey of ['meeting-copilot.scope.v2','meeting-copilot.scope']) t
   assert.equal(provider.props.value,'');
   assert.ok(!nodes(ui.tree).some(n=>n.props['aria-label']==='Answer model'));
   assert.equal(button(ui.tree,'Suggest answer').props.disabled,true);
-  assert.equal(button(ui.tree,'Show overlay').props.disabled,true);
+  assert.equal(button(ui.tree,'Show overlay').props.disabled,false);
   await button(ui.tree,'Suggest answer').props.onClick();
-  await button(ui.tree,'Show overlay').props.onClick();
-  assert.ok(!ui.requests.some(r=>['/assist','/overlay/show','/overlay/scope'].includes(r.path)));
+  assert.ok(!ui.requests.some(r=>r.path==='/assist'));
 });
 for (const provider of ['openai','openrouter']) test(`valid saved BYOK selection stays visible and submits exactly (${provider})`, async () => {
   const store=new Map([['meeting-copilot.scope.v2',JSON.stringify({answerProvider:provider,answerModel:'vendor/exact-model',excludeHistory:false})]]);
@@ -726,13 +724,12 @@ for (const provider of ['openai','openrouter']) test(`valid saved BYOK selection
   assert.equal(request.body.answer_provider,provider);
   assert.equal(request.body.answer_model,'vendor/exact-model');
 });
-test('supported provider absent from advertised catalog blocks Suggest and overlay publication', async () => {
+test('unsupported provider blocks Suggest but permits the read-only overlay', async () => {
   const ui=pane('alpha',true,false,'',{12:'openrouter',13:'vendor/exact-model'});
   assert.equal(button(ui.tree,'Suggest answer').props.disabled,true);
-  assert.equal(button(ui.tree,'Show overlay').props.disabled,true);
+  assert.equal(button(ui.tree,'Show overlay').props.disabled,false);
   await button(ui.tree,'Suggest answer').props.onClick();
-  await button(ui.tree,'Show overlay').props.onClick();
-  assert.ok(!ui.requests.some(r=>['/assist','/overlay/show','/overlay/scope'].includes(r.path)));
+  assert.ok(!ui.requests.some(r=>r.path==='/assist'));
 });
 
 // Effect-capable lifecycle tests use deterministic timers (no React package).
@@ -1523,7 +1520,7 @@ test('accepted scope sync clears the stale indicator', async () => {
   tree = rerender();
   await findButton(tree, 'Sync scope').props.onClick();
   tree = rerender();
-  assert.ok(JSON.stringify(tree).includes('Overlay scope updated to current settings'));
+  assert.ok(JSON.stringify(tree).includes('Read-only overlay updated. Ask questions in the pane.'));
 });
 
 test('suggesting an answer tracks the request and offers cancel', async () => {
@@ -1986,14 +1983,14 @@ test('new meeting sends new_meeting flag', async () => {
 });
 
 
-test('overlay show forwards the explicit web query', async () => {
+test('read-only overlay does not receive the pane web query', async () => {
   const { tree, requests } = pane('', true, true, 'explicit q');
   const btn = nodes(tree).filter(n => n.type === 'button').find(n => n.children.includes('Show overlay'));
   assert.ok(btn, 'show overlay offered');
   await btn.props.onClick();
   const show = requests.find(r => r.path === '/overlay/show');
   assert.ok(show, '/overlay/show called');
-  assert.equal(show.body.scope.web_query, 'explicit q');
+  assert.equal(show.body.scope.web_query, undefined);
 });
 
 test('clear resets local state when the request succeeds even if refresh fails', async () => {

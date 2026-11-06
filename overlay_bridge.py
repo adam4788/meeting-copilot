@@ -1,17 +1,8 @@
-"""Display-and-click bridge between the macOS overlay and the existing backend.
+"""Display bridge between the macOS overlay and the existing backend.
 
-Display + click only: polls GET /status, feeds bounded NDJSON snapshots to the
-compiled overlay helper's stdin, and POSTs /assist solely for explicit row
-clicks read from the helper's stdout. No auto-click, auto-send, auto-record,
-or capture control. Settings (models, transcript source, past-sessions scope,
-web fallback) stay in the Hermes desktop pane; this bridge only carries the
-pane-equivalent scope it was started with.
-
-Answers stream incrementally per clicked row: each click opens one
-request-scoped slot (POST /assist returns request_id) and only that slot's
-deltas (GET /assist/<request_id>) are appended to the clicked row. Providers
-without incremental support report completed-only honestly; completed
-strings are never chunked to fake streaming.
+Read-only display: forwards bounded transcript and question snapshots to the
+native helper. Answers are requested from the authenticated Desktop pane.
+The overlay retains no provider credential context and never admits answers.
 """
 import argparse
 import contextvars as _contextvars
@@ -26,6 +17,18 @@ import threading
 import time
 
 _POPEN_TYPE = subprocess.Popen
+
+
+def _helper_environment():
+    """Give the display helper only ordinary GUI/locale environment values."""
+    allowed = {'PATH', 'HOME', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'LC_ALL',
+               'LC_CTYPE', 'LC_MESSAGES', 'LC_NUMERIC', 'LC_TIME', 'LC_COLLATE',
+               'LC_MONETARY', 'LC_PAPER', 'LC_NAME', 'LC_ADDRESS', 'LC_TELEPHONE',
+               'LC_MEASUREMENT', 'LC_IDENTIFICATION',
+               'DISPLAY', 'XAUTHORITY', 'WAYLAND_DISPLAY', 'XDG_RUNTIME_DIR',
+               '__CF_USER_TEXT_ENCODING'}
+    return {key: value for key, value in os.environ.items()
+            if key in allowed}
 
 
 def _fresh_child_observation(process):
@@ -271,190 +274,37 @@ def parse_click(line):
 
 
 class BackendTransport:
-    """Injected backend handle: no HTTP, no second server, no unauthenticated socket.
-
-    The owning backend process constructs this around its own MeetingState, so
-    overlay clicks travel through already-authenticated in-process calls and
-    per-row request slots instead of a parallel unauthenticated gateway route.
-    `poll()` returns the live backend status dict for snapshot rendering.
-    """
+    """Read-only access to the owning backend; overlay answers use the pane."""
 
     def __init__(self, state, poll=None, pane_token=None):
         self._state = state
         self._poll = poll
-        self._poll_context = None
         self._pane_token = pane_token
         self._compat_admission_lock = threading.RLock()
-        # Capture the authorized pane/show/scope context HERE (construction
-        # happens on the pane's explicit action thread, before native click
-        # and answer-worker threads exist). Click/native threads never inherit
-        # it, so this is the only explicit propagation path.
-        self._poll_context = self._fresh_action_context()
-        try:
-            from agent.secret_scope import current_secret_scope_home
-            self._credential_home = self._poll_context.copy().run(current_secret_scope_home)
-        except ImportError:
-            self._credential_home = None
-
-    @staticmethod
-    def _fresh_action_context(expected_home=None):
-        """Publish fresh secrets, never a request's pre-admission snapshot.
-
-        Call under overlay admission serialization. The host refresh runs inside
-        a COPY of the authenticated action context; no editor identity, global
-        environment mutation, or in-place mutation of admitted workers. An
-        unscoped standalone transport retains its existing non-host behavior.
-        """
-        def capture():
-            try:
-                from agent.secret_scope import current_secret_scope, current_secret_scope_home
-            except ModuleNotFoundError as exc:
-                # Only a genuinely absent standalone host permits fallback.
-                # An installed but incompatible/broken scope API is not proof
-                # that this authenticated request was unscoped.
-                if expected_home is not None or exc.name != 'agent':
-                    raise RuntimeError('Overlay credential scope unavailable') from None
-                return _contextvars.copy_context()
-            previous_scope = current_secret_scope()
-            if previous_scope is None:
-                if expected_home is not None or current_secret_scope_home() is not None:
-                    raise RuntimeError('Overlay credential scope unavailable')
-                return _contextvars.copy_context()
-            from hermes_constants import get_hermes_home
-            from hermes_cli.web_server_profiles import _config_profile_scope
-            home = get_hermes_home().resolve()
-            from pathlib import Path
-            bound = current_secret_scope_home()
-            if (not bound or Path(bound).resolve() != home
-                    or (expected_home is not None and Path(expected_home).resolve() != home)):
-                raise RuntimeError('Overlay credential identity mismatch')
-            with _config_profile_scope('current'):
-                fresh_home = current_secret_scope_home()
-                if (current_secret_scope() is None or current_secret_scope() is previous_scope or not fresh_home
-                        or Path(fresh_home).resolve() != home
-                        or get_hermes_home().resolve() != home):
-                    raise RuntimeError('Overlay credential scope unavailable')
-                return _contextvars.copy_context()
-        try:
-            return _contextvars.copy_context().run(capture)
-        except Exception:
-            # Never reflect host/credential exceptions through Show or scope.
-            from fastapi import HTTPException
-            raise HTTPException(503, 'Overlay credential scope unavailable. Reopen the pane and retry.') from None
 
     def pane_context_matches(self):
-        """Compare the captured security context, excluding our action nonce.
-
-        The host owns its ContextVars; treat ANY other changed value as an
-        authorization change (fail closed), rather than guessing auth names.
-        """
-        if self._poll_context is None:
-            return False
-        previous = {var: self._poll_context[var] for var in self._poll_context
-                    if var is not _PANE_ACTION}
-        current = {var: value for var, value in _contextvars.copy_context().items()
-                   if var is not _PANE_ACTION}
-        try:
-            return previous == current
-        except Exception:
-            return False
+        # No request context is retained, so identity cannot be compared.
+        # Conservatively retire the display generation on every pane update.
+        return False
 
     def refresh_pane_token(self, token):
-        """Re-mint the action binding on a later explicit pane action."""
-        self._poll_context = None  # failure closes new admissions
         self._pane_token = token
-        self._poll_context = self._fresh_action_context(self._credential_home)
 
     def refresh_credentials(self):
-        """Reload secrets inside the retained pane identity, not the editor's.
-
-        Called only under the state's lifecycle/admission locks after an owner
-        credential edit. Existing answer contexts are independent snapshots.
-        Never mint a new pane capability or extend its heartbeat here.
-        """
-        from hermes_constants import get_hermes_home
-        editor_home = get_hermes_home().resolve()
-        previous = self._poll_context
-        # Any failure leaves NEW admissions closed, including partial writes.
-        self._poll_context = None
-        if previous is None or not self._pane_token or not self._credential_home:
-            raise RuntimeError('Overlay credential context unavailable')
-        def reload():
-            if (get_hermes_home().resolve() != editor_home
-                    or _PANE_ACTION.get() != self._pane_token):
-                raise RuntimeError('Overlay credential scope mismatch')
-            return self._fresh_action_context(self._credential_home)
-        self._poll_context = previous.copy().run(reload)
+        # The read-only overlay never consumes or retains provider credentials.
+        return None
 
     def admission_guard(self):
-        # Production uses the same outer lock as show/scope/hide publication.
-        # Minimal injected states may lack it; they still serialize locally.
         lock = getattr(self._state, 'overlay_lock', None)
         if lock is not None and hasattr(type(lock), '__enter__'):
             return lock
         return self._compat_admission_lock
 
     def assist(self, question, scope, row_id, expected_generation=None, expected_capture_generation=None):
-        with self.admission_guard():
-            return self._assist_locked(question, scope, row_id, expected_generation, expected_capture_generation)
+        raise RuntimeError('Overlay answers are unavailable. Ask in the Meeting Copilot pane.')
 
     def _assist_locked(self, question, scope, row_id, expected_generation, expected_capture_generation):
-        # Propagate the authorized pane/show/scope context explicitly into the
-        # click-driven answer worker thread. Native click handlers run on
-        # overlay threads that never inherit the pane request context, so
-        # run the backend call under an explicitly captured context. Never
-        # store auth: re-read the captured context here, and only inside the
-        # pane-context runner.
-        scope = dict(scope or {})
-        authoritative = getattr(self._state, 'overlay_scope_value', None)
-        if isinstance(authoritative, dict):
-            scope = dict(authoritative)
-        caller_context = None
-        try:
-            candidate = self._poll_context
-            if candidate is not None:
-                # Independent copy per invocation: overlapping row taps must
-                # never share one entered Context (RuntimeError) nor leak
-                # values between concurrent provider submissions.
-                caller_context = candidate.copy()
-        except Exception:
-            caller_context = None
-        if caller_context is None or self._pane_token is None or caller_context.get(_PANE_ACTION) != self._pane_token:
-            # No bound pane action (constructed off the pane thread, or an
-            # empty copied context): fail closed in the caller instead of
-            # running under an inherited default. Documented in docs/verification.md.
-            raise RuntimeError('overlay context is not from the pane action; re-show the overlay and retry')
-        # Enter the pane context in THIS thread so the snapshot below captures
-        # captures the pane's values (click/native threads never inherit them).
-        pane_values = {}
-        for var in caller_context:
-            try:
-                pane_values[var] = caller_context[var]
-            except Exception:
-                continue
-        result_holder = {}
-
-        def _call():
-            for var, value in pane_values.items():
-                try:
-                    var.set(value)
-                except Exception:
-                    continue
-            result_holder['result'] = self._state.assist(
-                question, scope.get('project'), scope.get('web_query'),
-                bool(scope.get('all_projects', False)),
-                bool(scope.get('web_fallback', False)),
-                scope.get('answer_provider'), scope.get('answer_model'),
-                row_id=row_id, expected_generation=expected_generation,
-                expected_capture_generation=expected_capture_generation,
-                **({'include_history': False} if scope.get('include_history') is False else {}))
-
-        caller_context.run(_call)
-        result = result_holder.get('result')
-        request_id = result.get('request_id') if isinstance(result, dict) else None
-        if not request_id:
-            raise RuntimeError('backend did not accept the question')
-        return request_id
+        raise RuntimeError('Overlay answers are unavailable. Ask in the Meeting Copilot pane.')
 
     def assist_request(self, request_id):
         return self._state.assist_request(request_id)
@@ -467,15 +317,11 @@ class BackendTransport:
 
     def poll_status(self):
         if self._poll is not None:
-            poll = self._poll
-            if self._poll_context is not None:
-                return self._poll_context.run(poll)
-            return poll()
+            return self._poll()
         try:
             return self._state.status(touch=False)
         except TypeError:
             return self._state.status()
-
 
 class OverlayBridge:
     """Owns one helper subprocess; backend truth in, snapshots out, clicks back.
@@ -759,6 +605,10 @@ class OverlayBridge:
         """The single path that may request an answer: an explicit overlay click."""
         row_id = parse_click(line)
         if row_id is None:
+            return False
+        # Reject even an old or modified helper's click. No pending provider
+        # work is created and no retained pane credentials are consulted.
+        if isinstance(self.transport, BackendTransport):
             return False
         queued = False
         with self.lock:
@@ -1082,7 +932,8 @@ class OverlayBridge:
             target = subprocess.Popen(
                 [self.helper_path] + list(getattr(self, 'helper_args', None) or []) + ['--protocol-version'],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=False, start_new_session=True)
+                stderr=subprocess.DEVNULL, text=False, start_new_session=True,
+                env=_helper_environment())
             with self.lock:
                 self._process_groups[target] = target.pid
                 self._register_stdout_locked(target)
@@ -1132,7 +983,8 @@ class OverlayBridge:
         try:
             target = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                       stderr=subprocess.DEVNULL, text=True, bufsize=1,
-                                      encoding='utf-8', errors='strict', start_new_session=True)
+                                      encoding='utf-8', errors='strict', start_new_session=True,
+                                      env=_helper_environment())
             with self.lock:
                 self._process_groups[target] = target.pid
                 self._register_stdout_locked(target)
@@ -1272,12 +1124,7 @@ class OverlayBridge:
             existing = self._poller
             if existing is not None and existing.is_alive():
                 return
-            pane_context = None
-            try:
-                import contextvars as _contextvars
-                pane_context = _contextvars.copy_context()
-            except Exception:
-                pane_context = None
+            pane_context = _contextvars.Context()  # never inherit pane credentials
             self._poller_seq += 1
             worker = threading.Thread(target=self._poll_loop,
                                       args=(pane_context, poll, self._poller_seq),
@@ -1475,13 +1322,18 @@ class OverlayBridge:
             segments = list(self.segments)
             answers = {row_id: dict(state) for row_id, state in self.answers.items()}
             message = self.message
-            if isinstance(self.scope.get('web_query'), str) and self.scope['web_query'].strip():
+            if isinstance(self.transport, BackendTransport):
+                notice = 'Read-only overlay. Ask questions in the Meeting Copilot pane.'
+                message = f'{message} · {notice}' if message else notice
+            elif isinstance(self.scope.get('web_query'), str) and self.scope['web_query'].strip():
                 notice = 'Public web query active for row requests; edit or clear it in the pane.'
                 message = f'{message} · {notice}' if message else notice
             busy = any(state.get('busy') for state in answers.values())
             listening = bool(self._listening)
             snapshot = build_snapshot({'segments': segments, 'busy': busy, 'listening': listening},
                                       answers, message)
+            if isinstance(self.transport, BackendTransport):
+                snapshot['answer_actions'] = False
             snapshot['snapshot_id'] = self.snapshot_id
             # Preserve pinned row order so streaming rows do not jump around.
             order_index = {row_id: index for index, row_id in enumerate(self.order)}

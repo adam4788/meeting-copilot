@@ -151,13 +151,9 @@ export default {
       const answerProviderAvailable = ['openai', 'openrouter'].includes(answerProvider) && providers.some(p => p.id === answerProvider);
       const busy = pending || data.busy;
       const allProjects = project === '__all_projects__';
-      // Suggest answers stay local-first: the explicit web query travels
-      // only to the explicit web button and to the overlay, never silently
-      // into Suggest. Overlay sync tracks the query separately (scopeKey)
-      // so editing or clearing it re-syncs instead of leaving stale state.
+      // Suggest answers stay local-first; explicit web queries stay in the pane.
       const scope = { project: allProjects ? null : project || null, all_projects: allProjects, web_fallback: webFallback, ...(excludeHistory ? { include_history: false } : {}), ...(answerProvider && answerModel ? { answer_provider: answerProvider, answer_model: answerModel } : {}) };
-      const overlayQuery = web.trim() ? { web_query: web.trim() } : {};
-      const overlayScopeKey = JSON.stringify({ ...scope, web_query: web.trim() || null });
+      const overlayScopeKey = JSON.stringify(scope);
       const unsupportedReasons = [
         allProjects && !data.capabilities?.all_projects ? 'All-projects search needs the updated backend (restart the gateway when other sessions are idle).' : null,
         webFallback && !data.capabilities?.automatic_web_fallback ? 'Automatic web fallback needs the updated backend.' : null,
@@ -232,10 +228,6 @@ export default {
       }
       useEffect(() => { if (overlayOn) { scopeSeq.current += 1; overlayActionAt.current.syncedKey = null; setScopeStale(true); } }, [scopeKey]);
       async function syncOverlayScope(seq) {
-        if (!answerProviderAvailable) {
-          setScopeStale(true); setOverlayMsg('Choose an available answer provider and model before syncing the overlay.');
-          return;
-        }
         const life = overlayActionAt.current;
         const owner = life.owner;
         const current = () => life.mounted && scopeSeq.current === seq && life.owner === owner;
@@ -243,11 +235,11 @@ export default {
         // intervening write, including manual and still-pending requests.
         life.syncedKey = null;
         try {
-          const res = await api('/overlay/scope', { scope: { ...scope, ...overlayQuery, seq, owner } });
+          const res = await api('/overlay/scope', { scope: { ...scope, seq, owner } });
           if (!current()) return;
           if (res?.accepted === false) throw new Error('Overlay scope was rejected.');
           life.syncedKey = scopeKey; setScopeStale(false);
-          setOverlayMsg('Overlay scope updated to current settings.');
+          setOverlayMsg('Read-only overlay updated. Ask questions in the pane.');
         } catch (e) {
           if (!current()) return;
           // Ordered hide fails closed without closing a newer pane or Show.
@@ -367,10 +359,6 @@ export default {
       async function toggleOverlay() {
         const life = overlayActionAt.current;
         if (!life.mounted) return;
-        if (!overlayOn && !overlayNeedsHide && (!answerProviderAvailable || (excludeHistory && unsupported))) {
-          setOverlayMsg('Choose an available answer provider and model; for history exclusion choose one project and turn off web search before showing the overlay.');
-          return;
-        }
         setPending(true); setOverlayMsg('');
         life.at = Date.now();
         try {
@@ -387,12 +375,12 @@ export default {
             // Fence even a lost/in-flight Show response: it may create a new
             // owner before a delayed credential response reaches this pane.
             life.overlayGeneration += 1;
-            const shown = await api('/overlay/show', { pane, action, scope: { ...scope, ...overlayQuery, seq: scopeSeq.current } });
+            const shown = await api('/overlay/show', { pane, action, scope: { ...scope, seq: scopeSeq.current } });
             if (!life.mounted || life.action !== action) return;
             if (shown?.accepted === false || !shown?.owner) throw new Error('This pane no longer owns the overlay. Reopen the pane to take ownership.');
             life.owner = shown.owner; life.syncedKey = scopeKey;
             setOverlayOn(true); setScopeStale(false);
-            setOverlayMsg('Overlay shown. It returns to click-through after ~10s — press the shortcut to interact, then tap a row for a streamed answer.');
+            setOverlayMsg('Read-only overlay shown. Ask questions in the Meeting Copilot pane.');
           }
           await qc.invalidateQueries({ queryKey: [ID, 'status'] });
         } catch (e) { if (life.mounted) {
@@ -598,7 +586,7 @@ export default {
       useEffect(() => {
         if (!liveEntry || !['done', 'error', 'cancelled'].includes(liveEntry.status)) return;
         // Once status has actually observed this terminal slot, the canonical
-        // result owns the view again (including later answers from the overlay).
+        // result owns the view again.
         const reconciled = !status.error && (data.recent || []).some(entry => entry.request_id === liveEntry.request_id && ['done', 'error', 'cancelled'].includes(entry.status));
         if (!currentLive || reconciled) setLiveEntry(null);
       }, [liveEntry, data.generation, data.recent, !!status.error]);
@@ -683,9 +671,9 @@ export default {
               : h(Button, { disabled: pending || overlayNeedsHide || cloudUnavailable || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), onClick: () => startCapture() }, ((data.segments || []).length || result || (data.recent || []).length) ? (backend === 'meetily' ? 'Resume' : 'Resume listening') : (backend === 'meetily' ? 'Attach to Meetily' : 'Start listening')),
             !data.listening && !data.stopping && ((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending || overlayNeedsHide || cloudUnavailable || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), title: 'Starts a fresh meeting; the earlier transcript, answers, and retry data are cleared', onClick: () => startCapture(true) }, 'New meeting'),
             (data.overlay_cleanup_error || (data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending, title: 'Clears past Q&A, transcript segments, and cached snippets for this meeting', onClick: async () => { if (typeof window !== 'undefined' && window.confirm && !window.confirm('Clear this meeting? Past questions, answers, and transcript segments are removed from the pane.')) return; if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } } }, 'Clear meeting'),
-            h(Button, { variant: 'secondary', disabled: pending || (!data.capabilities?.overlay && !overlayNeedsHide) || (!overlayOn && !overlayNeedsHide && !answerProviderAvailable), title: 'Show or hide the floating meeting overlay (macOS)', onClick: toggleOverlay }, overlayNeedsHide ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay')),
+            h(Button, { variant: 'secondary', disabled: pending || (!data.capabilities?.overlay && !overlayNeedsHide), title: 'Show or hide the read-only meeting overlay (macOS)', onClick: toggleOverlay }, overlayNeedsHide ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay')),
           h('p', { style: { ...muted, margin: 0 } }, 'Screen-share privacy: the overlay may be visible in screenshots or screen sharing. Hide it before sharing; capture exclusion is best-effort, not a guarantee.'),
-          web.trim() && h('p', { 'data-overlay-web-disclosure': true, role: 'status', style: { ...muted, margin: 0 } }, `Overlay questions use the public query “${web.trim().slice(0, 120)}”; it is sent to the web when you ask, until you clear it.`),
+          h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'The overlay is read-only. Ask questions in the Meeting Copilot pane.'),
           (data.overlay_cleanup_error || overlayMsg) && h('p', { role: 'status', style: { ...muted, margin: 0 } }, data.overlay_cleanup_error || overlayMsg),
           overlayNeedsHide && h('p', { role: 'alert', style: { ...muted, margin: 0 } }, 'Overlay shutdown is not confirmed. Retry hide overlay and verify the window is gone before screen-sharing.'),
           !data.capabilities?.overlay && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'Overlay helper unavailable. Check the macOS helper build and restart the gateway when other sessions are idle.'),
@@ -872,13 +860,13 @@ export default {
           h('span', null, webFallback ? 'Automatic web fallback: on. A public query may be drafted if local evidence is insufficient. Filtering is best-effort, not a privacy guarantee; turn off for sensitive calls.' : 'Automatic web fallback: off. Turn on to search the web when local evidence is insufficient.')),
         h('section', { style: { ...card, display: 'grid', gap: 10 } },
           h('strong', null, 'Meeting overlay (macOS)'),
-          h('p', { style: { ...muted, marginBottom: 0 } }, 'Tap a question to stream its answer; nothing is sent until you tap. Use Ctrl+Option+Cmd+O (default) to interact. It returns to click-through after about 10 seconds, or press the shortcut again. The overlay may appear in screen shares.'),
+          h('p', { style: { ...muted, marginBottom: 0 } }, 'The overlay displays the transcript and detected questions. Ask and view answers in the Meeting Copilot pane. The overlay may appear in screen shares.'),
 
           scopeStale && overlayOn && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'Settings changed — syncing overlay scope…'),
           (data.overlay_cleanup_error || overlayMsg) && h('p', { role: 'status', style: { ...muted, margin: 0 } }, data.overlay_cleanup_error || overlayMsg),
           !data.capabilities?.overlay && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'Overlay helper unavailable. Check the macOS helper build and restart the gateway, then try Show overlay again.'),
           h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
-            h(Button, { variant: overlayOn ? 'secondary' : undefined, disabled: pending || (!data.capabilities?.overlay && !overlayNeedsHide) || (!overlayOn && !overlayNeedsHide && !answerProviderAvailable), onClick: toggleOverlay }, overlayNeedsHide ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay'),
+            h(Button, { variant: overlayOn ? 'secondary' : undefined, disabled: pending || (!data.capabilities?.overlay && !overlayNeedsHide), onClick: toggleOverlay }, overlayNeedsHide ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay'),
             h(Button, { variant: 'secondary', disabled: pending || !overlayOn, onClick: async () => {
               setPending(true); setOverlayMsg('');
               scopeSeq.current += 1;

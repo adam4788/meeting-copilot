@@ -655,7 +655,7 @@ class BridgeLifecycleTests(ClickTests):
         self.assertFalse(any(s.get('busy') for s in overlay.answers.values()))
         overlay.stop()
 
-    def test_contextvars_propagate_from_pane_to_answer_worker_without_leaks(self):
+    def test_pane_context_is_not_used_by_read_only_overlay(self):
         import contextvars
         sentinel = contextvars.ContextVar('meeting-test-auth2')
         token = sentinel.set('pane-secret-value')
@@ -681,11 +681,10 @@ class BridgeLifecycleTests(ClickTests):
             overlay.update({'segments': [{'speaker': 'm', 'text': 'Who approves?'}],
                             'listening': True, 'generation': 0, 'capture_generation': 0})
             row_id = next(iter(overlay.questions))
-            self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
+            self.assertFalse(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
             for thread in list(overlay.threads):
                 thread.join(timeout=10)
-            self.assertEqual(seen.get('ctx'), 'pane-secret-value')
-            self.assertEqual(seen.get('kwargs', {}).get('row_id'), row_id)
+            self.assertEqual(seen, {})
             self.assertNotIn('pane-secret-value', repr(vars(overlay)))
             # Impossible environments (no copy_context) fail closed, documented.
             overlay.stop()
@@ -777,17 +776,8 @@ class BridgeLifecycleTests(ClickTests):
         self.assertEqual(overlay.answers[row_id]['answer'], 'Final answer.')
         self.assertTrue(overlay.answers[row_id]['completed_only'])
 
-    def test_end_to_end_mocked_backend_pane_native_protocol(self):
-        """Clicks reach the real request-specific row with current pane scope.
-
-        Uses the real MeetingState + BackendTransport (not an HTTP fake): the
-        pane scope flows through /overlay/show, the click creates a request
-        slot, and streamed chunks land on the clicked row only.
-
-        Portable: the helper spawn is faked with a slot process (no real
-        subprocess), so the full pane/show/click/status lifecycle runs on
-        every platform, including Windows CI.
-        """
+    def test_mocked_backend_pane_native_display_is_read_only(self):
+        """A shown overlay remains read-only with a fake native helper."""
         import time
         import server as real_server
         deltas = ['Two ', 'reviewers.']
@@ -826,96 +816,12 @@ class BridgeLifecycleTests(ClickTests):
         current_scope = {'project': 'demo', 'answer_provider': 'meta',
                          'answer_model': 'muse-spark-1.3', 'web_fallback': True}
         state.overlay_scope(dict(current_scope, owner=state.overlay_owner))
-        row_deadline = time.monotonic() + 10
-        clicked = False
-        while time.monotonic() < row_deadline:
-            try:
-                clicked = overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id}))
-            except AssertionError:
-                raise
-            except Exception:
-                clicked = False
-            if clicked:
-                break
-            time.sleep(0.05)
-        self.assertTrue(clicked)
-        for thread in list(overlay.threads):
-            thread.join(timeout=10)
-        self.assertEqual(overlay.answers[row_id]['answer'], 'Two reviewers.')
-        self.assertFalse(overlay.answers[row_id]['busy'])
-        self.assertEqual(captured[0]['question'], 'Who approves?')
-        self.assertEqual(captured[0]['kwargs'].get('project'), 'demo')
-        self.assertEqual(captured[0]['kwargs'].get('answer_provider'), 'meta')
-        self.assertEqual(captured[0]['kwargs'].get('answer_model'), 'muse-spark-1.3')
+        self.assertFalse(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
+        self.assertEqual(captured, [])
+        self.assertEqual(state.requests, {})
         state.overlay_hide()
         self.assertIsNone(state.overlay)
 
-    def test_first_partial_row_answer_visible_before_provider_finishes(self):
-        """Real backend/bridge with gated publication; no providers or GUI."""
-        import threading
-        from unittest.mock import patch
-        import server as real_server
-        release, partial, complete = (threading.Event() for _ in range(3))
-        checked_wait = self.checked_wait
-
-        class FakeGatedEngine:
-            def answer_stream(self, question, **kwargs):
-                header = {'model_route': 'fake/test', 'sources': [], 'warnings': [],
-                          'web_search': {'used': False}}
-                def gated():
-                    yield 'Two '
-                    checked_wait(release, 3, 'first partial provider gate')
-                    yield 'reviewers.'
-                return header, gated()
-            def answer(self, question, **kwargs):
-                raise AssertionError('streaming engine must use answer_stream')
-
-        engine = FakeGatedEngine()
-        engine.answer = self.checked_callback(engine.answer)
-        state = real_server.MeetingState(engine_factory=lambda: engine)
-        state.add_segment({'speaker': 'remote', 'text': 'Who approves?'})
-        state.listening = True
-        with _fake_overlay_spawn(), patch.object(state, '_overlay_helper_path', return_value='/fake/macos_overlay_for_test'):
-            shown = state.overlay_show({'project': 'demo'})
-        self.assertTrue(shown['shown'])
-        overlay = state.overlay
-        self.assertIsNotNone(overlay)
-        assert overlay is not None
-        overlay.update(state.status())
-        row_id = next(iter(overlay.questions))
-        state.overlay_scope({'owner': state.overlay_owner, 'project': 'demo'})
-        original_push = overlay.push
-
-        def push():
-            result = original_push()
-            # Observe only under bridge.lock, never state.lock -> bridge.lock.
-            with overlay.lock:
-                row = overlay.answers.get(row_id, {})
-                if row.get('answer') == 'Two ':
-                    partial.set()
-                if row.get('completed'):
-                    complete.set()
-            return result
-
-        try:
-            with patch.object(overlay, 'push', self.checked_callback(push)):
-                self.assertTrue(overlay.on_click_line(json.dumps({'type': 'click', 'id': row_id, 'snapshot_id': overlay.snapshot_id})))
-                self.assertTrue(partial.wait(3), 'partial must be published while provider is gated')
-                self.assertFalse(release.is_set())
-                release.set()
-                self.assertTrue(complete.wait(3))
-                with overlay.lock:
-                    self.assertEqual(overlay.answers[row_id]['answer'], 'Two reviewers.')
-                    self.assertFalse(overlay.answers[row_id]['completed_only'])
-        finally:
-            release.set()
-            # Pusher/status threads are intentionally long-lived. Stop them
-            # BEFORE joining instead of silently spending two 10s join budgets.
-            state.overlay_hide()
-            for thread in list(overlay.threads):
-                thread.join(3)
-                self.assertFalse(thread.is_alive(), thread.name)
-        self.assertIsNone(state.overlay)
 
     def test_timeout_cancels_slot_and_reports_retry(self):
         import time
@@ -1375,7 +1281,7 @@ class WarningPriorityTests(CheckedThreads):
 
 
 class ConcurrentAssistTests(CheckedThreads):
-    def test_overlapping_assists_do_not_share_context(self):
+    def test_overlapping_overlay_assists_are_all_rejected(self):
         import threading
         import time
         import contextvars
@@ -1406,8 +1312,9 @@ class ConcurrentAssistTests(CheckedThreads):
             thread.start()
         for thread in threads:
             thread.join(10)
-        self.assertEqual(errors, [])
-        self.assertEqual(sorted(entered), ['row-0', 'row-1', 'row-2', 'row-3'])
+        self.assertEqual(len(errors), 4)
+        self.assertTrue(all('Overlay answers are unavailable' in str(error) for error in errors))
+        self.assertEqual(entered, [])
 
     def test_stale_click_does_not_submit(self):
         from unittest.mock import Mock
@@ -1588,11 +1495,11 @@ class PaneTokenGateTests(CheckedThreads):
         # No pane token minted (constructed off the pane action thread):
         # an empty copied context must not authorize provider work.
         transport = bridge.BackendTransport(state)
-        with self.assertRaisesRegex(RuntimeError, 'not from the pane action'):
+        with self.assertRaisesRegex(RuntimeError, 'Overlay answers are unavailable'):
             transport.assist('q', {}, 'row-1')
         state.assist.assert_not_called()
 
-    def test_refresh_rebinds_to_the_latest_pane_action(self):
+    def test_refresh_cannot_enable_overlay_answers(self):
         import contextvars
         from unittest.mock import Mock
         state = Mock()
@@ -1602,8 +1509,9 @@ class PaneTokenGateTests(CheckedThreads):
         transport = bridge.BackendTransport(state, pane_token='first-token')
         bridge._PANE_ACTION.set('second-token')
         transport.refresh_pane_token('second-token')
-        self.assertEqual(transport.assist('q', {}, 'row-1'), 'r-1')
-        state.assist.assert_called_once()
+        with self.assertRaisesRegex(RuntimeError, 'Overlay answers are unavailable'):
+            transport.assist('q', {}, 'row-1')
+        state.assist.assert_not_called()
 
 
 class StaleAskTests(CheckedThreads):

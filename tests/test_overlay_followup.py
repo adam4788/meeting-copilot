@@ -96,37 +96,6 @@ class FollowupTests(CheckedThreads):
                 self.assertNotIn('private secret', str(overlay.pushed[-1]))
                 overlay.stop()
 
-    def test_real_backend_busy_and_stale_admission_are_sanitized(self):
-        for kind in ('busy', 'stale'):
-            with self.subTest(kind=kind):
-                state = server.MeetingState()
-                state.listening = True
-                state.add_segment({'id': 'a', 'text': 'Question?'})
-                token = bridge._PANE_ACTION.set('test-pane')
-                try:
-                    transport = bridge.BackendTransport(state, pane_token='test-pane')
-                finally:
-                    bridge._PANE_ACTION.reset(token)
-                overlay = bridge.OverlayBridge(transport=transport)
-                overlay.update(state.status(touch=False))
-                if kind == 'busy':
-                    state.requests['secret-id'] = {'request_id': 'secret-id', 'status': 'running'}
-                else:
-                    state.generation += 1  # backend advanced before bridge's next poll
-                self.assertTrue(overlay.on_click_line(click(overlay, 'a')))
-                for worker in list(overlay.threads):
-                    worker.join(2)
-                    self.assertFalse(worker.is_alive())
-                overlay.update(dict(segments=[{'id': 'a', 'text': 'Question?'}],
-                                    listening=True, generation=overlay._last_generation,
-                                    capture_generation=overlay._last_capture_generation))
-                warning = overlay.pushed[-1]['questions'][0]['warnings'][0]
-                self.assertIn('tap', warning.lower())
-                self.assertIn('retry', warning.lower())
-                self.assertIn('another answer' if kind == 'busy' else 'changed', warning.lower())
-                self.assertNotIn('secret-id', warning)
-                self.assertEqual(state.request_seq, 0)
-                overlay.stop()
 
     def test_reentrant_late_admission_failure_cannot_replace_newer_answer(self):
         class Transport:
@@ -217,53 +186,3 @@ class FollowupTests(CheckedThreads):
             finally:
                 state.overlay_release(pane, 3)
                 overlay.stop()
-
-    def test_partial_cancelled_before_status_pump_does_not_look_completed(self):
-        engine = Mock()
-        engine.supports_streaming.return_value = True
-        finish_provider, seen, release = (threading.Event() for _ in range(3))
-        def chunks():
-            yield 'Incomplete'
-            self.checked_wait(finish_provider, 3, 'provider finish')
-        engine.answer_stream.return_value = ({}, chunks())
-        state = server.MeetingState(engine_factory=lambda: engine)
-        state.listening = True
-        state.add_segment({'id': 'row', 'text': 'What is the plan?'})
-        token = bridge._PANE_ACTION.set('followup')
-        try:
-            transport = bridge.BackendTransport(state, pane_token='followup')
-        finally:
-            bridge._PANE_ACTION.reset(token)
-        overlay = bridge.OverlayBridge(transport=transport, poll_interval=0.001)
-        overlay.update(state.status(touch=False))
-        original = overlay.push
-        def push():
-            if overlay.answers.get('row', {}).get('answer') == 'Incomplete' and not seen.is_set():
-                seen.set()
-                self.checked_wait(release, 3, 'partial publication')
-            return original()
-        try:
-            with patch.object(overlay, 'push', self.checked_callback(push)):
-                self.assertTrue(overlay.on_click_line(click(overlay)))
-                self.assertTrue(seen.wait(2))
-                state.pause()
-                release.set()
-                for worker in overlay.threads:
-                    worker.join(2)
-                    self.assertFalse(worker.is_alive())
-            self.assertEqual(overlay.request_by_row, {})
-            # Before status update, cancellation must already label partial text.
-            partial = overlay.pushed[-1]['questions'][0]
-            self.assertTrue(not partial['answer'] or any('partial' in w.lower() for w in partial['warnings']))
-            overlay.update(state.status(touch=False))
-            self.assertIsNone(overlay.pushed[-1]['questions'][0]['answer'])
-        finally:
-            release.set()
-            finish_provider.set()
-            overlay.stop()
-            for worker in threading.enumerate():
-                if worker.name.startswith('meeting-answer-'):
-                    worker.join(2)
-                    self.assertFalse(worker.is_alive())
-        engine.answer_stream.assert_called_once()
-        self.assertEqual(self.worker_errors, [])

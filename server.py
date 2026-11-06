@@ -1066,9 +1066,8 @@ class MeetingState:
                              name='meeting-overlay-lease', daemon=True).start()
 
     def _refresh_overlay_token_locked(self, force=False):
-        # Re-bind the transport to this explicit pane action. Must run under
-        # overlay_lock on the pane's request thread so the captured context
-        # (and token) belong to the authenticated action, not a worker.
+        # Retire the display generation when pane authorization may have changed.
+        # The read-only transport retains no authenticated request context.
         import secrets
         bridge = self.overlay
         transport = getattr(bridge, 'transport', None)
@@ -1434,7 +1433,7 @@ class MeetingState:
             self.overlay_cleanup_error = 'Overlay startup is pending; shutdown is not confirmed.'
             self._overlay_startup_job = job
             import contextvars
-            context = contextvars.copy_context()
+            context = contextvars.Context()  # helper startup does not need pane secrets
             def launch():
                 try:
                     result = context.run(bridge.show_overlay)
@@ -1708,7 +1707,8 @@ class MeetingState:
                     'capabilities': {'all_projects': True, 'automatic_web_fallback': True, 'independent_models': True, 'history_opt_out': True,
                                      'meta_asr': _meta_key_present(),
                                      'macos_transcription': bool(macos_ready),
-                                     'overlay': overlay_available, 'overlay_stream': True, 'overlay_cancel': True,
+                                     'overlay': overlay_available, 'overlay_answers': False,
+                                     'overlay_stream': False, 'overlay_cancel': False,
                                      'macos_detail': self._macos_capability_detail(macos_ready)}}
 
     def _overlay_capability_available(self, overlay, overlay_status):

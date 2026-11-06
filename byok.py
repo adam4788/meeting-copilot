@@ -34,20 +34,19 @@ def secret(name, *, standalone=False):
     else:
         try:
             from agent import secret_scope
-            scope, home = _host_scope()
+            scope, _ = _host_scope()
             if scope is None:
                 return ''
-            # Hermes may fall back to the process environment on a scope miss.
-            # Snapshot only the requested key so a concurrent host refresh
-            # cannot turn a checked member into an environment fallback.
-            expected = scope.get(name)
-            if not isinstance(expected, str) or not expected:
-                return ''
-            token = secret_scope.set_secret_scope({name: expected}, profile_home=str(home))
+            # Force strict scope semantics without replacing the host-issued
+            # mapping. A concurrent change must never fall back to process env.
+            token = secret_scope.set_multiplex_context(True)
             try:
+                expected = scope.get(name)
+                if not isinstance(expected, str) or not expected:
+                    return ''
                 value = secret_scope.get_secret(name, '')
             finally:
-                secret_scope.reset_secret_scope(token)
+                secret_scope.reset_multiplex_context(token)
             if value != expected:
                 return ''
         except Exception:
@@ -73,7 +72,7 @@ def catalog():
         configured=bool(secret(name))
         status = ('Key available; connection and model unverified' if configured else
                   'Set key in Hermes Settings → Plugins → meeting-copilot-live (default profile)' if scoped else
-                  'Hermes did not provide a scoped credential context to this plugin host. Check host compatibility.')
+                  'Hermes did not provide a profile-scoped credential context. BYOK is unavailable in this host mode.')
         providers.append(dict(id=provider, label=label, models=[], custom_model=True,
             configured=configured, status=status))
     return {'providers': providers}
