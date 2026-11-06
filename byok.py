@@ -29,16 +29,28 @@ def secret(name, *, standalone=False):
             return ''
     return value.strip() if isinstance(value, str) else ''
 
+
+def _scope_available():
+    try:
+        from agent import secret_scope
+        return secret_scope.current_secret_scope() is not None
+    except Exception:
+        return False
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
 
 def catalog():
     providers=[]
+    scoped = _scope_available()
     for provider, (label, name, _) in PROVIDERS.items():
         configured=bool(secret(name))
+        status = ('Key available; connection and model unverified' if configured else
+                  'Set key in Hermes Settings → Plugins → meeting-copilot-live (default profile)' if scoped else
+                  'Hermes did not provide a scoped credential context to this plugin host. Check host compatibility.')
         providers.append(dict(id=provider, label=label, models=[], custom_model=True,
-            configured=configured, status='Key available; connection and model unverified' if configured else 'Set key in Hermes Settings → Plugins → meeting-copilot-live (default profile)'))
+            configured=configured, status=status))
     return {'providers': providers}
 
 

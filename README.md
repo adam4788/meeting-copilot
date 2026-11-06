@@ -131,8 +131,10 @@ Read [security and privacy](SECURITY.md) and the
   Missing or adversarial evidence can still produce an incorrect answer.
 - PDF, DOCX, and XLSX extraction is not implemented. Project scans and session
   reads are bounded; this is not a search of the whole computer.
-- Two dashboard search/scope integrations still depend on private Hermes APIs.
-  Review the [version compatibility cautions](docs/catalog-compatibility.md).
+- Optional web search depends on a registered, profile-scoped Hermes tool and
+  may be unavailable. The overlay still uses a private Hermes scope API. The
+  inspected isolated plugin-host route did not pass the request scope needed
+  for BYOK; see [compatibility cautions](docs/catalog-compatibility.md).
 
 ## Explore the repository
 

@@ -82,10 +82,13 @@ Results include `web_search: {used, mode, query}`.
 Local file/session retrieval runs before any optional web request. No query is
 built by string-copying the question, transcript or evidence; with fallback
 enabled the model drafts a filtered generic query (best effort, see Scope above).
-An explicit nonblank `web_query` is passed, unchanged, to Hermes
-`tools.web_tools.web_search_tool(query, limit=3)`. That field must come from an
-explicit user action, never from a model. Web sources are search descriptions,
-not downloaded or verified pages. No web extraction or link following occurs.
+An explicit nonblank `web_query` is passed to the registered public Hermes
+`web_search` tool with a limit of three, in the authenticated profile scope.
+That field must come from an explicit user action, never from a model. If the
+host has not registered the tool or does not supply a bound profile scope, the
+answer continues with local evidence and reports that web search is unavailable.
+Web sources are search descriptions, not downloaded or verified pages. No web
+extraction or link following occurs.
 
 Answer generation requires an explicit provider and exact model ID, or an
 injected standalone completion function. The Desktop uses scoped BYOK settings
@@ -128,10 +131,10 @@ leaking exception text; missing evidence is never replaced with invented facts.
 ## Hermes integration references
 
 - Official architecture: https://hermes-agent.nousresearch.com/docs/developer-guide/architecture/
-- Installed `tools/web_tools.py`: synchronous `web_search_tool(query, limit)` returns
-  a JSON string with `success` and `data.web` metadata.
-- The optional public-facade embedding helpers and remaining dashboard private
-  search/scope seams are described in [compatibility review](catalog-compatibility.md).
+- The public tool registry dispatches `web_search` with a JSON result containing
+  `success` and `data.web` metadata when the host has registered the tool.
+- The optional public-facade embedding helpers and remaining private scope seam
+  are described in [compatibility review](catalog-compatibility.md).
 
 Private Hermes APIs may change between releases; retrieval tests are independent
 of them, while live Desktop/web integration requires an installed, configured

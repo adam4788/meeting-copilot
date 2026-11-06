@@ -96,3 +96,12 @@ class FreshHostScopeTests(unittest.TestCase):
             BackendTransport._fresh_action_context(expected_home=self.home)
         self.assertEqual(reused.exception.status_code, 503)
         self.assertIs(self.scope.get(), self.old)
+
+    def test_admission_refresh_drops_a_revoked_key_after_request_scope_was_bound(self):
+        # Model an action that waited after the host bound its request scope.
+        # A copy of that request would still contain the revoked key.
+        delayed_request = contextvars.copy_context()
+        self.fresh = {}
+        admitted = BackendTransport._fresh_action_context(expected_home=self.home)
+        self.assertIn('OPENAI_API_KEY', delayed_request.run(self.scope.get))
+        self.assertNotIn('OPENAI_API_KEY', admitted.run(self.scope.get))

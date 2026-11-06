@@ -13,8 +13,10 @@ from contextlib import closing
 
 try:
     from .web_policy import plan_web
+    from .hermes_adapters import WebSearchUnavailable, registry_search
 except ImportError:  # top-level use (tests, scripts)
     from web_policy import plan_web
+    from hermes_adapters import WebSearchUnavailable, registry_search
 
 
 _DENIED = re.compile(r'(auth|credential|secret|password|token|config|\.env)', re.I)
@@ -661,11 +663,7 @@ class KnowledgeEngine:
             search = getattr(self._search_override, 'search', self._search_override)
             rows = search(query)
         else:
-            from tools.web_tools import web_search_tool
-            data = json.loads(web_search_tool(query, limit=3))
-            if not data.get('success', True):
-                raise RuntimeError('Configured web search unavailable')
-            rows = data.get('data', {}).get('web', [])
+            rows = registry_search(query)
         return [dict(id=f"web:{_clean_url(row.get('url', ''))}", title=_clean(str(row.get('title', 'Web result')))[:160],
                      source=_clean_url(row.get('url', '')), text=_clean(str(row.get('description', '')))[:1500],
                      updated_at=None) for row in rows[:3]]
@@ -714,6 +712,8 @@ class KnowledgeEngine:
                 try:
                     sources.extend(self._web(query))
                     web = {'used': True, 'mode': mode, 'query': query}
+                except WebSearchUnavailable:
+                    warnings.append('Web search unavailable in this Hermes host; using local evidence only.')
                 except Exception as exc:
                     warnings.append('Web search failed; using local evidence only.')
         if prepared is not None:
@@ -853,6 +853,8 @@ class KnowledgeEngine:
                 sources.extend(self._web(query))
                 web = {'used': True, 'mode': mode, 'query': query}
                 payload['evidence'] = [{'citation': i, 'title': s['title'], 'text': s['text'][:2050]} for i, s in enumerate(sources, 1)]
+            except WebSearchUnavailable:
+                warnings.append('Web search unavailable in this Hermes host; using local evidence only.')
             except Exception as exc:
                 warnings.append('Web search failed; using local evidence only.')
         messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)}]

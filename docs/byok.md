@@ -6,6 +6,12 @@ plugin obtains them only through `agent.secret_scope.get_secret` in a bound
 Hermes scope. An unavailable scope fails closed. Reopen the pane after changing
 settings. Never paste a key into chat, a model field, or an answer request.
 
+The inspected Hermes isolated plugin-host child route did not receive its
+parent's request-bound scope in an offline synthetic probe. BYOK may therefore
+be unavailable in host-isolation or secondary-profile routes; it does not fall
+back to the child process environment. Live Desktop/provider behavior remains
+unverified. See [compatibility](catalog-compatibility.md).
+
 Choose your provider and enter its exact model ID. Model access, credits and
 Chat Completions compatibility depend on your account. A configured key is not
 a successful connection test. The app does not infer models, discover account

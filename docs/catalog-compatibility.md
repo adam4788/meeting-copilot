@@ -7,8 +7,8 @@ pinned commit and its complete validator output before submission.
 ## Public API audit (2026-11-06)
 
 The [current public API list](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins/public-api)
-does not include either private import below. The catalog validator warns about
-them without failing, but the [catalog rules](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins/catalog-submission)
+does not include the private scope import below. The catalog validator warns
+without failing, but the [catalog rules](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins/catalog-submission)
 require public extension surfaces. A passing validator is therefore not a claim
 of full public-API conformance or catalog readiness.
 
@@ -19,49 +19,54 @@ explicitly supplied public `ctx.llm` facade. It calls the documented synchronous
 `agent.auxiliary_client`. This embedding helper follows the host's model and
 fallback policy; the fixed-origin BYOK answer path does not use it.
 
-Two active compatibility seams remain:
+Dashboard web search now uses the public `tools.registry` for an already
+registered `web_search` tool, with an explicit active-profile scope and a
+matching bound secret scope. It never imports a tool implementation to populate
+the registry or retries through a private path. If the registry, tool or bound
+scope is absent, the answer continues with local evidence and reports that web
+search is unavailable. The current dashboard API supplies no `ctx`, so it does
+not provide the parent-agent context of `ctx.dispatch_tool`. A fresh dashboard
+probe against the inspected host found no registered search tool; the optional
+web feature may therefore be unavailable even when a provider is configured.
+The separate embedding adapter still accepts an explicit `ctx.dispatch_tool`.
 
-- `knowledge.py` still calls `tools.web_tools.web_search_tool` for explicit web
-  opt-in. The optional embedding adapter `hermes_adapters.default_search()` now
-  requires an explicitly supplied public `ctx.dispatch_tool` and dispatches only
-  `web_search` with the exact query and a limit of three. It performs no context
-  discovery, retries, LLM calls or history searches. The current dashboard does
-  not use this adapter: its separately loaded API module exports `router`, and
-  the reviewed public dashboard contract supplies no `ctx` argument or factory.
-  Capturing an arbitrary plugin manager/context or using a global default would
-  lack a verified per-request profile/approval binding. The missing surface is
-  a documented profile-bound tool-dispatch handle available to dashboard route
-  handlers, with supported lifetime/context propagation to answer workers.
-  Public `ctx.dispatch_tool` exists for registered callbacks; this is specifically
-  a dashboard handoff gap, not a claim that Hermes lacks tool dispatch.
-  Explicit web opt-in, query filtering and failure reporting are unchanged.
-  The documented `agent.web_search_provider.WebSearchProvider` is an interface
-  for implementing and registering a provider; it does not select or dispatch
-  the configured provider for a dashboard route. The selection registry named
-  in the [provider guide](https://hermes-agent.nousresearch.com/docs/developer-guide/web-search-provider-plugin)
-  is not in the public API list.
-  A read-only check with the installed Hermes libraries and a fresh temporary
-  profile found no `web_search` entry in the public tool registry after importing
-  this dashboard API. Direct registry dispatch is therefore not a verified
-  substitute for the existing search path in a fresh plugin host.
-- `overlay_bridge.BackendTransport._fresh_action_context()` uses the private
-  `hermes_cli.web_server_profiles._config_profile_scope('current')` helper.
-  It refreshes a **copy** of the authenticated pane action context, verifies
-  profile-home identity, and captures a fresh secret snapshot for subsequent
-  actions. Already admitted answer workers retain their own snapshots.
-  Missing/incompatible host APIs fail closed with reopen guidance. This private
-  helper can change between Hermes versions. There is no documented equivalent
-  public fresh-copy scope API in the reviewed docs. The host's
-  `refresh_installed_secret_scope` mutates its installed mapping in place, so
-  calling it on a shared context could change admitted workers' snapshots.
-  `build_profile_secret_scope(home)` does return a fresh file/external/managed
-  mapping, and rebinding that mapping avoids mutating the original. However,
-  it does not itself perform the host's external-source hydration or use its
-  launch-profile resolver. In the inspected host, `_config_profile_scope` does
-  both where applicable. A synthetic comparison against the installed host
-  showed a launch-injected key in the host scope but not the direct builder's
-  mapping. Equivalence for injected credentials and routed profiles is therefore
-  unproven, so neither approach is a safe replacement yet.
+`overlay_bridge.BackendTransport._fresh_action_context()` uses the private
+`hermes_cli.web_server_profiles._config_profile_scope('current')` helper. It
+refreshes a **copy** of the authenticated pane action context, verifies
+profile-home identity, and captures a fresh secret snapshot for subsequent
+actions. Already admitted answer workers retain their own snapshots.
+Missing/incompatible host APIs fail closed with reopen guidance. This private
+helper can change between Hermes versions. There is no documented equivalent
+public fresh-copy scope API in the reviewed docs. The host's
+`refresh_installed_secret_scope` mutates its installed mapping in place, so
+calling it on a shared context could change admitted workers' snapshots.
+`build_profile_secret_scope(home)` does return a fresh file/external/managed
+mapping, and rebinding that mapping avoids mutating the original. However,
+it does not itself perform the host's external-source hydration or use its
+launch-profile resolver. In the inspected host, `_config_profile_scope` does
+both where applicable. A synthetic comparison against the installed host
+showed a launch-injected key in the host scope but not the direct builder's
+mapping. Equivalence for injected credentials and routed profiles is therefore
+unproven, so neither approach is a safe replacement yet.
+
+The inspected in-process dashboard route binds a host scope at request entry.
+Defensively copying that scope with the public `set_secret_scope` API preserves
+launch-injected, external and managed values already present and separates old
+workers from new requests. It does not refresh after an admission wait: an
+offline test bound a synthetic key, delayed the request, revoked the key, and
+found that a public copy still contained it while the existing admission refresh
+did not. The plugin no longer has a credential-edit route; its retained legacy
+change callback is not reached by `credentials.make_router`.
+
+The inspected isolated plugin-host child serves the forwarded dashboard router
+without transferring the parent's request-bound secret context. An offline probe
+of that host child route reported BYOK unavailable even with a synthetic launch
+value. The plugin intentionally does not fall back to process-environment keys.
+This also affects secondary-profile routes that Hermes forwards to a plugin host.
+An upstream request-scoped credential handoff is needed for those routes; live
+Desktop/provider behavior has not been verified. The public
+`credentialed_provider_request` handles declared OAuth/Codex sign-ins, not
+these OpenAI/OpenRouter API-key routes, so it is not a drop-in BYOK replacement.
 
 The needed scope API must refresh host-owned secret sources into a **new**
 authenticated-profile snapshot inside the action admission boundary, preserve

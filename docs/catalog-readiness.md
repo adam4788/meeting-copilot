@@ -52,9 +52,9 @@ A repository's own catalog folder does not list the plugin.
   dependencies and hardware verification; they are not silently installed into
   Hermes by this macOS catalog manifest. Meetily attachment is optional.
 
-See [compatibility cautions](catalog-compatibility.md): active private scope and
-search imports remain version-sensitive, and development mutation/probe helpers
-remain visible to scanners. Passing validation does not constitute maintainer
+See [compatibility cautions](catalog-compatibility.md): the private scope import
+remains version-sensitive, and development mutation/probe helpers remain visible
+to scanners. Passing validation does not constitute maintainer
 approval. No telemetry, self-update, credential changes or unattended recording
 are introduced by this preflight.
 

@@ -6,12 +6,16 @@ real Hermes home. Anything that needs the host goes through one of the
 factory functions below, which raise a clear error naming the missing
 capability instead of failing deep inside answer assembly.
 
-Meeting Copilot's explicit BYOK runtime does not use these completion/search
-factories. Embedders may inject the public ctx.llm facade or provide their own
-completion, search and history implementations.
+Meeting Copilot's BYOK runtime uses explicit provider selection. Embedders may
+inject the public ctx.llm facade or their own completion, search and history
+implementations. Dashboard search uses the profile-scoped public tool registry.
 """
 
 _MISSING = object()
+
+
+class WebSearchUnavailable(RuntimeError):
+    """The host has no safely scoped public search dispatch available."""
 
 
 def default_completion(llm=None):
@@ -60,7 +64,7 @@ def default_search(dispatch_tool=None):
 
     No implicit host context lookup. Dashboard callers must supply a dispatcher
     bound to their authenticated profile; this optional embedding helper cannot
-    manufacture one. The current dashboard's legacy search path is separate.
+    manufacture one.
     """
     def search(query):
         if not callable(dispatch_tool):
@@ -68,15 +72,39 @@ def default_search(dispatch_tool=None):
         try:
             import json as _json
             data = _json.loads(dispatch_tool('web_search', {'query': query, 'limit': 3}))
-            if not data.get('success', True):
+            if not isinstance(data, dict) or data.get('success') is not True:
                 raise ValueError('dispatch failed')
-            rows = data.get('data', {}).get('web', [])
+            payload = data.get('data')
+            if not isinstance(payload, dict):
+                raise ValueError('invalid web results')
+            rows = payload.get('web')
             if not isinstance(rows, list):
                 raise ValueError('invalid web results')
             return rows[:3]
         except Exception:
             raise RuntimeError('Hermes public web search failed') from None
     return search
+
+
+def registry_search(query):
+    """Dispatch once through an already registered, profile-scoped host tool.
+
+    Do not import tool implementations to populate the registry. A dashboard
+    without a bound host scope or registered public tool reports unavailable.
+    """
+    try:
+        from agent.secret_scope import current_secret_scope, current_secret_scope_home
+        from hermes_constants import hermes_home_key
+        from tools.registry import registry
+        scope = hermes_home_key()
+        bound = current_secret_scope_home()
+        if (current_secret_scope() is None or not bound or not scope
+                or hermes_home_key(bound) != scope
+                or registry.get_entry('web_search', scope=scope) is None):
+            raise WebSearchUnavailable()
+    except Exception:
+        raise WebSearchUnavailable('Hermes public web search is unavailable.') from None
+    return default_search(lambda name, args: registry.dispatch(name, args, scope=scope))(query)
 
 
 def default_history(hermes_home):

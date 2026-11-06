@@ -231,6 +231,38 @@ class KnowledgeTests(unittest.TestCase):
         self.assertEqual(llm.call_count, 1)
         self.assertEqual(result['web_search']['mode'], 'explicit')
 
+    def test_unavailable_public_web_search_keeps_local_answer_available(self):
+        from hermes_adapters import WebSearchUnavailable
+        (self.project / 'notes.md').write_text('Orchid approval.', encoding='utf-8')
+        with patch('knowledge.registry_search', side_effect=WebSearchUnavailable()), \
+             patch.object(self.engine, '_complete', return_value='Local answer [1].'):
+            result = self.engine.answer('Orchid', project='alpha', web_query='public docs')
+        self.assertFalse(result['web_search']['used'])
+        self.assertIn('Web search unavailable in this Hermes host; using local evidence only.',
+                      result['warnings'])
+        self.assertEqual(result['answer'], 'Local answer [1].')
+        self.assertTrue(result['sources'])
+
+    def test_local_answer_never_dispatches_web_without_opt_in(self):
+        with patch('knowledge.registry_search') as search, \
+             patch.object(self.engine, '_complete', return_value='Local answer.'):
+            result = self.engine.answer('Orchid')
+        search.assert_not_called()
+        self.assertEqual(result['answer'], 'Local answer.')
+        self.assertFalse(result['web_search']['used'])
+
+    def test_unavailable_public_web_search_is_visible_in_stream_header(self):
+        from hermes_adapters import WebSearchUnavailable
+        provider = Mock()
+        provider.stream_chunks = Mock(return_value=iter(['Local answer.']))
+        with patch('knowledge.registry_search', side_effect=WebSearchUnavailable()), \
+             patch.object(self.engine, '_complete', provider):
+            header, chunks = self.engine.answer_stream('Orchid', web_query='public docs')
+            self.assertEqual(list(chunks), ['Local answer.'])
+        self.assertFalse(header['web_search']['used'])
+        self.assertIn('Web search unavailable in this Hermes host; using local evidence only.',
+                      header['warnings'])
+
     def test_hidden_project_cannot_be_selected(self):
         hidden = self.projects / '.private'
         hidden.mkdir()

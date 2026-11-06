@@ -69,6 +69,7 @@ compile/sign helpers. A visible stopping state means shutdown is not confirmed.
 See [security](../SECURITY.md), [BYOK](byok.md), and
 [audio backpressure](native-backpressure.md).
 
-Dashboard web search and fresh copied action scopes still use version-sensitive
-private Hermes APIs. Missing/incompatible scopes fail closed. See
-[compatibility review](catalog-compatibility.md) for the remaining seams.
+Dashboard web search uses the public scoped tool registry and reports when it is
+unavailable. Fresh copied overlay action scopes still use a version-sensitive
+private Hermes API. Missing/incompatible scopes fail closed. See the
+[compatibility review](catalog-compatibility.md) for the remaining seam.

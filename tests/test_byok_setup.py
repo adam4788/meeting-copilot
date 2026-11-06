@@ -51,6 +51,22 @@ class SetupTests(unittest.TestCase):
         with patch.dict(sys.modules,{'agent':types.SimpleNamespace(secret_scope=scoped)}),patch.dict(os.environ,{'OPENAI_API_KEY':'synthetic-key'}):
             self.assertEqual(byok.secret('OPENAI_API_KEY'),'')
             with self.assertRaises(ValueError):byok.completion('openai','synthetic-model')
+
+    def test_catalog_distinguishes_missing_scope_from_missing_key(self):
+        import sys, types
+        scope = types.SimpleNamespace(current_secret_scope=lambda: None,
+                                      get_secret=lambda *_: self.fail('must not read unbound scope'))
+        with patch.dict(sys.modules, {'agent': types.SimpleNamespace(secret_scope=scope)}), \
+             patch.dict(os.environ, {'OPENAI_API_KEY': 'synthetic-key'}):
+            provider = byok.catalog()['providers'][0]
+        self.assertFalse(provider['configured'])
+        self.assertIn('scoped credential context', provider['status'])
+        self.assertNotIn('synthetic-key', str(provider))
+        scope.current_secret_scope = lambda: {}
+        scope.get_secret = lambda *_: ''
+        with patch.dict(sys.modules, {'agent': types.SimpleNamespace(secret_scope=scope)}):
+            provider = byok.catalog()['providers'][0]
+        self.assertIn('Set key in Hermes Settings', provider['status'])
     def test_meta_readiness_import_failure_never_borrows_environment(self):
         with patch('importlib.import_module',side_effect=RuntimeError('synthetic')),patch.dict(os.environ,{'MODEL_API_KEY':'synthetic-key'}):
             self.assertFalse(server._meta_key_present())

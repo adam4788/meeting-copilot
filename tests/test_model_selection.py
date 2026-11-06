@@ -34,7 +34,7 @@ class ModelSelectionTests(unittest.TestCase):
                 with self.subTest(pair=pair),self.assertRaises(ValueError):module.validate_selection(*pair)
 
     def test_missing_scoped_keys_are_reported_unconfigured_without_secret_details(self):
-        with patch('byok.secret',return_value=''):
+        with patch('byok.secret',return_value=''), patch('byok._scope_available',return_value=True):
             result=self.module().available_models()
         self.assertTrue(all(not p['configured'] for p in result['providers']))
         self.assertTrue(all('Hermes Settings' in p['status'] for p in result['providers']))
