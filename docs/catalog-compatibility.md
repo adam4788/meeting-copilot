@@ -31,10 +31,13 @@ web feature may therefore be unavailable even when a provider is configured.
 The separate embedding adapter still accepts an explicit `ctx.dispatch_tool`.
 
 `overlay_bridge.BackendTransport._fresh_action_context()` uses the private
-`hermes_cli.web_server_profiles._config_profile_scope('current')` helper. It
-refreshes a **copy** of the authenticated pane action context, verifies
-profile-home identity, and captures a fresh secret snapshot for subsequent
-actions. Already admitted answer workers retain their own snapshots.
+`hermes_cli.web_server_profiles._config_profile_scope('current')` helper. Show
+and explicit scope changes refresh a **copy** of the authenticated pane action
+context and verify profile-home identity. **Overlay clicks currently reuse that
+retained context without refreshing it.** A synthetic transport probe confirmed
+that clicks after a key rotation or deletion can use the old key until the pane
+action is refreshed. Treat this as an unresolved credential-freshness defect
+and avoid overlay answers until it is fixed.
 Missing/incompatible host APIs fail closed with reopen guidance. This private
 helper can change between Hermes versions. There is no documented equivalent
 public fresh-copy scope API in the reviewed docs. The host's
@@ -49,13 +52,20 @@ showed a launch-injected key in the host scope but not the direct builder's
 mapping. Equivalence for injected credentials and routed profiles is therefore
 unproven, so neither approach is a safe replacement yet.
 
+BYOK reads require a host-stamped scope whose home matches the active request.
+They snapshot only the requested key before calling the public `get_secret` API and reject a
+missing key instead of accepting Hermes's single-profile environment fallback.
+Launch-injected keys remain usable when the host includes them in its scope.
+An absent, unstamped, or mismatched scope fails closed.
+
 The inspected in-process dashboard route binds a host scope at request entry.
 Defensively copying that scope with the public `set_secret_scope` API preserves
 launch-injected, external and managed values already present and separates old
 workers from new requests. It does not refresh after an admission wait: an
 offline test bound a synthetic key, delayed the request, revoked the key, and
-found that a public copy still contained it while the existing admission refresh
-did not. The plugin no longer has a credential-edit route; its retained legacy
+found that a public copy still contained it. Directly invoking the private
+refresh helper saw the deletion, but the actual click path does not call that
+helper at admission. The plugin no longer has a credential-edit route; its retained legacy
 change callback is not reached by `credentials.make_router`.
 
 The inspected isolated plugin-host child serves the forwarded dashboard router

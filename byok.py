@@ -4,6 +4,7 @@ import os
 import re
 import urllib.request
 import urllib.error
+from pathlib import Path
 
 PROVIDERS = {
     'openai': ('OpenAI API', 'OPENAI_API_KEY', 'https://api.openai.com/v1/chat/completions'),
@@ -16,15 +17,39 @@ def validate(provider, model):
         raise ValueError('Choose a supported provider and exact model ID; never enter a key here.')
     return provider, model
 
+def _host_scope():
+    """Use only a host-stamped scope for the currently served profile."""
+    from agent import secret_scope
+    from hermes_constants import get_hermes_home
+    scope = secret_scope.current_secret_scope()
+    home = secret_scope.current_secret_scope_home()
+    if scope is None or not home or Path(home).resolve() != get_hermes_home().resolve():
+        return None, None
+    return scope, home
+
+
 def secret(name, *, standalone=False):
     if standalone:
         value = os.environ.get(name, '')
     else:
         try:
             from agent import secret_scope
-            if secret_scope.current_secret_scope() is None:
+            scope, home = _host_scope()
+            if scope is None:
                 return ''
-            value = secret_scope.get_secret(name, '')
+            # Hermes may fall back to the process environment on a scope miss.
+            # Snapshot only the requested key so a concurrent host refresh
+            # cannot turn a checked member into an environment fallback.
+            expected = scope.get(name)
+            if not isinstance(expected, str) or not expected:
+                return ''
+            token = secret_scope.set_secret_scope({name: expected}, profile_home=str(home))
+            try:
+                value = secret_scope.get_secret(name, '')
+            finally:
+                secret_scope.reset_secret_scope(token)
+            if value != expected:
+                return ''
         except Exception:
             return ''
     return value.strip() if isinstance(value, str) else ''
@@ -32,8 +57,8 @@ def secret(name, *, standalone=False):
 
 def _scope_available():
     try:
-        from agent import secret_scope
-        return secret_scope.current_secret_scope() is not None
+        scope, _ = _host_scope()
+        return scope is not None
     except Exception:
         return False
 

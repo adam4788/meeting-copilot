@@ -44,7 +44,9 @@ CI and plugin validation do not prove a complete meeting works on your computer.
   **Answer setup**. OpenAI and OpenRouter are the main Desktop answer routes.
 - Keeps past sessions excluded and web search off by default in new panes.
   Broader scopes are explicit choices; saved choices persist.
-- Offers a macOS meeting overlay. It may appear in screen shares.
+- Offers a macOS meeting overlay, which may appear in screen shares. Avoid
+  overlay answers until its credential-refresh defect is fixed: a click can
+  use a key that was rotated or removed after the overlay opened.
 
 ```mermaid
 flowchart TD

@@ -63,8 +63,10 @@ class SetupTests(unittest.TestCase):
         self.assertIn('scoped credential context', provider['status'])
         self.assertNotIn('synthetic-key', str(provider))
         scope.current_secret_scope = lambda: {}
+        scope.current_secret_scope_home = lambda: '/synthetic-profile'
         scope.get_secret = lambda *_: ''
-        with patch.dict(sys.modules, {'agent': types.SimpleNamespace(secret_scope=scope)}):
+        constants = types.SimpleNamespace(get_hermes_home=lambda: Path('/synthetic-profile'))
+        with patch.dict(sys.modules, {'agent': types.SimpleNamespace(secret_scope=scope), 'hermes_constants': constants}):
             provider = byok.catalog()['providers'][0]
         self.assertIn('Set key in Hermes Settings', provider['status'])
     def test_meta_readiness_import_failure_never_borrows_environment(self):
