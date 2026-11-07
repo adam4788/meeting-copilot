@@ -50,7 +50,7 @@ async function realBackend(t) {
       clearInterval: key => timers.delete(key), ...globals,
     }, { effects: true });
     return { ...p,
-      async refresh() { Object.assign(status, await rest('/status')); return p.rerender(); },
+      async refresh() { Object.assign(status, await transport('/status')); return p.rerender(); },
       async heartbeat() { for (const fn of timers.values()) await fn(); await rpc({ command: 'inspect' }); } };
   };
   return { rpc, rest, mount, traffic };
@@ -312,13 +312,18 @@ test('live helper EOF immediately replaces shown success with actionable cleanup
   timeout: 10000, skip: !['darwin', 'linux'].includes(process.platform),
 }, async t => {
   const backend = await realBackend(t);
-  const p = backend.mount();
+  // This lifecycle fixture uses a fake macOS capture object on both POSIX hosts.
+  // Advertise that fake readiness rather than selecting Windows capture on Linux.
+  const p = backend.mount({}, async (path, options) => {
+    const reply = await backend.rest(path, options);
+    if (path === '/status') reply.capabilities.macos_transcription = true;
+    return reply;
+  });
   await button(p.tree, 'Start listening').props.onClick(); // claim using fake audio only
   await button(await p.refresh(), 'Pause listening').props.onClick();
-  nodes(p.rerender()).find(n => n.props?.['aria-labelledby'] === 'mc-backend-label').props.onChange({ target: { value: 'native' } });
   await backend.rpc({ command: 'install-overlay-channel-fault' });
   await button(await p.refresh(), 'Show overlay').props.onClick();
-  assert.ok(JSON.stringify(p.rerender()).includes('Overlay shown'), JSON.stringify(backend.traffic.slice(-3)));
+  assert.ok(JSON.stringify(p.rerender()).includes('Read-only overlay shown'), JSON.stringify(backend.traffic.slice(-3)));
   await backend.rpc({ command: 'close-overlay-stdout' });
   let tree = await p.refresh();
   const status = (await backend.rpc({ command: 'inspect-overlay' })).status;
@@ -326,7 +331,7 @@ test('live helper EOF immediately replaces shown success with actionable cleanup
   assert.equal(status.overlay_stop_confirmed, false);
   assert.match(JSON.stringify(tree), /click channel failed/);
   assert.match(JSON.stringify(tree), /shutdown is not confirmed/);
-  assert.doesNotMatch(JSON.stringify(tree), /Overlay shown/);
+  assert.doesNotMatch(JSON.stringify(tree), /Read-only overlay shown/);
   assert.ok(!button(tree, 'Restart capture'), 'overlay fault must not suggest audio restart');
   assert.equal(button(tree, 'Start listening').props.disabled, true);
   await button(tree, 'Retry hide overlay').props.onClick();
