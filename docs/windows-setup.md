@@ -11,7 +11,7 @@ but managed installation provides Git provenance and an immutable pin.
 In PowerShell, install the published core revision:
 
 ```powershell
-hermes plugins install adam4788/meeting-copilot --ref b1e9089eef0d55da3c724306b13e5d4479a1eef0 --enable
+hermes plugins install adam4788/meeting-copilot --ref b01a55a05f2609f366eec8d5a035879754b8263c --enable
 ```
 
 This is a custom Git source, not an admitted catalog entry. The development tree
@@ -22,8 +22,8 @@ installed `meeting-copilot-live` also occupies the target directory: preserve it
 backend and standalone Desktop files before a managed replacement. Do not use
 `--force` as a generic troubleshooting step: it also accepts scan cautions.
 
-The local Windows changes described below are not in that published revision yet.
-Installing the pin alone does not install these changes.
+This pin includes the Windows dependency declarations and recent-transcript quick
+actions. A published build is not proof that Desktop has loaded it.
 
 After an approved installation, check:
 
@@ -37,6 +37,28 @@ The unified Desktop plugin is managed in **Settings → Plugins**. Its pane is
 it up. Python backend code already mounted by a running gateway may need an idle
 gateway restart. Finish active work first; never restart a busy gateway to load
 the plugin. Inspect the actual pane before assuming installation succeeded.
+
+## Desktop-managed installation and missing SoundCard
+
+For packaged Hermes Desktop, use **Capabilities > Plugins > Install from Git**
+(labels can vary), enter `https://github.com/adam4788/meeting-copilot`, and pin the
+full revision above in **Advanced**. Review both Agent and Desktop components,
+the selected profile, dependencies, and scanner findings. An existing installation
+may need the explicit **Force reinstall** option after reviewing its warnings;
+never accept an unexpected caution just to get past it.
+
+A source-checkout CLI and the packaged Desktop gateway can use different managed
+Python environments. Doctor succeeding in one does not prove capture is available
+in the other. Reopen the pane after installation and any idle-only restart, then
+check its Windows readiness message. Do not start recording while packages are
+reported missing.
+
+If Desktop still reports missing SoundCard, verify the install review actually
+completed in Desktop for the intended profile. If it fails with **Access denied**
+or **WinError 5**, stop and retain the error for troubleshooting. Do not change
+WindowsApps permissions, disable isolation, copy packages into the running runtime,
+or use arbitrary pip commands as a workaround. Typed project questions can still
+work with configured BYOK while capture setup remains blocked.
 
 ## Answer setup
 
@@ -59,11 +81,11 @@ opening devices, downloading models or testing recording permissions. Missing
 optional packages disable Windows Start in the pane, while answers remain usable.
 Metadata presence alone does not prove the native libraries or hardware work.
 
-This local revision declares NumPy, SoundCard and faster-whisper as Windows-only
+This revision declares NumPy, SoundCard and faster-whisper as Windows-only
 plugin dependencies. Hermes prepares them through its managed dependency resolver
 when installing/enabling this revision; macOS/Linux do not acquire this Windows
-stack. They are not in the older published pin above. Installing them in an
-unrelated development venv will not enable Desktop capture. A running gateway
+stack. Installing them in an unrelated development venv will not enable Desktop
+capture. A running gateway
 keeps its original dependency environment until an idle restart. Finish active
 work before restarting and recheck readiness afterward. Do not patch the active
 managed environment with an arbitrary pip command. Dependency preparation can

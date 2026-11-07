@@ -28,7 +28,7 @@ Windows Desktop pane and runtime verification is still in progress.
 | Linux | Python 3.11/3.12 suite and JavaScript checks passed in CI | Native audio and Desktop use are not established by these checks |
 
 This status describes source revision
-[`b1e9089`](https://github.com/adam4788/meeting-copilot/commit/b1e9089eef0d55da3c724306b13e5d4479a1eef0).
+[`b01a55a`](https://github.com/adam4788/meeting-copilot/commit/b01a55a05f2609f366eec8d5a035879754b8263c).
 See [CI](https://github.com/adam4788/meeting-copilot/actions),
 [verification notes](docs/verification.md), and the
 [native loss investigation](docs/native-backpressure.md).
@@ -42,6 +42,8 @@ CI and plugin validation do not prove a complete meeting works on your computer.
   or an optional, unofficial Meetily JSON attachment, depending on platform setup.
 - Sends an answer request to the provider and exact model you select in
   **Answer setup**. OpenAI and OpenRouter are the main Desktop answer routes.
+- Offers explicit recent-transcript actions: **Catch me up**, **Extract actions**,
+  and **Suggest a question**. These use your selected model, not the whole meeting.
 - Keeps past sessions excluded and web search off by default in new panes.
   Broader scopes are explicit choices; saved choices persist.
 - Offers a read-only macOS overlay for the transcript and detected questions.
@@ -70,7 +72,7 @@ Local transcription does not make hosted answers local.
 Requires **Hermes 0.22.7 or newer**. Install the published source at a full revision:
 
 ```sh
-hermes plugins install adam4788/meeting-copilot --ref b1e9089eef0d55da3c724306b13e5d4479a1eef0 --enable
+hermes plugins install adam4788/meeting-copilot --ref b01a55a05f2609f366eec8d5a035879754b8263c --enable
 hermes plugins doctor meeting-copilot-live --ci
 ```
 
