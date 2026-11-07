@@ -9,7 +9,7 @@ Start with [the overview](../README.md), then choose the guide for your task.
 | Configure answer keys/models | [BYOK](byok.md), [optional Meta](meta-api-key.md) |
 | Review consent and data movement | [Security](../SECURITY.md), [architecture](architecture.md) |
 | Understand document support and retrieval bounds | [Knowledge engine](knowledge.md) |
-| Prepare experimental Windows capture | [Windows audio](audio.md) |
+| Prepare experimental Windows capture | [Windows setup](windows-setup.md), [audio details](audio.md) |
 | Attach a Meetily recording | [Meetily adapter](meetily.md) |
 | Work on code or run checks | [Development](development.md), [contributing](../CONTRIBUTING.md) |
 | Review identity and artwork | [Brand guide](brand-guide.md), [asset notes](assets/README.md) |

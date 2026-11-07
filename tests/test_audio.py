@@ -6,6 +6,77 @@ import sys
 
 
 class AudioTests(unittest.TestCase):
+    def test_source_selection_never_opens_the_unselected_device(self):
+        import threading
+        from types import SimpleNamespace as NS
+        from audio import AudioCapture
+        for source, expected in [('microphone', 'you'), ('system', 'remote')]:
+            with self.subTest(source=source):
+                seen, opened = [], threading.Event()
+                def missing():
+                    self.fail('unselected default must never be accessed')
+                backend = NS(default_microphone=(lambda: NS(id='mic')) if source == 'microphone' else missing,
+                             default_speaker=(lambda: NS(id='out')) if source == 'system' else missing,
+                             get_microphone=lambda **kw: NS(id=kw['id']))
+                class Capture(AudioCapture):
+                    def _capture(self, speaker, device):
+                        seen.append(speaker)
+                        opened.set()
+                        self._stop.wait(2)
+                capture = Capture(source=source, backend=backend, model_factory=lambda *a, **kw: object())
+                try:
+                    capture.start(lambda segment: None)
+                    self.assertTrue(opened.wait(1), capture.status())
+                finally:
+                    capture.stop()
+                self.assertEqual(seen, [expected])
+                self.assertFalse(capture.status()['running'])
+        with self.assertRaises(ValueError):
+            AudioCapture(source='invalid')
+
+    def test_first_queue_loss_is_reported_immediately_in_pane_units(self):
+        from audio import AudioCapture
+        capture = AudioCapture(queue_size=1)
+        statuses = []
+        capture._on_status = statuses.append
+        capture._state = 'running'
+        capture._enqueue(('you', [], 1))
+        capture._enqueue(('remote', [], 2))
+        self.assertEqual(statuses[-1]['worker_dropped_chunks'], 1)
+        self.assertIn('Some words may be missing', statuses[-1]['warning'])
+        capture.stop()
+        self.assertEqual(capture.status()['worker_dropped_chunks'], 1)
+
+    def test_broken_numpy_import_stops_capture_and_reports_error(self):
+        import builtins
+        import threading
+        from unittest.mock import patch
+        from types import SimpleNamespace as NS
+        from audio import AudioCapture
+        failed = threading.Event()
+        real_import = builtins.__import__
+        def import_checked(name, *args, **kwargs):
+            if name == 'numpy':
+                raise ImportError('synthetic unavailable native dependency')
+            return real_import(name, *args, **kwargs)
+        backend = NS(default_microphone=lambda: NS(id='mic'),
+                     get_microphone=lambda **kw: NS(id='mic'))
+        capture = AudioCapture(source='microphone', backend=backend,
+                               model_factory=lambda *a, **kw: object())
+        def status(value):
+            if value['error']:
+                failed.set()
+        try:
+            with patch('builtins.__import__', side_effect=import_checked):
+                capture.start(lambda segment: self.fail('no transcription'), status)
+                self.assertTrue(failed.wait(2), capture.status())
+                capture.stop(timeout=2)
+            self.assertEqual(capture.status()['state'], 'error')
+            self.assertIn('ImportError', capture.status()['error'])
+            self.assertFalse(capture.status()['running'])
+        finally:
+            capture.stop()
+
     def test_devices_reports_ids_and_defaults_without_recording(self):
         from types import SimpleNamespace as NS
         from audio import AudioCapture

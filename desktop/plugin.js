@@ -333,6 +333,7 @@ export default {
         setAnswerUncertain(false); setProgressPaused(false);
       }
       const cloudUnavailable = backend === 'macos' && transcriptionProvider === 'meta' && !data.capabilities?.meta_asr;
+      const windowsUnavailable = backend === 'native' && data.capabilities?.windows_transcription === false;
       const overlayNeedsHide = !!data.overlay_cleanup_error || !!overlayActionAt.current.credentialShutdownUnconfirmed;
       function reflectCredentialOverlay(written, target) {
         const life = overlayActionAt.current;
@@ -390,14 +391,14 @@ export default {
         finally { if (life.mounted) setPending(false); }
       }
       async function startCapture(newMeeting = false) {
-        if (cloudUnavailable || overlayNeedsHide) return false;
+        if (cloudUnavailable || windowsUnavailable || overlayNeedsHide) return false;
         const retained = !!((data.segments || []).length || data.result || (data.recent || []).length || data.error_request);
         const last = data.last_session;
         const sourceChanged = last && (
           last.backend !== backend || (backend === 'meetily'
             ? last.recording_id !== (recording || null)
             : last.transcription_model !== transcriptionModel || last.audio_source !== audioSource
-              || (last.transcription_provider || 'local') !== transcriptionProvider || (last.asr_mode || 'ENDPOINTING') !== asrMode));
+              || (backend === 'macos' && ((last.transcription_provider || 'local') !== transcriptionProvider || (last.asr_mode || 'ENDPOINTING') !== asrMode))));
         const message = newMeeting
           ? 'Start a fresh meeting? The earlier transcript, answers, and retry data are cleared.'
           : 'These settings differ from the previous session, so starting begins a fresh meeting and clears the earlier transcript, answers, and retry data. Continue?';
@@ -409,7 +410,8 @@ export default {
           if (!life.mounted) return false;
           const ok = await act('/start', { pane, action: ++life.action, consent, backend, recording_id: recording || null,
             transcription_model: transcriptionModel, audio_source: audioSource, new_meeting: newMeeting,
-            transcription_provider: transcriptionProvider, asr_mode: asrMode });
+            transcription_provider: backend === 'native' ? 'local' : transcriptionProvider,
+            asr_mode: backend === 'native' ? 'ENDPOINTING' : asrMode });
           if (life.mounted && ok && (newMeeting || sourceChanged)) { resetMeetingInputs(); retireLocalOverlay(); }
           return ok;
         } catch (e) {
@@ -642,7 +644,7 @@ export default {
       // likewise recheck without borrowing another message's retry request.
       const localRecheck = assistFailed || (typeof error === 'string' && /^(Answer progress|Answer submission|Cancellation was not confirmed)/.test(error));
       const restartCapture = !data.listening && !data.stopping;
-      const captureBlocked = overlayNeedsHide || cloudUnavailable || !consent || (backend === 'meetily' && !recording)
+      const captureBlocked = overlayNeedsHide || cloudUnavailable || windowsUnavailable || !consent || (backend === 'meetily' && !recording)
         || (backend === 'macos' && !data.capabilities?.macos_transcription);
       return h('div', { style: { padding: 16, display: 'flex', flexDirection: 'column', gap: 14, height: '100%', minWidth: 0, width: '100%', boxSizing: 'border-box', overflowY: 'auto', overflowX: 'hidden', overflowWrap: 'anywhere', color: 'var(--ui-text-primary)' } },
         h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
@@ -661,6 +663,7 @@ export default {
             h('span', null, h('strong', null, 'Permission check. '), 'I have permission to capture/read this meeting and use its context with my configured model.')),
           backend === 'macos' && transcriptionProvider === 'meta' && h('p', { 'data-cloud-capture-disclosure': true, role: 'status', style: { ...muted, margin: 0 } }, `Cloud transcription selected: meeting audio is sent to Meta while listening. ${data.listening ? 'Pause to change' : 'Change'} the provider in Transcript source below.`),
           cloudUnavailable && h('p', { role: 'status', style: muted }, 'Meta cloud transcription is unavailable. Choose Local in Transcript source, or configure a Meta key and recheck backend readiness before Start.'),
+          windowsUnavailable && h('p', { role: 'status', style: muted }, data.capabilities?.windows_detail || 'Windows capture needs the optional audio dependencies. See the Windows setup guide.'),
           !data.listening && !data.stopping && (pending || !consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)) && h('p', { style: { ...muted, margin: 0 }, role: 'status' },
             pending ? 'Starting…' : !consent ? 'Confirm permission with the check above to enable Start.' : (backend === 'meetily' && !recording) ? 'Select an active Meetily recording below to enable Attach.' : 'Independent macOS transcription is unavailable here — see the source card below.'),
           h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
@@ -668,15 +671,15 @@ export default {
               ? h(Button, { variant: 'secondary', disabled: pending, onClick: () => act('/pause', {}) }, 'Retry stop')
               : data.listening
               ? h(Button, { variant: 'secondary', onClick: () => act('/pause', {}) }, data.backend === 'meetily' ? 'Detach' : 'Pause listening')
-              : h(Button, { disabled: pending || overlayNeedsHide || cloudUnavailable || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), onClick: () => startCapture() }, ((data.segments || []).length || result || (data.recent || []).length) ? (backend === 'meetily' ? 'Resume' : 'Resume listening') : (backend === 'meetily' ? 'Attach to Meetily' : 'Start listening')),
-            !data.listening && !data.stopping && ((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending || overlayNeedsHide || cloudUnavailable || (!consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)), title: 'Starts a fresh meeting; the earlier transcript, answers, and retry data are cleared', onClick: () => startCapture(true) }, 'New meeting'),
+              : h(Button, { disabled: pending || captureBlocked, onClick: () => startCapture() }, ((data.segments || []).length || result || (data.recent || []).length) ? (backend === 'meetily' ? 'Resume' : 'Resume listening') : (backend === 'meetily' ? 'Attach to Meetily' : 'Start listening')),
+            !data.listening && !data.stopping && ((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending || captureBlocked, title: 'Starts a fresh meeting; the earlier transcript, answers, and retry data are cleared', onClick: () => startCapture(true) }, 'New meeting'),
             (data.overlay_cleanup_error || (data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending, title: 'Clears past Q&A, transcript segments, and cached snippets for this meeting', onClick: async () => { if (typeof window !== 'undefined' && window.confirm && !window.confirm('Clear this meeting? Past questions, answers, and transcript segments are removed from the pane.')) return; if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } } }, 'Clear meeting'),
             h(Button, { variant: 'secondary', disabled: pending || (!data.capabilities?.overlay && !overlayNeedsHide), title: 'Show or hide the read-only meeting overlay (macOS)', onClick: toggleOverlay }, overlayNeedsHide ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay')),
           h('p', { style: { ...muted, margin: 0 } }, 'Screen-share privacy: the overlay may be visible in screenshots or screen sharing. Hide it before sharing; capture exclusion is best-effort, not a guarantee.'),
           h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'The overlay is read-only. Ask questions in the Meeting Copilot pane.'),
           (data.overlay_cleanup_error || overlayMsg) && h('p', { role: 'status', style: { ...muted, margin: 0 } }, data.overlay_cleanup_error || overlayMsg),
           overlayNeedsHide && h('p', { role: 'alert', style: { ...muted, margin: 0 } }, 'Overlay shutdown is not confirmed. Retry hide overlay and verify the window is gone before screen-sharing.'),
-          !data.capabilities?.overlay && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'Overlay helper unavailable. Check the macOS helper build and restart the gateway when other sessions are idle.'),
+          !data.capabilities?.overlay && h('p', { role: 'status', style: { ...muted, margin: 0 } }, backend === 'native' ? 'The floating overlay is macOS-only. Use this Meeting Copilot pane on Windows.' : 'Overlay helper unavailable. Check the macOS helper build and restart the gateway when other sessions are idle.'),
           h('p', { style: { ...muted, margin: 0 } }, 'No extra audio files are saved. Disconnect starts a pause or detach; check the stop status before assuming audio is off. Resume keeps this meeting. New meeting, different settings or Clear starts fresh. Pausing may discard the last few seconds.'),
           data.capture && h('div', { style: muted }, data.capture.message || data.capture.state || ''),
           data.capture && (data.capture.warning || lossText(data.capture)) && h('div', { role: 'status', style: muted },
@@ -726,23 +729,23 @@ export default {
             h('select', { value: backend, disabled: data.listening, onChange: e => setBackend(e.target.value), style: selectStyle, 'aria-labelledby': 'mc-backend-label' },
               h('option', { value: 'meetily' }, 'Meetily — use your existing recording'),
               h('option', { value: 'macos', disabled: !data.capabilities?.macos_transcription, title: data.capabilities?.macos_detail || '' }, 'macOS — without Meetily'),
-              h('option', { value: 'native', title: 'Windows only · experimental' }, 'Windows — experimental')))),
-          !data.capabilities?.macos_transcription && h('p', { style: { ...muted, margin: 0 } }, 'Independent macOS transcription is unavailable here. ' + (data.capabilities?.macos_detail || 'Select Meetily, or prepare macOS capture first.')),
+              h('option', { value: 'native', disabled: data.capabilities?.windows_transcription === false, title: data.capabilities?.windows_detail || 'Windows only · experimental' }, 'Windows — experimental')))),
           backend === 'macos' && !data.capabilities?.macos_transcription && h('p', { role: 'status', style: muted }, data.capabilities?.macos_detail || 'macOS transcription is unavailable on this machine.'),
-          backend === 'macos' && h('div', { style: { display: 'grid', gap: 8, paddingBottom: 12 } },
+          (backend === 'macos' || backend === 'native') && h('div', { style: { display: 'grid', gap: 8, paddingBottom: 12 } },
             h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Audio source'), h('select', { style: selectStyle, value: audioSource, disabled: data.listening, onChange: e => setAudioSource(e.target.value), 'aria-label': 'Audio source' },
               h('option', { value: 'microphone' }, 'Microphone'), h('option', { value: 'system' }, 'System audio'), h('option', { value: 'both' }, 'Microphone + system audio'))),
-            h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Transcription provider'), h('select', { style: selectStyle, value: transcriptionProvider, disabled: data.listening, onChange: e => setTranscriptionProvider(e.target.value), 'aria-label': 'Transcription provider' },
+            backend === 'macos' && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Transcription provider'), h('select', { style: selectStyle, value: transcriptionProvider, disabled: data.listening, onChange: e => setTranscriptionProvider(e.target.value), 'aria-label': 'Transcription provider' },
               h('option', { value: 'local' }, 'Local — faster-whisper on this Mac'),
               h('option', { value: 'meta', disabled: !data.capabilities?.meta_asr, title: data.capabilities?.meta_asr ? '' : 'Set the Meta API key in Hermes Settings → Plugins → meeting-copilot-live, then reopen this pane.' }, 'Meta Muse Voice — cloud transcription'))),
-            transcriptionProvider === 'local' && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Local transcription model'), h('select', { style: selectStyle, value: transcriptionModel, disabled: data.listening, onChange: e => setTranscriptionModel(e.target.value), 'aria-label': 'Local transcription model' },
+            (backend === 'native' || transcriptionProvider === 'local') && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Local transcription model'), h('select', { style: selectStyle, value: transcriptionModel, disabled: data.listening, onChange: e => setTranscriptionModel(e.target.value), 'aria-label': 'Local transcription model' },
               h('option', { value: 'tiny.en' }, 'Whisper tiny.en — fastest'), h('option', { value: 'base.en' }, 'Whisper base.en — balanced'), h('option', { value: 'small.en' }, 'Whisper small.en — higher accuracy'))),
-            transcriptionProvider === 'local' && h('span', { style: muted }, 'Runs on this Mac without Meetily. First use may download the model. Microphone or screen and system audio permission is required.'),
-            transcriptionProvider === 'meta' && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Meta ASR mode'), h('select', { style: selectStyle, value: asrMode, disabled: data.listening, onChange: e => setAsrMode(e.target.value), 'aria-label': 'Meta ASR mode' },
+            backend === 'native' && h('span', { style: muted }, 'Local transcription uses the default microphone and all audio on the default output, according to Audio source. First Start may download Whisper weights. ', data.capabilities?.windows_detail || 'Experimental; hardware is unverified.'),
+            backend === 'macos' && transcriptionProvider === 'local' && h('span', { style: muted }, 'Runs on this Mac without Meetily. First use may download the model. Microphone or screen and system audio permission is required.'),
+            backend === 'macos' && transcriptionProvider === 'meta' && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Meta ASR mode'), h('select', { style: selectStyle, value: asrMode, disabled: data.listening, onChange: e => setAsrMode(e.target.value), 'aria-label': 'Meta ASR mode' },
               h('option', { value: 'ENDPOINTING' }, 'Endpointing — one segment per utterance'),
               h('option', { value: 'DIARIZATION' }, 'Diarization — speaker labels per source'),
               h('option', { value: 'PUSH_TO_TALK' }, 'Push-to-talk — single-turn finals'))),
-            transcriptionProvider === 'meta' && h('span', { role: 'status', style: muted }, 'Cloud transcription: meeting audio is sent to Meta (muse-voice-transcribe) while listening. Only final turns are kept; the API key stays on the gateway and is never shown here.')),
+            backend === 'macos' && transcriptionProvider === 'meta' && h('span', { role: 'status', style: muted }, 'Cloud transcription: meeting audio is sent to Meta (muse-voice-transcribe) while listening. Only final turns are kept; the API key stays on the gateway and is never shown here.')),
           backend === 'meetily' && h('div', { style: { display: 'grid', gap: 8, paddingBottom: 12 } },
             h('span', { style: muted }, 'Start recording in Meetily, then select it here. Only the selected transcript is read.'),
             h('label', { style: { display: 'grid', gap: 6 } }, h('span', { id: 'mc-rec-label' }, 'Active Meetily recording'),

@@ -3,6 +3,7 @@
 Meeting Copilot has three separate setup tasks: install the plugin, configure an
 answer provider, and prepare a transcript source if you need meeting audio.
 Begin with a synthetic document question before testing a meeting.
+For native Windows, follow the [Windows setup guide](windows-setup.md).
 
 ## Install the published source
 

@@ -239,7 +239,7 @@ class MeetingState:
                 else:
                     import importlib
                     module = importlib.import_module(f'{__package__}.audio' if __package__ else 'audio')
-                    self.audio = module.AudioCapture()
+                    self.audio = module.AudioCapture(model_size=transcription_model, source=audio_source)
                 self.audio_options = options
             return self.audio
 
@@ -1682,6 +1682,9 @@ class MeetingState:
             overlay_available = self._overlay_capability_available(overlay, overlay_status)
             import sys as _sys_cap
             macos_ready = _sys_cap.platform == 'darwin' and self._macos_runtime_ready()
+            import importlib
+            audio_module = importlib.import_module(f'{__package__}.audio' if __package__ else 'audio')
+            windows = audio_module.windows_readiness()
             return {'listening': self.listening, 'stopping': self.pending_stop is not None,
                     'stop_confirmed': not self.listening and self.pending_stop is None,
                     'stop_attempts': self.stop_attempts,
@@ -1706,6 +1709,8 @@ class MeetingState:
                     'capabilities': {'all_projects': True, 'automatic_web_fallback': True, 'independent_models': True, 'history_opt_out': True,
                                      'meta_asr': _meta_key_present(),
                                      'macos_transcription': bool(macos_ready),
+                                     'windows_transcription': windows['ready'],
+                                     'windows_detail': windows['detail'],
                                      'overlay': overlay_available, 'overlay_answers': False,
                                      'overlay_stream': False, 'overlay_cancel': False,
                                      'macos_detail': self._macos_capability_detail(macos_ready)}}
