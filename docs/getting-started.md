@@ -18,8 +18,8 @@ Run **Open Meeting Copilot** from the command palette. Desktop settings labels
 may vary by Hermes version. Find this plugin's settings rather than entering
 credentials into the Copilot pane.
 
-The manifest declares `fastapi>=0.115,<1`; Hermes resolves it under its core
-constraints. Doctor checks registration and setup. It does not test your API
+The manifest declares FastAPI plus Windows-only NumPy, SoundCard and
+faster-whisper dependencies; Hermes resolves them under its core constraints. Doctor checks registration and setup. It does not test your API
 account, audio devices, or meeting accuracy. Catalog admission is a separate
 process; see [catalog preflight](catalog-readiness.md).
 

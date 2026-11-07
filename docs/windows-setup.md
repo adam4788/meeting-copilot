@@ -59,12 +59,16 @@ opening devices, downloading models or testing recording permissions. Missing
 optional packages disable Windows Start in the pane, while answers remain usable.
 Metadata presence alone does not prove the native libraries or hardware work.
 
-`requirements-audio.txt` declares NumPy, SoundCard and faster-whisper. They are
-optional, not automatically installed by the core plugin. The native fallback
-runs in the gateway interpreter, so installing them in an unrelated development
-venv will not enable Desktop capture. Have the Hermes runtime owner prepare these
-through its supported dependency workflow while idle. Do not patch an active
-managed environment with an arbitrary pip command.
+This local revision declares NumPy, SoundCard and faster-whisper as Windows-only
+plugin dependencies. Hermes prepares them through its managed dependency resolver
+when installing/enabling this revision; macOS/Linux do not acquire this Windows
+stack. They are not in the older published pin above. Installing them in an
+unrelated development venv will not enable Desktop capture. A running gateway
+keeps its original dependency environment until an idle restart. Finish active
+work before restarting and recheck readiness afterward. Do not patch the active
+managed environment with an arbitrary pip command. Dependency preparation can
+require a download; Whisper model weights are still fetched only at explicit
+warmup/Start. Review the actual dependency and scanner prompts.
 
 When dependencies and recording permissions have been separately verified, choose
 **Transcript source → Capture source → Windows — experimental**. The Windows

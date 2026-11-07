@@ -6,6 +6,9 @@ description: Read-only live meeting answers grounded in project files and past s
 requires_hermes: ">=0.22.7"
 python_dependencies:
   - "fastapi>=0.115,<1"
+  - "numpy>=1.26,<3; sys_platform == 'win32'"
+  - "SoundCard>=0.4.5,<1; sys_platform == 'win32'"
+  - "faster-whisper>=1.2,<2; sys_platform == 'win32'"
 provides_tools: []
 provides_hooks: []
 config_schema:

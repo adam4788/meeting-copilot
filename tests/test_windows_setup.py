@@ -7,6 +7,15 @@ import server
 
 
 class WindowsSetupTests(unittest.TestCase):
+    def test_windows_audio_dependencies_are_declared_with_platform_markers(self):
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1]
+        manifest = (root / 'plugin.yaml').read_text(encoding='utf-8')
+        audio_requirements = (root / 'requirements-audio.txt').read_text().splitlines()
+        for requirement in audio_requirements:
+            if requirement.strip() and not requirement.startswith('#'):
+                self.assertIn('  - "' + requirement + "; sys_platform == 'win32'\"", manifest)
+
     def test_readiness_checks_metadata_without_importing_audio_packages(self):
         seen = []
         def find(name):
