@@ -75,3 +75,14 @@ Generated hero art is conceptual project artwork, not an actual Hermes screen
 or a verified feature demonstration. Product screenshots, if added, must come
 from an observed interface with synthetic data and identify platform and revision.
 Do not substitute generated UI for a real screenshot.
+
+## Recent-context quick actions
+
+After fictional transcript text appears, **Catch me up**, **Extract actions**,
+and **Suggest a question** each send one explicit request through the selected
+BYOK provider/model and current source settings. They never run automatically.
+Keep past sessions excluded and web fallback off for a narrow-context test.
+The actions use a bounded recent transcript, not the whole meeting: older
+segments may be missing. Review decisions, owners and deadlines against what was
+actually said. Unstated details must remain unspecified. Cancellation and retry
+use the same controls as an ordinary answer; nothing is posted or spoken.

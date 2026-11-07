@@ -646,6 +646,13 @@ export default {
       const restartCapture = !data.listening && !data.stopping;
       const captureBlocked = overlayNeedsHide || cloudUnavailable || windowsUnavailable || !consent || (backend === 'meetily' && !recording)
         || (backend === 'macos' && !data.capabilities?.macos_transcription);
+      const hasRecentTranscript = Array.isArray(data.segments) && data.segments.slice(-40)
+        .some(segment => typeof segment?.text === 'string' && segment.text.trim());
+      const contextActions = [
+        ['Catch me up', 'Summarize only the recent available meeting transcript. Use sections: Summary, Decisions, Open questions. Distinguish tentative proposals from confirmed decisions. Say when the transcript does not establish something; do not imply this covers the whole meeting.'],
+        ['Extract actions', 'Extract action items only from the recent available meeting transcript. For each item show Action, Owner, Deadline. Include an owner or deadline only if explicitly stated; otherwise write unspecified. Distinguish proposed actions from agreed commitments. If none are stated, say so.'],
+        ['Suggest a question', 'Suggest one useful clarifying question grounded in the recent available meeting transcript, followed by one short reason to ask it. Do not invent facts, decisions, or commitments. If context is insufficient, say so.'],
+      ];
       return h('div', { style: { padding: 16, display: 'flex', flexDirection: 'column', gap: 14, height: '100%', minWidth: 0, width: '100%', boxSizing: 'border-box', overflowY: 'auto', overflowX: 'hidden', overflowWrap: 'anywhere', color: 'var(--ui-text-primary)' } },
         h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
           h('strong', { style: { fontSize: 17 } }, 'Meeting Copilot'),
@@ -756,6 +763,16 @@ export default {
             h('span', { style: muted }, 'Meetily saves its own recordings and transcripts. Pausing here detaches the copilot; it does not stop the Meetily recording.'))),
         h('label', { ref: composerRef, style: { display: 'grid', gap: 6 } }, h('strong', { id: 'mc-q-label' }, 'What should I say?'),
           h(Textarea, { value: question, maxLength: 4000, onChange: e => setQuestion(e.target.value.slice(0, 4000)), placeholder: 'Leave blank to answer the latest question, or type a question… (⌘/Ctrl+Enter to send)', rows: 3, 'aria-labelledby': 'mc-q-label', onKeyDown: e => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !e.repeat && !e.nativeEvent?.isComposing && !busy && !unsupported) { e.preventDefault(); assistNow(); } } })),
+        h('section', { 'aria-label': 'Recent meeting quick actions', style: { display: 'grid', gap: 8 } },
+          h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
+            ...contextActions.map(([label, prompt]) => h(Button, { key: label, variant: 'secondary',
+              disabled: !hasRecentTranscript || answerBlocked || unsupported,
+              title: 'Sends an explicit request to your selected answer model using recent available context',
+              onClick: () => { if (!hasRecentTranscript) return; return assistNow({}, prompt); } }, label))),
+          h('p', { style: { ...muted, margin: 0 }, 'data-recent-context-disclosure': true },
+            'Each action sends a request to your selected model using recent available transcript and your selected source settings, not the whole meeting. Review the result; missing owners or deadlines remain unspecified.'),
+          !hasRecentTranscript && h('p', { style: { ...muted, margin: 0 }, role: 'status' },
+            'Quick actions become available after transcript text arrives. You can still type a project question above.')),
         ...(unsupported ? [h('p', { role: 'alert', style: muted }, `Suggest is unavailable: ${unsupportedReasons.join(' ')} See Answer setup below, then restart the gateway when other sessions are idle.`)] : []),
         excludeHistory && !unsupported && h('p', { role: 'status', style: muted, 'data-history-excluded': true }, 'Past sessions and web search are excluded. Only the selected project is searched.'),
         h('p', { style: { ...muted, margin: 0 } }, 'Your question, part of the transcript and selected source snippets may be sent to the answer model.'),

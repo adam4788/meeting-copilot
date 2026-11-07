@@ -2068,3 +2068,84 @@ test('accepted assist with failed refresh is not reported as failed', async () =
   assert.ok(!nodes(after).some(n => n.type === 'button' && n.children.includes('Retry')), 'no Retry for an accepted request');
   assert.ok(nodes(after).some(n => n.type === 'button' && n.children.includes('Cancel answer')), 'accepted request stays tracked');
 });
+
+const contextLabels = ['Catch me up', 'Extract actions', 'Suggest a question'];
+const contextStatus = { segments: [{ speaker: 'you', text: 'The sample review moved to Monday.' }] };
+
+test('recent-context actions make no automatic calls and preserve explicit BYOK scope', async () => {
+  for (const label of contextLabels) {
+    const ui = pane('/projects/alpha', true, false, 'unused public query', { 12: 'openai', 13: 'gpt-test' }, {}, contextStatus);
+    assert.equal(ui.requests.length, 0);
+    assert.match(JSON.stringify(disclosedNodes(ui.tree)), /not the whole meeting/);
+    const action = button(ui.tree, label);
+    assert.equal(action.props.disabled, false);
+    await action.props.onClick();
+    const requests = ui.requests.filter(r => r.path === '/assist');
+    assert.equal(requests.length, 1);
+    const body = requests[0].body;
+    assert.equal(body.answer_provider, 'openai');
+    assert.equal(body.answer_model, 'gpt-test');
+    assert.equal(body.project, '/projects/alpha');
+    assert.equal(body.all_projects, false);
+    assert.equal(body.web_fallback, false);
+    assert.equal(body.web_query, undefined, 'typed web query is not automatically used');
+    assert.equal(body.response_contract, 'answer-admission-v1');
+    assert.match(body.question, /recent available meeting transcript/);
+    if (label === 'Extract actions') {
+      assert.match(body.question, /explicitly stated; otherwise write unspecified/);
+      assert.match(body.question, /proposed actions from agreed commitments/);
+    }
+    const composer = nodes(ui.rerender()).find(n => n.type === 'textarea');
+    assert.equal(composer.props.value, body.question, 'user sees the prompt that was sent');
+  }
+});
+
+test('quick actions preserve excluded-history or explicitly enabled web scope without weakening either', async () => {
+  for (const historyExcluded of [true, false]) {
+    const ui = pane('/projects/alpha', true, false, '', {}, {}, contextStatus);
+    nodes(ui.tree).find(n => n.props['aria-label'] === 'Exclude past sessions').props.onChange({ target: { checked: historyExcluded } });
+    nodes(ui.tree).find(n => n.props['aria-label'] === 'Automatic web fallback').props.onChange({ target: { checked: !historyExcluded } });
+    await button(ui.rerender(), 'Catch me up').props.onClick();
+    const body = ui.requests.find(r => r.path === '/assist').body;
+    assert.equal(body.include_history, historyExcluded ? false : undefined);
+    assert.equal(body.web_fallback, !historyExcluded);
+  }
+  const ui = pane('/projects/alpha', true, false, '', {}, {}, contextStatus);
+  for (const label of ['Exclude past sessions', 'Automatic web fallback'])
+    nodes(ui.tree).find(n => n.props['aria-label'] === label).props.onChange({ target: { checked: true } });
+  const action = button(ui.rerender(), 'Catch me up');
+  assert.equal(action.props.disabled, true, 'incompatible privacy choices still fail closed');
+  await action.props.onClick();
+  assert.equal(ui.requests.filter(r => r.path === '/assist').length, 0);
+});
+
+test('quick actions fail closed without transcript, while busy, or without model support', async () => {
+  const cases = [
+    { status: {} },
+    { status: { segments: [{ text: '   ' }] } },
+    { status: { ...contextStatus, busy: true } },
+    { status: contextStatus, supported: false },
+    { status: contextStatus, settings: { 12: 'unavailable', 13: 'model' } },
+  ];
+  for (const c of cases) {
+    const ui = pane('', c.supported !== false, false, '', c.settings || {}, {}, c.status);
+    for (const label of contextLabels) {
+      const action = button(ui.tree, label);
+      assert.equal(action.props.disabled, true);
+      await action.props.onClick(); // stale/programmatic callback must also be fenced
+    }
+    assert.equal(ui.requests.filter(r => r.path === '/assist').length, 0);
+  }
+});
+
+test('quick action double click cannot submit twice while admission is pending', async () => {
+  let release;
+  const admission = new Promise(resolve => { release = resolve; });
+  const ui = pane('', true, false, '', {}, { '/assist': () => admission }, contextStatus);
+  const action = button(ui.tree, 'Catch me up');
+  const first = action.props.onClick();
+  await button(ui.tree, 'Extract actions').props.onClick();
+  assert.equal(ui.requests.filter(r => r.path === '/assist').length, 1);
+  release({ request_id: 'quick-action', status: 'queued' });
+  await first;
+});
