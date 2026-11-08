@@ -679,6 +679,26 @@ test('host unload releases a claim that completes after disposal', async () => {
   ui.unmount(); ui.unmountSettings();
 });
 
+test('host unload fences an in-flight Restart before its release completes', async () => {
+  let finishRelease;
+  const release = new Promise(resolve => { finishRelease = resolve; });
+  const ui = pane('/projects/alpha', true, false, '', {}, { '/overlay/release': () => release }, {},
+    { setInterval: () => 0, clearInterval: () => {} }, { effects: true, settingsHost: true });
+  await new Promise(resolve => setImmediate(resolve));
+  const original = ui.contributions.find(item => item.area === 'panes');
+  const restart = ui.contributions.find(item => item.id === 'restart').data.run;
+  const pending = restart();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(ui.requests.filter(r => r.path === '/overlay/release').length, 1);
+  ui.hostUnload();
+  finishRelease({ accepted: true, stop_confirmed: true, overlay_stop_confirmed: true });
+  await pending;
+  assert.equal(ui.contributions.find(item => item.area === 'panes'), original, 'old Restart must not register a replacement');
+  assert.equal(ui.revealed.length, 0, 'old Restart must not reveal a replacement');
+  assert.equal(ui.requests.filter(r => r.path === '/overlay/release').length, 1);
+  ui.unmount(); ui.unmountSettings();
+});
+
 test('settings host registers Meeting Copilot in Settings → Plugins', () => {
   const ui = pane('/projects/alpha', true, false, '', {}, {}, {}, {}, { settingsHost: true });
   const page = ui.contributions.find(c => c.area === 'settings.plugins');
