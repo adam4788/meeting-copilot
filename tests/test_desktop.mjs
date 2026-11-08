@@ -2174,6 +2174,7 @@ test('evidence export copies only displayed answer and bounded indexed excerpts 
   assert.match(copies[0], /\[2\] Second source/);
   assert.match(copies[0], /Reported model route: openai \/ chosen-model/);
   assert.match(copies[0], /Partial response/);
+  assert.match(copies[0], /not meeting segments or timestamps/);
   assert.match(copies[0], /Source updated \(not meeting time\): 1970-01-01T00:00:00.000Z/);
   assert.ok(copies[0].includes('x'.repeat(900)));
   assert.ok(!copies[0].includes('x'.repeat(901)));

@@ -20,7 +20,7 @@ function evidenceReport(result) {
   if (warnings.length) lines.push('', 'WARNINGS', ...warnings.slice(0, 30).map(w => text(w, 2000)));
   const sources = Array.isArray(result.sources) ? result.sources : [];
   lines.push('', 'EVIDENCE EXCERPTS',
-    'Numbering matches the answer pane. Excerpts are limited to 900 characters each.');
+    'Numbering matches retrieved sources in the answer pane, not meeting segments or timestamps. Excerpts are limited to 900 characters each.');
   if (!sources.length) lines.push('No retrieved source excerpts accompanied this answer.');
   for (const [i, source] of sources.slice(0, 100).entries()) {
     const s = source || {};

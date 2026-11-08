@@ -160,7 +160,8 @@ In the answer pane, **Copy answer + evidence** copies a plain-text report only
 when you confirm. It includes the displayed answer, reported model route,
 warnings, and numbered source excerpts (up to 900 characters per source), so
 colleagues can inspect the basis for a suggestion. Source-update dates are not
-meeting timestamps. It is not a complete transcript or independently verified
+meeting timestamps; source numbers identify retrieved documents, not meeting
+segments. It is not a complete transcript or independently verified
 meeting record. The copy does not send a new model request and excludes the
 retained request snapshot and live transcript. Review confidential snippets and
 links before sharing; clipboard history or device sync may retain the copy.
