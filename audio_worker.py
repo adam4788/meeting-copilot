@@ -22,6 +22,9 @@ MAX_FRAME = 100000
 CHUNK_SAMPLES = 64000  # Earliest utterance boundary, separately per source.
 MAX_CHUNK_SAMPLES = 192000  # Twelve-second bound for continuous speech.
 SILENCE_SAMPLES = 6400  # 400ms trailing silence; avoid cutting words at four seconds.
+# Keep helper retirement plus session drain within the macOS adapter's default
+# 2.5s graceful-stop window, leaving a margin for scheduling and publication.
+META_SESSION_DRAIN_TIMEOUT = .75
 
 
 def utterance_boundary(buffers, count):
@@ -80,7 +83,7 @@ def decode_frame(line):
     if not np.isfinite(samples).all():
         raise ValueError('PCM values')
     native_drops = item.get('native_dropped_chunks', item.get('dropped_chunks'))
-    native_drops = int(native_drops) if isinstance(native_drops, int) and native_drops > 0 else 0
+    native_drops = int(native_drops) if type(native_drops) is int and native_drops > 0 else 0
     return ('you' if item['source'] == 'microphone' else 'remote'), samples, float(stamp), native_drops
 
 
@@ -385,72 +388,231 @@ def run_capture_meta(source, mode, api_key, model_id, helper=None, stop=None):
     sources = {'microphone': 'you', 'system': 'remote'}
     active = sources if source == 'both' else {source: sources[source]}
     queues = {name: asyncio.Queue(maxsize=64) for name in active}
+    ended_queues = set()
+    stop_requested = asyncio.Event()
     native_lost = {'count': 0}
+    worker_lost = {'count': 0}
+    native_error = {'code': None}
+    schedule_lock = threading.Lock()
+    accepting = {'value': True}
+    watcher_done = threading.Event()
+    terminate_lock = threading.Lock()
+
+    def schedule(callback, *args):
+        # Seal scheduling before closing the loop. The lock linearizes the
+        # check with call_soon_threadsafe, including on a stuck reader.
+        with schedule_lock:
+            if not accepting['value']:
+                return False
+            try:
+                loop.call_soon_threadsafe(callback, *args)
+            except RuntimeError:  # The loop may already be closed.
+                return False
+            return True
+
+    def terminate_helper():
+        with terminate_lock:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+            except Exception:
+                pass
+
+    def report_loss():
+        # Compatibility total combines native frames and Meta worker chunks;
+        # the warning and separate fields preserve their distinct units.
+        try:
+            emit({'type': 'status', 'state': 'running',
+                  'dropped_chunks': native_lost['count'] + worker_lost['count'],
+                  'native_dropped_chunks': native_lost['count'],
+                  'worker_dropped_chunks': worker_lost['count'],
+                  'warning': (f"Transcription falling behind; worker dropped {worker_lost['count']} chunk(s), "
+                              f"native dropped {native_lost['count']} frame(s). Some words may be missing.")})
+        except Exception:
+            pass
+
+    def report_native_loss(value):
+        # A helper frame carries a delta, not a cumulative total. Never copy
+        # untrusted helper warning text into the pane or count a boolean as 1.
+        if type(value) is not int or value <= 0:
+            return
+        native_lost['count'] += value
+        report_loss()
+
+    def remember_native_error(code):
+        native_error['code'] = code
 
     def reader():
         try:
             for line in process.stdout:
                 try:
+                    if len(line) > MAX_FRAME or not line.endswith(b'\n'):
+                        continue
+                    header = json.loads(line)
+                    if not isinstance(header, dict):
+                        continue
+                    if header.get('type') in ('status', 'error'):
+                        if not schedule(report_native_loss, header.get('native_dropped_chunks', header.get('dropped_chunks'))):
+                            break
+                        if header.get('type') == 'error':
+                            code = header.get('code')
+                            allowed = ('microphone_usage', 'microphone_permission', 'system_permission', 'capture', 'protocol')
+                            if not isinstance(code, str) or code not in allowed:
+                                code = 'capture'
+                            schedule(remember_native_error, code)
+                            break
+                        continue
                     speaker, samples, stamp, drops = decode_frame(line)
                 except Exception:
                     continue
-                native_lost['count'] += drops
+                if not schedule(report_native_loss, drops):
+                    break
                 name = 'microphone' if speaker == 'you' else 'system'
                 if name not in queues:
                     continue
                 frame = meta_asr.resample_to_24k(samples)
-                loop.call_soon_threadsafe(_offer, queues[name], frame)
+                if not schedule(_offer, queues[name], frame):
+                    break
         except Exception:
             pass
         finally:
-            loop.call_soon_threadsafe(_end_queues, queues)
+            schedule(_end_queues, queues)
 
     def _offer(target, frame):
+        # All queue and counter operations run on the loop thread. EOF also
+        # needs room; evicting an audio frame for it is still a worker loss.
         if target.full():
             try:
-                target.get_nowait()
+                evicted = target.get_nowait()
+                if evicted is not None:
+                    worker_lost['count'] += 1
+                    report_loss()
             except asyncio.QueueEmpty:
                 pass
         target.put_nowait(frame)
 
     def _end_queues(targets):
-        for target in targets.values():
-            target.put_nowait(None)
+        for name, target in targets.items():
+            if name not in ended_queues:
+                ended_queues.add(name)
+                _offer(target, None)
 
     def watcher():
-        stop.wait()
+        while not watcher_done.is_set():
+            if stop.wait(.1):
+                if not watcher_done.is_set():
+                    terminate_helper()
+                    schedule(stop_requested.set)
+                return
+
+    reader_thread = threading.Thread(target=reader, daemon=True, name='meta-audio-reader')
+    reader_thread.start()
+    threading.Thread(target=watcher, daemon=True, name='meta-audio-watcher').start()
+
+    reader_incomplete = False
+    session_incomplete = False
+    early_session_exit = False
+    retired = False
+
+    async def retire_reader():
+        nonlocal reader_incomplete, retired
+        if retired:
+            return
+        watcher_done.set()
+        terminate_helper()
         try:
             if process.poll() is None:
-                process.terminate()
+                try:
+                    process.wait(timeout=.25)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=.25)
         except Exception:
             pass
-
-    threading.Thread(target=reader, daemon=True).start()
-    threading.Thread(target=watcher, daemon=True).start()
+        # Stop the helper before waiting for its final pipe frames. A stuck
+        # reader must not block exit; do not close its pipe while it is alive.
+        reader_thread.join(timeout=.75)
+        reader_incomplete = reader_thread.is_alive()
+        with schedule_lock:
+            accepting['value'] = False
+        # Every accepted callback precedes this barrier, including an EOF
+        # from the reader. No reader event can follow the eventual summary.
+        await asyncio.sleep(0)
+        _end_queues(queues)  # Idempotent; also unblocks a stuck-reader session.
+        retired = True
 
     async def main_async():
+        nonlocal session_incomplete, early_session_exit
         tasks = [asyncio.ensure_future(meta_asr.run_session(
             queues[name], emit, api_key, model_id, mode, label))
             for name, label in active.items()]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for result in results:
-            if isinstance(result, meta_asr.MetaAsrError):
-                raise result
+        stop_task = asyncio.ensure_future(stop_requested.wait())
+        try:
+            # A single failed/finished source or an explicit stop retires
+            # capture rather than waiting forever for another source's EOF.
+            await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
+            early_session_exit = any(task.done() and name not in ended_queues
+                                     for name, task in zip(active, tasks))
+            await retire_reader()
+            pending = {task for task in tasks if not task.done()}
+            if pending:
+                _, pending = await asyncio.wait(pending, timeout=META_SESSION_DRAIN_TIMEOUT)
+            if pending:
+                session_incomplete = True
+                for task in pending:
+                    task.cancel()
+                await asyncio.sleep(0)
+            errors = [task.exception() for task in tasks if task.done() and not task.cancelled()]
+            # Prefer the provider-specific error, but never turn another
+            # session exception into an apparently successful capture.
+            for error in errors:
+                if isinstance(error, meta_asr.MetaAsrError):
+                    raise error
+            for error in errors:
+                if error is not None:
+                    raise error
+        finally:
+            stop_task.cancel()
 
     try:
         loop.run_until_complete(main_async())
     finally:
         try:
-            if process.poll() is None:
-                process.terminate()
-                process.wait(timeout=.5)
-        except Exception:
-            pass
-        loop.close()
-    if native_lost['count']:
-        emit({'type': 'status', 'state': 'stopped', 'dropped_chunks': native_lost['count'],
-              'native_dropped_chunks': native_lost['count'],
-              'warning': f"Stopped with native {native_lost['count']} dropped frame(s); some words may be missing."})
+            loop.run_until_complete(retire_reader())
+            # Sessions may stop before consuming all queued audio. Count each
+            # abandoned frame once; a terminal sentinel is not audio.
+            for target in queues.values():
+                while not target.empty():
+                    if target.get_nowait() is not None:
+                        worker_lost['count'] += 1
+            if (native_lost['count'] or worker_lost['count'] or reader_incomplete
+                    or session_incomplete or early_session_exit):
+                warning = (f"Stopped with worker {worker_lost['count']} dropped chunk(s), "
+                           f"native {native_lost['count']} dropped frame(s); some words may be missing.")
+                if reader_incomplete:
+                    warning += ' Reader had not finished; tail accounting may be incomplete.'
+                if session_incomplete:
+                    warning += ' Transcription session drain was incomplete.'
+                if early_session_exit:
+                    warning += ' Transcription session ended before capture finished.'
+                emit({'type': 'status', 'state': 'stopped',
+                      'dropped_chunks': native_lost['count'] + worker_lost['count'],
+                      'native_dropped_chunks': native_lost['count'],
+                      'worker_dropped_chunks': worker_lost['count'],
+                      'reader_incomplete': reader_incomplete, 'warning': warning})
+            # The adapter stops reading after an error. Publish the terminal
+            # loss summary first so the user can still see missing audio.
+            if native_error['code']:
+                code = native_error['code']
+                emit({'type': 'error', 'code': code, 'message': error_message(code)})
+        finally:
+            loop.close()
+            if not reader_incomplete:
+                try:
+                    if process.stdout is not None:
+                        process.stdout.close()
+                except Exception:
+                    pass
 
 
 def _read_meta_worker_key(stream):

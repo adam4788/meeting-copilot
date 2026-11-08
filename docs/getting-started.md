@@ -30,13 +30,14 @@ verify the Desktop pane, a provider account, or native audio on your machine.
 
 ## Configure answers
 
-1. In Hermes plugin settings, open **meeting-copilot-live** for the default
-   profile. Enter an OpenAI or OpenRouter key in its matching secret field and
-   save. Never paste keys into chat, questions, or model fields.
-2. Reopen the pane after settings change. First finish active requests and pause
+1. In **Settings → Plugins → Meeting Copilot**, open the agent settings for the
+   default profile. Enter an OpenAI or OpenRouter key in its matching secret
+   field and save. Never paste keys into chat, questions, or model fields.
+2. Reopen the pane after changing keys. First finish active requests and pause
    capture; admitted requests retain their credential snapshots.
-3. Expand **Answer setup**, choose **Answer provider**, and enter the exact
-   **Answer model** ID your account supports.
+3. On the plugin settings page, choose **Answer provider** and enter the exact
+   **Answer model** ID your account supports. Older Desktop hosts without
+   plugin settings pages keep **Answer setup** in the pane.
 
 Keys, credits, and Chat Completions compatibility depend on the account. There
 is no account model discovery or automatic provider/model fallback. A saved key
@@ -47,8 +48,9 @@ unverified; see [BYOK boundaries](byok.md). The optional
 ## Choose project evidence
 
 Project discovery uses `MEETING_COPILOT_PROJECT_ROOT` when configured in the
-backend environment, otherwise `~/Documents/Projects`. Each project must be a
-direct child directory. For example:
+backend environment. Otherwise it uses `~/Documents/Projects`, falling back to
+`~/Projects` only when the first directory does not exist and the latter does.
+Each project must be a direct child directory. For example:
 
 ```text
 Projects/
@@ -61,10 +63,10 @@ are UTF-8 `.md`, `.txt`, and `.rst`; PDF, DOCX, and XLSX extraction is unavailab
 Hidden paths, symlinks, dependency trees, and common credential filenames are
 excluded. Filtering is best effort, so keep secrets out of searchable material.
 
-In **Answer setup**, select one project in **Search scope**, keep **Exclude past
-sessions** checked, leave **Automatic web fallback** off, and leave **Specific
-public web query** empty. A fresh pane excludes history and web; saved scope
-choices persist. **All projects + sessions** can include unrelated evidence.
+In the plugin settings, select one project in **Search scope**, keep **Exclude
+past sessions** checked, leave **Automatic web fallback** off, and leave any
+specific public web query empty. A fresh pane excludes history and web; saved
+scope choices persist. **All projects + sessions** can include unrelated evidence.
 
 If a project is missing, check the root and child-directory layout. An already
 running backend will not automatically pick up an environment change. Arrange

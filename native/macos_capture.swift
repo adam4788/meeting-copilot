@@ -9,6 +9,9 @@ import CoreGraphics
 
 private let writer = DispatchQueue(label: "meeting.audio.stdout")
 private let slots = DispatchSemaphore(value: 4)
+// The single startup status must not compete with real-time PCM. Its separate
+// slot keeps the queue bounded while preserving startup and loss reporting.
+private let controlSlots = DispatchSemaphore(value: 1)
 private let dropCounter = DispatchQueue(label: "meeting.audio.drops")
 private var droppedFrames = 0
 // Written only by the serial writer; read only after its shutdown barrier.
@@ -26,7 +29,8 @@ private func writerTiming() -> [String: Double] {
 // Drops are counted and the cumulative total rides on the next successful frame
 // so no loss point stays invisible to the transcriber.
 private func emit(_ object: [String: Any], critical: Bool = false) {
-    if slots.wait(timeout: .now()) != .success {
+    let selectedSlots = critical ? controlSlots : slots
+    if selectedSlots.wait(timeout: .now()) != .success {
         if critical { exit(2) }
         dropCounter.sync { droppedFrames += 1 }
         return
@@ -41,7 +45,7 @@ private func emit(_ object: [String: Any], critical: Bool = false) {
     writer.async { [payload, pending, enqueuedAt] in
         let beganAt = DispatchTime.now().uptimeNanoseconds
         maxQueueNs = max(maxQueueNs, beganAt - enqueuedAt)
-        defer { slots.signal() }
+        defer { selectedSlots.signal() }
         guard let data = try? JSONSerialization.data(withJSONObject: payload), data.count < 100000 else {
             // Never silently discard a loss report: re-queue it for the next frame.
             if pending > 0 { dropCounter.sync { droppedFrames += pending } }

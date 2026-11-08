@@ -12,6 +12,32 @@ import re
 import uuid
 
 
+def reference_warnings(answer, source_count, snapshot):
+    """Flag invalid identities, not factual support; never echo answer text."""
+    answer = answer if isinstance(answer, str) else ''
+    warnings = []
+    transcript_warning = (snapshot.citation_warning(answer) if snapshot is not None else
+                          'Answer transcript references are invalid; verify against the sent context.'
+                          if re.search(r'\[T\d+\]', answer) else None)
+    if transcript_warning:
+        warnings.append(transcript_warning)
+    refs = re.findall(r'\[(\d+)\]', answer)
+    def valid_ref(ref):
+        # Keep the accumulator bounded while preserving leading zeroes and
+        # Unicode decimal digits, even for a very long provider response.
+        number = 0
+        for digit in ref:
+            number = number * 10 + int(digit)
+            if number > source_count:
+                return False
+        return number >= 1
+    if (source_count and not refs) or any(not valid_ref(ref) for ref in refs):
+        warnings.append('Answer citations are missing or invalid; verify against the listed evidence.')
+    if not source_count:
+        warnings.append('No matching local/session evidence found; transcript alone is not independent verification.')
+    return warnings
+
+
 @dataclass(frozen=True)
 class Segment:
     ref: str

@@ -490,18 +490,32 @@ test('live capture error offers a status recheck, not a false restart label', as
 function pane(scope, supported = true, fallback = true, web = '', settings = {}, respond = {}, statusExtra = {}, browserGlobals = {}, qcBehavior = {}) {
   let registered;
   let stateIndex = 0;
-  const values = [];
+  let values = [];
+  const paneValues = values, settingsValues = [];
   const requests = [];
+  const queryOptions = [];
   const contributions = [];
   const revealed = [];
   const notices = [];
-  const effects = [];
+  let effects = [];
+  const paneEffects = effects, settingsEffects = [];
+  const delayedPaneEffects = [];
   let effectIndex = 0;
   let pendingEffects = [];
+  const scheduleEffect = (fn, deps) => {
+    if (!qcBehavior.effects) return;
+    const i = effectIndex++;
+    const old = effects[i];
+    if (!old || !deps || deps.some((value, j) => !Object.is(value, old.deps?.[j]))) {
+      pendingEffects.push(() => { old?.cleanup?.(); effects[i] = { deps, cleanup: fn() }; });
+    }
+  };
   let statusQuery;
   let visible = false;
   const visibility = { get: () => visible };
+  let preferenceAtom;
   const ctx = {
+    ...(qcBehavior.storage ? { storage: qcBehavior.storage } : {}),
     rest: async (path, options = {}) => {
       requests.push({ path, ...options });
       const defaults = { '/overlay/lifecycle': { revision: 0, epoch: 'backend-epoch' }, '/overlay/claim': { pane: 'test-pane' }, '/overlay/show': { shown: true, owner: 'test-owner' }, '/overlay/release': { accepted: true } };
@@ -524,39 +538,61 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
       };
     },
   };
+  if (qcBehavior.settingsHost) ctx.registerSettingsPage = page => {
+    if (qcBehavior.settingsHostThrows) throw new Error('unsupported settings host');
+    contributions.push({ ...page, area: 'settings.plugins', render: () => {
+      const previous = { values, effects, stateIndex, effectIndex, pendingEffects };
+      values = settingsValues; effects = settingsEffects; stateIndex = 0; effectIndex = 0; pendingEffects = [];
+      try { const tree = page.render(); for (const effect of pendingEffects) effect(); return tree; }
+      finally { ({ values, effects, stateIndex, effectIndex, pendingEffects } = previous); }
+    } });
+    return () => {};
+  };
   const h = (type, props, ...children) => typeof type === 'function'
     ? type(props || {}) : { type, props: props || {}, children: children.flat(Infinity) };
   const source = readFileSync(new URL('../desktop/plugin.js', import.meta.url), 'utf8')
     .replace(/^import .*;\r?\n/gm, '').replace('export default', 'const plugin =');
   const unregister = vm.runInNewContext(source + '\nplugin.register(ctx);', {
     ctx, h, crypto: webcrypto,
+    atom: initial => {
+      if (typeof initial !== 'object') { let value = initial; return { get: () => value, set: next => { value = next; } }; }
+      const overrides = qcBehavior.noSeedOverrides ? {} : { 0: scope, ...(qcBehavior.freshDefaults ? {} : { 12: 'openai', 13: 'gpt-test', 18: false }), ...settings };
+      let value = { ...initial, ...(Object.hasOwn(overrides, 0) ? { project: overrides[0] } : {}),
+        ...(Object.hasOwn(overrides, 9) ? { webFallback: overrides[9] } : {}),
+        ...(Object.hasOwn(overrides, 12) ? { answerProvider: overrides[12] } : {}),
+        ...(Object.hasOwn(overrides, 13) ? { answerModel: overrides[13] } : {}),
+        ...(Object.hasOwn(overrides, 18) ? { excludeHistory: overrides[18] } : {}) };
+      preferenceAtom = { get: () => value, set: next => { value = next; } };
+      return preferenceAtom;
+    },
     useState: initial => {
       const i = stateIndex++;
       if (!(i in values)) {
         const overrides = { 0: scope, 2: web, ...(qcBehavior.freshDefaults ? {} : {12:'openai',13:'gpt-test'}), ...settings };
-        // The history toggle is a new hook at index 18; preserve legacy test
-        // fixture indexes for the hooks that follow it.
-        const legacyIndex = i > 18 ? i - 1 : i;
-        values[i] = i === 18 ? (qcBehavior.freshDefaults ? initial : false) : Object.hasOwn(overrides, legacyIndex) ? overrides[legacyIndex] : initial === true ? fallback : initial;
+        // Answer preferences now live in a shared atom, not pane hook slots.
+        const indexes = [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 14, 15, 16, 17];
+        const legacyIndex = indexes[i] ?? i + 4;
+        values[i] = values === settingsValues ? initial : Object.hasOwn(overrides, legacyIndex) ? overrides[legacyIndex] : initial === true ? fallback : initial;
       }
-      return [values[i], v => { values[i] = typeof v === 'function' ? v(values[i]) : v; }];
+      const slots = values;
+      return [slots[i], v => { slots[i] = typeof v === 'function' ? v(slots[i]) : v; }];
     },
     useRef: initial => {
       const i = stateIndex++;
       if (!(i in values)) values[i] = { current: initial };
       return values[i];
     },
-    useEffect: (fn, deps) => {
-      if (!qcBehavior.effects) return;
-      const i = effectIndex++;
-      const old = effects[i];
-      if (!old || !deps || deps.some((value, j) => !Object.is(value, old.deps?.[j]))) {
-        pendingEffects.push(() => { old?.cleanup?.(); effects[i] = { deps, cleanup: fn() }; });
-      }
-    },
-    useQueryClient: () => ({ invalidateQueries: qcBehavior.failInvalidate ? async () => { throw new Error('invalidate failed'); } : async () => {} }),
-    useQuery: options => { if (options.queryKey[1] === 'status') statusQuery = options; return ({ error: options.queryKey[1] === 'status' ? qcBehavior.statusError : null, data: options.queryKey[1] === 'status'
-      ? { capabilities: supported ? { all_projects: true, automatic_web_fallback: true, independent_models: true, history_opt_out: true, macos_transcription: true, overlay: true, overlay_stream: true, overlay_cancel: true } : undefined, ...statusExtra }
+    useEffect: scheduleEffect,
+    useLayoutEffect: scheduleEffect,
+    useSyncExternalStore: (_subscribe, snapshot) => snapshot(),
+    useQueryClient: () => ({ invalidateQueries: qcBehavior.failInvalidate ? async () => { throw new Error('invalidate failed'); } : async () => {},
+      getQueryState: key => key[1] === 'status'
+        ? ({ error: qcBehavior.statusError, isPending: qcBehavior.statusPending, data: { overlay_shown: false, overlay_stop_confirmed: true, busy: false, requests: {}, capabilities: supported ? { all_projects: true, automatic_web_fallback: true, independent_models: true, history_opt_out: true, overlay: true } : undefined, ...statusExtra } })
+        : key[1] === 'projects' ? { data: [{ name: 'alpha', path: '/projects/alpha' }], status: 'success' }
+        : key[1] === 'models' ? { data: { providers: qcBehavior.providers ?? [{ id: 'openai', label: 'OpenAI API', models: [], custom_model: true, configured: true, status: 'Key available; connection and model unverified' }] }, status: 'success' }
+        : undefined }),
+    useQuery: options => { queryOptions.push(options); if (options.queryKey[1] === 'status' && options.enabled !== false) statusQuery = options; return ({ error: options.queryKey[1] === 'status' ? qcBehavior.statusError : null, data: options.queryKey[1] === 'status'
+      ? { overlay_shown: false, overlay_stop_confirmed: true, busy: false, requests: {}, capabilities: supported ? { all_projects: true, automatic_web_fallback: true, independent_models: true, history_opt_out: true, macos_transcription: true, overlay: true, overlay_stream: true, overlay_cancel: true } : undefined, ...statusExtra }
       : options.queryKey[1] === 'projects' ? [{ name: 'alpha', path: '/projects/alpha' }]
       : options.queryKey[1] === 'models' ? { providers: qcBehavior.providers ?? [{ id: 'openai', label: 'OpenAI API', models: [], custom_model: true, configured: true, status: 'Key available; connection and model unverified' }] } : [] }); },
     useValue: atom => atom.get(),
@@ -566,14 +602,446 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
   const render = () => {
     stateIndex = 0; effectIndex = 0; pendingEffects = [];
     const tree = registered.render();
-    for (const effect of pendingEffects) effect();
+    if (qcBehavior.delayPaneEffects) delayedPaneEffects.push(...pendingEffects);
+    else for (const effect of pendingEffects) effect();
     return tree;
   };
-  return { tree: render(), rerender: render, requests, contributions, revealed, notices, unregister,
+  return { tree: qcBehavior.skipInitialPane ? null : render(), rerender: render, requests, queryOptions, contributions, revealed, notices, unregister,
+    forcePreferences: patch => preferenceAtom.set({ ...preferenceAtom.get(), ...patch }),
+    flushPaneEffects: () => { qcBehavior.delayPaneEffects = false; for (const effect of delayedPaneEffects.splice(0)) effect(); },
     pollStatus: () => statusQuery.queryFn(),
-    unmount: () => { for (const effect of effects) effect?.cleanup?.(); },
+    unmountSettings: () => { for (const effect of settingsEffects) effect?.cleanup?.(); },
+    unmount: () => { for (const effect of paneEffects) effect?.cleanup?.(); },
     replayEffects: () => { for (const effect of effects) effect?.cleanup?.(); effects.length = 0; return render(); } };
 }
+test('settings host registers Meeting Copilot in Settings → Plugins', () => {
+  const ui = pane('/projects/alpha', true, false, '', {}, {}, {}, {}, { settingsHost: true });
+  const page = ui.contributions.find(c => c.area === 'settings.plugins');
+  assert.ok(page, 'registerSettingsPage must contribute a native settings page');
+  assert.equal(page.title, 'Meeting Copilot');
+  assert.equal(typeof page.render, 'function');
+});
+
+test('settings fields contain padding and border within their available width', () => {
+  const ui = pane('/projects/alpha', true, false, '', {}, {}, {}, {}, { settingsHost: true });
+  let page = ui.contributions.find(c => c.area === 'settings.plugins').render();
+  const provider = nodes(page).find(n => n.props['aria-labelledby'] === 'mc-provider-label');
+  provider.props.onChange({ target: { value: 'openai' } });
+  page = ui.contributions.find(c => c.area === 'settings.plugins').render();
+  const model = nodes(page).find(n => n.props['aria-label'] === 'Answer model');
+  assert.ok(model);
+  assert.equal(model.props.style.boxSizing, 'border-box');
+});
+
+test('native settings move answer preferences and propagate changes to an open pane', async () => {
+  const ui = pane('/projects/alpha', true, false, '', {}, {}, {}, {}, { settingsHost: true });
+  const page = ui.contributions.find(c => c.area === 'settings.plugins');
+  assert.ok(page, 'native settings page is available');
+  let settings = page.render();
+  assert.ok(nodes(settings).some(n => n.props['aria-labelledby'] === 'mc-scope-label'));
+  assert.ok(nodes(settings).some(n => n.props['aria-label'] === 'Exclude past sessions'));
+  assert.ok(nodes(settings).some(n => n.props['aria-labelledby'] === 'mc-provider-label'));
+  assert.ok(fallbackControl(settings));
+  assert.doesNotMatch(JSON.stringify(ui.tree), /Bring your own API key/);
+  assert.equal(nodes(ui.tree).some(n => n.props['aria-labelledby'] === 'mc-scope-label'), false);
+  assert.ok(nodes(ui.tree).some(n => n.props['aria-label'] === 'Capture session'));
+  assert.ok(button(ui.tree, 'Show overlay'));
+  assert.ok(button(ui.tree, 'Suggest answer'));
+  assert.equal(nodes(ui.tree).some(n => n.props['aria-label'] === 'Specific public web query'), false);
+  assert.ok(nodes(settings).some(n => n.props['aria-label'] === 'Specific public web query'));
+  fallbackControl(settings).props.onChange({ target: { checked: true } });
+  const paneAfter = ui.rerender();
+  assert.ok(disclosedNodes(paneAfter).some(n => n.props['data-web-fallback-disclosure']));
+  assert.equal(ui.requests.some(r => ['/assist', '/start', '/overlay/show'].includes(r.path)), false);
+  await button(paneAfter, 'Suggest answer').props.onClick();
+  assert.equal(ui.requests.find(r => r.path === '/assist').body.web_fallback, true);
+});
+
+test('explicit web search is gated by history-exclusion privacy with visible guidance', async () => {
+  const ui = pane('/projects/alpha', true, false, '', {}, { '/assist': { request_id: 'web-privacy' } }, {},
+    { setInterval: () => 0, clearInterval: () => {} }, { settingsHost: true, effects: true });
+  ui.forcePreferences({ excludeHistory: true });
+  ui.rerender();
+  const page = ui.contributions.find(c => c.area === 'settings.plugins');
+  let tree = page.render();
+  nodes(tree).find(n => n.props['aria-label'] === 'Specific public web query').props.onChange({ target: { value: 'public documentation' } });
+  tree = page.render();
+  const action = button(tree, 'Check sources + web');
+  assert.equal(action.props.disabled, true, 'explicit web cannot bypass excluded-history privacy');
+  assert.match(JSON.stringify(tree), /Turn off Exclude past sessions/i);
+  await action.props.onClick();
+  assert.equal(ui.requests.some(r => r.path === '/assist'), false);
+  ui.forcePreferences({ excludeHistory: false });
+  ui.rerender();
+  tree = page.render();
+  assert.equal(button(tree, 'Check sources + web').props.disabled, false);
+  await button(tree, 'Check sources + web').props.onClick();
+  assert.equal(ui.requests.find(r => r.path === '/assist').body.web_query, 'public documentation');
+  ui.unmount(); ui.unmountSettings();
+});
+
+test('settings web action uses the current question from the pane, not an old render', async () => {
+  const ui = pane('/projects/alpha', true, false, '', {}, { '/assist': { request_id: 'fresh-question' } }, {},
+    { setInterval: () => 0, clearInterval: () => {} }, { settingsHost: true, effects: true });
+  const composer = nodes(ui.tree).find(n => n.props['aria-labelledby'] === 'mc-q-label');
+  composer.props.onChange({ target: { value: 'Current synthetic question?' } });
+  ui.rerender();
+  const page = ui.contributions.find(c => c.area === 'settings.plugins');
+  let tree = page.render();
+  nodes(tree).find(n => n.props['aria-label'] === 'Specific public web query').props.onChange({ target: { value: 'public documentation' } });
+  tree = page.render();
+  await button(tree, 'Check sources + web').props.onClick();
+  assert.equal(ui.requests.find(r => r.path === '/assist').body.question, 'Current synthetic question?');
+  ui.unmount(); ui.unmountSettings();
+});
+
+test('settings public query explicitly uses the current pane and cannot outlive it', async () => {
+  const ui = pane('/projects/alpha', true, false, '', {}, { '/assist': { request_id: 'web-1' } }, {},
+    { setInterval: () => 0, clearInterval: () => {} }, { settingsHost: true, effects: true });
+  const page = ui.contributions.find(c => c.area === 'settings.plugins');
+  let settings = page.render();
+  const input = nodes(settings).find(n => n.props['aria-label'] === 'Specific public web query');
+  assert.ok(input, 'public query is in Settings');
+  input.props.onChange({ target: { value: 'public documentation' } });
+  assert.equal(ui.requests.some(r => r.path === '/assist'), false, 'typing never sends');
+  settings = page.render();
+  const submit = button(settings, 'Check sources + web');
+  assert.equal(submit.props.disabled, false);
+  await submit.props.onClick();
+  assert.equal(ui.requests.find(r => r.path === '/assist').body.web_query, 'public documentation');
+  ui.unmount();
+  await submit.props.onClick();
+  assert.equal(ui.requests.filter(r => r.path === '/assist').length, 1, 'retired pane cannot be used');
+  ui.unmountSettings();
+});
+
+function settingsStore() {
+  const map = new Map();
+  return { map, get: (key, fallback) => map.has(key) ? map.get(key) : fallback,
+    set: (key, value) => map.set(key, JSON.parse(JSON.stringify(value))) };
+}
+const settingsPage = ui => ui.contributions.find(c => c.area === 'settings.plugins');
+const settingNode = (tree, label) => nodes(tree).find(n => n.props['aria-label'] === label || n.props['aria-labelledby'] === label);
+
+test('confirmed external overlay shutdown unlocks settings without replaying a show', async () => {
+  const ui = pane('/projects/alpha', true, false, '', {}, {
+    '/status': { overlay_shown: false, overlay_stop_confirmed: true, busy: false, requests: {} },
+  }, {}, { setInterval: () => 0, clearInterval: () => {} }, { settingsHost: true, effects: true });
+  await button(ui.tree, 'Show overlay').props.onClick();
+  assert.equal(settingNode(settingsPage(ui).render(), 'mc-scope-label').props.disabled, true);
+  await ui.pollStatus();
+  assert.equal(settingNode(settingsPage(ui).render(), 'mc-scope-label').props.disabled, false);
+  assert.equal(ui.requests.filter(r => r.path === '/overlay/show').length, 1);
+  ui.unmount(); ui.unmountSettings();
+});
+
+test('a status begun during an overlay show cannot unlock its newly shown overlay', async () => {
+  let finishShow, finishStatus;
+  const show = new Promise(resolve => { finishShow = resolve; });
+  const status = new Promise(resolve => { finishStatus = resolve; });
+  const ui = pane('/projects/alpha', true, false, '', {}, {
+    '/overlay/show': () => show, '/status': () => status,
+  }, {}, { setInterval: () => 0, clearInterval: () => {} }, { settingsHost: true, effects: true });
+  const showing = button(ui.tree, 'Show overlay').props.onClick();
+  await new Promise(resolve => setImmediate(resolve));
+  const stale = ui.pollStatus();
+  finishShow({ shown: true, owner: 'test-owner' });
+  await showing;
+  finishStatus({ overlay_shown: false, overlay_stop_confirmed: true, busy: false, requests: {} });
+  await stale;
+  assert.equal(settingNode(settingsPage(ui).render(), 'mc-scope-label').props.disabled, true);
+  ui.unmount(); ui.unmountSettings();
+});
+
+test('settings observes pane cache without registering a query that can revive capture', () => {
+  const ui = pane(undefined, true, false, '', {}, {}, {}, {},
+    { settingsHost: true, skipInitialPane: true, noSeedOverrides: true });
+  const before = ui.queryOptions.length;
+  settingsPage(ui).render();
+  assert.equal(ui.queryOptions.length, before, 'settings must not install a queryFn on pane-owned cache keys');
+  assert.equal(ui.requests.length, 0, 'settings alone never requests status');
+});
+
+test('settings without a mounted pane save deferred defaults without any backend query', async () => {
+  const storage = settingsStore();
+  const legacy = new Map([['meeting-copilot.scope.v2', JSON.stringify({ project: '/projects/old', answerProvider: 'openai', answerModel: 'old-model', excludeHistory: true,
+    transcriptionProvider: 'meta', transcriptionChoiceVersion: 1, secret: 'never-copy-secret', transcript: 'never-copy-transcript', consent: true, web: 'never-copy-query' })]]);
+  const globals = { localStorage: { getItem: k => legacy.get(k) || null, setItem: (k, v) => legacy.set(k, v) }, setInterval: () => 0, clearInterval: () => {} };
+  const ui = pane(undefined, true, false, '', {}, {}, {}, globals, { settingsHost: true, skipInitialPane: true, noSeedOverrides: true, storage, effects: true });
+  let tree = settingsPage(ui).render();
+  assert.match(JSON.stringify(tree), /defaults for the next pane/);
+  assert.ok(ui.queryOptions.every(q => q.enabled === false), 'settings only observes cached queries');
+  assert.equal(ui.requests.length, 0, 'no /status or other backend access before opening pane');
+  settingNode(tree, 'Project path').props.onChange({ target: { value: '/projects/alpha' } });
+  tree = settingsPage(ui).render();
+  settingNode(tree, 'mc-provider-label').props.onChange({ target: { value: 'openai' } });
+  tree = settingsPage(ui).render();
+  settingNode(tree, 'Answer model').props.onChange({ target: { value: 'gpt-test' } });
+  tree = settingsPage(ui).render();
+  fallbackControl(tree).props.onChange({ target: { checked: true } });
+  settingNode(tree, 'Specific public web query').props.onChange({ target: { value: 'not saved' } });
+  tree = settingsPage(ui).render();
+  assert.equal(button(tree, 'Check sources + web').props.disabled, true);
+  await button(tree, 'Check sources + web').props.onClick();
+  assert.equal(ui.requests.length, 0, 'editing and disabled actions do not contact backend');
+  const saved = storage.map.get('preferences-v1');
+  assert.equal(saved.project, '/projects/alpha');
+  assert.equal(saved.answerModel, 'gpt-test');
+  assert.equal(saved.webFallback, true);
+  assert.equal(saved.transcriptionProvider, 'meta');
+  assert.equal(saved.transcriptionChoiceVersion, 1, 'explicit cloud selection retains its provenance');
+  assert.doesNotMatch(JSON.stringify(saved), /never-copy|not saved/);
+  for (const key of ['secret', 'transcript', 'consent', 'web', 'web_query']) assert.equal(Object.hasOwn(saved, key), false);
+  const paneTree = ui.rerender();
+  assert.ok(disclosedNodes(paneTree).some(n => n.props['data-web-fallback-disclosure']));
+  assert.equal(ui.requests.some(r => ['/start', '/assist', '/overlay/show'].includes(r.path)), false);
+  ui.unmount(); ui.unmountSettings();
+  const restarted = pane(undefined, true, false, '', {}, {}, {}, globals, { settingsHost: true, skipInitialPane: true, noSeedOverrides: true, storage });
+  const restored = settingsPage(restarted).render();
+  assert.equal(settingNode(restored, 'Project path').props.value, '/projects/alpha');
+  assert.equal(settingNode(restored, 'Answer model').props.value, 'gpt-test');
+  assert.equal(fallbackControl(restored).props.checked, true);
+  assert.equal(settingNode(restored, 'Specific public web query').props.value, '');
+  assert.equal(restarted.requests.length, 0);
+});
+
+for (const bad of [{ overlay_shown: null }, { overlay_shown: true }, { overlay_shown: undefined }, { overlay_stop_confirmed: false }, { overlay_stop_confirmed: undefined }, { busy: true }, { busy: undefined }, { requests: { active: { status: 'running' } } }, { requests: undefined }, { overlay_cleanup_error: 'unconfirmed' }]) {
+  test(`settings fail closed for mounted pane state ${JSON.stringify(bad)}`, () => {
+    const state = {};
+    const storage = settingsStore();
+    const ui = pane('/projects/alpha', true, false, '', {}, {}, state, {}, { settingsHost: true, storage });
+    const page = settingsPage(ui), stale = page.render();
+    Object.assign(state, bad);
+    const locked = page.render();
+    for (const label of ['mc-scope-label', 'Exclude past sessions', 'mc-provider-label', 'Answer model']) assert.equal(settingNode(locked, label).props.disabled, true, label);
+    assert.equal(fallbackControl(locked).props.disabled, true);
+    assert.match(JSON.stringify(locked), /hide the overlay.*finish or cancel/i);
+    settingNode(stale, 'mc-scope-label').props.onChange({ target: { value: '__all_projects__' } });
+    settingNode(stale, 'Exclude past sessions').props.onChange({ target: { checked: true } });
+    settingNode(stale, 'mc-provider-label').props.onChange({ target: { value: 'openrouter' } });
+    settingNode(stale, 'Answer model').props.onChange({ target: { value: 'changed' } });
+    fallbackControl(stale).props.onChange({ target: { checked: true } });
+    assert.equal(storage.map.size, 0, 'stale handlers cannot save');
+    assert.equal(ui.requests.length, 0);
+  });
+}
+
+test('settings guard covers overlay Show and answer admission before status can catch up', async () => {
+  for (const action of ['Show overlay', 'Suggest answer']) {
+    let complete;
+    const path = action === 'Show overlay' ? '/overlay/show' : '/assist';
+    const ui = pane('/projects/alpha', true, false, '', {}, { [path]: () => new Promise(resolve => { complete = resolve; }) }, {},
+      { setInterval: () => 0, clearInterval: () => {} }, { settingsHost: true, effects: true });
+    const page = settingsPage(ui), stale = page.render();
+    const pending = button(ui.tree, action).props.onClick();
+    await settle();
+    assert.equal(typeof complete, 'function');
+    const locked = page.render();
+    assert.equal(settingNode(locked, 'mc-scope-label').props.disabled, true);
+    assert.equal(fallbackControl(locked).props.disabled, true);
+    settingNode(stale, 'mc-scope-label').props.onChange({ target: { value: '__all_projects__' } });
+    fallbackControl(stale).props.onChange({ target: { checked: true } });
+    assert.equal(settingNode(page.render(), 'mc-scope-label').props.value, '/projects/alpha');
+    assert.equal(fallbackControl(page.render()).props.checked, false);
+    complete(action === 'Show overlay' ? { shown: true, owner: 'owner' } : { request_id: 'running' });
+    await pending;
+    assert.equal(settingNode(page.render(), 'mc-scope-label').props.disabled, true, 'confirmed operation remains locked until idle evidence');
+    ui.unmount(); ui.unmountSettings();
+  }
+});
+
+test('an immediate pane click sends the newest scope, never a stale snapshot', async () => {
+  const ui = pane('/projects/alpha', true, false, '', {}, {}, {}, {}, { settingsHost: true });
+  const staleSuggest = button(ui.tree, 'Suggest answer');
+  const page = settingsPage(ui);
+  fallbackControl(page.render()).props.onChange({ target: { checked: true } });
+  await staleSuggest.props.onClick();
+  assert.equal(ui.requests.filter(r => r.path === '/assist').length, 1);
+  assert.equal(ui.requests.find(r => r.path === '/assist').body.web_fallback, true);
+});
+
+test('unavailable preference storage is disclosed instead of claiming defaults were saved', () => {
+  const storage = { get: (_key, fallback) => fallback, set: () => {} }; // host silently drops writes
+  const ui = pane(undefined, true, false, '', {}, {}, {}, {},
+    { settingsHost: true, skipInitialPane: true, noSeedOverrides: true, storage });
+  let tree = settingsPage(ui).render();
+  settingNode(tree, 'Project path').props.onChange({ target: { value: '/projects/session-only' } });
+  tree = settingsPage(ui).render();
+  assert.equal(settingNode(tree, 'Project path').props.value, '/projects/session-only');
+  assert.match(JSON.stringify(tree), /could not be saved.*session/i);
+  assert.ok(ui.notices.some(n => n.kind === 'warning' && /could not be saved/i.test(n.message)));
+});
+
+test('project migration and edits preserve ordinary names that contain token-like words', () => {
+  for (const project of ['/projects/tokenizer', '/projects/password-manager', '/projects/sk-learn']) {
+    const storage = settingsStore();
+    const legacy = new Map([['meeting-copilot.scope.v2', JSON.stringify({ project, answerProvider: 'openai', answerModel: 'tokenizer' })]]);
+    const ui = pane(undefined, true, false, '', {}, {}, {}, { localStorage: { getItem: k => legacy.get(k) || null } },
+      { settingsHost: true, skipInitialPane: true, noSeedOverrides: true, storage });
+    let tree = settingsPage(ui).render();
+    assert.equal(settingNode(tree, 'Project path').props.value, project);
+    assert.equal(settingNode(tree, 'Answer model').props.value, 'tokenizer');
+    settingNode(tree, 'Project path').props.onChange({ target: { value: project + '-new' } });
+    tree = settingsPage(ui).render();
+    assert.equal(settingNode(tree, 'Project path').props.value, project + '-new');
+    assert.equal(storage.map.get('preferences-v1').project, project + '-new');
+  }
+});
+
+test('secret-like model input and old accidental secrets are never persisted as preferences', () => {
+  const storage = settingsStore();
+  const legacy = new Map([['meeting-copilot.scope.v2', JSON.stringify({ answerProvider: 'openai', answerModel: 'sk-legacy-secret' })]]);
+  const ui = pane(undefined, true, false, '', {}, {}, {}, { localStorage: { getItem: k => legacy.get(k) || null } },
+    { settingsHost: true, skipInitialPane: true, noSeedOverrides: true, storage });
+  let tree = settingsPage(ui).render();
+  assert.equal(settingNode(tree, 'Answer model').props.value, '', 'do not migrate a credential mistaken for a model');
+  settingNode(tree, 'Answer model').props.onChange({ target: { value: 'sk-example-secret' } });
+  tree = settingsPage(ui).render();
+  assert.equal(settingNode(tree, 'Answer model').props.value, '');
+  assert.doesNotMatch(JSON.stringify([...storage.map.values()]), /sk-(legacy|example)-secret/);
+});
+
+for (const throws of [false, true]) test(`older or partial host keeps inline settings and web action (throws=${throws})`, () => {
+  const ui = pane('/projects/alpha', true, false, '', {}, {}, {}, {}, { settingsHost: throws, settingsHostThrows: throws });
+  assert.ok(settingNode(ui.tree, 'mc-scope-label'));
+  assert.ok(settingNode(ui.tree, 'mc-provider-label'));
+  assert.ok(fallbackControl(ui.tree));
+  assert.ok(settingNode(ui.tree, 'Specific public web query'));
+  assert.ok(button(ui.tree, 'Check sources + web'));
+  assert.match(JSON.stringify(ui.tree), /Bring your own API key/);
+});
+
+test('late pane persistence cannot roll back a newer Settings edit', () => {
+  const storage = settingsStore();
+  const ui = pane('/projects/alpha', true, false, '', {}, {}, {},
+    { setInterval: () => 0, clearInterval: () => {} }, { settingsHost: true, effects: true, delayPaneEffects: true, storage });
+  fallbackControl(settingsPage(ui).render()).props.onChange({ target: { checked: true } });
+  assert.equal(storage.map.get('preferences-v1').webFallback, true);
+  ui.flushPaneEffects();
+  assert.equal(storage.map.get('preferences-v1').webFallback, true, 'capture effect merges current answer preferences');
+  assert.equal(fallbackControl(settingsPage(ui).render()).props.checked, true);
+  ui.unmount(); ui.unmountSettings();
+});
+
+for (const [excludeHistory, webFallback] of [[false, true], [true, false]]) test(`separate settings and mounted pane roots use migrated updated full scope (history excluded=${excludeHistory}, web=${webFallback})`, async () => {
+  const storage = settingsStore();
+  const old = new Map([['meeting-copilot.scope.v2', JSON.stringify({ project: '/projects/old', answerProvider: 'openai', answerModel: 'old-model', excludeHistory: !excludeHistory, webFallback: !webFallback })]]);
+  const ui = pane(undefined, true, false, '', {}, { '/assist': { request_id: 'new-answer' } }, {},
+    { localStorage: { getItem: k => old.get(k) || null }, setInterval: () => 0, clearInterval: () => {} },
+    { settingsHost: true, effects: true, delayPaneEffects: true, noSeedOverrides: true, storage,
+      providers: [{ id: 'openai', label: 'OpenAI' }, { id: 'openrouter', label: 'OpenRouter' }] });
+  const page = settingsPage(ui);
+  const immediateSuggest = button(ui.tree, 'Suggest answer');
+  let tree = page.render();
+  assert.equal(settingNode(tree, 'mc-scope-label').props.value, '/projects/old', 'v2 project migrates');
+  assert.equal(settingNode(tree, 'Answer model').props.value, 'old-model', 'v2 model migrates');
+  settingNode(tree, 'mc-scope-label').props.onChange({ target: { value: '/projects/alpha' } });
+  tree = page.render();
+  settingNode(tree, 'mc-provider-label').props.onChange({ target: { value: 'openrouter' } });
+  tree = page.render();
+  settingNode(tree, 'Answer model').props.onChange({ target: { value: 'vendor/new-model' } });
+  tree = page.render();
+  settingNode(tree, 'Exclude past sessions').props.onChange({ target: { checked: excludeHistory } });
+  tree = page.render();
+  fallbackControl(tree).props.onChange({ target: { checked: webFallback } });
+  ui.flushPaneEffects(); // an older pane render must not persist its stale snapshot
+  const saved = storage.map.get('preferences-v1');
+  assert.equal(saved.project, '/projects/alpha');
+  assert.equal(saved.answerProvider, 'openrouter');
+  assert.equal(saved.answerModel, 'vendor/new-model');
+  assert.equal(saved.excludeHistory, excludeHistory);
+  assert.equal(saved.webFallback, webFallback);
+  assert.equal(ui.requests.some(r => ['/assist', '/start', '/overlay/show'].includes(r.path)), false);
+  await immediateSuggest.props.onClick(); // simulate a click before the pane root commits
+  const body = ui.requests.find(r => r.path === '/assist').body;
+  assert.equal(body.project, '/projects/alpha');
+  assert.equal(body.all_projects, false);
+  assert.equal(body.answer_provider, 'openrouter');
+  assert.equal(body.answer_model, 'vendor/new-model');
+  assert.equal(body.include_history, excludeHistory ? false : undefined);
+  assert.equal(body.web_fallback, webFallback);
+  ui.unmount(); ui.unmountSettings();
+});
+
+test('old web draft cannot target a remounted pane lifecycle', async () => {
+  const ui = pane('/projects/alpha', true, false, '', {}, { '/assist': { request_id: 'web' } }, {},
+    { setInterval: () => 0, clearInterval: () => {} }, { settingsHost: true, effects: true });
+  const page = settingsPage(ui);
+  settingNode(page.render(), 'Specific public web query').props.onChange({ target: { value: 'public docs' } });
+  const stale = button(page.render(), 'Check sources + web');
+  assert.equal(stale.props.disabled, false);
+  ui.replayEffects();
+  const fresh = page.render();
+  assert.equal(button(fresh, 'Check sources + web').props.disabled, true);
+  await stale.props.onClick();
+  assert.equal(ui.requests.some(r => r.path === '/assist'), false);
+  settingNode(fresh, 'Specific public web query').props.onChange({ target: { value: 'public docs again' } });
+  await button(page.render(), 'Check sources + web').props.onClick();
+  assert.equal(ui.requests.find(r => r.path === '/assist').body.web_query, 'public docs again');
+  ui.unmount(); ui.unmountSettings();
+});
+
+test('unmounted settings callbacks and failed status cannot change mounted pane preferences', () => {
+  const qc = { settingsHost: true, effects: true, statusError: null };
+  const storage = settingsStore(); qc.storage = storage;
+  const ui = pane('/projects/alpha', true, false, '', {}, {}, {},
+    { setInterval: () => 0, clearInterval: () => {} }, qc);
+  const page = settingsPage(ui), stale = page.render();
+  qc.statusError = new Error('unavailable');
+  assert.equal(fallbackControl(page.render()).props.disabled, true);
+  fallbackControl(stale).props.onChange({ target: { checked: true } });
+  assert.equal(storage.map.get('preferences-v1').webFallback, false);
+  qc.statusError = null;
+  ui.unmountSettings();
+  fallbackControl(stale).props.onChange({ target: { checked: true } });
+  assert.equal(storage.map.get('preferences-v1').webFallback, false);
+  ui.unmount();
+});
+
+test('legacy web defaults stay off and unproven cloud opt-in stays local in native settings', () => {
+  const legacy = new Map([['meeting-copilot.scope', JSON.stringify({ project: '/projects/alpha', webFallback: true, web: 'private query', transcriptionProvider: 'meta', answerProvider: 'openai', answerModel: 'gpt-test' })]]);
+  const storage = settingsStore();
+  const ui = pane(undefined, true, false, '', {}, {}, {}, { localStorage: { getItem: k => legacy.get(k) || null } },
+    { settingsHost: true, noSeedOverrides: true, storage, skipInitialPane: true });
+  const tree = settingsPage(ui).render();
+  assert.equal(fallbackControl(tree).props.checked, false);
+  assert.equal(settingNode(tree, 'Specific public web query').props.value, '');
+  fallbackControl(tree).props.onChange({ target: { checked: false } });
+  assert.equal(storage.map.get('preferences-v1').transcriptionProvider, 'local');
+  assert.doesNotMatch(JSON.stringify(storage.map.get('preferences-v1')), /private query/);
+});
+
+test('explicit answer-tracking reset needs a fresh idle status before settings unlock', async () => {
+  const idle = { overlay_shown: false, overlay_stop_confirmed: true, busy: false, requests: {} };
+  const ui = pane('/projects/alpha', true, false, '', {}, {
+    '/assist': () => { throw new Error('lost response'); }, '/status': idle,
+  }, {}, { window: { confirm: () => true }, setInterval: () => 0, clearInterval: () => {} },
+    { settingsHost: true, effects: true });
+  await button(ui.tree, 'Suggest answer').props.onClick();
+  assert.equal(fallbackControl(settingsPage(ui).render()).props.disabled, true);
+  await button(ui.rerender(), 'Reset local answer tracking').props.onClick();
+  assert.equal(ui.requests.filter(r => r.path === '/assist').length, 1);
+  assert.ok(ui.requests.some(r => r.path === '/status'), 'fresh read after explicit reset');
+  assert.equal(fallbackControl(settingsPage(ui).render()).props.disabled, false);
+  ui.unmount(); ui.unmountSettings();
+});
+
+test('explicit reset does not unlock settings while fresh status remains busy', async () => {
+  const status = { overlay_shown: false, overlay_stop_confirmed: true, busy: true, requests: { active: { status: 'running' } } };
+  const ui = pane('/projects/alpha', true, false, '', {}, {
+    '/assist': () => { throw new Error('lost response'); }, '/status': () => status,
+  }, {}, { window: { confirm: () => true }, setInterval: () => 0, clearInterval: () => {} },
+    { settingsHost: true, effects: true });
+  await button(ui.tree, 'Suggest answer').props.onClick();
+  await button(ui.rerender(), 'Reset local answer tracking').props.onClick();
+  assert.equal(fallbackControl(settingsPage(ui).render()).props.disabled, true);
+  status.busy = false; status.requests = {};
+  await ui.pollStatus();
+  assert.equal(fallbackControl(settingsPage(ui).render()).props.disabled, false);
+  assert.equal(ui.requests.filter(r => r.path === '/assist').length, 1);
+  ui.unmount(); ui.unmountSettings();
+});
+
 test('Windows capture explains missing dependencies and blocks Start without blocking answers', async () => {
   const ui = pane('/projects/alpha', true, false, '', { 3: true, 4: 'native' }, {}, {
     capabilities: { all_projects: true, independent_models: true, history_opt_out: true,
@@ -681,7 +1149,7 @@ test('web settings explain opt-in and public queries where used', () => {
   const setup = nodes(ui.tree).find(n => n.type === 'details' && nodes(n).some(x => x.type === 'summary' && JSON.stringify(x.children).includes('Answer setup')));
   setup.props.onToggle({ currentTarget: { open: true } });
   let tree = ui.rerender();
-  const toggle = nodes(tree).find(n => n.type === 'input' && n.props['aria-label'] === 'Automatic web fallback');
+  const toggle = fallbackControl(tree);
   assert.equal(toggle.props.checked, false);
   const toggleLabel = nodes(tree).find(n => n.type === 'label' && nodes(n).includes(toggle));
   assert.match(JSON.stringify(toggleLabel), /Automatic web fallback.*off/i);
@@ -1021,11 +1489,11 @@ test('real effects do not auto-sync unchanged Show scope', async () => {
   p.unmount();
 });
 
-test('real effects still synchronize changed scope with its owner', async () => {
+test('real effects synchronize an adversarially forced scope with its owner', async () => {
   const p = lifecyclePane({ '/overlay/scope': { accepted: true } });
   await button(p.tree, 'Show overlay').props.onClick();
   let tree = p.rerender();
-  nodes(tree).find(n => n.type === 'select' && n.props.value === 'alpha').props.onChange({ target: { value: '' } });
+  p.forcePreferences({ project: '' }); // bypass the public guard to exercise sync defense-in-depth
   tree = p.rerender();
   await p.flushTimers();
   const syncs = p.requests.filter(r => r.path === '/overlay/scope');
@@ -1082,8 +1550,8 @@ test('effect remount gets a fresh capability; old cleanup never releases the new
 
 async function settle() { for (let i = 0; i < 30; i++) await Promise.resolve(); }
 function changeProject(p, value) {
-  const tree = p.rerender();
-  nodes(tree).find(n => n.type === 'select' && n.props['aria-labelledby'] === 'mc-scope-label').props.onChange({ target: { value } });
+  // Force a corrupt/external mutation, not an allowed UI preference change.
+  p.forcePreferences({ project: value });
   return p.rerender();
 }
 
@@ -1238,6 +1706,11 @@ function nodes(tree) {
   return tree && typeof tree === 'object' ? [tree, ...(tree.children || []).flatMap(nodes)] : [];
 }
 
+function fallbackControl(tree) {
+  const label = nodes(tree).find(n => n.type === 'label' && JSON.stringify(n.children).includes('Automatic web fallback:'));
+  return nodes(label).find(n => n.type === 'input' && n.props.type === 'checkbox');
+}
+
 test('native opener restores the namespaced pane without capture requests', () => {
   const { contributions, revealed, requests } = pane('');
   const open = contributions.find(c => c.area === 'palette' && c.data.label === 'Open Meeting Copilot');
@@ -1319,6 +1792,65 @@ test('meta cloud transcription is opt-in, warns, and sends provider/mode', async
   const body = requests.find(r => r.path === '/start').body;
   assert.equal(body.transcription_provider, 'meta');
   assert.equal(body.asr_mode, 'DIARIZATION');
+});
+
+test('capture permission exposes the complete visible consent to assistive technology', () => {
+  const ui = pane('', true, false, '', { 3: false, 4: 'macos' });
+  const capture = nodes(ui.tree).find(n => n.type === 'section' && n.props['aria-label'] === 'Capture session');
+  const label = nodes(capture).find(n => n.type === 'label'
+    && JSON.stringify(n.children).includes('I have permission to capture/read this meeting'));
+  assert.ok(label, 'the consent text must be part of the checkbox label');
+  const input = nodes(label).find(n => n.type === 'input' && n.props.type === 'checkbox');
+  assert.ok(input, 'the checkbox must be associated with its visible consent');
+  assert.equal(input.props['aria-label'], undefined, 'a short aria-label must not override the visible consent');
+  assert.equal(input.props['aria-labelledby'], undefined, 'the full visible label must be the accessible name');
+  assert.match(JSON.stringify(label.children), /use its context with my configured model/);
+  assert.equal(input.props.checked, false);
+  assert.equal(button(ui.tree, 'Start listening').props.disabled, true);
+  input.props.onChange({ target: { checked: true } });
+  assert.equal(button(ui.rerender(), 'Start listening').props.disabled, false);
+  assert.equal(ui.requests.length, 0, 'checking consent alone does not initiate capture');
+});
+
+test('capture consent is described by the cloud disclosure only when cloud audio is selected', () => {
+  for (const [backend, provider, expected] of [['macos', 'meta', true], ['macos', 'local', false], ['meetily', 'meta', false]]) {
+    const { tree } = pane('', true, false, '', { 4: backend, 25: provider });
+    const capture = nodes(tree).find(n => n.type === 'section' && n.props['aria-label'] === 'Capture session');
+    const label = nodes(capture).find(n => n.type === 'label'
+      && JSON.stringify(n.children).includes('I have permission to capture/read this meeting'));
+    const input = nodes(label).find(n => n.type === 'input' && n.props.type === 'checkbox');
+    const notice = nodes(capture).find(n => n.props['data-cloud-capture-disclosure'] === true);
+    if (expected) {
+      assert.ok(notice?.props.id, 'the cloud disclosure must have a linkable identity');
+      assert.equal(input.props['aria-describedby'], notice.props.id, 'focus on consent must announce cloud audio transmission');
+      assert.match(JSON.stringify(notice.children), /meeting audio is sent to Meta/i);
+    } else {
+      assert.equal(notice, undefined, `${backend}/${provider} must not announce cloud audio`);
+      assert.equal(input.props['aria-describedby'], undefined, `${backend}/${provider} must not reference an absent disclosure`);
+    }
+  }
+});
+
+test('web controls expose their privacy disclosure to assistive technology', () => {
+  const ui = pane('', true, false, '', {});
+  let tree = ui.tree;
+  let label = nodes(tree).find(n => n.type === 'label'
+    && JSON.stringify(n.children).includes('Automatic web fallback: off'));
+  let checkbox = nodes(label).find(n => n.type === 'input' && n.props.type === 'checkbox');
+  assert.ok(checkbox, 'the fallback checkbox must be inside its visible label');
+  assert.equal(checkbox.props['aria-label'], undefined, 'a short aria-label must not override the visible privacy text');
+  checkbox.props.onChange({ target: { checked: true } });
+  tree = ui.rerender();
+  label = nodes(tree).find(n => n.type === 'label'
+    && JSON.stringify(n.children).includes('Automatic web fallback: on'));
+  assert.match(JSON.stringify(label.children), /public query.*filtering.*not a privacy guarantee/i);
+  checkbox = nodes(label).find(n => n.type === 'input' && n.props.type === 'checkbox');
+  assert.equal(checkbox.props.checked, true);
+  const input = nodes(tree).find(n => n.props['aria-label'] === 'Specific public web query');
+  const notice = nodes(tree).find(n => n.props['data-web-query-disclosure']);
+  assert.ok(notice?.props.id, 'the explicit-query warning must have a linkable identity');
+  assert.equal(input.props['aria-describedby'], notice.props.id, 'the query control must describe what leaves the device');
+  assert.match(JSON.stringify(notice.children), /query is sent to the web.*Do not include private details/i);
 });
 
 test('capture card discloses cloud audio transmission for selected Meta transcription', () => {
@@ -1456,9 +1988,10 @@ test('automatic web fallback can be disabled and explicit web query remains sepa
   await buttons.find(n => n.children.includes('Suggest answer')).props.onClick();
   assert.equal(requests.at(-1).body.web_fallback, false);
   assert.equal(requests.at(-1).body.web_query, undefined);
-  await buttons.find(n => n.children.includes('Check sources + web')).props.onClick();
-  assert.equal(requests.at(-1).body.web_query, 'public product documentation');
-  assert.equal(requests.at(-1).body.web_fallback, false);
+  const separate = pane('', true, false, 'public product documentation');
+  await button(separate.tree, 'Check sources + web').props.onClick();
+  assert.equal(separate.requests.at(-1).body.web_query, 'public product documentation');
+  assert.equal(separate.requests.at(-1).body.web_fallback, false);
 });
 
 test('overlay section shows explicitly, syncs current scope, and warns about screen share', async () => {
@@ -1522,7 +2055,9 @@ test('pane imports every React hook it calls (no undeclared globals)', () => {
   const imported = reactImports(src);
   const called = new Set([...src.matchAll(/(?<![A-Za-z0-9_.])use[A-Z]\w*(?=\()/g)].map(m => m[0]));
   const provided = new Set(['useState', 'useRef', 'useEffect', 'useQueryClient', 'useQuery', 'useValue']);
+  const localHooks = new Set([...src.matchAll(/\bfunction\s+(use[A-Z]\w*)\s*\(/g)].map(m => m[1]));
   for (const hook of called) {
+    if (localHooks.has(hook)) continue;
     assert.ok(imported.has(hook) || provided.has(hook), `${hook} must be imported or harness-provided`);
     if (hook.startsWith('use') && !['useState', 'useRef', 'useEffect', 'useQueryClient', 'useQuery', 'useValue'].includes(hook)) {
       assert.ok(imported.has(hook), `${hook} is not a known harness global and must be imported from react`);
@@ -1922,14 +2457,18 @@ test('layout order: capture session with permission comes first, transcript abov
   assert.ok(sessionAt > -1 && sourceAt > sessionAt, 'session card precedes source card');
   const session = flat[sessionAt];
   const sessionNodes = nodes(session);
-  assert.ok(sessionNodes.some(n => n.type === 'input' && n.props.type === 'checkbox'
-    && n.props['aria-label'] === 'Capture permission'), 'permission check lives in the top card');
+  assert.ok(sessionNodes.some(n => n.type === 'label'
+    && JSON.stringify(n.children).includes('I have permission to capture/read this meeting')
+    && nodes(n).some(child => child.type === 'input' && child.props.type === 'checkbox')),
+    'permission check lives in the top card');
   assert.ok(sessionNodes.some(n => n.type === 'button'
     && (n.children.includes('Start listening') || n.children.includes('Attach to Meetily')
       || n.children.includes('Resume') || n.children.includes('Resume listening'))),
     'primary start lives in the top card');
   const source = flat[sourceAt];
-  assert.ok(!nodes(source).some(n => n.type === 'input' && n.props['aria-label'] === 'Capture permission'),
+  assert.ok(!nodes(source).some(n => n.type === 'label'
+    && JSON.stringify(n.children).includes('I have permission to capture/read this meeting')
+    && nodes(n).some(child => child.type === 'input' && child.props.type === 'checkbox')),
     'no duplicate permission check in the source card');
   const transcriptAt = flat.findIndex(n => n.type === 'details'
     && JSON.stringify(n.children).includes('Live transcript'));
@@ -2109,15 +2648,15 @@ test('quick actions preserve excluded-history or explicitly enabled web scope wi
   for (const historyExcluded of [true, false]) {
     const ui = pane('/projects/alpha', true, false, '', {}, {}, contextStatus);
     nodes(ui.tree).find(n => n.props['aria-label'] === 'Exclude past sessions').props.onChange({ target: { checked: historyExcluded } });
-    nodes(ui.tree).find(n => n.props['aria-label'] === 'Automatic web fallback').props.onChange({ target: { checked: !historyExcluded } });
+    fallbackControl(ui.tree).props.onChange({ target: { checked: !historyExcluded } });
     await button(ui.rerender(), 'Catch me up').props.onClick();
     const body = ui.requests.find(r => r.path === '/assist').body;
     assert.equal(body.include_history, historyExcluded ? false : undefined);
     assert.equal(body.web_fallback, !historyExcluded);
   }
   const ui = pane('/projects/alpha', true, false, '', {}, {}, contextStatus);
-  for (const label of ['Exclude past sessions', 'Automatic web fallback'])
-    nodes(ui.tree).find(n => n.props['aria-label'] === label).props.onChange({ target: { checked: true } });
+  nodes(ui.tree).find(n => n.props['aria-label'] === 'Exclude past sessions').props.onChange({ target: { checked: true } });
+  fallbackControl(ui.tree).props.onChange({ target: { checked: true } });
   const action = button(ui.rerender(), 'Catch me up');
   assert.equal(action.props.disabled, true, 'incompatible privacy choices still fail closed');
   await action.props.onClick();
@@ -2155,6 +2694,29 @@ test('quick action double click cannot submit twice while admission is pending',
   await first;
 });
 
+test('evidence pane and confirmed export show the full bounded model excerpt', async () => {
+  const copies = [], prompts = [];
+  // Astral symbols require code-point slicing to match Python's provider payload.
+  const sourceText = '😀'.repeat(1025) + ' IMPORTANT SYNTHETIC FACT ' + 'z'.repeat(1300);
+  const expected = Array.from(sourceText).slice(0, 2050).join('');
+  const omitted = Array.from(sourceText).slice(0, 2051).join('');
+  const ui = pane('', true, false, '', {}, {}, { result: {
+    answer: 'Synthetic answer [1]', sources: [{ title: 'Synthetic source', source: 'docs/synthetic.md', text: sourceText }],
+  } }, { window: { confirm: message => { prompts.push(message); return true; } },
+    navigator: { clipboard: { writeText: async text => copies.push(text) } } });
+  const paneText = JSON.stringify(ui.tree);
+  assert.ok(paneText.includes('IMPORTANT SYNTHETIC FACT'), 'the pane must include facts after the old 900-character cutoff');
+  assert.ok(paneText.includes(expected), 'display the same Unicode code-point prefix as the provider bound');
+  assert.ok(!paneText.includes(omitted), 'do not display source text beyond the provider excerpt limit');
+  assert.match(paneText, /excerpt.*2,050.*characters/i);
+  assert.equal(copies.length, 0);
+  await button(ui.tree, 'Copy answer + evidence').props.onClick();
+  assert.match(prompts[0], /2,050 characters per source/);
+  assert.ok(copies[0].includes(expected));
+  assert.ok(!copies[0].includes(omitted));
+  assert.match(copies[0], /excerpt.*2,050.*characters/i);
+});
+
 test('evidence export copies only displayed answer and bounded indexed excerpts after confirmation', async () => {
   const copies = [], prompts = [];
   const ui = pane('/projects/alpha', true, false, '', {}, {}, {
@@ -2176,8 +2738,7 @@ test('evidence export copies only displayed answer and bounded indexed excerpts 
   assert.match(copies[0], /Partial response/);
   assert.match(copies[0], /not meeting segments or timestamps/);
   assert.match(copies[0], /Source updated \(not meeting time\): 1970-01-01T00:00:00.000Z/);
-  assert.ok(copies[0].includes('x'.repeat(900)));
-  assert.ok(!copies[0].includes('x'.repeat(901)));
+  assert.ok(copies[0].includes('x'.repeat(950)));
   assert.doesNotMatch(copies[0], /PRIVATE REQUEST|SECRET|NEW LIVE/);
   assert.equal(ui.requests.length, 0, 'copy sends no backend or provider request');
   assert.match(ui.notices.at(-1).message, /copied/);
@@ -2219,6 +2780,36 @@ const sentSnapshotFixture = { schema: 'transcript-snapshot-v1', snapshot_id: 'sy
   omitted_segments: 2, segments: [{ ref: 'T1', speaker: 'meeting', text: 'PRIVATE SENT CONTEXT',
     timestamp: 12, timestamp_kind: 'meetily_audio_start_time_uninterpreted', shortened: true }] };
 
+test('recent answers retain their own source and transcript context without automatic export', async () => {
+  const copies = [], prompts = [];
+  const previousSnapshot = { ...sentSnapshotFixture, snapshot_id: 'previous',
+    provider_json: '{"segments":[{"ref":"T1","text":"PREVIOUS SENT CONTEXT"}]}',
+    segments: [{ ref: 'T1', speaker: 'Prior', text: 'PREVIOUS SENT CONTEXT', timestamp: null }] };
+  const currentSnapshot = { ...sentSnapshotFixture, snapshot_id: 'current',
+    provider_json: '{"segments":[{"ref":"T1","text":"CURRENT SENT CONTEXT"}]}',
+    segments: [{ ref: 'T1', speaker: 'Now', text: 'CURRENT SENT CONTEXT', timestamp: null }] };
+  const ui = pane('', true, false, '', {}, {}, {
+    result: { answer: 'New answer [T1]', transcript_snapshot: currentSnapshot },
+    recent: [{ request_id: 'old', question: 'Earlier question', status: 'done', answer: 'Old answer [T1] [1]',
+      transcript_snapshot: previousSnapshot, sources: [{ title: 'Old file', text: 'OLD EVIDENCE EXCERPT' }] }],
+    segments: [{ speaker: 'Live', text: 'NEW LIVE WORDS' }],
+  }, { window: { confirm: message => { prompts.push(message); return true; } },
+    navigator: { clipboard: { writeText: async text => copies.push(text) } } });
+  const recent = nodes(ui.tree).find(n => n.type === 'details'
+    && n.children.some(child => child?.type === 'summary' && JSON.stringify(child.children).includes('Recent answers')));
+  assert.ok(recent);
+  assert.match(JSON.stringify(recent), /PREVIOUS SENT CONTEXT/);
+  assert.match(JSON.stringify(recent), /OLD EVIDENCE EXCERPT/);
+  assert.doesNotMatch(JSON.stringify(recent), /CURRENT SENT CONTEXT|NEW LIVE WORDS/);
+  const copyContext = nodes(recent).find(n => n.type === 'button' && n.children.includes('Copy sent transcript context'));
+  assert.ok(copyContext, 'each retained answer should expose its own sent transcript context');
+  assert.equal(copies.length, 0, 'history must never export automatically');
+  await copyContext.props.onClick();
+  assert.equal(copies[0], previousSnapshot.provider_json, 'copy must use this historical snapshot, not the latest one');
+  assert.match(prompts[0], /confidential meeting text/);
+  assert.equal(ui.requests.length, 0, 'viewing and copying history does not make a provider request');
+});
+
 test('sent transcript context is separately disclosed and exported exactly only on confirmation', async () => {
   const copies = [], confirms = [];
   const ui = pane('', true, false, '', {}, {}, { result: { answer: 'Suggestion [T1]',
@@ -2236,6 +2827,37 @@ test('sent transcript context is separately disclosed and exported exactly only 
   assert.match(confirms[1], /confidential meeting text/);
   assert.match(confirms[1], /history or sync/);
   assert.equal(ui.requests.length, 0);
+});
+
+test('failed historical requests never claim unconfirmed context was sent', () => {
+  const ui = pane('', true, false, '', {}, {}, { recent: [{ request_id: 'failed', question: 'Failed request',
+    status: 'error', answer: '', transcript_snapshot: sentSnapshotFixture }] });
+  const recent = nodes(ui.tree).find(n => n.type === 'details'
+    && n.children.some(child => child?.type === 'summary' && JSON.stringify(child.children).includes('Recent answers')));
+  assert.ok(recent);
+  assert.doesNotMatch(JSON.stringify(recent), /Transcript context sent with this answer|PRIVATE SENT CONTEXT/);
+  assert.equal(nodes(recent).find(n => n.type === 'button' && n.children.includes('Copy sent transcript context')), undefined);
+});
+
+test('historical transcript references disclose missing context and reject invalid or unconfirmed copies', async () => {
+  for (const snapshot of [undefined, { ...sentSnapshotFixture, provider_json: 'x'.repeat(16001) }, sentSnapshotFixture]) {
+    const copies = [];
+    const ui = pane('', true, false, '', {}, {}, { recent: [{ request_id: 'prior', question: 'Earlier',
+      status: 'done', answer: 'Prior answer [T1]', transcript_snapshot: snapshot }] }, {
+      window: { confirm: () => false }, navigator: { clipboard: { writeText: async text => copies.push(text) } },
+    });
+    const recent = nodes(ui.tree).find(n => n.type === 'details'
+      && n.children.some(child => child?.type === 'summary' && JSON.stringify(child.children).includes('Recent answers')));
+    if (!snapshot) {
+      assert.match(JSON.stringify(recent), /Transcript context for this answer is unavailable/);
+    } else {
+      const copy = nodes(recent).find(n => n.type === 'button' && n.children.includes('Copy sent transcript context'));
+      assert.equal(copy.props.disabled, snapshot.provider_json.length > 16000);
+      await copy.props.onClick();
+    }
+    assert.deepEqual(copies, []);
+    assert.equal(ui.requests.length, 0);
+  }
 });
 
 test('sent transcript export refuses missing confirmation and handles clipboard denial', async () => {

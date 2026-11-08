@@ -34,7 +34,8 @@ Its printed assertions are the verification result; there is no recorded meeting
 ## Desktop: ask about a fictional project
 
 1. Complete [installation and BYOK setup](getting-started.md). Keep capture
-   paused. Choose a provider and an exact model ID in **Answer setup**.
+   paused. Choose a provider and an exact model ID in **Settings → Plugins →
+   Meeting Copilot** (or **Answer setup** on older Desktop hosts).
 2. Create `copilot-sample/launch.md` beneath your configured project root using
    only this fictional text:
 

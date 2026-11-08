@@ -59,6 +59,18 @@ the energy threshold, and the copy budget. The four-second earliest boundary,
 400ms silence criterion and twelve-second bound are unchanged. This reduces
 reader work; it does not establish that the observed native loss is fixed.
 
+The investigation also found that the one-time `running` status competed for
+one of the same four PCM slots. If those slots were full at startup, the helper
+exited immediately before reporting either readiness or pending drops. The status
+now has one separate bounded control slot. A deterministic device-free test
+saturates all four PCM slots, verifies the status carries the three dropped frames,
+and checks the real worker forwards that count once. This protects startup
+reporting; it does **not** increase PCM capacity, prevent dropped frames, or
+prove delivery through a permanently blocked pipe. The optional Meta worker now
+also reports native loss deltas carried by status, error and PCM frames during
+capture and in its stopped summary. This does not add writer timing diagnostics
+to that path or establish loss-free cloud transcription.
+
 Further physical tests require a freshly confirmed quiet, private environment.
 Do not suppress drop warnings or treat a synthetic scheduling experiment as
 native-device reliability verification. No new microphone permission was
