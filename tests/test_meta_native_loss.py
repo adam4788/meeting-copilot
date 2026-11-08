@@ -342,7 +342,7 @@ print(json.dumps(events))
     def test_stop_summary_arrives_within_default_macos_grace_window(self):
         # MacOSAudioCapture.stop defaults to a 2.5s graceful worker window.
         script = r'''
-import asyncio, base64, io, json, signal, threading
+import asyncio, base64, io, json, os, signal, sys, threading
 from pathlib import Path
 from unittest.mock import patch
 import audio_worker, meta_asr
@@ -353,7 +353,12 @@ class Process:
     stdout=io.BytesIO(line)
     def poll(self): return 0
 stop=threading.Event()
-signal.signal(signal.SIGTERM, lambda *_: stop.set())
+if os.name == 'nt' or os.environ.get('MC_TEST_STOP_VIA_STDIN') == '1':
+    # Windows terminate() is an unconditional TerminateProcess, not SIGTERM.
+    # Exercise the same graceful stop event via a private stdin control byte.
+    threading.Thread(target=lambda: (sys.stdin.buffer.read(1), stop.set()), daemon=True).start()
+else:
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
 async def session(q, *_args):
     await q.get()
     print('SYNTHETIC_READY', flush=True)
@@ -363,28 +368,34 @@ with patch.object(audio_worker.subprocess,'Popen',return_value=Process()), \
     audio_worker.run_capture_meta('microphone','ENDPOINTING','synthetic-key','fake',helper=Path('/synthetic'),stop=stop)
 '''
         import os
-        import select
-        proc = subprocess.Popen([sys.executable, '-u', '-c', script], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        self.assertIsNotNone(proc.stdout)
-        prefix = b''
+        proc = subprocess.Popen([sys.executable, '-u', '-c', script], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdin, stdout, stderr_pipe = proc.stdin, proc.stdout, proc.stderr
+        assert stdin is not None and stdout is not None and stderr_pipe is not None
+        ready = threading.Event()
+        rows = []
+        def read_output():
+            for line in stdout:
+                rows.append(line)
+                if line.strip() == b'SYNTHETIC_READY':
+                    ready.set()
+        reader = threading.Thread(target=read_output, daemon=True)
+        reader.start()
         try:
-            deadline = time.monotonic() + 3
-            while b'SYNTHETIC_READY\n' not in prefix:
-                remaining = deadline - time.monotonic()
-                self.assertGreater(remaining, 0, 'synthetic worker did not become ready')
-                ready, _, _ = select.select([proc.stdout], [], [], remaining)
-                self.assertTrue(ready, 'synthetic worker did not become ready')
-                data = os.read(proc.stdout.fileno(), 4096)
-                self.assertTrue(data, 'synthetic worker exited before becoming ready')
-                prefix += data
-            proc.terminate()
+            self.assertTrue(ready.wait(5), 'synthetic worker did not become ready')
+            if os.name == 'nt' or os.environ.get('MC_TEST_STOP_VIA_STDIN') == '1':
+                stdin.write(b'x')
+                stdin.flush()
+            else:
+                proc.terminate()
             try:
-                rest, stderr = proc.communicate(timeout=2.5)
+                proc.wait(timeout=2.5)
             except subprocess.TimeoutExpired:
                 self.fail('worker did not emit its summary within the default graceful stop window')
+            reader.join(timeout=2)
+            self.assertFalse(reader.is_alive(), 'worker output reader did not reach EOF')
+            stderr = stderr_pipe.read()
             self.assertEqual(proc.returncode, 0, stderr.decode())
-            rows = (prefix + rest).decode().splitlines()
-            events = [json.loads(row) for row in rows if row != 'SYNTHETIC_READY']
+            events = [json.loads(row) for row in rows if row.strip() != b'SYNTHETIC_READY']
             stopped = [e for e in events if e.get('state') == 'stopped']
             self.assertEqual(len(stopped), 1)
             self.assertEqual(stopped[0]['native_dropped_chunks'], 2)
@@ -394,10 +405,10 @@ with patch.object(audio_worker.subprocess,'Popen',return_value=Process()), \
             if proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=2)
-            if proc.stdout is not None:
-                proc.stdout.close()
-            if proc.stderr is not None:
-                proc.stderr.close()
+            reader.join(timeout=2)
+            stdin.close()
+            stdout.close()
+            stderr_pipe.close()
 
     def test_ended_source_bounds_a_stuck_other_session_and_warns(self):
         script = r'''
