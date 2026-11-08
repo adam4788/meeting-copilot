@@ -21,13 +21,13 @@ bring-your-own-key setup. Live responses from those accounts remain unverified.
 Native audio is experimental; macOS fictional-audio checks found dropped frames.
 Windows Desktop pane and runtime verification is still in progress.
 
-| Platform | Automated checks at the pinned revision | Desktop and native audio status |
+| Platform | Earlier CI checkpoint (b01a55a) | Desktop and native audio status |
 | --- | --- | --- |
 | Windows | Python 3.11/3.12 suite and JavaScript checks passed in CI | Desktop pane/runtime under verification; SoundCard/WASAPI capture remains experimental |
 | macOS | Python 3.12 suite, JavaScript checks, and overlay helper build/self-test passed in CI | Microphone/system-audio checks used fictional content; native frame loss remains unresolved |
 | Linux | Python 3.11/3.12 suite and JavaScript checks passed in CI | Native audio and Desktop use are not established by these checks |
 
-This status describes source revision
+The CI results above describe source revision
 [`b01a55a`](https://github.com/adam4788/meeting-copilot/commit/b01a55a05f2609f366eec8d5a035879754b8263c).
 See [CI](https://github.com/adam4788/meeting-copilot/actions),
 [verification notes](docs/verification.md), and the
@@ -72,7 +72,7 @@ Local transcription does not make hosted answers local.
 Requires **Hermes 0.22.7 or newer**. Install the published source at a full revision:
 
 ```sh
-hermes plugins install adam4788/meeting-copilot --ref b01a55a05f2609f366eec8d5a035879754b8263c --enable
+hermes plugins install adam4788/meeting-copilot --ref 9a261fd4e549f7ce1715fc39ee49b5a2907d42c6 --enable
 hermes plugins doctor meeting-copilot-live --ci
 ```
 

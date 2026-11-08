@@ -28,3 +28,24 @@ environment contains the audio packages, but the packaged gateway still reports
 SoundCard missing. That installation/runtime mismatch is separate from CI success.
 No live provider response or physical Windows recording is established by this
 checkpoint. Follow the [Windows setup troubleshooting](windows-setup.md#desktop-managed-installation-and-missing-soundcard).
+
+## Evidence build: 9a261fd (2026-11-08)
+
+The installation guides pin `9a261fd4e549f7ce1715fc39ee49b5a2907d42c6`, which
+adds portable answer/evidence copy and immutable per-answer transcript context.
+Its exact runtime export passed doctor discovery/import/registration and catalog
+validation including dependency preparation; security scan reported SAFE. Two
+initial dependency attempts failed on an upstream GitHub 504; the subsequent run
+explicitly completed resolution and installation. A disposable host synchronization
+warning remained, so this does not establish active packaged Desktop readiness.
+
+Local Windows checks: 756 Python tests passed, 86 platform/optional-Hermes skips;
+151 Desktop tests passed, 2 POSIX skips; 3 packaging checks passed. Independent
+review reran all 19 snapshot unit/integration tests. The synthetic checks cover
+exact provider-context equality, correction and retry behavior, clear/session
+isolation, bounded retention and separate clipboard consent. Current hosted CI
+runs are available in [Actions](https://github.com/adam4788/meeting-copilot/actions).
+
+Backend timestamps remain uninterpreted, and a valid reference is not proof that
+a model's claim is true. No new physical recording, live provider account test,
+or successful packaged Windows activation is claimed by this build.

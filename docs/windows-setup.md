@@ -11,7 +11,7 @@ but managed installation provides Git provenance and an immutable pin.
 In PowerShell, install the published core revision:
 
 ```powershell
-hermes plugins install adam4788/meeting-copilot --ref b01a55a05f2609f366eec8d5a035879754b8263c --enable
+hermes plugins install adam4788/meeting-copilot --ref 9a261fd4e549f7ce1715fc39ee49b5a2907d42c6 --enable
 ```
 
 This is a custom Git source, not an admitted catalog entry. The development tree
