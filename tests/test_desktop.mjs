@@ -699,6 +699,23 @@ test('host unload fences an in-flight Restart before its release completes', asy
   ui.unmount(); ui.unmountSettings();
 });
 
+test('host unload stops synthetic backend capture and rejects stale Start', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t);
+  const ui = backend.mount();
+  try {
+    const start = button(ui.tree, 'Start listening');
+    await start.props.onClick();
+    assert.equal((await backend.rpc({ command: 'inspect' })).running, true);
+    ui.hostUnload();
+    const stopped = await backend.rpc({ command: 'inspect' });
+    assert.equal(stopped.running, false, 'host disposal must release owned capture');
+    assert.equal(stopped.stops, 1);
+    await start.props.onClick();
+    assert.equal((await backend.rpc({ command: 'inspect' })).running, false);
+    assert.equal(backend.traffic.filter(r => r.path === '/start').length, 1);
+  } finally { ui.unmount(); await backend.rpc({ command: 'inspect' }); }
+});
+
 test('settings host registers Meeting Copilot in Settings → Plugins', () => {
   const ui = pane('/projects/alpha', true, false, '', {}, {}, {}, {}, { settingsHost: true });
   const page = ui.contributions.find(c => c.area === 'settings.plugins');
