@@ -16,6 +16,12 @@
 - The desktop integration uses the host's authenticated plugin API. Do not expose
   a development server or plugin API without authentication to a network.
 
+Explicit **Copy answer + evidence** exports the displayed answer and source
+excerpts to the clipboard after confirmation. It does not include the hidden
+request snapshot or automatically copy the live transcript. Excerpts can be
+confidential; clipboard history and device sync may retain them. Clear meeting
+does not clear the OS clipboard or copies you saved elsewhere.
+
 ## Credentials and model selection
 
 Configure API keys only in Hermes-managed secret settings for this plugin's

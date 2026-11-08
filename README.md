@@ -153,3 +153,14 @@ Read [security and privacy](SECURITY.md) and the
 Meeting Copilot is an independent community project. It is not an official Nous
 Research product and is not endorsed by Nous Research. Code is licensed under
 [MIT](LICENSE).
+
+### Portable evidence
+
+In the answer pane, **Copy answer + evidence** copies a plain-text report only
+when you confirm. It includes the displayed answer, reported model route,
+warnings, and numbered source excerpts (up to 900 characters per source), so
+colleagues can inspect the basis for a suggestion. Source-update dates are not
+meeting timestamps. It is not a complete transcript or independently verified
+meeting record. The copy does not send a new model request and excludes the
+retained request snapshot and live transcript. Review confidential snippets and
+links before sharing; clipboard history or device sync may retain the copy.

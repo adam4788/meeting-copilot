@@ -2154,3 +2154,61 @@ test('quick action double click cannot submit twice while admission is pending',
   release({ request_id: 'quick-action', status: 'queued' });
   await first;
 });
+
+test('evidence export copies only displayed answer and bounded indexed excerpts after confirmation', async () => {
+  const copies = [], prompts = [];
+  const ui = pane('/projects/alpha', true, false, '', {}, {}, {
+    result: { answer: 'Review Monday [1].', model_route: 'openai / chosen-model',
+      warnings: ['Partial response: verify this.'], request: { transcript: 'PRIVATE REQUEST SNAPSHOT', api_key: 'SECRET' },
+      sources: [{ title: 'Planning note', source: 'docs/plan.md', text: 'x'.repeat(950), updated_at: 0 },
+        { title: 'Second source', source: 'https://example.test/note', text: 'Supporting quote' }] },
+    segments: [{ text: 'NEW LIVE TRANSCRIPT MUST NOT LEAK' }],
+  }, { window: { confirm: message => { prompts.push(message); return true; } },
+    navigator: { clipboard: { writeText: async text => copies.push(text) } } });
+  assert.equal(copies.length, 0, 'export is not automatic');
+  await button(ui.tree, 'Copy answer + evidence').props.onClick();
+  assert.equal(copies.length, 1);
+  assert.match(prompts[0], /confidential/);
+  assert.match(copies[0], /Review Monday \[1\]/);
+  assert.match(copies[0], /\[1\] Planning note/);
+  assert.match(copies[0], /\[2\] Second source/);
+  assert.match(copies[0], /Reported model route: openai \/ chosen-model/);
+  assert.match(copies[0], /Partial response/);
+  assert.match(copies[0], /Source updated \(not meeting time\): 1970-01-01T00:00:00.000Z/);
+  assert.ok(copies[0].includes('x'.repeat(900)));
+  assert.ok(!copies[0].includes('x'.repeat(901)));
+  assert.doesNotMatch(copies[0], /PRIVATE REQUEST|SECRET|NEW LIVE/);
+  assert.equal(ui.requests.length, 0, 'copy sends no backend or provider request');
+  assert.match(ui.notices.at(-1).message, /copied/);
+});
+
+test('evidence export never touches clipboard without a positive privacy confirmation', async () => {
+  for (const browser of [{}, { window: { confirm: () => false } }]) {
+    let writes = 0;
+    const ui = pane('', true, false, '', {}, {}, { result: { answer: 'Synthetic answer' } }, {
+      ...browser, navigator: { clipboard: { writeText: async () => writes++ } },
+    });
+    await button(ui.tree, 'Copy answer + evidence').props.onClick();
+    assert.equal(writes, 0);
+    assert.equal(ui.requests.length, 0);
+  }
+});
+
+test('evidence export explicitly reports absent sources and clipboard failures', async () => {
+  let copy;
+  const ui = pane('', true, false, '', {}, {}, { result: { answer: 'Unverified suggestion' } }, {
+    window: { confirm: () => true }, navigator: { clipboard: { writeText: async text => { copy = text; throw new Error('denied'); } } },
+  });
+  await button(ui.tree, 'Copy answer + evidence').props.onClick();
+  assert.match(copy, /No retrieved source excerpts/);
+  assert.match(copy, /not a complete meeting transcript/);
+  assert.match(JSON.stringify(ui.rerender()), /Clipboard unavailable/);
+  assert.equal(ui.notices.length, 0);
+});
+
+test('evidence export is unavailable without a displayed answer', () => {
+  const empty = pane('', true, false, '', {}, {}, {});
+  assert.equal(button(empty.tree, 'Copy answer + evidence'), undefined);
+  const blank = pane('', true, false, '', {}, {}, { result: { answer: '' } });
+  assert.equal(button(blank.tree, 'Copy answer + evidence').props.disabled, true);
+});

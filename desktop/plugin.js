@@ -7,6 +7,36 @@ const muted = { color: 'var(--ui-text-secondary)', fontSize: 12, lineHeight: 1.5
 const card = { border: '1px solid var(--ui-stroke-secondary)', borderRadius: 10, padding: 14, minWidth: 0, boxSizing: 'border-box', background: 'var(--ui-bg-card)' };
 const selectStyle = { padding: 8, borderRadius: 6, width: '100%', maxWidth: '100%', minWidth: 0, color: 'var(--ui-text-primary)', background: 'var(--ui-bg-card)', border: '1px solid var(--ui-stroke-secondary)' };
 
+// Portable evidence is assembled only from the displayed answer, never current
+// meeting state, credentials, or request snapshots. Clipboard remains explicit.
+function evidenceReport(result) {
+  const text = (value, max) => typeof value === 'string' ? value.slice(0, max) : '';
+  const lines = ['MEETING COPILOT — ANSWER + EVIDENCE',
+    'AI-generated suggestion. Review against the excerpts; sources are not independent verification.',
+    'This is not a complete meeting transcript or a verified record of decisions.', '',
+    'Reported model route: ' + (text(result.model_route, 300) || 'unspecified'), '',
+    'ANSWER', text(result.answer, 64000)];
+  const warnings = Array.isArray(result.warnings) ? result.warnings : [];
+  if (warnings.length) lines.push('', 'WARNINGS', ...warnings.slice(0, 30).map(w => text(w, 2000)));
+  const sources = Array.isArray(result.sources) ? result.sources : [];
+  lines.push('', 'EVIDENCE EXCERPTS',
+    'Numbering matches the answer pane. Excerpts are limited to 900 characters each.');
+  if (!sources.length) lines.push('No retrieved source excerpts accompanied this answer.');
+  for (const [i, source] of sources.slice(0, 100).entries()) {
+    const s = source || {};
+    lines.push('', `[${i + 1}] ${text(s.title, 1000) || text(s.source, 2000) || 'Source'}`,
+      'Source: ' + (text(s.source, 2000) || 'unspecified'));
+    if (s.updated_at !== undefined && s.updated_at !== null) {
+      const date = typeof s.updated_at === 'number' ? new Date(s.updated_at * 1000) : null;
+      const updated = date ? (Number.isFinite(date.getTime()) ? date.toISOString() : '') : text(s.updated_at, 300);
+      if (updated) lines.push('Source updated (not meeting time): ' + updated);
+    }
+    lines.push('Excerpt:', text(s.text, 900) || '(No excerpt available)');
+  }
+  if (sources.length > 100) lines.push('', 'Additional sources omitted from this bounded export.');
+  lines.push('', 'Privacy: this copy contains source excerpts and may contain confidential material. Review before sharing.');
+  return lines.join('\n');
+}
 export default {
   id: ID,
   name: 'Meeting Copilot',
@@ -803,6 +833,12 @@ export default {
           h('div', { style: { whiteSpace: 'pre-wrap', lineHeight: 1.65, paddingTop: 8 } }, liveEntry.answer || 'Contacting your sources…'),
           ...((liveEntry.warnings || []).map((w, i) => h('p', { key: `lw-${i}`, style: muted }, w)))),
         result && h('section', { style: card, 'aria-live': 'polite', ref: answerRef, 'data-answer-result': true },
+          h(Button, { variant: 'secondary', disabled: !result.answer, onClick: async () => {
+            if (!usable()) return;
+            if (typeof window === 'undefined' || typeof window.confirm !== 'function' || !window.confirm('Copy this answer and its source excerpts? The clipboard may include confidential project text or links. Review before sharing. No new model request is sent.')) return;
+            try { await navigator.clipboard.writeText(evidenceReport(result)); notify('info', 'Answer and evidence copied. Review before sharing.'); }
+            catch (_) { setError('Clipboard unavailable. Select and copy the answer and evidence manually.'); }
+          } }, 'Copy answer + evidence'),
           h('div', { style: { display: 'flex', justifyContent: 'space-between' } }, h('strong', null, 'Suggested answer'), h('span', { style: muted }, `${Number.isFinite(result.elapsed_seconds) ? `${result.elapsed_seconds.toFixed(1)}s` : ''}${result.model_route ? ` · ${result.model_route}` : ''}`)),
           h('div', { style: { whiteSpace: 'pre-wrap', lineHeight: 1.65, paddingTop: 10 } }, result.answer),
           result.web_search?.used && h('p', { style: muted }, `${result.web_search.mode === 'automatic' ? 'Automatic web fallback' : 'Explicit web search'}: ${result.web_search.query}`),
