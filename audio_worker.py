@@ -397,6 +397,7 @@ def run_capture_meta(source, mode, api_key, model_id, helper=None, stop=None):
     accepting = {'value': True}
     watcher_done = threading.Event()
     terminate_lock = threading.Lock()
+    termination_requested = {'value': False}
 
     def schedule(callback, *args):
         # Seal scheduling before closing the loop. The lock linearizes the
@@ -412,6 +413,12 @@ def run_capture_meta(source, mode, api_key, model_id, helper=None, stop=None):
 
     def terminate_helper():
         with terminate_lock:
+            # A second SIGTERM makes the native helper exit immediately,
+            # before its final loss report. The watcher and retirement can
+            # both reach here while the first termination is still settling.
+            if termination_requested['value']:
+                return
+            termination_requested['value'] = True
             try:
                 if process.poll() is None:
                     process.terminate()
@@ -441,6 +448,9 @@ def run_capture_meta(source, mode, api_key, model_id, helper=None, stop=None):
 
     def remember_native_error(code):
         native_error['code'] = code
+        # A provider may never finish even after reader EOF. Fatal native
+        # errors must initiate the same bounded retirement as an explicit stop.
+        stop_requested.set()
 
     def reader():
         try:
@@ -510,12 +520,13 @@ def run_capture_meta(source, mode, api_key, model_id, helper=None, stop=None):
     threading.Thread(target=watcher, daemon=True, name='meta-audio-watcher').start()
 
     reader_incomplete = False
+    forced_kill = False
     session_incomplete = False
     early_session_exit = False
     retired = False
 
     async def retire_reader():
-        nonlocal reader_incomplete, retired
+        nonlocal reader_incomplete, forced_kill, retired
         if retired:
             return
         watcher_done.set()
@@ -523,16 +534,21 @@ def run_capture_meta(source, mode, api_key, model_id, helper=None, stop=None):
         try:
             if process.poll() is None:
                 try:
-                    process.wait(timeout=.25)
+                    # The native helper itself settles for 0.3s before its
+                    # final writer barrier; allow time for that tail report.
+                    process.wait(timeout=.7)
                 except subprocess.TimeoutExpired:
+                    # EOF after a kill does not prove the terminal loss delta
+                    # was delivered. Record uncertainty even if the reader exits.
+                    forced_kill = True
                     process.kill()
-                    process.wait(timeout=.25)
+                    process.wait(timeout=.1)
         except Exception:
             pass
         # Stop the helper before waiting for its final pipe frames. A stuck
         # reader must not block exit; do not close its pipe while it is alive.
-        reader_thread.join(timeout=.75)
-        reader_incomplete = reader_thread.is_alive()
+        reader_thread.join(timeout=.25)
+        reader_incomplete = forced_kill or reader_thread.is_alive()
         with schedule_lock:
             accepting['value'] = False
         # Every accepted callback precedes this barrier, including an EOF
@@ -586,11 +602,14 @@ def run_capture_meta(source, mode, api_key, model_id, helper=None, stop=None):
                     if target.get_nowait() is not None:
                         worker_lost['count'] += 1
             if (native_lost['count'] or worker_lost['count'] or reader_incomplete
-                    or session_incomplete or early_session_exit):
+                    or session_incomplete or early_session_exit or native_error['code']):
                 warning = (f"Stopped with worker {worker_lost['count']} dropped chunk(s), "
                            f"native {native_lost['count']} dropped frame(s); some words may be missing.")
                 if reader_incomplete:
-                    warning += ' Reader had not finished; tail accounting may be incomplete.'
+                    if forced_kill:
+                        warning += ' Helper was forcibly stopped; tail accounting may be incomplete.'
+                    else:
+                        warning += ' Reader had not finished; tail accounting may be incomplete.'
                 if session_incomplete:
                     warning += ' Transcription session drain was incomplete.'
                 if early_session_exit:
@@ -607,7 +626,7 @@ def run_capture_meta(source, mode, api_key, model_id, helper=None, stop=None):
                 emit({'type': 'error', 'code': code, 'message': error_message(code)})
         finally:
             loop.close()
-            if not reader_incomplete:
+            if not reader_thread.is_alive():
                 try:
                     if process.stdout is not None:
                         process.stdout.close()
