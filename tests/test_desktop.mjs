@@ -495,7 +495,7 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
   const requests = [];
   const queryOptions = [];
   const contributions = [];
-  const revealed = [];
+  const revealed = [], hostDisposers = [];
   const notices = [];
   let effects = [];
   const paneEffects = effects, settingsEffects = [];
@@ -516,6 +516,7 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
   let preferenceAtom;
   const ctx = {
     ...(qcBehavior.storage ? { storage: qcBehavior.storage } : {}),
+    onDispose: dispose => hostDisposers.push(dispose),
     rest: async (path, options = {}) => {
       requests.push({ path, ...options });
       const defaults = { '/overlay/lifecycle': { revision: 0, epoch: 'backend-epoch' }, '/overlay/claim': { pane: 'test-pane' }, '/overlay/show': { shown: true, owner: 'test-owner' }, '/overlay/release': { accepted: true } };
@@ -610,10 +611,111 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
     forcePreferences: patch => preferenceAtom.set({ ...preferenceAtom.get(), ...patch }),
     flushPaneEffects: () => { qcBehavior.delayPaneEffects = false; for (const effect of delayedPaneEffects.splice(0)) effect(); },
     pollStatus: () => statusQuery.queryFn(),
+    hostUnload: () => { for (const dispose of hostDisposers) dispose(); },
     unmountSettings: () => { for (const effect of settingsEffects) effect?.cleanup?.(); },
     unmount: () => { for (const effect of paneEffects) effect?.cleanup?.(); },
     replayEffects: () => { for (const effect of effects) effect?.cleanup?.(); effects.length = 0; return render(); } };
 }
+test('host unload fences retained commands without relying on register return value', async () => {
+  const source = readFileSync(new URL('../desktop/plugin.js', import.meta.url), 'utf8')
+    .replace(/^import .*;\r?\n/gm, '').replace('export default', 'const plugin =');
+  const contributions = [], disposers = [], reveals = [];
+  const ctx = {
+    register(item) {
+      contributions.push(item);
+      const dispose = () => { const index = contributions.indexOf(item); if (index >= 0) contributions.splice(index, 1); };
+      disposers.push(dispose);
+      return dispose;
+    },
+    onDispose: dispose => { disposers.push(dispose); },
+    rest: async () => ({}),
+  };
+  const atom = initial => { let value = initial; return { get: () => value, set: next => { value = next; } }; };
+  const host = { paneVisibility: () => atom(false), revealPane: id => reveals.push(id), notify: () => {} };
+  // The real host tracks ctx registrations and intentionally ignores register's return.
+  vm.runInNewContext(source + '\nplugin.register(ctx);', { ctx, h: () => null, atom, host, PALETTE_AREA: 'palette' });
+  const restart = contributions.find(item => item.id === 'restart').data.run;
+  const open = contributions.find(item => item.id === 'open').data.run;
+  for (const dispose of [...disposers]) dispose();
+  assert.equal(contributions.length, 0, 'host removed the contributed UI');
+  await restart();
+  open();
+  assert.deepEqual(contributions, [], 'retained commands must not recreate a pane after unload');
+  assert.deepEqual(reveals, [], 'retained commands must not reveal a pane after unload');
+});
+
+test('host unload releases its claimed pane once even before React unmount', async () => {
+  const ui = pane('/projects/alpha', true, false, '', {}, {}, {},
+    { setInterval: () => 0, clearInterval: () => {} }, { effects: true, settingsHost: true });
+  await new Promise(resolve => setImmediate(resolve)); // allow the synthetic pane claim to resolve
+  assert.equal(ui.requests.filter(r => r.path === '/overlay/claim').length, 1);
+  const staleSuggest = button(ui.tree, 'Suggest answer');
+  const stalePoll = ui.pollStatus;
+  ui.hostUnload();
+  ui.hostUnload(); // host and fallback cleanup may both run
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(ui.requests.filter(r => r.path === '/overlay/release').length, 1);
+  await staleSuggest.props.onClick();
+  assert.equal(ui.requests.filter(r => r.path === '/assist').length, 0);
+  await assert.rejects(stalePoll(), /retired/i, 'unloaded plugin cannot make a stale status request');
+  assert.equal(ui.requests.filter(r => r.path === '/status').length, 0);
+  ui.unmount(); ui.unmountSettings();
+  assert.equal(ui.requests.filter(r => r.path === '/overlay/release').length, 1);
+});
+
+test('host unload releases a claim that completes after disposal', async () => {
+  let finishClaim;
+  const claim = new Promise(resolve => { finishClaim = resolve; });
+  const ui = pane('/projects/alpha', true, false, '', {}, { '/overlay/claim': () => claim }, {},
+    { setInterval: () => 0, clearInterval: () => {} }, { effects: true, settingsHost: true });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(ui.requests.filter(r => r.path === '/overlay/claim').length, 1);
+  ui.hostUnload();
+  finishClaim({ accepted: true, pane: 'late-test-pane' });
+  await new Promise(resolve => setImmediate(resolve));
+  const released = ui.requests.filter(r => r.path === '/overlay/release');
+  assert.equal(released.length, 1);
+  assert.equal(released[0].body.pane, 'late-test-pane');
+  ui.unmount(); ui.unmountSettings();
+});
+
+test('host unload fences an in-flight Restart before its release completes', async () => {
+  let finishRelease;
+  const release = new Promise(resolve => { finishRelease = resolve; });
+  const ui = pane('/projects/alpha', true, false, '', {}, { '/overlay/release': () => release }, {},
+    { setInterval: () => 0, clearInterval: () => {} }, { effects: true, settingsHost: true });
+  await new Promise(resolve => setImmediate(resolve));
+  const original = ui.contributions.find(item => item.area === 'panes');
+  const restart = ui.contributions.find(item => item.id === 'restart').data.run;
+  const pending = restart();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(ui.requests.filter(r => r.path === '/overlay/release').length, 1);
+  ui.hostUnload();
+  finishRelease({ accepted: true, stop_confirmed: true, overlay_stop_confirmed: true });
+  await pending;
+  assert.equal(ui.contributions.find(item => item.area === 'panes'), original, 'old Restart must not register a replacement');
+  assert.equal(ui.revealed.length, 0, 'old Restart must not reveal a replacement');
+  assert.equal(ui.requests.filter(r => r.path === '/overlay/release').length, 1);
+  ui.unmount(); ui.unmountSettings();
+});
+
+test('host unload stops synthetic backend capture and rejects stale Start', { timeout: 10000 }, async t => {
+  const backend = await realBackend(t);
+  const ui = backend.mount();
+  try {
+    const start = button(ui.tree, 'Start listening');
+    await start.props.onClick();
+    assert.equal((await backend.rpc({ command: 'inspect' })).running, true);
+    ui.hostUnload();
+    const stopped = await backend.rpc({ command: 'inspect' });
+    assert.equal(stopped.running, false, 'host disposal must release owned capture');
+    assert.equal(stopped.stops, 1);
+    await start.props.onClick();
+    assert.equal((await backend.rpc({ command: 'inspect' })).running, false);
+    assert.equal(backend.traffic.filter(r => r.path === '/start').length, 1);
+  } finally { ui.unmount(); await backend.rpc({ command: 'inspect' }); }
+});
+
 test('settings host registers Meeting Copilot in Settings → Plugins', () => {
   const ui = pane('/projects/alpha', true, false, '', {}, {}, {}, {}, { settingsHost: true });
   const page = ui.contributions.find(c => c.area === 'settings.plugins');

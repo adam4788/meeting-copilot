@@ -319,7 +319,7 @@ export default {
       // Fence all outbound work, including previously captured Assist/retry
       // callbacks. Release uses the registration-level request, never fallback.
       const usable = () => registered() && paneEntry.active && !paneEntry.retired;
-      const api = (path, body) => (usable() || (path === '/status' && body === undefined)) ? request(path, body)
+      const api = (path, body) => (active && (usable() || (path === '/status' && body === undefined))) ? request(path, body)
         : Promise.reject(new Error('This pane is retired. Close and reopen it.'));
       const qc = useQueryClient();
       const saved = preferences.get();
@@ -1305,12 +1305,17 @@ export default {
     ctx.register({ id: 'open', area: PALETTE_AREA, data: { id: `${ID}.open`, label: 'Open Meeting Copilot', keywords: ['meeting', 'copilot', 'show', 'restore'], run: openPane } });
     ctx.register({ id: 'restart', area: PALETTE_AREA, data: { id: `${ID}.restart`, label: 'Restart Meeting Copilot', keywords: ['meeting', 'copilot', 'restart', 'reload'], run: restartPlugin } });
     ctx.register({ id: 'meeting-help', area: PALETTE_AREA, data: { label: 'Meeting Copilot: usage', run: () => host.notify({ kind: 'info', message: 'Open Meeting Copilot. Choose one project, All projects + sessions, or sessions only. Web fallback is off by default and can be enabled. Confirm consent and attach your recording, then Suggest answer.' }) } });
-    return () => {
+    const dispose = () => {
+      if (!active) return;
+      active = false;
       for (const life of lifecycles) {
         life.mounted = false;
         releaseOverlayPane(life);
       }
-      active = false;
     };
+    // Hermes tracks explicit disposers; its runtime loader ignores register's
+    // return value. Keep the return as a fallback for older/test hosts.
+    if (typeof ctx.onDispose === 'function') ctx.onDispose(dispose);
+    return dispose;
   },
 };
