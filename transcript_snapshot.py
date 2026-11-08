@@ -1,6 +1,6 @@
-"""Source-only prototype: immutable, bounded provider transcript provenance.
+"""Immutable, bounded provider transcript provenance.
 
-Not wired into runtime yet. A caller must send provider_json unchanged and retain
+The runtime sends provider_json unchanged and retains
 this snapshot with that answer; never resolve refs against the live buffer.
 """
 from dataclasses import dataclass
@@ -8,6 +8,7 @@ from collections import deque
 import hashlib
 import json
 import math
+import re
 import uuid
 
 
@@ -35,6 +36,18 @@ class Snapshot:
     sha256: str
     omitted_segments: int
 
+    def citation_warning(self, answer):
+        refs = re.findall(r'\[(T\d+)\]', str(answer))
+        valid = {s.ref for s in self.segments}
+        return ('Answer transcript references are invalid; verify against the sent context.'
+                if any(ref not in valid for ref in refs) else None)
+
+    def public(self):
+        return {'schema': 'transcript-snapshot-v1', 'snapshot_id': self.snapshot_id,
+                'provider_json': self.provider_json, 'sha256': self.sha256,
+                'omitted_segments': self.omitted_segments,
+                'segments': [s.payload() for s in self.segments]}
+
     def resolve(self, snapshot_id, ref):
         """Scope references to this answer; never resolve another snapshot's T1."""
         if snapshot_id != self.snapshot_id:
@@ -46,7 +59,7 @@ def build_snapshot(segments, *, backend, clean, max_chars=6000):
     """Sanitize first, then budget the exact serialized provider representation.
 
     Caller must provide the production sanitizer and trusted backend selection.
-    Native timestamps are chunk starts, not exact utterance timings. Meetily's
+    Backend timestamps are not interpreted as utterance timings. Meetily's
     audio_start_time is kept uninterpreted; it is not converted into UTC or a
     playback offset. Backend IDs are provenance, not globally stable citations.
     """
@@ -76,9 +89,9 @@ def build_snapshot(segments, *, backend, clean, max_chars=6000):
         source_id = raw.get('id')
         source_id = str(clean(str(source_id)[:600]))[:600] if source_id is not None else None
         stamp = raw.get('timestamp')
-        valid = (type(stamp) in (int, float) and 0 <= stamp <= 253402300799
+        valid = (raw.get('timestamp_supplied', True) is True and type(stamp) in (int, float) and 0 <= stamp <= 253402300799
                  and math.isfinite(stamp))
-        kind = ('capture_chunk_start_unix_seconds' if backend in ('native', 'macos')
+        kind = ('backend_reported_time_uninterpreted' if backend in ('native', 'macos')
                 else 'meetily_audio_start_time_uninterpreted' if backend == 'meetily' else 'unknown')
         stamp = float(stamp) if valid and kind != 'unknown' else None
         if stamp is None:

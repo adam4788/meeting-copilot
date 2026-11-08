@@ -456,7 +456,7 @@ export default {
       // changing exact replay context or routing to a truncated project/model.
       const boundedAnswer = body => {
         const limits = { question: 4000, transcript: 16000, project: 1000, web_query: 300,
-          answer_provider: 100, answer_model: 200, row_id: 200, request_id: 100 };
+          answer_provider: 100, answer_model: 200, row_id: 200, request_id: 100, replay_request_id: 100 };
         for (const [key, limit] of Object.entries(limits)) {
           if (body[key] != null && (typeof body[key] !== 'string' || body[key].length > limit)) {
             setError('Answer was not sent: question, saved context, or selected settings exceed supported field limits. Edit the question/settings and ask explicitly.');
@@ -521,6 +521,7 @@ export default {
           ...(req.web_query ? { web_query: req.web_query } : {}),
           ...(req.answer_provider ? { answer_provider: req.answer_provider, answer_model: req.answer_model } : {}),
           ...(typeof req.transcript === 'string' ? { transcript: req.transcript } : {}),
+          ...(req.replay_request_id ? { replay_request_id: req.replay_request_id } : {}),
           ...(req.row_id ? { row_id: req.row_id } : {}) });
         if (!body) return;
         answerSubmitting.current = true;
@@ -841,6 +842,21 @@ export default {
           } }, 'Copy answer + evidence'),
           h('div', { style: { display: 'flex', justifyContent: 'space-between' } }, h('strong', null, 'Suggested answer'), h('span', { style: muted }, `${Number.isFinite(result.elapsed_seconds) ? `${result.elapsed_seconds.toFixed(1)}s` : ''}${result.model_route ? ` · ${result.model_route}` : ''}`)),
           h('div', { style: { whiteSpace: 'pre-wrap', lineHeight: 1.65, paddingTop: 10 } }, result.answer),
+          result.transcript_snapshot?.schema === 'transcript-snapshot-v1' && h('details', { style: { marginTop: 12 } },
+            h('summary', { style: { cursor: 'pointer', ...muted } }, 'Transcript context sent with this answer'),
+            h('p', { style: muted }, 'Frozen recent context, not the current transcript or a complete meeting. References identify excerpts, not verified claims. Backend times are uninterpreted; no exact utterance time or playback offset is verified. Missing owners, dates and timestamps must not be inferred.'),
+            h('p', { style: muted }, `${result.transcript_snapshot.omitted_segments || 0} segment(s) omitted by the context limit.`),
+            ...(result.transcript_snapshot.segments || []).map((s, i) => h('div', { key: i, style: { ...muted, whiteSpace: 'pre-wrap', paddingTop: 8 } },
+              h('strong', null, `[${s.ref}] ${s.speaker}: `), s.text,
+              s.shortened && h('span', null, ' (excerpt shortened)'),
+              h('div', null, s.timestamp == null ? 'Time unavailable' : `${s.timestamp_kind}: ${s.timestamp} (backend metadata, not verified utterance time)`))),
+            h(Button, { variant: 'secondary', disabled: typeof result.transcript_snapshot.provider_json !== 'string' || result.transcript_snapshot.provider_json.length > 16000, onClick: async () => {
+              if (!usable()) return;
+              if (typeof window === 'undefined' || typeof window.confirm !== 'function' || !window.confirm('Copy the exact transcript context sent for this answer? It can contain confidential meeting text and metadata. Clipboard history or sync may retain it. Review before sharing.')) return;
+              try { await navigator.clipboard.writeText(result.transcript_snapshot.provider_json); notify('info', 'Sent transcript context copied. Review before sharing.'); }
+              catch (_) { setError('Clipboard unavailable. Select and copy the sent context manually.'); }
+            } }, 'Copy sent transcript context')),
+
           result.web_search?.used && h('p', { style: muted }, `${result.web_search.mode === 'automatic' ? 'Automatic web fallback' : 'Explicit web search'}: ${result.web_search.query}`),
           ...(result.warnings || []).map((w, i) => h('p', { key: `warning-${i}`, style: muted }, w)),
           result.answer && /partial|interrupt/i.test((result.warnings || []).join(' ')) && (result.request || lastAsked) && h('div', { style: { paddingTop: 8 } }, h(Button, { variant: 'secondary', disabled: answerBlocked, onClick: () => replayRequest(result.request || { question: lastAsked.question, ...(lastAsked.scope || {}) }) }, 'Retry for the complete response')),

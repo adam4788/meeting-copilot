@@ -2213,3 +2213,58 @@ test('evidence export is unavailable without a displayed answer', () => {
   const blank = pane('', true, false, '', {}, {}, { result: { answer: '' } });
   assert.equal(button(blank.tree, 'Copy answer + evidence').props.disabled, true);
 });
+
+const sentSnapshotFixture = { schema: 'transcript-snapshot-v1', snapshot_id: 'synthetic-snapshot',
+  provider_json: '{"snapshot_id":"synthetic-snapshot","segments":[{"ref":"T1","text":"PRIVATE SENT CONTEXT"}]}',
+  omitted_segments: 2, segments: [{ ref: 'T1', speaker: 'meeting', text: 'PRIVATE SENT CONTEXT',
+    timestamp: 12, timestamp_kind: 'meetily_audio_start_time_uninterpreted', shortened: true }] };
+
+test('sent transcript context is separately disclosed and exported exactly only on confirmation', async () => {
+  const copies = [], confirms = [];
+  const ui = pane('', true, false, '', {}, {}, { result: { answer: 'Suggestion [T1]',
+    transcript_snapshot: sentSnapshotFixture }, segments: [{ text: 'NEW LIVE WORDS' }] }, {
+    window: { confirm: msg => { confirms.push(msg); return true; } },
+    navigator: { clipboard: { writeText: async text => copies.push(text) } },
+  });
+  assert.equal(copies.length, 0);
+  assert.match(JSON.stringify(ui.tree), /not verified claims/);
+  assert.match(JSON.stringify(ui.tree), /not verified utterance time/);
+  await button(ui.tree, 'Copy answer + evidence').props.onClick();
+  assert.doesNotMatch(copies[0], /PRIVATE SENT CONTEXT|NEW LIVE WORDS/);
+  await button(ui.tree, 'Copy sent transcript context').props.onClick();
+  assert.equal(copies[1], sentSnapshotFixture.provider_json);
+  assert.match(confirms[1], /confidential meeting text/);
+  assert.match(confirms[1], /history or sync/);
+  assert.equal(ui.requests.length, 0);
+});
+
+test('sent transcript export refuses missing confirmation and handles clipboard denial', async () => {
+  for (const confirm of [undefined, () => false]) {
+    const ui = pane('', true, false, '', {}, {}, { result: { answer: 'Answer', transcript_snapshot: sentSnapshotFixture } }, {
+      window: { confirm }, navigator: { clipboard: { writeText: async () => assert.fail('must not copy') } },
+    });
+    await button(ui.tree, 'Copy sent transcript context').props.onClick();
+    assert.equal(ui.requests.length, 0);
+  }
+  const ui = pane('', true, false, '', {}, {}, { result: { answer: 'Answer', transcript_snapshot: sentSnapshotFixture } }, {
+    window: { confirm: () => true },
+  });
+  await button(ui.tree, 'Copy sent transcript context').props.onClick();
+  assert.match(JSON.stringify(ui.rerender()), /Clipboard unavailable/);
+});
+
+test('snapshot retry forwards only server replay identity and original text, never live metadata', async () => {
+  const req = { question: 'Saved question', transcript: 'saved input', replay_request_id: 'prior-request',
+    include_history: false, project: '/projects/alpha', answer_provider: 'openai', answer_model: 'gpt-test' };
+  const ui = pane('/projects/alpha', true, false, '', {}, {}, {
+    answer_error: 'failed', error: 'failed', error_source: 'answer', error_request: req,
+    segments: [{ text: 'new live words' }],
+  });
+  const retry = nodes(ui.tree).find(n => n.type === 'button' && n.children.some(x => typeof x === 'string' && x.startsWith('Retry')));
+  assert.ok(retry);
+  await retry.props.onClick();
+  const request = ui.requests.find(r => r.path === '/assist');
+  assert.equal(request.body.replay_request_id, 'prior-request');
+  assert.equal(request.body.transcript, 'saved input');
+  assert.equal(request.body.transcript_snapshot, undefined);
+});

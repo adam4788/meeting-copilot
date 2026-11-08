@@ -165,3 +165,12 @@ segments. It is not a complete transcript or independently verified
 meeting record. The copy does not send a new model request and excludes the
 retained request snapshot and live transcript. Review confidential snippets and
 links before sharing; clipboard history or device sync may retain the copy.
+### Frozen transcript context
+
+Answers based on live segments retain the exact bounded, sanitized transcript
+context sent to the model, even after transcript corrections. Inspect its
+per-answer excerpts in **Transcript context sent with this answer**. Backend
+times remain uninterpreted, and references are not proof that a model claim is
+correct. A separate **Copy sent transcript context** action requires confirmation;
+ordinary evidence export excludes it. See [transcript context](docs/transcript-context.md)
+for retry, retention, timing and verification limits.

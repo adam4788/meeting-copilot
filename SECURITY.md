@@ -22,6 +22,13 @@ request snapshot or automatically copy the live transcript. Excerpts can be
 confidential; clipboard history and device sync may retain them. Clear meeting
 does not clear the OS clipboard or copies you saved elsewhere.
 
+New live-context answers also retain an immutable sanitized snapshot of the exact
+bounded transcript JSON passed to the provider, including supplied segment IDs
+and uninterpreted backend times. It is held only with bounded request state;
+Clear/new meeting retires it. Explicit transcript-context copy has a separate
+confirmation and can persist in clipboard history or sync. Ordinary answer and
+evidence copy excludes it. A valid excerpt reference is not factual verification.
+
 ## Credentials and model selection
 
 Configure API keys only in Hermes-managed secret settings for this plugin's

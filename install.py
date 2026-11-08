@@ -8,7 +8,7 @@ from pathlib import Path
 import shutil
 import sys
 
-FILES = ('server.py', 'credentials.py', 'byok.py', 'knowledge.py', 'web_policy.py', 'audio.py', 'meetily.py',
+FILES = ('transcript_snapshot.py', 'server.py', 'credentials.py', 'byok.py', 'knowledge.py', 'web_policy.py', 'audio.py', 'meetily.py',
          'macos_audio.py', 'audio_worker.py', 'model_selection.py', 'meta_models.py', 'meta_asr.py',
          'overlay_bridge.py', 'answer_core.py', 'hermes_adapters.py', 'ask.py', 'eval_retrieval.py',
          'demo_standalone.py',

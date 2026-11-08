@@ -31,7 +31,7 @@ class SnapshotTests(unittest.TestCase):
         self.assertIsNone(a.segments[0].source_id)
 
     def test_timestamp_semantics_never_invent_wall_time_for_meetily(self):
-        for backend, kind in [('native', 'capture_chunk_start_unix_seconds'), ('macos', 'capture_chunk_start_unix_seconds'), ('meetily', 'meetily_audio_start_time_uninterpreted')]:
+        for backend, kind in [('native', 'backend_reported_time_uninterpreted'), ('macos', 'backend_reported_time_uninterpreted'), ('meetily', 'meetily_audio_start_time_uninterpreted')]:
             s = self.make([dict(text='Words', timestamp=12.5)], backend=backend).segments[0]
             self.assertEqual(s.timestamp, 12.5)
             self.assertEqual(s.timestamp_kind, kind)

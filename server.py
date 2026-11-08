@@ -71,6 +71,7 @@ class AssistRequest(BaseModel):
     answer_model: str | None = Field(default=None, max_length=200)
     # Exact-replay retry: a stored transcript snapshot instead of current segments.
     transcript: str | None = Field(default=None, max_length=16000)
+    replay_request_id: str | None = Field(default=None, max_length=100)
 
 
 class AssistCancelRequest(BaseModel):
@@ -148,6 +149,7 @@ class MeetingState:
         self.busy = False
         self.result = None
         self.requests = {}
+        self.transcript_snapshots = {}
         self.request_seq = 0
         self.live_workers = 0
         self.generation = 0
@@ -197,7 +199,8 @@ class MeetingState:
         if text:
             with self.lock:
                 item = {'speaker': str(segment.get('speaker', 'remote'))[:30], 'text': text,
-                        'timestamp': segment.get('timestamp', time.time())}
+                        'timestamp': segment.get('timestamp', time.time()),
+                        'timestamp_supplied': 'timestamp' in segment}
                 if segment.get('partial_tail') is True:
                     item['partial_tail'] = True
                 segment_id = segment.get('id')
@@ -315,6 +318,7 @@ class MeetingState:
                 for e in self.requests.values():
                     e['cancelled'] = True
                 self.requests.clear()
+                self.transcript_snapshots.clear()
                 self.generation += 1
                 self.session_key = session_key
             self.backend = backend
@@ -641,7 +645,7 @@ class MeetingState:
                     self.engine = module.KnowledgeEngine()
             return self.engine
 
-    def assist(self, question, project=None, web_query=None, all_projects=False, web_fallback=False, answer_provider=None, answer_model=None, request_id=None, row_id=None, transcript=None, expected_generation=None, expected_capture_generation=None, include_history=True):
+    def assist(self, question, project=None, web_query=None, all_projects=False, web_fallback=False, answer_provider=None, answer_model=None, request_id=None, row_id=None, transcript=None, expected_generation=None, expected_capture_generation=None, include_history=True, replay_request_id=None):
         from fastapi import HTTPException
         import secrets
         if all_projects and project:
@@ -682,12 +686,30 @@ class MeetingState:
                 # Explicit row requests never hijack another row: 409 carries the
                 # owner so the caller keeps attribution instead of polling /status.
                 raise _AnswerRejected(409, f"Request {live[0]['request_id']} is already being prepared.")
+            snapshot = None
+            if transcript is None and self.segments:
+                import importlib
+                provenance = importlib.import_module(f'{__package__}.transcript_snapshot' if __package__ else 'transcript_snapshot')
+                knowledge = importlib.import_module(f'{__package__}.knowledge' if __package__ else 'knowledge')
+                snapshot = provenance.build_snapshot(self.segments, backend=self.backend, clean=knowledge._clean)
             transcript = ('\n'.join(f"{s['speaker']}: {s['text']}" for s in list(self.segments)[-40:])[-16000:]
                           if transcript is None else str(transcript)[-16000:])
             if not question.strip():
                 if not transcript:
                     raise _AnswerRejected(400, 'Enter a question or start listening first.')
                 question = 'Suggest a concise answer to the most recent question in this transcript.'
+            if replay_request_id is not None:
+                prior = self.requests.get(replay_request_id)
+                original = prior.get('request', {}) if prior else {}
+                supplied = dict(question=question[:4000], transcript=transcript, project=project,
+                                web_query=web_query, all_projects=all_projects, web_fallback=web_fallback,
+                                answer_provider=answer_provider, answer_model=answer_model,
+                                row_id=row_id, include_history=include_history)
+                if (not prior or prior.get('generation') != self.generation
+                        or replay_request_id not in self.transcript_snapshots
+                        or any(original.get(k) != v for k, v in supplied.items())):
+                    raise _AnswerRejected(409, 'Saved transcript context is unavailable or changed; ask a new question.')
+                snapshot = self.transcript_snapshots[replay_request_id]
             self.request_seq += 1
             request_id = (str(request_id or '').strip() or f'r-{self.request_seq}-{secrets.token_hex(4)}')[:100]
             if request_id in self.requests:
@@ -699,6 +721,7 @@ class MeetingState:
                              if entry.get('status') in ('done', 'error', 'cancelled') or entry.get('cancelled')]
                 for key in droppable[:len(self.requests) - 7]:
                     del self.requests[key]
+                    self.transcript_snapshots.pop(key, None)
                 if len(self.requests) >= 8:
                     raise _AnswerRejected(409, 'Too many pending answer requests.')
             # Reserve worker capacity only after every rejecting check above:
@@ -718,6 +741,9 @@ class MeetingState:
                                  'project': project, 'web_query': web_query, 'all_projects': all_projects,
                                  'web_fallback': web_fallback, 'answer_provider': answer_provider,
                                  'answer_model': answer_model, 'row_id': row_id, 'include_history': include_history}}
+            if snapshot is not None:
+                self.transcript_snapshots[request_id] = snapshot
+                entry['request']['replay_request_id'] = request_id
             self.requests[request_id] = entry
             self.busy, self.error, self.result = True, None, None
             self.error_request = None
@@ -751,6 +777,8 @@ class MeetingState:
                     probe = probe_fn(**{k: v for k, v in options.items() if k != 'include_history'}) if callable(probe_fn) else True
                 except Exception:
                     probe = True
+                if snapshot is not None and getattr(engine, 'supports_transcript_snapshot', False):
+                    options['transcript_snapshot'] = snapshot
                 stream_header, chunks = None, None
                 if probe:
                     if aborted():
@@ -793,6 +821,7 @@ class MeetingState:
                         elif generation == self.generation:
                             entry_ref.update({'status': 'done', 'answer': result.get('answer', ''),
                                               'sources': result.get('sources', []), 'warnings': result.get('warnings', []),
+                                              'transcript_snapshot': result.get('transcript_snapshot'),
                                               'web_search': result.get('web_search', {'used': False}),
                                               'model_route': result.get('model_route', ''),
                                               'streaming': bool(result.get('streaming', False)),
@@ -820,6 +849,7 @@ class MeetingState:
                     header = stream_header or {}
                     entry_ref['model_route'] = header.get('model_route', '')
                     entry_ref['sources'] = header.get('sources', [])
+                    entry_ref['transcript_snapshot'] = header.get('transcript_snapshot')
                     entry_ref['warnings'] = header.get('warnings', [])
                     entry_ref['web_search'] = header.get('web_search', {'used': False})
                 try:
@@ -862,6 +892,7 @@ class MeetingState:
                             elif generation == self.generation:
                                 entry_ref.update({'status': 'done', 'answer': result.get('answer', ''),
                                                   'sources': result.get('sources', []), 'warnings': result.get('warnings', []),
+                                              'transcript_snapshot': result.get('transcript_snapshot'),
                                                   'web_search': result.get('web_search', {'used': False}),
                                                   'model_route': result.get('model_route', ''),
                                                   'streaming': bool(result.get('streaming', False)),
@@ -878,6 +909,10 @@ class MeetingState:
                         return
                     with self.lock:
                         warnings = list(entry_ref.get('warnings') or [])
+                        if snapshot is not None:
+                            citation_warning = snapshot.citation_warning(entry_ref.get('answer', ''))
+                            if citation_warning and citation_warning not in warnings:
+                                warnings.append(citation_warning)
                         msg = 'Stream interrupted; showing a partial answer. Retry for the complete response.'
                         if msg not in warnings:
                             warnings.append(msg)
@@ -885,6 +920,10 @@ class MeetingState:
                 with self.lock:
                     if generation == self.generation and not entry_ref.get('cancelled'):
                         warnings = list(entry_ref.get('warnings') or [])
+                        if snapshot is not None:
+                            citation_warning = snapshot.citation_warning(entry_ref.get('answer', ''))
+                            if citation_warning and citation_warning not in warnings:
+                                warnings.append(citation_warning)
                         sources = entry_ref.get('sources') or []
                         import re as _re
                         citations = [int(n) for n in _re.findall(r'\[(\d+)\]', entry_ref.get('answer') or '')]
@@ -901,7 +940,8 @@ class MeetingState:
                         self.result = {'answer': entry_ref['answer'], 'sources': entry_ref['sources'],
                                        'warnings': warnings, 'web_search': entry_ref['web_search'],
                                        'model_route': entry_ref['model_route'], 'streaming': True,
-                                       'completed_only': False, 'request': entry_ref.get('request')}
+                                       'completed_only': False, 'request': entry_ref.get('request'),
+                                       'transcript_snapshot': entry_ref.get('transcript_snapshot')}
                     elif entry_ref.get('cancelled'):
                         entry_ref['status'] = 'cancelled'
             except Exception as exc:
@@ -920,6 +960,10 @@ class MeetingState:
                             # as a complete answer, and never as a bare error
                             # that hides what already arrived.
                             warnings = list(entry_ref.get('warnings') or [])
+                            if snapshot is not None:
+                                citation_warning = snapshot.citation_warning(entry_ref.get('answer', ''))
+                                if citation_warning and citation_warning not in warnings:
+                                    warnings.append(citation_warning)
                             msg = 'Stream interrupted; showing a partial answer. Retry for the complete response.'
                             if msg not in warnings:
                                 warnings.append(msg)
@@ -928,7 +972,8 @@ class MeetingState:
                             self.result = {'answer': entry_ref['answer'], 'sources': entry_ref.get('sources', []),
                                            'warnings': warnings, 'web_search': entry_ref.get('web_search', {'used': False}),
                                            'model_route': entry_ref.get('model_route', ''), 'streaming': True,
-                                           'completed_only': False, 'request': entry_ref.get('request')}
+                                           'completed_only': False, 'request': entry_ref.get('request'),
+                                       'transcript_snapshot': entry_ref.get('transcript_snapshot')}
                         else:
                             entry_ref.update({'status': 'error', 'error': ANSWER_FAILURE})
                             self.error = ANSWER_FAILURE
@@ -1812,7 +1857,7 @@ def make_router(state):
     def assist(body: AssistRequest):
         try:
             return state.assist(body.question, body.project, body.web_query, body.all_projects, body.web_fallback, body.answer_provider, body.answer_model,
-                                request_id=body.request_id, row_id=body.row_id, transcript=body.transcript, include_history=body.include_history)
+                                request_id=body.request_id, row_id=body.row_id, transcript=body.transcript, include_history=body.include_history, replay_request_id=body.replay_request_id)
         except _AnswerRejected as exc:
             if body.response_contract != 'answer-admission-v1':
                 raise
@@ -1899,6 +1944,7 @@ def make_router(state):
             for key in [k for k, e in state.requests.items()
                         if e.get('status') in ('done', 'error', 'cancelled')]:
                 del state.requests[key]
+                state.transcript_snapshots.pop(key, None)
             # A retiring tail window must not resurrect pre-clear speech:
             # late callbacks from the old capture stay rejected after Clear.
             # Retire the generation atomically with clearing: callbacks that
