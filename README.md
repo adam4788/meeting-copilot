@@ -41,7 +41,8 @@ CI and plugin validation do not prove a complete meeting works on your computer.
 - Uses local Whisper transcription, optional explicit Meta cloud transcription,
   or an optional, unofficial Meetily JSON attachment, depending on platform setup.
 - Sends an answer request to the provider and exact model you select in
-  **Answer setup**. OpenAI and OpenRouter are the main Desktop answer routes.
+  **Settings → Plugins → Meeting Copilot**. OpenAI and OpenRouter are the main
+  Desktop answer routes.
 - Offers explicit recent-transcript actions: **Catch me up**, **Extract actions**,
   and **Suggest a question**. These use your selected model, not the whole meeting.
 - Keeps past sessions excluded and web search off by default in new panes.
@@ -88,11 +89,12 @@ audio readiness. Windows capture remains experimental.
 
 ## Ask your first question
 
-1. Configure an OpenAI or OpenRouter API key in the secret field for
-   **meeting-copilot-live** in Hermes plugin settings, then save and reopen the
-   pane. Never put keys in chat or model fields.
-2. Open **Answer setup**, choose the matching provider, and enter an exact model
-   ID supported by your account's Chat Completions API.
+1. In **Settings → Plugins → Meeting Copilot**, open the plugin's agent settings
+   for the default profile and save an OpenAI or OpenRouter key in its secret
+   field. Reopen the pane; never put keys in chat or model fields.
+2. In the plugin settings page, choose the matching answer provider and an exact
+   model ID supported by your account's Chat Completions API. Older Desktop hosts
+   without plugin settings pages keep **Answer setup** in the pane.
 3. Select one project. Keep **Exclude past sessions** checked, automatic web
    fallback off, and the specific public web query empty.
 4. Type a question about a synthetic project file and choose **Suggest answer**.
@@ -158,8 +160,8 @@ Research product and is not endorsed by Nous Research. Code is licensed under
 
 In the answer pane, **Copy answer + evidence** copies a plain-text report only
 when you confirm. It includes the displayed answer, reported model route,
-warnings, and numbered source excerpts (up to 900 characters per source), so
-colleagues can inspect the basis for a suggestion. Source-update dates are not
+warnings, and numbered source excerpts (up to 2,050 Unicode characters per
+source), so colleagues can inspect the basis for a suggestion. Source-update dates are not
 meeting timestamps; source numbers identify retrieved documents, not meeting
 segments. It is not a complete transcript or independently verified
 meeting record. The copy does not send a new model request and excludes the

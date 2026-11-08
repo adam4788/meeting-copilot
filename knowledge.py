@@ -14,9 +14,11 @@ from contextlib import closing
 try:
     from .web_policy import plan_web
     from .hermes_adapters import WebSearchUnavailable, registry_search
+    from .transcript_snapshot import reference_warnings
 except ImportError:  # top-level use (tests, scripts)
     from web_policy import plan_web
     from hermes_adapters import WebSearchUnavailable, registry_search
+    from transcript_snapshot import reference_warnings
 
 
 _DENIED = re.compile(r'(auth|credential|secret|password|token|config|\.env)', re.I)
@@ -763,13 +765,9 @@ class KnowledgeEngine:
             if aborted():
                 raise _Aborted('cancelled before provider submission')
             text = complete([{'role': 'system', 'content': system}, {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)}])
-            if transcript_snapshot is not None:
-                citation_warning = transcript_snapshot.citation_warning(text)
-                if citation_warning:
-                    warnings.append(citation_warning)
-            citations = [int(n) for n in re.findall(r'\[(\d+)\]', text)]
-            if sources and (not citations or any(n < 1 or n > len(sources) for n in citations)):
-                warnings.append('Answer citations are missing or invalid; verify against the listed evidence.')
+            for warning in reference_warnings(text, len(sources), transcript_snapshot):
+                if warning not in warnings:
+                    warnings.append(warning)
         except _Aborted:
             raise
         except Exception as exc:
@@ -777,7 +775,9 @@ class KnowledgeEngine:
             warnings.append('Model request failed.')
             provider_error = 'Model request failed.'
         if not sources:
-            warnings.append('No matching local/session evidence found; transcript alone is not independent verification.')
+            message = 'No matching local/session evidence found; transcript alone is not independent verification.'
+            if message not in warnings:
+                warnings.append(message)
         # A fallback answer arrived completed, even on a streaming-capable
         # route: report what this answer did, not what the route could do.
         streaming = False if prepared is not None else _completion_supports_streaming(complete)
@@ -869,6 +869,8 @@ class KnowledgeEngine:
                 warnings.append('Web search unavailable in this Hermes host; using local evidence only.')
             except Exception as exc:
                 warnings.append('Web search failed; using local evidence only.')
+        if not sources:
+            warnings.append('No matching local/session evidence found; transcript alone is not independent verification.')
         messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)}]
         web_planned = web_planned or (query is not None)
         header = {'model_route': model_route, 'sources': sources, 'warnings': warnings, 'web_search': web,

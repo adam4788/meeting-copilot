@@ -22,11 +22,15 @@ result = engine.answer("What approval is required?", transcript="", project="exa
 (Unix seconds, or `None` for web snippets). `answer` returns `answer`, `sources`,
 `elapsed_seconds`, and `warnings`. Sources are numbered in list order for `[1]`
 citations. A source is evidence supplied to the model, not proof that every
-answer statement is supported. Invalid/missing citations produce a warning.
+answer statement is supported. Missing or out-of-range numeric citations and
+transcript references without a matching snapshot produce warnings, including
+on interrupted partial streams. An answer without retrieved evidence is also
+marked; a syntactically valid citation does not verify its claim.
 Offload calls to a worker thread; no autonomous agent is started.
 
 Project root discovery: explicit argument, `MEETING_COPILOT_PROJECT_ROOT`, then
-`~/Documents/Projects`. Hermes home discovery: explicit argument, `HERMES_HOME`,
+`~/Documents/Projects`, falling back to `~/Projects` when the former is absent
+and the latter exists. Hermes home discovery: explicit argument, `HERMES_HOME`,
 then `%LOCALAPPDATA%/hermes` on Windows or `~/.hermes` elsewhere. Only the default
 profile is supported. Project selection must resolve to one direct child of the
 project root. With no selected project, only prior sessions are searched unless

@@ -1,14 +1,24 @@
-import { createElement as h, useState, useEffect, useRef } from 'react';
-import { host, useValue, useQuery, useQueryClient, Button, Input, Textarea, Badge, PALETTE_AREA } from '@hermes/plugin-sdk';
+import { createElement as h, useState, useEffect, useLayoutEffect, useRef, useSyncExternalStore } from 'react';
+import { host, atom, useValue, useQuery, useQueryClient, Button, Input, Textarea, Badge, PALETTE_AREA } from '@hermes/plugin-sdk';
 
 const ID = 'meeting-copilot-live';
 const speakerPalette = ['var(--ui-accent)', 'var(--ui-green, var(--ui-accent))', 'var(--ui-orange, var(--ui-accent))', 'var(--ui-red, var(--ui-accent))', 'var(--ui-cyan, var(--ui-accent))', 'var(--ui-purple, var(--ui-accent))'];
 const muted = { color: 'var(--ui-text-secondary)', fontSize: 12, lineHeight: 1.5 };
 const card = { border: '1px solid var(--ui-stroke-secondary)', borderRadius: 10, padding: 14, minWidth: 0, boxSizing: 'border-box', background: 'var(--ui-bg-card)' };
-const selectStyle = { padding: 8, borderRadius: 6, width: '100%', maxWidth: '100%', minWidth: 0, color: 'var(--ui-text-primary)', background: 'var(--ui-bg-card)', border: '1px solid var(--ui-stroke-secondary)' };
+const selectStyle = { padding: 8, borderRadius: 6, width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box', color: 'var(--ui-text-primary)', background: 'var(--ui-bg-card)', border: '1px solid var(--ui-stroke-secondary)' };
 
 // Portable evidence is assembled only from the displayed answer, never current
 // meeting state, credentials, or request snapshots. Clipboard remains explicit.
+// Python bounds model evidence by Unicode code points; JS string.slice counts
+// UTF-16 units instead. Iterate only to the bound, even for a huge input.
+function evidenceExcerpt(value) {
+  const chars = [];
+  for (const char of (typeof value === 'string' ? value : '')) {
+    if (chars.length === 2050) return { text: chars.join(''), truncated: true };
+    chars.push(char);
+  }
+  return { text: chars.join(''), truncated: false };
+}
 function evidenceReport(result) {
   const text = (value, max) => typeof value === 'string' ? value.slice(0, max) : '';
   const lines = ['MEETING COPILOT — ANSWER + EVIDENCE',
@@ -20,7 +30,7 @@ function evidenceReport(result) {
   if (warnings.length) lines.push('', 'WARNINGS', ...warnings.slice(0, 30).map(w => text(w, 2000)));
   const sources = Array.isArray(result.sources) ? result.sources : [];
   lines.push('', 'EVIDENCE EXCERPTS',
-    'Numbering matches retrieved sources in the answer pane, not meeting segments or timestamps. Excerpts are limited to 900 characters each.');
+    'Numbering matches retrieved sources in the answer pane, not meeting segments or timestamps. Excerpts are limited to 2,050 characters each.');
   if (!sources.length) lines.push('No retrieved source excerpts accompanied this answer.');
   for (const [i, source] of sources.slice(0, 100).entries()) {
     const s = source || {};
@@ -31,7 +41,9 @@ function evidenceReport(result) {
       const updated = date ? (Number.isFinite(date.getTime()) ? date.toISOString() : '') : text(s.updated_at, 300);
       if (updated) lines.push('Source updated (not meeting time): ' + updated);
     }
-    lines.push('Excerpt:', text(s.text, 900) || '(No excerpt available)');
+    const excerpt = evidenceExcerpt(s.text);
+    lines.push('Excerpt:', excerpt.text || '(No excerpt available)');
+    if (excerpt.truncated) lines.push('[Excerpt limited to 2,050 characters.]');
   }
   if (sources.length > 100) lines.push('', 'Additional sources omitted from this bounded export.');
   lines.push('', 'Privacy: this copy contains source excerpts and may contain confidential material. Review before sharing.');
@@ -45,7 +57,7 @@ export default {
   register(ctx) {
     function MetaKeySettings() {
       return h('section', { style: card }, h('strong', null, 'Bring your own API key'),
-        h('p', { style: muted }, 'Configure OpenAI or OpenRouter in Hermes Settings → Plugins → meeting-copilot-live (default profile). Keys stay in Hermes-managed secret settings. Never enter keys in chat or model fields. Reopen this pane after setup. Local transcription does not use an answer key.'));
+        h('p', { style: muted }, 'Configure OpenAI or OpenRouter in Hermes Settings → Plugins → meeting-copilot-live (default profile; Agent settings on newer hosts). Keys stay in Hermes-managed secret settings. Never enter keys in chat or model fields. Reopen the pane after changing keys. Local transcription does not use an answer key.'));
     }
     const request = (path, body) => ctx.rest(path, body === undefined ? {} : { method: 'POST', body });
     // Survives plugin unregister/re-register in the SAME renderer. Neither a
@@ -55,19 +67,242 @@ export default {
     const registration = order.registration = (order.registration || 0) + 1;
     let active = true;
     let paneRegistration = null;
+    let paneIds = 0;
     const registered = () => active && order.registration === registration;
     const lifecycles = new Set();
     const notify = (kind, message) => { try { host.notify({ kind, message }); } catch (e) {} };
+    const SCOPE_KEY = 'meeting-copilot.scope.v2';
+    const PREFERENCE_KEY = 'preferences-v1';
+    const preferenceFields = ['project', 'backend', 'excludeHistory', 'webFallback', 'transcriptionModel', 'audioSource', 'answerProvider', 'answerModel', 'transcriptionProvider', 'transcriptionChoiceVersion', 'asrMode'];
+    // Match the backend's credential-like model rejection before persistence.
+    // This is defense in depth, not a general secret detector.
+    const secretLike = value => typeof value === 'string' && /sk-|ghp_|github_pat_|bearer|api[_-]?key|password|access[_-]?token|refresh[_-]?token|eyJ[A-Za-z0-9_-]{10,}/i.test(value);
+    // Paths are not model IDs: words like "tokenizer" and "password-manager"
+    // can be legitimate names. Reject only credential-shaped path segments.
+    const secretPath = value => typeof value === 'string' && /(?:^|[\\/])(?:sk-|ghp_|github_pat_)[A-Za-z0-9_-]{12,}/i.test(value);
+    const safeModel = value => value === '' || (typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._/:@+-]{0,199}$/.test(value) && !value.includes('://') && !secretLike(value));
+    function loadPreferences() {
+      try {
+        let stored = null, current = null, legacy = null;
+        try { stored = ctx.storage?.get(PREFERENCE_KEY, null); } catch (_) {}
+        try { if (typeof localStorage !== 'undefined') current = localStorage.getItem(SCOPE_KEY); } catch (_) {}
+        try { if (typeof localStorage !== 'undefined') legacy = localStorage.getItem('meeting-copilot.scope'); } catch (_) {}
+        const parsed = stored && typeof stored === 'object' ? stored : JSON.parse(current || '{}');
+        const out = {};
+        for (const k of ['project', 'backend', 'transcriptionModel', 'audioSource', 'answerProvider', 'answerModel', 'transcriptionProvider', 'asrMode']) {
+          if (typeof parsed?.[k] === 'string') out[k] = parsed[k].slice(0, 500);
+        }
+        for (const k of ['webFallback', 'excludeHistory']) if (typeof parsed?.[k] === 'boolean') out[k] = parsed[k];
+        if (parsed?.transcriptionChoiceVersion === 1) out.transcriptionChoiceVersion = 1;
+        if (!stored && !current && legacy) {
+          try {
+            const old = JSON.parse(legacy);
+            // Never migrate legacy web defaults or one-shot queries as opt-in.
+            for (const k of ['project', 'backend', 'transcriptionModel', 'audioSource', 'answerProvider', 'answerModel', 'transcriptionProvider', 'asrMode'])
+              if (typeof old?.[k] === 'string') out[k] = old[k].slice(0, 500);
+          } catch (_) {}
+        }
+        if (!['openai', 'openrouter'].includes(out.answerProvider)) { delete out.answerProvider; delete out.answerModel; }
+        for (const key of Object.keys(out)) if (key === 'project' ? secretPath(out[key]) : secretLike(out[key])) delete out[key];
+        if (out.answerModel && !safeModel(out.answerModel)) delete out.answerModel;
+        if (out.transcriptionProvider === 'meta' && parsed?.transcriptionChoiceVersion !== 1) out.transcriptionProvider = 'local';
+        return out;
+      } catch (_) { return {}; }
+    }
+    const loaded = loadPreferences();
+    const preferences = atom({ project: '', backend: 'meetily', webFallback: false, transcriptionModel: 'base.en', audioSource: 'microphone', answerProvider: '', answerModel: '', transcriptionProvider: 'local', asrMode: 'ENDPOINTING', ...loaded,
+      excludeHistory: loaded.excludeHistory !== undefined ? loaded.excludeHistory : !loaded.webFallback });
+    const storageFailed = atom(false);
+    function savePreferences(patch) {
+      if (Object.entries(patch).some(([key, value]) => (key === 'project' ? secretPath(value) : secretLike(value)) || (key === 'answerModel' && !safeModel(value)))) {
+        notify('warning', 'Do not enter API keys or secret-like values in preference fields. Use Hermes-managed Agent settings for keys.');
+        return;
+      }
+      const next = { ...preferences.get(), ...patch };
+      preferences.set(next);
+      const safe = {};
+      for (const key of preferenceFields) if (next[key] !== undefined) safe[key] = next[key];
+      let saved = false;
+      try {
+        const encoded = JSON.stringify(safe);
+        if (ctx.storage?.set && ctx.storage?.get) {
+          ctx.storage.set(PREFERENCE_KEY, safe);
+          saved = JSON.stringify(ctx.storage.get(PREFERENCE_KEY, null)) === encoded;
+        } else if (typeof localStorage !== 'undefined') {
+          localStorage.setItem(SCOPE_KEY, encoded);
+          saved = localStorage.getItem(SCOPE_KEY) === encoded;
+        }
+      } catch (_) { /* Restricted storage and quota failures stay session-only. */ }
+      if (!saved && !storageFailed.get()) notify('warning', 'Preferences could not be saved. They apply only for this session.');
+      if (storageFailed.get() !== !saved) storageFailed.set(!saved);
+    }
+    // Synchronous local locks cover the gaps before React renders or a status
+    // poll can observe a Show/answer admission. They never hold meeting data.
+    const safety = { overlayAction: false, overlayVisible: false, overlayUnknown: false, overlayToken: 0, answer: false, answerKnown: false, answerToken: 0 };
+    const safetySignal = atom(0);
+    const signalSafety = () => safetySignal.set(safetySignal.get() + 1);
+    async function checkedStatus(api) {
+      // Only a GET begun after the operation can settle a local uncertainty.
+      const overlayToken = safety.overlayToken, answerToken = safety.answerToken;
+      const overlayWasActive = safety.overlayAction;
+      const result = await api('/status');
+      let changed = false;
+      if (overlayToken === safety.overlayToken && !overlayWasActive && !safety.overlayAction && (safety.overlayUnknown || safety.overlayVisible) &&
+          result?.overlay_shown === false && result?.overlay_stop_confirmed === true) {
+        safety.overlayUnknown = false; safety.overlayVisible = false; changed = true;
+      }
+      if (answerToken === safety.answerToken && safety.answer && safety.answerKnown && result?.busy === false &&
+          result.requests && typeof result.requests === 'object' && !Array.isArray(result.requests) && Object.keys(result.requests).length === 0) {
+        safety.answer = false; changed = true;
+      }
+      if (changed) signalSafety();
+      return result;
+    }
+    function hasMountedPane() {
+      return !!(registered() && paneRegistration?.active && paneRegistration.life?.mounted);
+    }
+    function mayChangePreferences(qc, status, live = () => true) {
+      if (!registered() || !live()) return false;
+      // With no mounted pane these are deferred defaults only. Do not poll the
+      // legacy /status endpoint: before a pane claim it can renew capture.
+      if (!hasMountedPane()) return true;
+      const latest = typeof qc.getQueryState === 'function' ? qc.getQueryState([ID, 'status']) : null;
+      const state = latest || status;
+      const data = state?.data;
+      return !!(!state?.error && state?.status !== 'error' && state?.status !== 'pending' && !state?.isPending
+        && data?.overlay_shown === false && data?.overlay_stop_confirmed === true && data?.busy === false && data.requests && typeof data.requests === 'object'
+        && !Array.isArray(data.requests) && Object.keys(data.requests).length === 0 && !data.overlay_cleanup_error
+        && !safety.overlayAction && !safety.overlayVisible && !safety.overlayUnknown && !safety.answer);
+    }
+    const updatePreferences = (patch, qc, status, live) => {
+      if (!mayChangePreferences(qc, status, live)) return false;
+      savePreferences(patch);
+      return true;
+    };
+    function answerScope(prefs) {
+      const all = prefs.project === '__all_projects__';
+      return { project: all ? null : prefs.project || null, all_projects: all, web_fallback: prefs.webFallback,
+        ...(prefs.excludeHistory ? { include_history: false } : {}),
+        ...(prefs.answerProvider && prefs.answerModel ? { answer_provider: prefs.answerProvider, answer_model: prefs.answerModel } : {}) };
+    }
+    let settingsAvailable = false;
+    // A disabled useQuery can still replace the shared query's queryFn. Observe
+    // the cache directly so Settings never installs a /status fetch that could
+    // renew an old capture lease after its pane has gone away.
+    const emptyQuery = Object.freeze({ data: undefined, error: null, status: 'pending' });
+    function useCachedQuery(qc, kind) {
+      const snapshot = () => qc.getQueryState?.([ID, kind]) || emptyQuery;
+      const state = useSyncExternalStore(listener => qc.getQueryCache?.()?.subscribe(listener) || (() => {}), snapshot, snapshot);
+      return { ...state, isPending: !!state.isPending || state.status === 'pending' };
+    }
+    function AnswerPreferences({ prefs, status, projects, models, qc, live }) {
+      const data = status.data || {};
+      const unsaved = useValue(storageFailed);
+      const { project, excludeHistory, answerProvider, answerModel, webFallback } = prefs;
+      const allProjects = project === '__all_projects__';
+      const mounted = hasMountedPane();
+      const providers = mounted ? (models.data?.providers || []) : [{ id: 'openai', label: 'OpenAI API' }, { id: 'openrouter', label: 'OpenRouter' }];
+      const entries = Array.isArray(projects.data) ? projects.data : (projects.data?.projects || []);
+      const locked = !mayChangePreferences(qc, status, live);
+      const change = patch => updatePreferences(patch, qc, status, live);
+      return h('div', { style: { display: 'grid', gap: 14 }, 'aria-label': 'Answer preferences' },
+        h('p', { style: { ...muted, margin: 0 } }, 'These preferences apply to future answers. Changing them does not start capture or send a request.'),
+        unsaved && h('p', { role: 'alert', style: { ...muted, margin: 0 } }, 'Preferences could not be saved. They apply only for this session.'),
+        !mounted && h('p', { role: 'status', style: { ...muted, margin: 0 } }, unsaved
+          ? 'The pane is closed. Changes apply only while this session remains open; they do not modify an existing overlay or answer. Open the pane to check backend status and available projects.'
+          : 'The pane is closed. Changes are saved as defaults for the next pane; they do not modify an existing overlay or answer. Open the pane to check backend status and available projects.'),
+        locked && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'To change answer settings, hide the overlay, finish or cancel any answer, and wait for backend status to confirm both are idle. If status is unavailable or shutdown is unconfirmed, reopen the pane and check it.'),
+        h('label', { style: { display: 'grid', gap: 6 } }, h('strong', { id: 'mc-scope-label' }, 'Search scope'),
+          h('select', { value: project, style: selectStyle, 'aria-labelledby': 'mc-scope-label', disabled: locked || (mounted && projects.isPending),
+            onChange: e => {
+              const value = e.target.value;
+              const known = entries.some(p => (typeof p === 'string' ? p : (p.path || p.name)) === value);
+              const isMounted = hasMountedPane();
+              const latest = typeof qc.getQueryState === 'function' ? qc.getQueryState([ID, 'status']) : status;
+              if ((!isMounted || !projects.isPending) && (value === '' || (value === '__all_projects__' && (!isMounted || latest?.data?.capabilities?.all_projects)) || known || value === project)) change({ project: value });
+            } },
+            h('option', { value: '' }, 'Past sessions only'),
+            h('option', { value: '__all_projects__', disabled: mounted && !data.capabilities?.all_projects }, 'All projects + sessions'),
+            project && !allProjects && !entries.some(p => (typeof p === 'string' ? p : (p.path || p.name)) === project) && h('option', { value: project }, project),
+            ...entries.map(p => { const value = typeof p === 'string' ? p : (p.path || p.name); return h('option', { value, key: value }, typeof p === 'string' ? p.split(/[\\/]/).pop() : (p.name || value)); }))),
+        !mounted && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Project path (optional)'),
+          h('input', { style: selectStyle, value: allProjects ? '' : project, disabled: locked, maxLength: 500, placeholder: 'Project folder path', 'aria-label': 'Project path', onChange: e => { if (!hasMountedPane()) change({ project: e.target.value.slice(0, 500) }); } })),
+        projects.error && h('div', { role: 'alert', style: muted }, 'Project lookup unavailable. Check the backend connection.'),
+        allProjects && h('p', { style: { ...muted, margin: 0 } }, 'Searches supported text files across up to 100 eligible project folders plus past sessions, not your whole computer. Evidence can include unrelated projects; review it before sharing.'),
+        h('label', { style: { ...muted, display: 'flex', gap: 8, alignItems: 'flex-start' } },
+          h('input', { type: 'checkbox', checked: excludeHistory, disabled: locked, onChange: e => change({ excludeHistory: e.target.checked }), 'aria-label': 'Exclude past sessions' }),
+          h('span', null, 'Exclude past sessions. Choose one project and turn off web search.')),
+        h('section', { style: { ...card, display: 'grid', gap: 10 } },
+          h('strong', null, 'Answer model'),
+          h('label', { style: { display: 'grid', gap: 6 } }, h('span', { id: 'mc-provider-label' }, 'Answer provider'),
+            h('select', { style: selectStyle, value: answerProvider, disabled: locked || (mounted && !data.capabilities?.independent_models), 'aria-labelledby': 'mc-provider-label',
+              onChange: e => { if ((!hasMountedPane() || data.capabilities?.independent_models) && ['', 'openai', 'openrouter'].includes(e.target.value)) change({ answerProvider: e.target.value, answerModel: '' }); } },
+              h('option', { value: '' }, 'Choose provider…'), ...providers.map(p => h('option', { value: p.id, key: p.id }, p.label || p.id)))),
+          answerProvider && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Answer model'),
+            h('input', { style: selectStyle, value: answerModel, disabled: locked, maxLength: 200, placeholder: 'Exact model ID from your provider', onChange: e => change({ answerModel: e.target.value.slice(0, 200) }), 'aria-label': 'Answer model', autoComplete: 'off' })),
+          answerProvider && h('p', { role: 'status', style: muted }, mounted ? (providers.find(p => p.id === answerProvider)?.status || 'Provider unavailable; choose OpenAI or OpenRouter.') : 'Provider readiness will be checked when you open the pane.'),
+          models.error && h('p', { role: 'alert', style: { ...muted, margin: 0 } }, 'Provider readiness unavailable. Check Hermes plugin secret settings.'),
+          h('p', { style: { ...muted, margin: 0 } }, 'Only for Copilot answers, not chat or transcription.')),
+        h('label', { style: { ...muted, display: 'flex', gap: 8, alignItems: 'flex-start', border: '1px solid var(--ui-stroke-secondary)', borderRadius: 10, padding: '10px 12px', background: 'var(--ui-bg-card)' } },
+          h('input', { type: 'checkbox', checked: webFallback, disabled: locked, onChange: e => change({ webFallback: e.target.checked }) }),
+          h('span', null, webFallback ? 'Automatic web fallback: on. A public query may be drafted if local evidence is insufficient. Filtering is best-effort, not a privacy guarantee; turn off for sensitive calls.' : 'Automatic web fallback: off. Turn on to search the web when local evidence is insufficient.')),
+        h(MetaKeySettings));
+    }
+    function SettingsPage() {
+      const qc = useQueryClient();
+      const live = useRef(true);
+      useEffect(() => { live.current = true; return () => { live.current = false; }; }, []);
+      const [webDraft, setWebDraft] = useState({ text: '', target: null });
+      useValue(safetySignal);
+      const prefs = useValue(preferences);
+      // Observe the pane's cache, but never cause Settings to fetch on its own.
+      const status = useCachedQuery(qc, 'status');
+      const projects = useCachedQuery(qc, 'projects');
+      const models = useCachedQuery(qc, 'models');
+      const bridge = paneRegistration?.webBridge;
+      const ready = !!(!prefs.excludeHistory && bridge && bridge.life === webDraft.target && bridge.canRun());
+      return h('section', { style: { display: 'grid', gap: 14, maxWidth: 720, padding: 16 } },
+        h('h2', { style: { margin: 0 } }, 'Answer setup'),
+        h(AnswerPreferences, { prefs, status, projects, models, qc, live: () => live.current }),
+        h('details', null, h('summary', { style: { cursor: 'pointer', fontWeight: 700 } }, 'Search online with a specific query'),
+          h('div', { style: { display: 'grid', gap: 8, paddingTop: 10 } },
+            h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Specific public web query'),
+              h(Input, { value: webDraft.text, maxLength: 300, onChange: e => setWebDraft({ text: e.target.value.slice(0, 300), target: paneRegistration?.webBridge?.life || null }), placeholder: 'Public query — no client names or meeting details', 'aria-label': 'Specific public web query', 'aria-describedby': 'mc-settings-web-query' })),
+            h('span', { id: 'mc-settings-web-query', 'data-web-query-disclosure': true, style: muted }, 'This query is sent to the web and overrides automatic fallback for this request. Do not include private details. It is not saved; the answer appears in the current Meeting Copilot pane.'),
+            !ready && h('span', { role: 'status', style: muted }, prefs.excludeHistory
+              ? 'Turn off Exclude past sessions to use a public web query.'
+              : 'Open Meeting Copilot, choose an available answer model, and enter the query for that pane. Finish any answer first. If the pane was reopened, enter the query again.'),
+            h(Button, { variant: 'secondary', disabled: !ready || !webDraft.text.trim(), onClick: () => {
+              const current = paneRegistration?.webBridge;
+              if (!live.current || !registered() || preferences.get().excludeHistory || !current || current.life !== webDraft.target || !current.canRun() || !webDraft.text.trim()) return;
+              const query = webDraft.text.trim();
+              setWebDraft({ text: '', target: null });
+              return current.run(query);
+            } }, 'Check sources + web'))));
+    }
+    if (typeof ctx.registerSettingsPage === 'function') {
+      try {
+        const dispose = ctx.registerSettingsPage({ id: 'settings', title: 'Meeting Copilot', icon: 'comment-discussion', render: () => h(SettingsPage) });
+        settingsAvailable = typeof dispose === 'function';
+      } catch (_) { /* Older/partial hosts keep the complete inline controls. */ }
+    }
     function releaseOverlayPane(life) {
       lifecycles.delete(life);
       if (life.release) return life.release;
       if (!life.pane) return Promise.resolve({ accepted: false });
+      const overlayToken = ++safety.overlayToken;
+      if (safety.overlayVisible || safety.overlayAction || life.owner) safety.overlayUnknown = true;
+      signalSafety();
       life.released = true;
       try { life.release = Promise.resolve(request('/overlay/release', { pane: life.pane, action: ++life.action })); }
       catch (error) { life.release = Promise.reject(error); }
       // Observe cleanup failures too; Restart still receives the rejection.
       const warnStop = () => notify('warning', 'Capture stop is not confirmed. Lease expiry initiates stop but cannot guarantee physical shutdown. Reopen Meeting Copilot to check status and Retry stop; verify the OS audio indicator.');
       life.release.then(result => {
+        if (overlayToken === safety.overlayToken && result?.accepted === true && result?.overlay_stop_confirmed === true) {
+          safety.overlayVisible = false; safety.overlayUnknown = false;
+          signalSafety();
+        }
         if (result?.stop_confirmed === false || result?.stopping) warnStop();
         if (result?.overlay_stop_confirmed === false) notify('warning', result.overlay_cleanup_error || 'Overlay shutdown is not confirmed. Reopen the pane and Retry hide overlay.');
       }, warnStop);
@@ -87,47 +322,11 @@ export default {
       const api = (path, body) => (usable() || (path === '/status' && body === undefined)) ? request(path, body)
         : Promise.reject(new Error('This pane is retired. Close and reopen it.'));
       const qc = useQueryClient();
-      const SCOPE_KEY = 'meeting-copilot.scope.v2';
-      const loadScope = () => {
-        try {
-          // Web fallback became opt-in: a value inherited from the legacy key
-          // (written when ON was the default) must not silently re-enable it.
-          const current = typeof localStorage !== 'undefined' ? localStorage.getItem(SCOPE_KEY) : null;
-          const legacy = typeof localStorage !== 'undefined' ? localStorage.getItem('meeting-copilot.scope') : null;
-          const parsed = JSON.parse(current || '{}');
-          if (!parsed || typeof parsed !== 'object') return {};
-          const out = {};
-          for (const k of ['project', 'backend', 'transcriptionModel', 'audioSource', 'answerProvider', 'answerModel', 'transcriptionProvider', 'asrMode']) {
-            if (typeof parsed[k] === 'string') out[k] = parsed[k].slice(0, 500);
-          }
-          if (typeof parsed.webFallback === 'boolean') out.webFallback = parsed.webFallback;
-          if (typeof parsed.excludeHistory === 'boolean') out.excludeHistory = parsed.excludeHistory;
-          if (parsed.project && typeof parsed.project !== 'string') delete out.project;
-          if (!current && legacy) {
-            try {
-              const oldParsed = JSON.parse(legacy);
-              if (oldParsed && typeof oldParsed === 'object') {
-                for (const k of ['project', 'backend', 'transcriptionModel', 'audioSource', 'answerProvider', 'answerModel', 'transcriptionProvider', 'asrMode']) {
-                  if (out[k] === undefined && typeof oldParsed[k] === 'string') out[k] = oldParsed[k].slice(0, 500);
-                }
-              }
-            } catch (e) {}
-          }
-          // Reset routes the current pane cannot display; a blank select must never
-          // retain a hidden provider/model pair from an earlier version.
-          if (!['openai', 'openrouter'].includes(out.answerProvider)) {
-            delete out.answerProvider; delete out.answerModel;
-          }
-          // Old versions persisted Meta after automatic capability discovery.
-          // No provenance means no cloud opt-in, even if the value says Meta.
-          if (out.transcriptionProvider === 'meta' && parsed.transcriptionChoiceVersion !== 1) out.transcriptionProvider = 'local';
-          return out;
-        } catch (e) { return {}; }
-      };
-      const saved = loadScope();
-      const [project, setProject] = useState(saved.project || '');
+      const saved = preferences.get();
+      const prefs = useValue(preferences);
+      const { project, webFallback, answerProvider, answerModel, excludeHistory } = prefs;
       const [question, setQuestion] = useState('');
-      const [web, setWeb] = useState(saved.web || '');
+      const [web, setWeb] = useState('');
       const [consent, setConsent] = useState(false);
       const [backend, setBackend] = useState(saved.backend || 'meetily');
       const [recording, setRecording] = useState('');
@@ -141,19 +340,15 @@ export default {
       }
       const [pending, setPending] = useState(false);
       const [showTranscript, setShowTranscript] = useState(false);
-      const [webFallback, setWebFallback] = useState(saved.webFallback !== undefined ? saved.webFallback : false);
       const [transcriptionModel, setTranscriptionModel] = useState(saved.transcriptionModel || 'base.en');
       const [audioSource, setAudioSource] = useState(saved.audioSource || 'microphone');
-      const [answerProvider, setAnswerProvider] = useState(saved.answerProvider || '');
-      const [answerModel, setAnswerModel] = useState(saved.answerModel || '');
       const [overlayOn, setOverlayOn] = useState(false);
       const [overlayMsg, setOverlayMsg] = useState('');
       const [copied, setCopied] = useState(false);
       const [persistWarning, setPersistWarning] = useState('');
-      // New users start with project-only evidence; saved explicit choices persist.
-      const [excludeHistory, setExcludeHistory] = useState(saved.excludeHistory !== undefined ? saved.excludeHistory : !(saved.webFallback || saved.web));
 
-      const status = useQuery({ queryKey: [ID, 'status'], queryFn: () => api('/status'), refetchInterval: 2500, retry: 1 });
+
+      const status = useQuery({ queryKey: [ID, 'status'], queryFn: () => checkedStatus(api), refetchInterval: 2500, retry: 1 });
       // Keep the overlay lease alive while the pane is visible; overlay helper
       // polls use touch=false so only this heartbeat extends the 30s watchdog.
       useEffect(() => {
@@ -182,7 +377,7 @@ export default {
       const busy = pending || data.busy;
       const allProjects = project === '__all_projects__';
       // Suggest answers stay local-first; explicit web queries stay in the pane.
-      const scope = { project: allProjects ? null : project || null, all_projects: allProjects, web_fallback: webFallback, ...(excludeHistory ? { include_history: false } : {}), ...(answerProvider && answerModel ? { answer_provider: answerProvider, answer_model: answerModel } : {}) };
+      const scope = answerScope(prefs);
       const overlayScopeKey = JSON.stringify(scope);
       const unsupportedReasons = [
         allProjects && !data.capabilities?.all_projects ? 'All-projects search needs the updated backend (restart the gateway when other sessions are idle).' : null,
@@ -319,7 +514,7 @@ export default {
             body = { ...body, pane, action: ++life.action };
           }
           const response = await api(path, body);
-          if (path === '/clear') { retireLocalOverlay(); setOverlayMsg(response?.overlay_cleanup_error ? 'Overlay shutdown is not confirmed. Retry hide overlay and verify the window is gone before sharing.' : ''); }
+          if (path === '/clear') { retireLocalOverlay(response?.overlay_stop_confirmed === true); setOverlayMsg(response?.overlay_cleanup_error ? 'Overlay shutdown is not confirmed. Retry hide overlay and verify the window is gone before sharing.' : ''); }
         }
         catch (e) {
           // Only local, tagged lifecycle messages are trusted. Transport and
@@ -351,16 +546,17 @@ export default {
       const [answerUncertain, setAnswerUncertain] = useState(false);
       const [progressPaused, setProgressPaused] = useState(false);
       useEffect(() => {
-        try {
-          if (typeof localStorage !== 'undefined') localStorage.setItem(SCOPE_KEY, JSON.stringify({ project, backend, excludeHistory, webFallback, transcriptionModel, audioSource, answerProvider, answerModel, transcriptionProvider, transcriptionChoiceVersion: 1, asrMode }));
-        } catch (e) { setPersistWarning('Preferences could not be saved in this browser (storage unavailable). Settings still apply for this session.'); }
-      }, [project, backend, excludeHistory, webFallback, transcriptionModel, audioSource, answerProvider, answerModel, transcriptionProvider, asrMode]);
+        // Patch the current shared snapshot, never a captured answer setting:
+        // a late pane effect must not roll back a newer Settings edit.
+        if (usable()) savePreferences({ backend, transcriptionModel, audioSource, transcriptionProvider, transcriptionChoiceVersion: 1, asrMode });
+      }, [backend, transcriptionModel, audioSource, transcriptionProvider, asrMode]);
       // Capability discovery never opts a meeting into cloud audio. Only an
       // explicit selection or persisted provider choice may select Meta.
       function resetMeetingInputs() {
         setQuestion(''); setWeb(''); setLastAsked(null); setLiveEntry(null);
         setTrackedRequest(null); setError(''); setAssistFailed(false);
         setAnswerUncertain(false); setProgressPaused(false);
+        if (safety.answer && safety.answerKnown) { safety.answerToken += 1; signalSafety(); }
       }
       const cloudUnavailable = backend === 'macos' && transcriptionProvider === 'meta' && !data.capabilities?.meta_asr;
       const windowsUnavailable = backend === 'native' && data.capabilities?.windows_transcription === false;
@@ -380,16 +576,23 @@ export default {
           ? 'Overlay shutdown is not confirmed. Retry hide overlay and verify the window is gone before sharing.'
           : 'Overlay was closed after the key edit. Show overlay to reopen with current credentials.');
       }
-      function retireLocalOverlay() {
+      function retireLocalOverlay(confirmed = false) {
         const life = overlayActionAt.current;
+        const wasUnsafe = safety.overlayVisible || safety.overlayUnknown || safety.overlayAction || !!life.owner;
         life.overlayGeneration += 1;
         life.owner = null; life.syncedKey = null; life.credentialShutdownUnconfirmed = false;
+        safety.overlayVisible = false; safety.overlayUnknown = wasUnsafe && !confirmed;
+        signalSafety();
         scopeSeq.current += 1;
         setOverlayOn(false); setScopeStale(false); setOverlayMsg('');
       }
       async function toggleOverlay() {
         const life = overlayActionAt.current;
-        if (!life.mounted) return;
+        if (!life.mounted || safety.overlayAction) return;
+        if (!overlayOn && !overlayNeedsHide && JSON.stringify(answerScope(preferences.get())) !== overlayScopeKey) return;
+        safety.overlayAction = true;
+        safety.overlayToken += 1;
+        signalSafety();
         setPending(true); setOverlayMsg('');
         life.at = Date.now();
         try {
@@ -401,7 +604,7 @@ export default {
             if (!life.mounted || life.action !== action) return;
             if (hidden?.accepted === false) throw new Error('This pane no longer owns the overlay. Reopen the pane to take ownership.');
             if (hidden?.overlay_stop_confirmed === false) throw new Error(hidden.overlay_cleanup_error || 'Overlay shutdown is not confirmed.');
-            retireLocalOverlay();
+            retireLocalOverlay(hidden?.overlay_stop_confirmed === true);
           } else {
             // Fence even a lost/in-flight Show response: it may create a new
             // owner before a delayed credential response reaches this pane.
@@ -410,15 +613,16 @@ export default {
             if (!life.mounted || life.action !== action) return;
             if (shown?.accepted === false || !shown?.owner) throw new Error('This pane no longer owns the overlay. Reopen the pane to take ownership.');
             life.owner = shown.owner; life.syncedKey = scopeKey;
+            safety.overlayVisible = true; safety.overlayUnknown = false;
             setOverlayOn(true); setScopeStale(false);
             setOverlayMsg('Read-only overlay shown. Ask questions in the Meeting Copilot pane.');
           }
           await qc.invalidateQueries({ queryKey: [ID, 'status'] });
-        } catch (e) { if (life.mounted) {
+        } catch (e) { safety.overlayUnknown = true; if (life.mounted) {
           setOverlayMsg('Overlay action not confirmed. Retry Show / Hide overlay; if it still fails, close and reopen this pane. Check the macOS helper and backend connection. A window may still be visible: verify before screen-sharing.');
           if (!overlayOn) setOverlayOn(false);
         } }
-        finally { if (life.mounted) setPending(false); }
+        finally { safety.overlayAction = false; signalSafety(); if (life.mounted) setPending(false); }
       }
       async function startCapture(newMeeting = false) {
         if (cloudUnavailable || windowsUnavailable || overlayNeedsHide) return false;
@@ -451,6 +655,7 @@ export default {
       }
       const answerSubmitting = useRef(false);
       const answerBlocked = !!(busy || answerUncertain || trackedRequest || Object.keys(data.requests || {}).length);
+      const answerSafetyToken = safety.answerToken;
       // Bound every outgoing answer string, including stored legacy replays.
       // Reject oversized saved snapshots/identifiers rather than silently
       // changing exact replay context or routing to a truncated project/model.
@@ -470,6 +675,8 @@ export default {
       const acceptAnswer = res => {
         if (res?.contract === 'answer-admission-v1' && res.accepted === false &&
             ['invalid_request', 'busy', 'capacity'].includes(res.reason)) {
+          safety.answer = false;
+          signalSafety();
           setError({ invalid_request: 'Answer was not accepted. Enter a question or start listening; check the selected scope.',
             busy: 'Answer was not accepted because another answer is active. Wait for it to finish or cancel it, then ask again.',
             capacity: 'Answer was not accepted because workers are still busy. Wait for them to finish, then ask again.' }[res.reason]);
@@ -477,16 +684,34 @@ export default {
           return;
         }
         if (!res?.request_id) throw new Error('Unconfirmed answer submission');
+        safety.answerKnown = true; safety.answerToken += 1; signalSafety();
         setAnswerUncertain(false); setProgressPaused(false);
         setLiveEntry(null); setTrackedRequest(res.request_id);
       };
       async function assistNow(extra = {}, questionOverride, scopeOverride) {
-        if (!usable() || !overlayActionAt.current.mounted || answerBlocked || answerSubmitting.current || unsupported) return;
+        if (!usable() || !overlayActionAt.current.mounted || answerBlocked || answerSubmitting.current || safety.answer) return;
+        // Read the shared atom at the action, not the pane render that created
+        // this callback: Settings and pane are independent React roots.
+        const currentPrefs = preferences.get();
+        const latestState = typeof qc.getQueryState === 'function' ? qc.getQueryState([ID, 'status']) : status;
+        const currentData = latestState?.data || data;
+        const catalog = typeof qc.getQueryData === 'function' ? qc.getQueryData([ID, 'models']) : null;
+        const currentProviders = catalog?.providers || providers;
+        const isAll = currentPrefs.project === '__all_projects__';
+        const invalid = (isAll && !currentData.capabilities?.all_projects) ||
+          (currentPrefs.webFallback && !currentData.capabilities?.automatic_web_fallback) ||
+          !['openai', 'openrouter'].includes(currentPrefs.answerProvider) || !currentPrefs.answerModel ||
+          !currentProviders.some(p => p.id === currentPrefs.answerProvider) || !currentData.capabilities?.independent_models ||
+          (currentPrefs.excludeHistory && (!currentData.capabilities?.history_opt_out || !currentPrefs.project || isAll || currentPrefs.webFallback || web.trim() || extra.web_query || (scopeOverride && scopeOverride.include_history !== false)));
+        if (invalid || latestState?.error || currentData.busy || Object.keys(currentData.requests || {}).length) {
+          setError('Answer was not sent. Check the current answer settings and wait for any active answer to finish.');
+          return;
+        }
         const asked = questionOverride !== undefined ? questionOverride : question;
-        const scopeUsed = scopeOverride || scope;
+        const scopeUsed = scopeOverride || answerScope(currentPrefs);
         const body = boundedAnswer({ question: asked, ...scopeUsed, ...extra, response_contract: 'answer-admission-v1' });
         if (!body) return;
-        answerSubmitting.current = true;
+        answerSubmitting.current = true; safety.answer = true; safety.answerKnown = false; safety.answerToken += 1; signalSafety();
         if (questionOverride !== undefined) setQuestion(questionOverride);
         setPending(true); setError(''); setAssistFailed(false);
         // Remember for explicit partial replay, not automatic transport retry.
@@ -503,11 +728,25 @@ export default {
         try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }); }
         catch (e) {}
       }
+      // A settings-page web action is bound to this exact mounted lifecycle.
+      // It cannot retain its query or dispatch after the pane is replaced.
+      useEffect(() => {
+        const life = overlayActionAt.current;
+        const bridge = { life, canRun: () => {
+          const latest = typeof qc.getQueryState === 'function' ? qc.getQueryState([ID, 'status']) : status;
+          return !!(usable() && paneRegistration === paneEntry && life.mounted && !answerBlocked && !answerSubmitting.current &&
+            !safety.answer && !unsupported && !latest?.error && latest?.data?.busy === false &&
+            latest.data.requests && Object.keys(latest.data.requests).length === 0 &&
+            JSON.stringify(answerScope(preferences.get())) === overlayScopeKey);
+        }, run: query => { if (bridge.canRun()) return currentAssist.current({ web_query: query }); } };
+        paneEntry.webBridge = bridge; signalSafety();
+        return () => { if (paneEntry.webBridge === bridge) { paneEntry.webBridge = null; signalSafety(); } };
+      }, [overlayScopeKey, answerBlocked, unsupported]);
       // Exact replay: resend a stored request verbatim (question, scope,
       // transcript snapshot) instead of whatever the pane currently shows.
       async function replayRequest(req) {
-        if (!usable() || !overlayActionAt.current.mounted || !req || answerBlocked || answerSubmitting.current) return;
-        if (excludeHistory && req.include_history !== false) {
+        if (!usable() || !overlayActionAt.current.mounted || !req || answerBlocked || answerSubmitting.current || safety.answer) return;
+        if (preferences.get().excludeHistory && req.include_history !== false) {
           setError('This saved answer used past sessions. Ask a new question to keep past sessions excluded.');
           return;
         }
@@ -524,7 +763,7 @@ export default {
           ...(req.replay_request_id ? { replay_request_id: req.replay_request_id } : {}),
           ...(req.row_id ? { row_id: req.row_id } : {}) });
         if (!body) return;
-        answerSubmitting.current = true;
+        answerSubmitting.current = true; safety.answer = true; safety.answerKnown = false; safety.answerToken += 1; signalSafety();
         if (typeof req.question === 'string') setQuestion(req.question);
         setPending(true); setError(''); setAssistFailed(false);
         // A lost replay response may still mean the backend accepted it.
@@ -555,6 +794,8 @@ export default {
             const entry = await ctx.rest(`/assist/${trackedRequest}?missing=sentinel-v1`);
             if (!alive) return;
             if (entry?.contract === 'answer-progress-v1' && entry.status === 'missing') {
+              safety.answer = false;
+              signalSafety();
               setTrackedRequest(null); setLiveEntry(null);
               setError('That answer is no longer available (new meeting or restart cleared it). Ask again.');
               try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }); } catch (ignored) {}
@@ -576,6 +817,8 @@ export default {
             // A recovered poll clears a stale progress error; other errors stay.
             setError(prev => (typeof prev === 'string' && (prev.startsWith('Answer progress') || prev.startsWith('That answer is no longer'))) ? '' : prev);
             if (entry && (entry.status === 'done' || entry.status === 'error' || entry.status === 'cancelled')) {
+              safety.answer = false;
+              signalSafety();
               setAnswerUncertain(false); setAssistFailed(false);
               setError(current => /^(Answer submission|Cancellation was not confirmed|Answer progress unavailable)/.test(current) ? '' : current);
               setTrackedRequest(null);
@@ -651,11 +894,39 @@ export default {
         }
       }, [result?.answer, liveEntry?.answer, liveEntry?.status]);
       const [, setRetirement] = useState('');
+      // Settings has a separate root. Its bridge must use the most recently
+      // committed pane callback, including the visible question, not the
+      // callback captured when the bridge effect was first installed.
+      const currentAssist = useRef(assistNow);
+      useLayoutEffect(() => { currentAssist.current = assistNow; });
       paneEntry.retire = message => { paneEntry.retired = message; setRetirement(message); };
       if (paneEntry.retired) return h('section', { role: 'alert', style: card },
         h('strong', null, 'Meeting Copilot pane retired — actions disabled'),
         h('p', null, paneEntry.retired),
         h('p', null, 'Close this pane and reopen Meeting Copilot. Check capture status and Retry stop if needed before giving fresh consent. If audio remains active, quit the capture process or revoke audio permissions and verify the OS indicator.'));
+      const transcriptContext = snapshot => h('details', { style: { marginTop: 12 } },
+        h('summary', { style: { cursor: 'pointer', ...muted } }, 'Transcript context sent with this answer'),
+        h('p', { style: muted }, 'Frozen recent context, not the current transcript or a complete meeting. References identify excerpts, not verified claims. Backend times are uninterpreted; no exact utterance time or playback offset is verified. Missing owners, dates and timestamps must not be inferred.'),
+        h('p', { style: muted }, `${snapshot.omitted_segments || 0} segment(s) omitted by the context limit.`),
+        ...(Array.isArray(snapshot.segments) ? snapshot.segments : []).map((s, i) => h('div', { key: i, style: { ...muted, whiteSpace: 'pre-wrap', paddingTop: 8 } },
+          h('strong', null, `[${s.ref}] ${s.speaker}: `), s.text,
+          s.shortened && h('span', null, ' (excerpt shortened)'),
+          h('div', null, s.timestamp == null ? 'Time unavailable' : `${s.timestamp_kind}: ${s.timestamp} (backend metadata, not verified utterance time)`))),
+        h(Button, { variant: 'secondary', disabled: typeof snapshot.provider_json !== 'string' || snapshot.provider_json.length > 16000, onClick: async () => {
+          if (!usable() || typeof snapshot.provider_json !== 'string' || snapshot.provider_json.length > 16000) return;
+          if (typeof window === 'undefined' || typeof window.confirm !== 'function' || !window.confirm('Copy the exact transcript context sent for this answer? It can contain confidential meeting text and metadata. Clipboard history or sync may retain it. Review before sharing.')) return;
+          try { await navigator.clipboard.writeText(snapshot.provider_json); notify('info', 'Sent transcript context copied. Review before sharing.'); }
+          catch (_) { setError('Clipboard unavailable. Select and copy the sent context manually.'); }
+        } }, 'Copy sent transcript context'));
+      const evidenceItem = (s, i) => {
+        const excerpt = evidenceExcerpt(s.text);
+        return h('div', { key: s.id || i, style: { ...muted, marginTop: 8, padding: '8px 10px', border: '1px solid var(--ui-stroke-secondary)', borderRadius: 8, overflowWrap: 'anywhere' } },
+          h('strong', null, `[${i + 1}] ${s.title || s.source || 'Source'}`),
+          /^https?:\/\//.test(s.source || '') ? h('a', { href: s.source, target: '_blank', rel: 'noopener noreferrer', style: { display: 'block', color: 'var(--ui-accent)' } }, s.source) : h('div', null, s.source),
+          s.updated_at && h('div', null, `Updated: ${typeof s.updated_at === 'number' ? new Date(s.updated_at * 1000).toLocaleString() : s.updated_at}`),
+          h('div', { style: { whiteSpace: 'pre-wrap' } }, excerpt.text || '(No excerpt available)'),
+          excerpt.truncated && h('div', null, 'Excerpt limited to 2,050 characters.'));
+      };
       // Each message owns its action. A legacy summary or a retained request
       // alone is never evidence that the displayed error came from an answer.
       const answerError = data.answer_error || (data.error_source === 'answer' ? data.error : null);
@@ -675,6 +946,7 @@ export default {
       // likewise recheck without borrowing another message's retry request.
       const localRecheck = assistFailed || (typeof error === 'string' && /^(Answer progress|Answer submission|Cancellation was not confirmed)/.test(error));
       const restartCapture = !data.listening && !data.stopping;
+      const cloudAudioSelected = backend === 'macos' && transcriptionProvider === 'meta';
       const captureBlocked = overlayNeedsHide || cloudUnavailable || windowsUnavailable || !consent || (backend === 'meetily' && !recording)
         || (backend === 'macos' && !data.capabilities?.macos_transcription);
       const hasRecentTranscript = Array.isArray(data.segments) && data.segments.slice(-40)
@@ -697,9 +969,9 @@ export default {
               ? `Listening via ${data.backend || backend}${lossText(data.capture)}${data.capture?.warning ? ' · transcript may be incomplete' : ''}`
               : ((data.segments || []).length || result || (data.recent || []).length) ? 'Paused — resume this meeting or start a fresh one.' : 'Not capturing yet.')),
           h('label', { style: { display: 'flex', gap: 8, alignItems: 'flex-start', border: '1px solid var(--ui-stroke-secondary)', borderRadius: 10, padding: '10px 12px', background: 'var(--ui-bg-card)' } },
-            h('input', { type: 'checkbox', checked: consent, disabled: data.listening, onChange: e => setConsent(e.target.checked), 'aria-label': 'Capture permission' }),
+            h('input', { type: 'checkbox', checked: consent, disabled: data.listening, onChange: e => setConsent(e.target.checked), 'aria-describedby': cloudAudioSelected ? `${paneEntry.a11yId}-cloud-audio` : undefined }),
             h('span', null, h('strong', null, 'Permission check. '), 'I have permission to capture/read this meeting and use its context with my configured model.')),
-          backend === 'macos' && transcriptionProvider === 'meta' && h('p', { 'data-cloud-capture-disclosure': true, role: 'status', style: { ...muted, margin: 0 } }, `Cloud transcription selected: meeting audio is sent to Meta while listening. ${data.listening ? 'Pause to change' : 'Change'} the provider in Transcript source below.`),
+          cloudAudioSelected && h('p', { id: `${paneEntry.a11yId}-cloud-audio`, 'data-cloud-capture-disclosure': true, role: 'status', style: { ...muted, margin: 0 } }, `Cloud transcription selected: meeting audio is sent to Meta while listening. ${data.listening ? 'Pause to change' : 'Change'} the provider in Transcript source below.`),
           cloudUnavailable && h('p', { role: 'status', style: muted }, 'Meta cloud transcription is unavailable. Choose Local in Transcript source, or configure a Meta key and recheck backend readiness before Start.'),
           windowsUnavailable && h('p', { role: 'status', style: muted }, data.capabilities?.windows_detail || 'Windows capture needs the optional audio dependencies. See the Windows setup guide.'),
           !data.listening && !data.stopping && (pending || !consent || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)) && h('p', { style: { ...muted, margin: 0 }, role: 'status' },
@@ -758,7 +1030,7 @@ export default {
             h('li', null, backend === 'meetily' ? 'Confirm permission above, pick your active Meetily recording below, then Attach.' : 'Confirm permission above, then Start listening.'),
             h('li', null, 'Type a question (or leave blank for the latest one) and choose Suggest answer.'),
             h('li', null, 'Read the cited answer; open Evidence for sources.'))),
-        h(MetaKeySettings, { api, life: overlayActionAt.current, onOverlayTransition: reflectCredentialOverlay }),
+
         h(data.listening ? 'details' : 'section', data.listening ? null : { style: card },
           ...(data.listening ? [h('summary', { style: { cursor: 'pointer', ...muted } }, `Transcript source: ${data.backend || backend} — listening (pause to change settings)`)] : []),
           h('span', { id: 'mc-source-label', style: { fontWeight: 700 } }, 'Transcript source'),
@@ -804,16 +1076,26 @@ export default {
             'Each action sends a request to your selected model using recent available transcript and your selected source settings, not the whole meeting. Review the result; missing owners or deadlines remain unspecified.'),
           !hasRecentTranscript && h('p', { style: { ...muted, margin: 0 }, role: 'status' },
             'Quick actions become available after transcript text arrives. You can still type a project question above.')),
-        ...(unsupported ? [h('p', { role: 'alert', style: muted }, `Suggest is unavailable: ${unsupportedReasons.join(' ')} See Answer setup below, then restart the gateway when other sessions are idle.`)] : []),
+        settingsAvailable && h('div', { style: { ...muted, display: 'flex', gap: 6, alignItems: 'center' } },
+          'Answer options are in Settings → Plugins → Meeting Copilot.',
+          typeof host.navigate === 'function' && h('button', { type: 'button', onClick: () => host.navigate(`/settings?tab=plugins&plugin=${ID}`), style: { color: 'var(--ui-accent)', background: 'transparent', border: 0, cursor: 'pointer' } }, 'Open settings')),
+        ...(unsupported ? [h('p', { role: 'alert', style: muted }, `Suggest is unavailable: ${unsupportedReasons.join(' ')} See ${settingsAvailable ? 'Settings → Plugins → Meeting Copilot' : 'Answer setup below'}, then restart the gateway when other sessions are idle.`)] : []),
         excludeHistory && !unsupported && h('p', { role: 'status', style: muted, 'data-history-excluded': true }, 'Past sessions and web search are excluded. Only the selected project is searched.'),
-        h('p', { style: { ...muted, margin: 0 } }, 'Your question, part of the transcript and selected source snippets may be sent to the answer model.'),
+        h('p', { style: { ...muted, margin: 0 } }, 'Your question, part of the transcript and selected source snippets may be sent to the answer model. If enabled in Settings, automatic fallback may also send a public query.'),
         webFallback && h('p', { 'data-web-fallback-disclosure': true, role: 'status', style: { ...muted, margin: 0 } }, 'Automatic web fallback is on: if local evidence is insufficient, a public query may be drafted. Filtering is not a privacy guarantee; turn it off for sensitive calls.'),
         h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
           h(Button, { disabled: answerBlocked || unsupported, onClick: () => assistNow() }, busy ? 'Checking your sources…' : 'Suggest answer'),
-          (answerUncertain || progressPaused || (assistFailed && trackedRequest)) && h(Button, { variant: 'secondary', disabled: pending, onClick: () => {
+          (answerUncertain || progressPaused || (assistFailed && trackedRequest)) && h(Button, { variant: 'secondary', disabled: pending, onClick: async () => {
+            if (!usable() || answerSubmitting.current || safety.answerToken !== answerSafetyToken) return;
             if (typeof window === 'undefined' || typeof window.confirm !== 'function' || !window.confirm('Reset only local answer tracking? The earlier request may still be running or complete. This does not cancel it or send anything. Review available answers first. Asking again afterwards may resend the same meeting context and create a duplicate.')) return;
             setTrackedRequest(null); setLiveEntry(null); setAnswerUncertain(false);
             setProgressPaused(false); setAssistFailed(false); setError('');
+            if (safety.answer) {
+              // An explicit reset permits a new authoritative read, never an
+              // automatic resend or a release based on a pre-admission cache.
+              safety.answerKnown = true; safety.answerToken += 1; signalSafety();
+              try { await checkedStatus(api); } catch (_) {}
+            }
           } }, 'Reset local answer tracking'),
           cancellableId && h(Button, { variant: 'secondary', onClick: async () => {
               try { await api('/assist/cancel', { request_id: cancellableId }); }
@@ -836,36 +1118,20 @@ export default {
         result && h('section', { style: card, 'aria-live': 'polite', ref: answerRef, 'data-answer-result': true },
           h(Button, { variant: 'secondary', disabled: !result.answer, onClick: async () => {
             if (!usable()) return;
-            if (typeof window === 'undefined' || typeof window.confirm !== 'function' || !window.confirm('Copy this answer and its source excerpts? The clipboard may include confidential project text or links. Review before sharing. No new model request is sent.')) return;
+            if (typeof window === 'undefined' || typeof window.confirm !== 'function' || !window.confirm('Copy this answer and its source excerpts (up to 2,050 characters per source)? The clipboard may include confidential project text or links. Review before sharing. No new model request is sent.')) return;
             try { await navigator.clipboard.writeText(evidenceReport(result)); notify('info', 'Answer and evidence copied. Review before sharing.'); }
             catch (_) { setError('Clipboard unavailable. Select and copy the answer and evidence manually.'); }
           } }, 'Copy answer + evidence'),
           h('div', { style: { display: 'flex', justifyContent: 'space-between' } }, h('strong', null, 'Suggested answer'), h('span', { style: muted }, `${Number.isFinite(result.elapsed_seconds) ? `${result.elapsed_seconds.toFixed(1)}s` : ''}${result.model_route ? ` · ${result.model_route}` : ''}`)),
           h('div', { style: { whiteSpace: 'pre-wrap', lineHeight: 1.65, paddingTop: 10 } }, result.answer),
-          result.transcript_snapshot?.schema === 'transcript-snapshot-v1' && h('details', { style: { marginTop: 12 } },
-            h('summary', { style: { cursor: 'pointer', ...muted } }, 'Transcript context sent with this answer'),
-            h('p', { style: muted }, 'Frozen recent context, not the current transcript or a complete meeting. References identify excerpts, not verified claims. Backend times are uninterpreted; no exact utterance time or playback offset is verified. Missing owners, dates and timestamps must not be inferred.'),
-            h('p', { style: muted }, `${result.transcript_snapshot.omitted_segments || 0} segment(s) omitted by the context limit.`),
-            ...(result.transcript_snapshot.segments || []).map((s, i) => h('div', { key: i, style: { ...muted, whiteSpace: 'pre-wrap', paddingTop: 8 } },
-              h('strong', null, `[${s.ref}] ${s.speaker}: `), s.text,
-              s.shortened && h('span', null, ' (excerpt shortened)'),
-              h('div', null, s.timestamp == null ? 'Time unavailable' : `${s.timestamp_kind}: ${s.timestamp} (backend metadata, not verified utterance time)`))),
-            h(Button, { variant: 'secondary', disabled: typeof result.transcript_snapshot.provider_json !== 'string' || result.transcript_snapshot.provider_json.length > 16000, onClick: async () => {
-              if (!usable()) return;
-              if (typeof window === 'undefined' || typeof window.confirm !== 'function' || !window.confirm('Copy the exact transcript context sent for this answer? It can contain confidential meeting text and metadata. Clipboard history or sync may retain it. Review before sharing.')) return;
-              try { await navigator.clipboard.writeText(result.transcript_snapshot.provider_json); notify('info', 'Sent transcript context copied. Review before sharing.'); }
-              catch (_) { setError('Clipboard unavailable. Select and copy the sent context manually.'); }
-            } }, 'Copy sent transcript context')),
+          result.transcript_snapshot?.schema === 'transcript-snapshot-v1' && transcriptContext(result.transcript_snapshot),
 
           result.web_search?.used && h('p', { style: muted }, `${result.web_search.mode === 'automatic' ? 'Automatic web fallback' : 'Explicit web search'}: ${result.web_search.query}`),
           ...(result.warnings || []).map((w, i) => h('p', { key: `warning-${i}`, style: muted }, w)),
           result.answer && /partial|interrupt/i.test((result.warnings || []).join(' ')) && (result.request || lastAsked) && h('div', { style: { paddingTop: 8 } }, h(Button, { variant: 'secondary', disabled: answerBlocked, onClick: () => replayRequest(result.request || { question: lastAsked.question, ...(lastAsked.scope || {}) }) }, 'Retry for the complete response')),
           h('details', { style: { marginTop: 12 } }, h('summary', { style: { cursor: 'pointer', ...muted } }, `Evidence · ${(result.sources || []).length} sources`),
-            ...(result.sources || []).map((s, i) => h('div', { key: s.id || i, style: { ...muted, marginTop: 8, padding: '8px 10px', border: '1px solid var(--ui-stroke-secondary)', borderRadius: 8, overflowWrap: 'anywhere' } },
-              h('strong', null, `[${i + 1}] ${s.title || s.source || 'Source'}`),
-              /^https?:\/\//.test(s.source || '') ? h('a', { href: s.source, target: '_blank', rel: 'noopener noreferrer', style: { display: 'block', color: 'var(--ui-accent)' } }, s.source) : h('div', null, s.source),
-              s.updated_at && h('div', null, `Updated: ${typeof s.updated_at === 'number' ? new Date(s.updated_at * 1000).toLocaleString() : s.updated_at}`),
-              h('div', { style: { whiteSpace: 'pre-wrap' } }, (s.text || '').slice(0, 900)))))),
+            h('p', { style: muted }, 'Excerpts are limited to 2,050 characters per source.'),
+            ...(result.sources || []).map(evidenceItem))),
         h('details', { open: showTranscript, onToggle: e => setShowTranscript(e.currentTarget.open) },
           h('summary', { style: { cursor: 'pointer', ...muted } }, `Live transcript · ${transcript.length} segments`),
           ...(() => {
@@ -889,7 +1155,7 @@ export default {
             })
               : [h('p', { key: 'empty', style: { ...muted, margin: 0 } }, 'No transcript segments yet — attach or start listening, then speak.')]))),
         (Array.isArray(data.recent) && data.recent.length > 0) && h('details', null, h('summary', { style: { cursor: 'pointer', ...muted } }, `Recent answers · ${data.recent.length}`),
-          h('p', { style: muted }, 'Kept for this session only — a restart, new meeting, or new answer session clears older entries. History evidence shows source titles only; full excerpts appear with the live answer.'),
+          h('p', { style: muted }, 'Kept for this session only — a restart, new meeting, or new answer session clears older entries. Retained excerpts and sent context may contain confidential information.'),
           ...[...data.recent].reverse().map((entry, i) => h('div', { key: entry.request_id || i, style: { ...card, marginTop: 8 } },
             h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8 } },
               h('strong', null, (entry.question || '').slice(0, 200) || 'Answer'),
@@ -897,39 +1163,21 @@ export default {
             h('div', { style: { whiteSpace: 'pre-wrap', lineHeight: 1.65, paddingTop: 8 } }, entry.answer || '(no answer text)'),
             entry.answer_shortened && h('p', { style: muted }, 'History keeps a shortened copy; the full answer appeared here when first delivered.'),
             ...((entry.warnings || []).map((w, j) => h('p', { key: `rw-${j}`, style: muted }, w))),
-            (entry.sources || []).length > 0 && h('details', { style: { marginTop: 8 } }, h('summary', { style: { cursor: 'pointer', ...muted } }, `Evidence · ${entry.sources.length} sources${entry.sources.length > 6 ? ' (showing first 6)' : ''}`),
-              ...(entry.sources || []).slice(0, 6).map((s, k) => h('div', { key: s.id || k, style: { ...muted, paddingTop: 6, overflowWrap: 'anywhere' } }, h('strong', null, `[${k + 1}] ${s.title || s.source || 'Source'}`)))),
+            entry.status === 'done' && entry.transcript_snapshot?.schema === 'transcript-snapshot-v1' && transcriptContext(entry.transcript_snapshot),
+            typeof entry.answer === 'string' && /\[T\d+\]/.test(entry.answer)
+              && (entry.status !== 'done' || entry.transcript_snapshot?.schema !== 'transcript-snapshot-v1')
+              && h('p', { style: muted }, 'Transcript context for this answer is unavailable or could not be confirmed.'),
+            (entry.sources || []).length > 0 && h('details', { style: { marginTop: 8 } }, h('summary', { style: { cursor: 'pointer', ...muted } }, `Evidence · ${entry.sources.length} sources${entry.sources.length > 9 ? ' (showing first 9)' : ''}`),
+              h('p', { style: muted }, 'Excerpts are limited to 2,050 characters per source.'),
+              ...(entry.sources || []).slice(0, 9).map(evidenceItem)),
             h('div', { style: { paddingTop: 8, display: 'flex', gap: 8, flexWrap: 'wrap' } },
               entry.answer && h(Button, { variant: 'secondary', onClick: async () => { if (!usable()) return; try { await navigator.clipboard.writeText(entry.answer); } catch (e) { setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, 'Copy this answer'),
               entry.request && h(Button, { variant: 'secondary', disabled: answerBlocked, onClick: () => replayRequest(entry.request) }, /partial|interrupt|unavailable|failed|error/i.test((entry.warnings || []).join(' ') + ' ' + (entry.status || '')) ? 'Retry for the complete response' : 'Ask again'))))),
         h('details', { open: setupOpen, onToggle: e => setSetupOpen(e.currentTarget.open), style: { border: '1px solid var(--ui-stroke-secondary)', borderRadius: 12, padding: '2px 14px 14px', background: 'var(--ui-bg-card)' } },
-        h('summary', { style: { cursor: 'pointer', fontWeight: 700, color: 'var(--ui-text-primary)', padding: '12px 0', fontSize: 14 } }, setupOpen ? '\u25be Answer setup' : '\u25b8 Answer setup'),
+        h('summary', { style: { cursor: 'pointer', fontWeight: 700, color: 'var(--ui-text-primary)', padding: '12px 0', fontSize: 14 } }, `${setupOpen ? '\u25be' : '\u25b8'} ${settingsAvailable ? 'More actions' : 'Answer setup'}`),
         h('div', { style: { display: 'flex', flexDirection: 'column', gap: 14, paddingTop: 4 } },
 
-        h('label', { style: { display: 'grid', gap: 6 } }, h('strong', { id: 'mc-scope-label' }, 'Search scope'),
-          h('select', { value: project, onChange: e => setProject(e.target.value), style: selectStyle, 'aria-labelledby': 'mc-scope-label', disabled: projects.isPending },
-            h('option', { value: '' }, 'Past sessions only'),
-            h('option', { value: '__all_projects__', disabled: !data.capabilities?.all_projects }, 'All projects + sessions'),
-            ...entries.map(p => { const value = typeof p === 'string' ? p : (p.path || p.name); return h('option', { value, key: value }, typeof p === 'string' ? p.split(/[\\/]/).pop() : (p.name || value)); }))),
-        projects.error && h('div', { role: 'alert', style: muted }, `Project lookup unavailable: ${projects.error.message}`),
-        allProjects && h('p', { style: { ...muted, margin: 0 } }, 'Searches supported text files across up to 100 eligible project folders plus past sessions, not your whole computer. Evidence can include unrelated projects; review it before sharing.'),
-        h('label', { style: { ...muted, display: 'flex', gap: 8, alignItems: 'flex-start' } },
-          h('input', { type: 'checkbox', checked: excludeHistory, disabled: answerBlocked || overlayOn || data.overlay_shown === true || data.overlay_shown === null || overlayNeedsHide, onChange: e => setExcludeHistory(e.target.checked), 'aria-label': 'Exclude past sessions' }),
-          h('span', null, 'Exclude past sessions. Choose one project and turn off web search. Hide the overlay and finish any answer before changing this setting.')),
-        h('section', { style: { ...card, display: 'grid', gap: 10 } },
-          h('span', { id: 'mc-model-label', style: { fontWeight: 700 } }, 'Answer model'),
-          h('div', { style: { display: 'grid', gap: 8 } },
-            h('label', { style: { display: 'grid', gap: 6 } }, h('span', { id: 'mc-provider-label' }, 'Answer provider'),
-              h('select', { style: selectStyle, value: answerProvider, disabled: busy || !data.capabilities?.independent_models, onChange: e => { setAnswerProvider(e.target.value); setAnswerModel(''); }, 'aria-labelledby': 'mc-provider-label' },
-                h('option', { value: '' }, 'Choose provider…'), ...providers.map(p => h('option', { value: p.id, key: p.id }, p.label || p.id)))),
-            answerProvider && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Answer model'),
-              h('input', { style: selectStyle, value: answerModel, disabled: busy, maxLength: 200, placeholder: 'Exact model ID from your provider', onChange: e => setAnswerModel(e.target.value), 'aria-label': 'Answer model', autoComplete: 'off' }))),
-          answerProvider && h('p', { role: 'status', style: muted }, providers.find(p => p.id === answerProvider)?.status || 'Provider unavailable; choose OpenAI or OpenRouter.'),
-          modelCatalog.error && h('p', { role: 'alert', style: { ...muted, margin: 0 } }, 'Provider readiness unavailable. Check Hermes plugin secret settings.'),
-          h('p', { style: { ...muted, margin: 0 } }, 'This choice is only for Copilot answers, not chat or transcription.')),
-        h('label', { style: { ...muted, display: 'flex', gap: 8, alignItems: 'flex-start', border: '1px solid var(--ui-stroke-secondary)', borderRadius: 10, padding: '10px 12px', background: 'var(--ui-bg-card)', cursor: 'pointer' } },
-          h('input', { type: 'checkbox', checked: webFallback, onChange: e => setWebFallback(e.target.checked), 'aria-label': 'Automatic web fallback' }),
-          h('span', null, webFallback ? 'Automatic web fallback: on. A public query may be drafted if local evidence is insufficient. Filtering is best-effort, not a privacy guarantee; turn off for sensitive calls.' : 'Automatic web fallback: off. Turn on to search the web when local evidence is insufficient.')),
+        !settingsAvailable && h(AnswerPreferences, { prefs, status, projects, models: modelCatalog, qc, live: () => usable() && overlayActionAt.current.mounted }),
         h('section', { style: { ...card, display: 'grid', gap: 10 } },
           h('strong', null, 'Meeting overlay (macOS)'),
           h('p', { style: { ...muted, marginBottom: 0 } }, 'The overlay displays the transcript and detected questions. Ask and view answers in the Meeting Copilot pane. The overlay may appear in screen shares.'),
@@ -947,11 +1195,11 @@ export default {
               try { await syncOverlayScope(seq); }
               finally { setPending(false); }
             } }, scopeStale ? 'Sync scope •' : 'Sync scope'))),
-        h('details', null, h('summary', { style: { cursor: 'pointer', ...muted, padding: '4px 0' } }, 'Search online with a specific query'),
+        !settingsAvailable && h('details', null, h('summary', { style: { cursor: 'pointer', ...muted, padding: '4px 0' } }, 'Search online with a specific query'),
           h('div', { style: { display: 'grid', gap: 8, paddingTop: 10 } },
             h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Specific public web query'),
-              h(Input, { value: web, maxLength: 300, onChange: e => setWeb(e.target.value.slice(0, 300)), placeholder: 'Public query — no client names or meeting details', 'aria-label': 'Specific public web query' })),
-            h('span', { 'data-web-query-disclosure': true, style: muted }, 'This query is sent to the web and overrides automatic fallback for this request. Do not include private details.'),
+              h(Input, { value: web, maxLength: 300, onChange: e => setWeb(e.target.value.slice(0, 300)), placeholder: 'Public query — no client names or meeting details', 'aria-label': 'Specific public web query', 'aria-describedby': `${paneEntry.a11yId}-web-query` })),
+            h('span', { id: `${paneEntry.a11yId}-web-query`, 'data-web-query-disclosure': true, style: muted }, 'This query is sent to the web and overrides automatic fallback for this request. Do not include private details. This action stays in the pane so it uses this meeting and only runs when you press Check sources + web.'),
             h(Button, { variant: 'secondary', disabled: busy || unsupported || !web.trim(), onClick: () => assistNow({ web_query: web.trim() }) }, 'Check sources + web'))),
         )),
         h('p', { style: { ...muted, marginTop: 'auto' } }, 'Read-only assistance. Nothing is spoken, posted, or changed for you. Check suggestions before using them.'));
@@ -959,7 +1207,7 @@ export default {
     const paneId = `${ID}:pane`;
     const visibility = typeof host.paneVisibility === 'function' ? host.paneVisibility(paneId) : null;
     const registerPane = () => {
-      const entry = { active: true, life: null };
+      const entry = { active: true, life: null, a11yId: `${ID}-pane-${registration}-${++paneIds}` };
       paneRegistration = entry;
       const remove = ctx.register({ id: 'pane', area: 'panes', title: 'Meeting Copilot', data: { placement: 'right', width: '440px' },
         render: () => registered() && entry.active && paneRegistration === entry ? h(MeetingPane, { registration: entry }) : null });

@@ -36,9 +36,10 @@ default profile. Production requests use `agent.secret_scope.get_secret` in a
 bound host scope; unavailable scopes fail closed. The plugin does not edit
 credential stores. The old in-pane editor and startup dotenv bridge are retired.
 
-Choose an explicit provider and exact model ID in Answer setup. There is no
-generic host-model fallback. Reopen the pane after settings changes, after
-finishing requests and pausing capture. Already admitted workers retain their
+Choose an explicit provider and exact model ID in **Settings → Plugins → Meeting
+Copilot** (or the pane's Answer setup on older Desktop hosts). There is no
+generic host-model fallback. After changing keys, finish requests, pause capture,
+and reopen the pane. Already admitted workers retain their
 credential snapshots; a submitted request cannot be recalled by changing keys.
 
 The standalone CLI is offline-only and does not read provider credentials.

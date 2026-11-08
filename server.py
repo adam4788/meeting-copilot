@@ -10,6 +10,11 @@ from fastapi.routing import APIRoute
 from starlette.responses import JSONResponse
 from pydantic import BaseModel, Field, StrictBool
 
+try:
+    from .transcript_snapshot import reference_warnings
+except ImportError:  # top-level use (tests, scripts)
+    from transcript_snapshot import reference_warnings
+
 
 def _is_engine_abort(exc):
     """True when the engine raised its cooperative-cancellation signal."""
@@ -751,6 +756,7 @@ class MeetingState:
 
         def work(entry_ref):
             streamed_any = False
+            options = {}
             def aborted():
                 with self.lock:
                     return bool(entry_ref.get('cancelled') or generation != self.generation)
@@ -761,7 +767,6 @@ class MeetingState:
                 if aborted():
                     mark_cancelled()
                     return
-                options = {}
                 if answer_provider is not None or answer_model is not None:
                     options = {'answer_provider': answer_provider, 'answer_model': answer_model}
                 if not include_history:
@@ -909,10 +914,6 @@ class MeetingState:
                         return
                     with self.lock:
                         warnings = list(entry_ref.get('warnings') or [])
-                        if snapshot is not None:
-                            citation_warning = snapshot.citation_warning(entry_ref.get('answer', ''))
-                            if citation_warning and citation_warning not in warnings:
-                                warnings.append(citation_warning)
                         msg = 'Stream interrupted; showing a partial answer. Retry for the complete response.'
                         if msg not in warnings:
                             warnings.append(msg)
@@ -920,17 +921,9 @@ class MeetingState:
                 with self.lock:
                     if generation == self.generation and not entry_ref.get('cancelled'):
                         warnings = list(entry_ref.get('warnings') or [])
-                        if snapshot is not None:
-                            citation_warning = snapshot.citation_warning(entry_ref.get('answer', ''))
-                            if citation_warning and citation_warning not in warnings:
-                                warnings.append(citation_warning)
-                        sources = entry_ref.get('sources') or []
-                        import re as _re
-                        citations = [int(n) for n in _re.findall(r'\[(\d+)\]', entry_ref.get('answer') or '')]
-                        if sources and (not citations or any(n < 1 or n > len(sources) for n in citations)):
-                            msg = 'Answer citations are missing or invalid; verify against the listed evidence.'
-                            if msg not in warnings:
-                                warnings.append(msg)
+                        for warning in reference_warnings(entry_ref.get('answer'), len(entry_ref.get('sources') or []), options.get('transcript_snapshot')):
+                            if warning not in warnings:
+                                warnings.append(warning)
                         if len(entry_ref.get('answer') or '') >= 12000:
                             trunc = 'Answer reached the 12,000-character overlay cap and was shortened; ask a follow-up for the rest.'
                             if trunc not in warnings:
@@ -960,10 +953,13 @@ class MeetingState:
                             # as a complete answer, and never as a bare error
                             # that hides what already arrived.
                             warnings = list(entry_ref.get('warnings') or [])
-                            if snapshot is not None:
-                                citation_warning = snapshot.citation_warning(entry_ref.get('answer', ''))
-                                if citation_warning and citation_warning not in warnings:
-                                    warnings.append(citation_warning)
+                            for warning in reference_warnings(entry_ref.get('answer'), len(entry_ref.get('sources') or []), options.get('transcript_snapshot')):
+                                if warning not in warnings:
+                                    warnings.append(warning)
+                            if len(entry_ref.get('answer') or '') >= 12000:
+                                trunc = 'Answer reached the 12,000-character overlay cap and was shortened; ask a follow-up for the rest.'
+                                if trunc not in warnings:
+                                    warnings.append(trunc)
                             msg = 'Stream interrupted; showing a partial answer. Retry for the complete response.'
                             if msg not in warnings:
                                 warnings.append(msg)

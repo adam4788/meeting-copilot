@@ -11,10 +11,13 @@ The model receives the snapshot JSON unchanged as its transcript context, alongs
 the question and retrieved evidence. Optional automatic web planning uses this
 same frozen window, with its additional path redaction; it never receives a
 different slice of the live transcript. The answer's **Transcript context sent with
-this answer** section displays the same retained excerpts. Completed and partial
-streamed answers carry their own snapshot. Numeric document citations and transcript
-references such as `[T1]` are separate. Unknown transcript references trigger a
-warning; a valid reference does not verify that the model's claim follows from it.
+this answer** section displays the same retained excerpts. Recent answers show
+their own retained context and evidence while available, rather than the newest
+answer's context. Completed and partial streamed answers carry their own
+snapshot. Numeric document citations and transcript references such as `[T1]`
+are separate. Unknown transcript references trigger a warning even when no
+snapshot was retained; a valid reference does not verify that the model's claim
+follows from it.
 
 ## Times and identities
 

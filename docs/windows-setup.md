@@ -64,10 +64,11 @@ work with configured BYOK while capture setup remains blocked.
 
 The core supports project retrieval and typed questions independently of audio.
 In Hermes's managed plugin settings, choose the intended profile and set an
-OpenAI or OpenRouter key in the secure field. Keep keys out of chat, shell history,
-logs and project files. Reopen the pane after saving. In **Answer setup**, choose
-the provider and its exact model ID. Leave paid requests pending until that
-choice and setup are complete.
+OpenAI or OpenRouter key in the secure agent-settings field. Keep keys out of
+chat, shell history, logs and project files. Reopen the pane after saving a key.
+In **Settings → Plugins → Meeting Copilot**, choose the provider and its exact
+model ID. Older Desktop hosts without plugin settings pages keep **Answer setup**
+in the pane. Leave paid requests pending until that choice and setup are complete.
 
 Select one project, keep **Exclude past sessions** checked and web off for
 project-only evidence. Type a question in **What should I say?** and use
