@@ -45,8 +45,9 @@ Its printed assertions are the verification result; there is no recorded meeting
    Finance approval is required before the sample launch review.
    ```
 
-3. Select **copilot-sample** in **Search scope**. Keep **Exclude past sessions**
-   checked, automatic web fallback off, and the specific web query empty.
+3. Select **copilot-sample** in settings under **Search scope**. Keep **Exclude
+   past sessions** checked and automatic web fallback off. Keep the pane's
+   specific public web query empty.
 4. Ask **What approval is required before the sample launch review?** and choose
    **Suggest answer**. This sends a provider request with selected context and
    may incur billing.
@@ -57,7 +58,9 @@ Its printed assertions are the verification result; there is no recorded meeting
 ## Optional: add fictional meeting context
 
 Only on a prepared platform with participant permission, select the intended
-transcript source, confirm **Permission check**, and explicitly start capture.
+transcript source in plugin settings, then in the pane confirm **Permission
+check** and explicitly start capture. On older hosts, source controls remain
+in the pane. Reconfirm permission after changing capture settings.
 Say: **The sample review moved to Monday. Finance still needs to approve it.**
 Then type **When is the sample review, and what approval is required?** and ask.
 

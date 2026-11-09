@@ -67,8 +67,9 @@ In Hermes's managed plugin settings, choose the intended profile and set an
 OpenAI or OpenRouter key in the secure agent-settings field. Keep keys out of
 chat, shell history, logs and project files. Reopen the pane after saving a key.
 In **Settings → Plugins → Meeting Copilot**, choose the provider and its exact
-model ID. Older Desktop hosts without plugin settings pages keep **Answer setup**
-in the pane. Leave paid requests pending until that choice and setup are complete.
+model ID; the pane's **Open settings** button navigates there. Older Desktop hosts
+without plugin settings pages keep **Answer setup** and **Transcript source** in
+the pane. Leave paid requests pending until that choice and setup are complete.
 
 Select one project, keep **Exclude past sessions** checked and web off for
 project-only evidence. Type a question in **What should I say?** and use
@@ -94,16 +95,20 @@ require a download; Whisper model weights are still fetched only at explicit
 warmup/Start. Review the actual dependency and scanner prompts.
 
 When dependencies and recording permissions have been separately verified, choose
-**Transcript source → Capture source → Windows — experimental**. The Windows
-controls provide **Audio source** (Microphone, System audio, or both) and **Local
-transcription model** (tiny.en, base.en, small.en). Only the selected source is
+**Settings → Plugins → Meeting Copilot → Transcript source → Capture source →
+Windows — experimental** (or use **Transcript source** in the pane on older
+hosts). The Windows controls provide **Audio source** (Microphone, System audio,
+or both) and **Local transcription model** (tiny.en, base.en, small.en). Only the selected source is
 opened. The pane uses default Windows devices; system loopback includes all audio
 on the default output, which may differ from the device used by a meeting app.
 Whisper runs locally on the CPU; the first explicit Start may download weights.
 The selected answer provider remains separate from transcription.
 
-Confirm participant consent and a private test environment before **Start
-listening**. Use **Pause listening** and verify the stop status. A slow driver or
+In the pane, confirm participant consent and a private test environment before
+**Start listening**; confirm permission again after changing capture settings.
+Pause and verify an idle stop status before editing capture defaults. Opening
+Settings may unmount the pane and initiate pause. Use **Pause listening** and
+verify the stop status. A slow driver or
 inference can leave shutdown unconfirmed; do not assume a hidden pane proves
 audio stopped. Queues stay bounded; evicted transcription chunks are shown in the
 pane and may mean missing words. Native frame loss is not measured by this
