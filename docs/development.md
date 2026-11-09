@@ -33,6 +33,23 @@ probe; it does not establish loss-free capture. The `tests.verify_overlay_*`
 modules are development mutation checks. See [native backpressure](native-backpressure.md)
 and [overlay lifecycle](overlay-lifecycle.md).
 
+## Reviewed macOS audio dependencies
+
+`requirements-macos-audio.txt` is the constraints input. The committed
+`requirements-macos-audio.lock` pins all transitive wheels and SHA-256 digests for
+the reviewed CPython 3.12 / Apple Silicon setup. Preparation uses official PyPI,
+requires hashes, and refuses source builds or automatic interpreter downloads.
+To propose an update, regenerate the lock from official metadata and review its
+diff before testing it in a fresh isolated environment:
+
+```sh
+uv --no-config pip compile requirements-macos-audio.txt --generate-hashes --python-version 3.12 --python-platform aarch64-apple-darwin --only-binary=:all: --no-python-downloads --no-header --default-index https://pypi.org/simple --output-file requirements-macos-audio.lock
+```
+
+Do not run audio preparation to validate a lock in an active user's interpreter.
+Import checks need no device, model weights or provider calls. A compatible
+wheel lock is not evidence of transcription quality or Intel Mac support.
+
 ## Plugin validation
 
 Use an isolated Hermes validation environment; these commands do not test a live

@@ -1676,15 +1676,28 @@ class MeetingState:
     def _overlay_helper_path(self):
         import os as _os
         from pathlib import Path as _Path
-        override = _os.environ.get('MEETING_COPILOT_OVERLAY_HELPER', '').strip()
-        if override:
-            candidate = _Path(override)
-            if candidate.is_file():
-                return str(candidate)
         here = _Path(__file__).resolve().parent
-        for candidate in (here / 'macos_overlay', here / 'native' / 'macos_overlay'):
-            if candidate.is_file():
-                return str(candidate)
+        import importlib
+        runtime = importlib.import_module(f'{__package__}.native_runtime' if __package__ else 'native_runtime')
+        # Catalog helpers must match the current pin. The legacy override is
+        # still supported for installations using dashboard/core.
+        catalog = runtime.is_catalog(here)
+        if not catalog:
+            override = _os.environ.get('MEETING_COPILOT_OVERLAY_HELPER', '').strip()
+            if override:
+                candidate = _Path(override)
+                if candidate.is_file():
+                    return str(candidate)
+        try:
+            if catalog:
+                candidates = (runtime.artifact_dir(here) / 'macos_overlay',)
+            else:
+                candidates = (here / 'macos_overlay', here / 'native' / 'macos_overlay')
+            for candidate in candidates:
+                if candidate.is_file():
+                    return str(candidate)
+        except (OSError, ValueError, TypeError, RuntimeError):
+            pass
         return None
 
     def status(self, touch=True):
@@ -1806,18 +1819,15 @@ class MeetingState:
 
     def _macos_runtime_ready(self):
         """True only when the macOS worker env and helper look present. No probing."""
-        import os as _os
         from pathlib import Path as _Path
+        import importlib
         try:
             root = _Path(__file__).resolve().parent
-            helper = root / 'macos_capture'
-            worker = root / 'audio_worker.py'
-            runtime = root / 'audio-runtime/bin/python'
-            venv = root / '.venv-audio/bin/python'
-            override = _os.environ.get('MEETING_COPILOT_AUDIO_PYTHON', '').strip()
-            python_ok = (_Path(override).is_file() if override else
-                         (runtime.is_file() or venv.is_file()))
-            return bool(helper.is_file() and worker.is_file() and python_ok)
+            audio = importlib.import_module(f'{__package__}.macos_audio' if __package__ else 'macos_audio')
+            artifacts = audio._native_runtime().artifact_dir(root)
+            helper = audio.capture_helper(root, artifacts)
+            python = audio.worker_python(root, artifacts)
+            return bool(helper.is_file() and (root / 'audio_worker.py').is_file() and python)
         except Exception:
             return False
 

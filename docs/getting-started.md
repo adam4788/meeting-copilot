@@ -22,9 +22,8 @@ Run **Open Meeting Copilot** from the command palette. Desktop settings labels
 may vary by Hermes version. Find this plugin's settings rather than entering
 credentials into the Copilot pane.
 
-This guide describes the layout in this source checkout. The pinned published
-revision above predates the settings-page-only layout; install a revision that
-contains the change before expecting that layout.
+The runtime release includes the settings-page layout described below. Older
+Desktop hosts without plugin-settings pages show the documented inline fallback.
 
 The manifest declares FastAPI plus Windows-only NumPy, SoundCard and
 faster-whisper dependencies; Hermes resolves them under its core constraints. Doctor checks registration and setup. It does not test your API
@@ -91,7 +90,7 @@ have permission from participants and have checked the chosen source.
 
 | Source | Preparation and limits |
 | --- | --- |
-| macOS native | Run `python prepare_macos.py --home /path/to/profile` from the plugin source. It requires **preinstalled CPython 3.12**, uv, and Apple Command Line Tools with the macOS 26 SDK. It creates an isolated audio environment, installs its declared dependencies and compiles/signs helpers. Automatic Python downloads are disabled; install the interpreter separately from a trusted source. Both catalog and custom layouts are supported. Preparation does not start capture or request recording permission. Native loss is unresolved. |
+| macOS native | Run `python prepare_macos.py --home /path/to/profile` from the plugin source. The reviewed audio lock targets **Apple Silicon and preinstalled CPython 3.12**; uv and Apple Command Line Tools with the macOS 26 SDK are also required. Setup installs checksum-pinned wheels from official PyPI and compiles/signs reviewable native source. Catalog-generated files stay outside the Git checkout in profile-owned, version-bound storage; rerun preparation after a runtime update. Automatic Python downloads are disabled. Legacy custom layouts remain supported. Preparation does not start capture or request recording permission. Native loss is unresolved. |
 | Windows native | Experimental SoundCard/WASAPI capture, with optional dependencies in `requirements-audio.txt`. Consult [Windows audio](audio.md). Desktop setup is being verified separately; prior standalone synthetic checks do not prove the complete Desktop flow. |
 | Meetily | Optional, unofficial attachment to an explicitly chosen active JSON recording. Meetily owns its recording files and retention. See [adapter setup](meetily.md). |
 

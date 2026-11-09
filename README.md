@@ -93,8 +93,12 @@ self-update the catalog or bypass installation consent.
 
 Open the command palette and run **Open Meeting Copilot**. Agent enablement and
 the Desktop Plugins switch are separate; check both for the intended profile.
-Audio preparation is separate. Installation and doctor do not start recording
-or verify a live provider. See [the setup guide](docs/getting-started.md).
+Audio preparation is separate. Its reviewed wheel lock targets Apple Silicon
+and CPython 3.12; setup verifies SHA-256 hashes from official PyPI and builds the
+native helpers from source. Catalog-generated files stay outside the pinned
+checkout in version-bound profile storage; rerun preparation after updating.
+Installation and doctor do not start recording or verify a live provider. See
+[the setup guide](docs/getting-started.md).
 
 Review scanner findings for the exact pin before continuing. A reloaded pane
 is not provider or audio readiness. Windows capture remains experimental.

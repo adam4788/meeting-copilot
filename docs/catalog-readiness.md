@@ -61,9 +61,13 @@ release. Current rules impose no commit-age waiting period.
 - Capture requires consent and Start. Optional Meta transcription sends audio
   off-device. Local Whisper uses an isolated audio environment and model cache;
   initial model preparation may download weights.
-- macOS setup requires preinstalled CPython 3.12, uv and Apple Command Line Tools
-  with the macOS 26 SDK. It installs declared Python packages and compiles/signs
-  reviewable native source. Automatic interpreter downloads are disabled.
+- macOS audio setup targets Apple Silicon and requires preinstalled CPython 3.12,
+  uv and Apple Command Line Tools with the macOS 26 SDK. It installs the committed
+  `requirements-macos-audio.lock` from official PyPI with SHA-256 verification and
+  compiles/signs reviewable native source. Automatic interpreter downloads are
+  disabled. Catalog artifacts live outside the Git checkout in profile-owned,
+  version-bound storage so updates cannot carry stale helpers or venv symlinks;
+  rerun preparation after updating the runtime.
 - Capture, transcription and the overlay use child processes only after explicit
   actions. Setup does not start capture. There is no telemetry, self-update,
   credential-store modification or unattended recording.
