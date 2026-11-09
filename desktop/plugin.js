@@ -1,4 +1,4 @@
-import { createElement as h, useState, useEffect, useRef, useSyncExternalStore } from 'react';
+import { createElement as h, useState, useEffect, useLayoutEffect, useRef, useSyncExternalStore } from 'react';
 import { host, atom, useValue, useQuery, useQueryClient, Button, Input, Textarea, Badge, PALETTE_AREA } from '@hermes/plugin-sdk';
 
 const ID = 'meeting-copilot-live';
@@ -114,7 +114,16 @@ export default {
       } catch (_) { return {}; }
     }
     const loaded = loadPreferences();
-    const preferences = atom({ project: '', backend: 'meetily', webFallback: false, transcriptionModel: 'base.en', audioSource: 'microphone', answerProvider: '', answerModel: '', transcriptionProvider: 'local', asrMode: 'ENDPOINTING', ...loaded,
+    // An empty backend means no explicit choice. Resolve the running backend's
+    // platform from its real readiness/details, not the renderer's OS (which
+    // may be a remote client). Never save the inferred choice as a preference.
+    function defaultBackend(caps) {
+      const mac = caps?.macos_transcription === true || (typeof caps?.macos_detail === 'string' && caps.macos_detail.startsWith('On macOS:'));
+      const windows = caps?.windows_transcription === true || (typeof caps?.windows_detail === 'string' && caps.windows_detail.startsWith('Windows capture needs optional audio dependencies in the gateway interpreter:'));
+      return mac === windows ? '' : mac ? 'macos' : 'native';
+    }
+    const effectiveCapture = (prefs, caps) => ({ ...prefs, backend: prefs.backend || defaultBackend(caps) });
+    const preferences = atom({ project: '', backend: '', webFallback: false, transcriptionModel: 'base.en', audioSource: 'both', answerProvider: '', answerModel: '', transcriptionProvider: 'local', asrMode: 'ENDPOINTING', ...loaded,
       excludeHistory: loaded.excludeHistory !== undefined ? loaded.excludeHistory : !loaded.webFallback });
     const storageFailed = atom(false);
     let captureRevision = 0; // memory-only consent fence; never persist consent
@@ -128,7 +137,7 @@ export default {
       if (['backend', 'audioSource', 'transcriptionModel', 'transcriptionProvider', 'asrMode'].some(key => previous[key] !== next[key])) captureRevision++;
       preferences.set(next);
       const safe = {};
-      for (const key of preferenceFields) if (next[key] !== undefined) safe[key] = next[key];
+      for (const key of preferenceFields) if (next[key] !== undefined && !(key === 'backend' && !next[key])) safe[key] = next[key];
       let saved = false;
       try {
         const encoded = JSON.stringify(safe);
@@ -280,7 +289,7 @@ export default {
     function CapturePreferences({ prefs, status, qc, live }) {
       const mounted = hasMountedPane();
       const data = status.data || {};
-      const { backend, audioSource, transcriptionProvider, transcriptionModel, asrMode } = prefs;
+      const { backend, audioSource, transcriptionProvider, transcriptionModel, asrMode } = effectiveCapture(prefs, data.capabilities);
       const locked = !mayChangeCapture(qc, status, live);
       const change = (field, value, choices) => {
         if (!choices.includes(value) || !mayChangeCapture(qc, status, live)) return;
@@ -298,6 +307,7 @@ export default {
         locked && h('p', { role: 'status', style: muted }, 'Pause capture and wait for confirmed idle status before changing transcript settings. If status is unavailable, reopen the pane and check it.'),
         h('label', { style: { display: 'grid', gap: 6 } }, h('span', { id: 'mc-backend-label' }, 'Capture source'),
           h('select', { value: backend, disabled: locked, style: selectStyle, 'aria-labelledby': 'mc-backend-label', onChange: e => change('backend', e.target.value, ['meetily', 'macos', 'native']) },
+            h('option', { value: '', disabled: true }, 'Choose a capture source…'),
             h('option', { value: 'meetily' }, 'Meetily — use your existing recording'),
             h('option', { value: 'macos', disabled: mounted && !data.capabilities?.macos_transcription, title: data.capabilities?.macos_detail || '' }, 'macOS — without Meetily'),
             h('option', { value: 'native', disabled: mounted && data.capabilities?.windows_transcription !== true, title: data.capabilities?.windows_detail || 'Windows only · experimental' }, 'Windows — experimental'))),
@@ -401,8 +411,7 @@ export default {
       const [question, setQuestion] = useState('');
       const [web, setWeb] = useState('');
       const [consent, setConsent] = useState(false);
-      const [fallbackBackend, setBackend] = useState(saved.backend || 'meetily');
-      const backend = settingsAvailable ? prefs.backend : fallbackBackend;
+      const [fallbackBackend, setBackend] = useState(saved.backend || '');
       const [recording, setRecording] = useState('');
       const [error, setErrorValue] = useState('');
       function setError(value) {
@@ -415,7 +424,7 @@ export default {
       const [pending, setPending] = useState(false);
       const [showTranscript, setShowTranscript] = useState(false);
       const [fallbackTranscriptionModel, setTranscriptionModel] = useState(saved.transcriptionModel || 'base.en');
-      const [fallbackAudioSource, setAudioSource] = useState(saved.audioSource || 'microphone');
+      const [fallbackAudioSource, setAudioSource] = useState(saved.audioSource || 'both');
       const transcriptionModel = settingsAvailable ? prefs.transcriptionModel : fallbackTranscriptionModel;
       const audioSource = settingsAvailable ? prefs.audioSource : fallbackAudioSource;
       const [overlayOn, setOverlayOn] = useState(false);
@@ -425,6 +434,7 @@ export default {
 
 
       const status = useQuery({ queryKey: [ID, 'status'], queryFn: () => checkedStatus(api), refetchInterval: 2500, retry: 1 });
+      const backend = (settingsAvailable ? prefs.backend : fallbackBackend) || defaultBackend(status.data?.capabilities);
       // Keep the overlay lease alive while the pane is visible; overlay helper
       // polls use touch=false so only this heartbeat extends the 30s watchdog.
       useEffect(() => {
@@ -627,11 +637,7 @@ export default {
       const [setupOpen, setSetupOpen] = useState(false);
       const [answerUncertain, setAnswerUncertain] = useState(false);
       const [progressPaused, setProgressPaused] = useState(false);
-      useEffect(() => {
-        // Patch the current shared snapshot, never a captured answer setting:
-        // a late pane effect must not roll back a newer Settings edit.
-        if (!settingsAvailable && usable()) savePreferences({ backend, transcriptionModel, audioSource, transcriptionProvider, transcriptionChoiceVersion: 1, asrMode });
-      }, [backend, transcriptionModel, audioSource, transcriptionProvider, asrMode]);
+      // Older hosts persist only actual source edits, never inferred defaults.
       // Capability discovery never opts a meeting into cloud audio. Only an
       // explicit selection or persisted provider choice may select Meta.
       function resetMeetingInputs() {
@@ -641,7 +647,7 @@ export default {
         if (safety.answer && safety.answerKnown) { safety.answerToken += 1; signalSafety(); }
       }
       const cloudUnavailable = backend === 'macos' && transcriptionProvider === 'meta' && !data.capabilities?.meta_asr;
-      const windowsUnavailable = backend === 'native' && (settingsAvailable ? data.capabilities?.windows_transcription !== true : data.capabilities?.windows_transcription === false);
+      const windowsUnavailable = backend === 'native' && data.capabilities?.windows_transcription !== true;
       const overlayNeedsHide = !!data.overlay_cleanup_error || !!overlayActionAt.current.credentialShutdownUnconfirmed;
       function reflectCredentialOverlay(written, target) {
         const life = overlayActionAt.current;
@@ -711,15 +717,16 @@ export default {
           if (!usable() || !actionLife.mounted || overlayActionAt.current !== actionLife) return false;
           if (token === undefined ? (safety.captureAction || safety.captureUnknown)
               : (!safety.captureAction || safety.captureToken !== token)) return false;
-          const current = settingsAvailable ? preferences.get() : captureInput.current.source;
           const latest = qc.getQueryState?.([ID, 'status']) || status;
           const caps = latest?.data?.capabilities || {};
+          const current = settingsAvailable ? effectiveCapture(preferences.get(), caps)
+            : { ...captureInput.current.source, backend: captureInput.current.explicitBackend || defaultBackend(caps) };
           return !!(captureStatusIdle(latest) && !latest?.data?.overlay_cleanup_error && !actionLife.credentialShutdownUnconfirmed &&
             consentPrefs.current && captureKey(current) === captureKey(renderedCapture) && captureInput.current.recording === recording &&
-            (!settingsAvailable || (captureRevision === renderedCaptureRevision &&
-              consentPrefs.current.revision === captureRevision && consentPrefs.current.key === captureKey(current))) &&
-            (backend !== 'meetily' || recording) && (backend !== 'macos' || (caps.macos_transcription && (transcriptionProvider !== 'meta' || caps.meta_asr))) &&
-            (backend !== 'native' || (settingsAvailable ? caps.windows_transcription === true : caps.windows_transcription !== false)));
+            captureRevision === renderedCaptureRevision && consentPrefs.current.revision === captureRevision && consentPrefs.current.key === captureKey(current) &&
+            sourceVersion.current.revision === renderedSourceRevision && consentPrefs.current.sourceRevision === renderedSourceRevision &&
+            !!backend && (backend !== 'meetily' || recording) && (backend !== 'macos' || (caps.macos_transcription && (transcriptionProvider !== 'meta' || caps.meta_asr))) &&
+            (backend !== 'native' || caps.windows_transcription === true));
         };
         if (!canStartCurrent()) {
           if (usable()) setError('Capture settings changed or status is uncertain. Review the source and confirm permission again before starting.');
@@ -992,20 +999,52 @@ export default {
       }, [result?.answer, liveEntry?.answer, liveEntry?.status]);
       const [, setRetirement] = useState('');
       const renderedCapture = { backend, audioSource, transcriptionModel, transcriptionProvider, asrMode };
+      // Even a transient inferred source change revokes old consent; switching
+      // back must not resurrect it or a Start waiting on an earlier claim.
+      const sourceVersion = useRef({ backend, revision: 0 });
+      if (sourceVersion.current.backend !== backend) {
+        sourceVersion.current = { backend, revision: sourceVersion.current.revision + 1 };
+      }
+      const renderedSourceRevision = sourceVersion.current.revision;
       const renderedCaptureRevision = captureRevision;
-      const consentPrefs = useRef(consent ? { key: captureKey(renderedCapture), revision: renderedCaptureRevision } : null);
+      const consentPrefs = useRef(consent ? { key: captureKey(renderedCapture), revision: renderedCaptureRevision, sourceRevision: renderedSourceRevision } : null);
       // Event-time authority, independent of React's next render. A source or
       // recording change also invalidates a Start already awaiting its claim.
-      const captureInput = useRef({ source: renderedCapture, recording, revision: 0 });
+      const captureInput = useRef({ source: renderedCapture, explicitBackend: fallbackBackend, recording, revision: 0 });
+      // A late authoritative discovery changes the consent-bound source too.
+      if (!settingsAvailable && !fallbackBackend && captureInput.current.source.backend !== backend) {
+        captureInput.current.source = { ...captureInput.current.source, backend };
+        captureInput.current.revision += 1;
+      }
       const changeCaptureInput = (field, value, setter) => {
         if (!usable() || !actionLife.mounted || overlayActionAt.current !== actionLife) return;
         if (field === 'recording') captureInput.current.recording = value;
-        else captureInput.current.source = { ...captureInput.current.source, [field]: value };
+        else {
+          captureInput.current.source = { ...captureInput.current.source, [field]: value };
+          if (field === 'backend') captureInput.current.explicitBackend = value;
+          if (!settingsAvailable) savePreferences({ [field]: value, ...(field === 'transcriptionProvider' ? { transcriptionChoiceVersion: 1 } : {}) });
+        }
         captureInput.current.revision += 1;
         setter(value);
       };
       const [, setConsentRevision] = useState(0);
-      const consentValid = consent && (!settingsAvailable || (consentPrefs.current?.key === captureKey(renderedCapture) && consentPrefs.current?.revision === renderedCaptureRevision));
+      useLayoutEffect(() => {
+        // Query notifications may be batched into one React render. Fence every
+        // effective-source transition synchronously, including away-and-back.
+        const observeSource = () => {
+          if (!usable() || !actionLife.mounted || overlayActionAt.current !== actionLife) return;
+          const latest = qc.getQueryState?.([ID, 'status']) || status;
+          const next = (settingsAvailable ? preferences.get().backend : captureInput.current.explicitBackend)
+            || defaultBackend(latest?.data?.capabilities);
+          if (sourceVersion.current.backend === next) return;
+          sourceVersion.current = { backend: next, revision: sourceVersion.current.revision + 1 };
+          setConsentRevision(value => value + 1);
+        };
+        const unsubscribe = qc.getQueryCache?.()?.subscribe(observeSource);
+        observeSource();
+        return () => unsubscribe?.();
+      }, [qc, actionLife]);
+      const consentValid = consent && consentPrefs.current?.key === captureKey(renderedCapture) && consentPrefs.current?.revision === renderedCaptureRevision && consentPrefs.current?.sourceRevision === renderedSourceRevision;
       paneEntry.retire = message => { paneEntry.retired = message; setRetirement(message); };
       if (paneEntry.retired) return h('section', { role: 'alert', style: card },
         h('strong', null, 'Meeting Copilot pane retired — actions disabled'),
@@ -1056,9 +1095,10 @@ export default {
       const cloudAudioSelected = backend === 'macos' && transcriptionProvider === 'meta';
       const cloudAudioActive = data.listening && data.last_session?.backend === 'macos' && data.last_session?.transcription_provider === 'meta';
       const cloudAudioDisclosed = cloudAudioSelected || cloudAudioActive;
-      const sourceSummary = backend === 'meetily' ? 'Meetily — choose an active recording below'
+      const sourceSummary = !backend ? 'Not identified — choose a capture source'
+        : backend === 'meetily' ? (recording ? 'Meetily · recording selected' : 'Meetily — choose an active recording below')
         : `${backend === 'macos' ? 'macOS' : 'Windows'} · ${{ microphone: 'Microphone', system: 'System audio', both: 'Microphone + system audio' }[audioSource] || audioSource} · ${cloudAudioSelected ? `Meta (${asrMode})` : `Local transcription (${transcriptionModel})`}`;
-      const captureBlocked = overlayNeedsHide || cloudUnavailable || windowsUnavailable || !consentValid || (backend === 'meetily' && !recording)
+      const captureBlocked = !backend || overlayNeedsHide || cloudUnavailable || windowsUnavailable || !consentValid || (backend === 'meetily' && !recording)
         || (settingsAvailable && !mayChangeCapture(qc, status, () => usable() && actionLife.mounted && overlayActionAt.current === actionLife))
         || (backend === 'macos' && !data.capabilities?.macos_transcription);
       const hasRecentTranscript = Array.isArray(data.segments) && data.segments.slice(-40)
@@ -1073,7 +1113,6 @@ export default {
           h('strong', { style: { fontSize: 17 } }, 'Meeting Copilot'),
           h(Badge, { title: status.error ? 'Backend unavailable. Check the backend connection, installation, and plugin enablement.' : status.isPending ? 'Contacting backend…' : undefined }, statusLabel)),
         settingsAvailable && h('div', { style: { ...muted, display: 'flex', gap: 8, alignItems: 'center' } },
-          'Capture and answer defaults: Settings → Plugins → Meeting Copilot.',
           typeof host.navigate === 'function' && h('button', { type: 'button', onClick: () => { if (usable()) host.navigate(`/settings?tab=plugins&plugin=${ID}`); }, style: { color: 'var(--ui-accent)', background: 'transparent', border: 0, cursor: 'pointer' } }, 'Open settings')),
         // Capture session first: the permission check and the primary
         // start/pause actions live at the top, before any setup detail.
@@ -1083,13 +1122,14 @@ export default {
             h('span', { style: muted, role: 'status' }, settingsAvailable && status.error ? 'Capture status unavailable — check the backend connection.' : settingsAvailable && status.isPending ? 'Checking capture status…' : data.stopping ? 'Stop is not confirmed — audio may still be active.' : data.listening
               ? `Listening via ${data.backend || backend}${lossText(data.capture)}${data.capture?.warning ? ' · transcript may be incomplete' : ''}`
               : ((data.segments || []).length || result || (data.recent || []).length) ? 'Paused — resume this meeting or start a fresh one.' : 'Not capturing yet.')),
-          settingsAvailable && h('p', { style: { ...muted, margin: 0 } }, `Capture source: ${sourceSummary} (next capture).`),
+          h('p', { style: { ...muted, margin: 0 } }, `Capture source: ${sourceSummary} (next capture).`),
           h('label', { style: { display: 'flex', gap: 8, alignItems: 'flex-start', border: '1px solid var(--ui-stroke-secondary)', borderRadius: 10, padding: '10px 12px', background: 'var(--ui-bg-card)' } },
             h('input', { type: 'checkbox', checked: consentValid, disabled: data.listening, onChange: e => {
               if (e.target.checked && (!usable() || !actionLife.mounted || overlayActionAt.current !== actionLife ||
-                  captureInput.current.recording !== recording || (!settingsAvailable && captureKey(captureInput.current.source) !== captureKey(renderedCapture)) ||
-                  (settingsAvailable && (captureRevision !== renderedCaptureRevision || captureKey(preferences.get()) !== captureKey(renderedCapture))))) return;
-              consentPrefs.current = e.target.checked ? { key: captureKey(renderedCapture), revision: renderedCaptureRevision } : null;
+                  captureInput.current.recording !== recording || captureRevision !== renderedCaptureRevision || sourceVersion.current.revision !== renderedSourceRevision ||
+                  (!settingsAvailable && captureKey(captureInput.current.source) !== captureKey(renderedCapture)) ||
+                  (settingsAvailable && captureKey(effectiveCapture(preferences.get(), (qc.getQueryState?.([ID, 'status']) || status)?.data?.capabilities)) !== captureKey(renderedCapture)))) return;
+              consentPrefs.current = e.target.checked ? { key: captureKey(renderedCapture), revision: renderedCaptureRevision, sourceRevision: renderedSourceRevision } : null;
               setConsent(e.target.checked);
               setConsentRevision(value => value + 1);
             }, 'aria-describedby': cloudAudioDisclosed ? `${paneEntry.a11yId}-cloud-audio` : undefined }),
@@ -1097,34 +1137,30 @@ export default {
           cloudAudioDisclosed && h('p', { id: `${paneEntry.a11yId}-cloud-audio`, 'data-cloud-capture-disclosure': true, role: 'status', style: { ...muted, margin: 0 } }, `Cloud transcription ${cloudAudioActive ? 'active' : 'selected'}: meeting audio is sent to Meta while listening. ${data.listening ? 'Pause to change' : 'Change'} the provider in ${settingsAvailable ? 'Meeting Copilot settings' : 'Transcript source below'}.`),
           data.listening && data.backend === 'macos' && !data.last_session?.transcription_provider && h('p', { role: 'status', style: muted }, 'The active transcription provider is not confirmed. Check capture status and pause if unsure.'),
           cloudUnavailable && h('p', { role: 'status', style: muted }, `Meta cloud transcription is unavailable. Choose Local in ${settingsAvailable ? 'Meeting Copilot settings' : 'Transcript source'}, or configure a Meta key and recheck backend readiness before Start.`),
-          windowsUnavailable && h('p', { role: 'status', style: muted }, data.capabilities?.windows_detail || 'Windows capture needs the optional audio dependencies. See the Windows setup guide.'),
-          !data.listening && !data.stopping && (pending || !consentValid || (backend === 'meetily' && !recording) || (backend === 'macos' && !data.capabilities?.macos_transcription)) && h('p', { style: { ...muted, margin: 0 }, role: 'status' },
-            pending ? 'Starting…' : !consentValid ? (consent && settingsAvailable ? 'Capture settings changed. Confirm permission again before starting.' : 'Confirm permission with the check above to enable Start.') : (backend === 'meetily' && !recording) ? 'Select an active Meetily recording below to enable Attach.' : `Independent macOS transcription is unavailable here — see ${settingsAvailable ? 'Meeting Copilot settings' : 'the source card below'}.`),
+          backend === 'macos' && !data.capabilities?.macos_transcription && h('p', { role: 'status', style: muted }, data.capabilities?.macos_detail || 'macOS transcription readiness was not reported. Check the backend and macOS setup guide.'),
+          windowsUnavailable && h('p', { role: 'status', style: muted }, data.capabilities?.windows_detail || 'Windows capture readiness was not reported. Check the backend and Windows setup guide.'),
+          !data.listening && !data.stopping && (pending || !backend || !consentValid || (backend === 'meetily' && !recording)) && h('p', { style: { ...muted, margin: 0 }, role: 'status' },
+            pending ? 'Starting…' : !backend ? `Choose a capture source in ${settingsAvailable ? 'Meeting Copilot settings' : 'Transcript source below'}.` : !consentValid ? (consent ? 'Capture settings changed. Confirm permission again before starting.' : 'Confirm permission to enable Start.') : 'Select an active Meetily recording below to enable Attach.'),
           h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
             data.stopping
               ? h(Button, { variant: 'secondary', disabled: pending, onClick: () => act('/pause', {}) }, 'Retry stop')
               : data.listening
               ? h(Button, { variant: 'secondary', onClick: () => act('/pause', {}) }, data.backend === 'meetily' ? 'Detach' : 'Pause listening')
               : h(Button, { disabled: pending || captureBlocked, onClick: () => startCapture() }, ((data.segments || []).length || result || (data.recent || []).length) ? (backend === 'meetily' ? 'Resume' : 'Resume listening') : (backend === 'meetily' ? 'Attach to Meetily' : 'Start listening')),
-            !data.listening && !data.stopping && ((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending || captureBlocked, title: 'Starts a fresh meeting; the earlier transcript, answers, and retry data are cleared', onClick: () => startCapture(true) }, 'New meeting'),
-            (data.overlay_cleanup_error || (data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending, title: 'Clears past Q&A, transcript segments, and cached snippets for this meeting', onClick: async () => { if (typeof window !== 'undefined' && window.confirm && !window.confirm('Clear this meeting? Past questions, answers, and transcript segments are removed from the pane.')) return; if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } } }, 'Clear meeting'),
-            h(Button, { variant: 'secondary', disabled: pending || (!data.capabilities?.overlay && !overlayNeedsHide), title: 'Show or hide the read-only meeting overlay (macOS)', onClick: toggleOverlay }, overlayNeedsHide ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay')),
-          h('p', { style: { ...muted, margin: 0 } }, 'Screen-share privacy: the overlay may be visible in screenshots, recordings or screen sharing. Capture exclusion is best-effort, not a guarantee. Hide the overlay when it must not appear.'),
-          h('p', { 'data-overlay-controls-help': true, style: { ...muted, margin: 0 } }, 'In the overlay, press ⌃⌥⌘O (Control + Option + Command + O) to drag the header, use position presets, or toggle Show in recordings. It returns to click-through automatically.'),
-          h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'The overlay is read-only. Ask questions in the Meeting Copilot pane.'),
-          (data.overlay_cleanup_error || overlayMsg) && h('p', { role: 'status', style: { ...muted, margin: 0 } }, data.overlay_cleanup_error || overlayMsg),
-          overlayNeedsHide && h('p', { role: 'alert', style: { ...muted, margin: 0 } }, 'Overlay shutdown is not confirmed. Retry hide overlay and verify the window is gone before screen-sharing.'),
+            !data.listening && !data.stopping && !!((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending || captureBlocked, title: 'Starts a fresh meeting; the earlier transcript, answers, and retry data are cleared', onClick: () => startCapture(true) }, 'New meeting'),
+            !!(data.overlay_cleanup_error || (data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending, title: 'Clears past Q&A, transcript segments, and cached snippets for this meeting', onClick: async () => { if (typeof window !== 'undefined' && window.confirm && !window.confirm('Clear this meeting? Past questions, answers, and transcript segments are removed from the pane.')) return; if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } } }, 'Clear meeting')),
+          h('div', { role: overlayNeedsHide ? 'alert' : undefined, style: { display: 'grid', gap: 6 } },
+            h(Button, { variant: 'secondary', disabled: pending || (!data.capabilities?.overlay && !overlayNeedsHide), title: 'Show or hide the read-only meeting overlay (macOS)', onClick: toggleOverlay }, overlayNeedsHide ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay'),
+            (data.overlay_cleanup_error || overlayMsg) && h('p', { role: overlayNeedsHide ? undefined : 'status', style: { ...muted, margin: 0 } }, data.overlay_cleanup_error || overlayMsg),
+            h('p', { style: { ...muted, margin: 0 } }, 'Screen-share privacy: the overlay may appear in screenshots, recordings or screen sharing. Exclusion is best-effort, not a guarantee. Hide it when it must not appear.'),
+            h('p', { 'data-overlay-controls-help': true, style: { ...muted, margin: 0 } }, 'Overlay is read-only; ask questions here. ⌃⌥⌘O temporarily enables interaction; see Help.')),
           !data.capabilities?.overlay && h('p', { role: 'status', style: { ...muted, margin: 0 } }, backend === 'native' ? 'The floating overlay is macOS-only. Use this Meeting Copilot pane on Windows.' : 'Overlay helper unavailable. Check the macOS helper build and restart the gateway when other sessions are idle.'),
-          h('p', { style: { ...muted, margin: 0 } }, 'No extra audio files are saved. Disconnect starts a pause or detach; check the stop status before assuming audio is off. Resume keeps this meeting. New meeting, different settings or Clear starts fresh. Pausing may discard the last few seconds.'),
           data.capture && h('div', { style: muted }, data.capture.message || data.capture.state || ''),
           data.capture && (data.capture.warning || lossText(data.capture)) && h('div', { role: 'status', style: muted },
             ['Transcript may be incomplete',
              lossText(data.capture),
              data.capture.warning ? `: ${data.capture.warning}` : ''].join(''))),
-        data.overlay_cleanup_error && h('div', { role: 'alert', style: card },
-          h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' } },
-            h('span', null, data.overlay_cleanup_error),
-            h(Button, { variant: 'secondary', disabled: pending, onClick: toggleOverlay }, 'Retry hide overlay'))),
+
         errorCard(error, localRecheck ? 'Recheck status' : 'Dismiss', async () => {
           if (localRecheck) {
             // Resume GET-only progress checks; never replay an uncertain POST.
@@ -1149,12 +1185,6 @@ export default {
         status.error && errorCard('Backend unavailable. Check the backend connection, installation, and plugin enablement.',
           'Retry', recheckStatus),
         persistWarning && h('p', { role: 'status', style: muted }, persistWarning),
-        !data.listening && !data.stopping && !result && h('section', { style: card, 'aria-label': 'Getting started' },
-          h('strong', null, 'Getting started'),
-          h('ol', { style: { ...muted, margin: '8px 0 0', paddingLeft: 20, display: 'grid', gap: 4 } },
-            h('li', null, backend === 'meetily' ? 'Confirm permission above, pick your active Meetily recording below, then Attach.' : 'Confirm permission above, then Start listening.'),
-            h('li', null, 'Type a question (or leave blank for the latest one) and choose Suggest answer.'),
-            h('li', null, 'Read the cited answer; open Evidence for sources.'))),
 
         !settingsAvailable && h(data.listening ? 'details' : 'section', data.listening ? null : { style: card },
           ...(data.listening ? [h('summary', { style: { cursor: 'pointer', ...muted } }, `Transcript source: ${data.backend || backend} — listening (pause to change settings)`)] : []),
@@ -1162,10 +1192,10 @@ export default {
           h('div', { style: { display: 'grid', gap: 6, paddingTop: 8, paddingBottom: 10 } },
             h('label', { style: { display: 'grid', gap: 6 } }, h('span', { id: 'mc-backend-label' }, 'Capture source'),
             h('select', { value: backend, disabled: data.listening, onChange: e => changeCaptureInput('backend', e.target.value, setBackend), style: selectStyle, 'aria-labelledby': 'mc-backend-label' },
+              h('option', { value: '', disabled: true }, 'Choose a capture source…'),
               h('option', { value: 'meetily' }, 'Meetily — use your existing recording'),
               h('option', { value: 'macos', disabled: !data.capabilities?.macos_transcription, title: data.capabilities?.macos_detail || '' }, 'macOS — without Meetily'),
-              h('option', { value: 'native', disabled: data.capabilities?.windows_transcription === false, title: data.capabilities?.windows_detail || 'Windows only · experimental' }, 'Windows — experimental')))),
-          backend === 'macos' && !data.capabilities?.macos_transcription && h('p', { role: 'status', style: muted }, data.capabilities?.macos_detail || 'macOS transcription is unavailable on this machine.'),
+              h('option', { value: 'native', disabled: data.capabilities?.windows_transcription !== true, title: data.capabilities?.windows_detail || 'Windows only · experimental' }, 'Windows — experimental')))),
           (backend === 'macos' || backend === 'native') && h('div', { style: { display: 'grid', gap: 8, paddingBottom: 12 } },
             h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Audio source'), h('select', { style: selectStyle, value: audioSource, disabled: data.listening, onChange: e => changeCaptureInput('audioSource', e.target.value, setAudioSource), 'aria-label': 'Audio source' },
               h('option', { value: 'microphone' }, 'Microphone'), h('option', { value: 'system' }, 'System audio'), h('option', { value: 'both' }, 'Microphone + system audio'))),
@@ -1191,7 +1221,8 @@ export default {
             h('span', { style: muted }, 'Meetily saves its own recordings and transcripts. Pausing here detaches the copilot; it does not stop the Meetily recording.'))),
         h('label', { ref: composerRef, style: { display: 'grid', gap: 6 } }, h('strong', { id: 'mc-q-label' }, 'What should I say?'),
           h(Textarea, { value: question, maxLength: 4000, onChange: e => setQuestion(e.target.value.slice(0, 4000)), placeholder: 'Leave blank to answer the latest question, or type a question… (⌘/Ctrl+Enter to send)', rows: 3, 'aria-labelledby': 'mc-q-label', onKeyDown: e => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !e.repeat && !e.nativeEvent?.isComposing && !busy && !unsupported) { e.preventDefault(); assistNow(); } } })),
-        h('section', { 'aria-label': 'Recent meeting quick actions', style: { display: 'grid', gap: 8 } },
+        h('details', { 'aria-label': 'Recent meeting quick actions' },
+          h('summary', { style: { cursor: 'pointer', ...muted } }, 'Quick actions'),
           h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
             ...contextActions.map(([label, prompt]) => h(Button, { key: label, variant: 'secondary',
               disabled: !hasRecentTranscript || answerBlocked || unsupported,
@@ -1202,9 +1233,11 @@ export default {
           !hasRecentTranscript && h('p', { style: { ...muted, margin: 0 }, role: 'status' },
             'Quick actions become available after transcript text arrives. You can still type a project question above.')),
 
-        ...(unsupported ? [h('p', { role: 'alert', style: muted }, `Suggest is unavailable: ${unsupportedReasons.join(' ')} See ${settingsAvailable ? 'Settings → Plugins → Meeting Copilot' : 'Answer setup below'}, then restart the gateway when other sessions are idle.`)] : []),
-        excludeHistory && !unsupported && h('p', { role: 'status', style: muted, 'data-history-excluded': true }, 'Past sessions and web search are excluded. Only the selected project is searched.'),
-        h('p', { style: { ...muted, margin: 0 } }, 'Your question, part of the transcript and selected source snippets may be sent to the answer model. If enabled in Settings, automatic fallback may also send a public query.'),
+        ...(unsupported ? [h('p', { role: 'alert', style: muted }, `Suggest is unavailable: ${unsupportedReasons.join(' ')} See ${settingsAvailable ? 'Meeting Copilot settings' : 'Answer setup below'}.`)] : []),
+        h('p', { role: 'status', style: { ...muted, margin: 0 }, 'data-history-excluded': excludeHistory },
+          excludeHistory ? (unsupported ? 'Past-session exclusion requested — resolve the warning before submitting.' : 'Past sessions and web search are excluded. Only the selected project is searched.')
+            : `Search scope: ${project === '__all_projects__' ? 'all projects + sessions (may include unrelated projects)' : project ? `${project.split(/[\\/]/).pop()} + past sessions` : 'past sessions only'}${webFallback ? ' · automatic web on' : ' · automatic web off'}.`),
+        h('p', { style: { ...muted, margin: 0 } }, `Your question, part of the transcript and selected source snippets may be sent to the answer model${answerProvider && answerModel ? `: ${answerProvider} / ${answerModel}` : ' you choose'}.`),
         webFallback && h('p', { 'data-web-fallback-disclosure': true, role: 'status', style: { ...muted, margin: 0 } }, 'Automatic web fallback is on: if local evidence is insufficient, a public query may be drafted. Filtering is not a privacy guarantee; turn it off for sensitive calls.'),
         h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
           h(Button, { disabled: answerBlocked || unsupported, onClick: () => assistNow() }, busy ? 'Checking your sources…' : 'Suggest answer'),
@@ -1227,7 +1260,7 @@ export default {
               try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }); }
               catch (e) { setError('Answer progress unavailable after cancellation. Recheck status before asking again.'); }
             } }, 'Cancel answer'),
-          h(Button, { variant: 'secondary', disabled: !result?.answer, onClick: async () => { if (!usable()) return; try { await navigator.clipboard.writeText(result.answer); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch (e) { setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, copied ? 'Copied ✓' : 'Copy'),
+          result?.answer && h(Button, { variant: 'secondary', onClick: async () => { if (!usable()) return; try { await navigator.clipboard.writeText(result.answer); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch (e) { setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, copied ? 'Copied ✓' : 'Copy'),
           question && h(Button, { variant: 'secondary', disabled: busy, onClick: () => { setQuestion(''); composerRef.current?.querySelector('textarea')?.focus(); } }, 'Clear question')),
         currentLive && ['error', 'cancelled'].includes(currentLive.status) && !data.error && h('section', { style: card, 'aria-live': 'polite', 'data-terminal-answer': true },
           h('p', null, currentLive.status === 'error' ? answerFailure() : 'Answer cancelled.'),
@@ -1302,14 +1335,9 @@ export default {
 
         !settingsAvailable && h(AnswerPreferences, { prefs, status, projects, models: modelCatalog, qc, live: () => usable() && overlayActionAt.current.mounted }),
         h('section', { style: { ...card, display: 'grid', gap: 10 } },
-          h('strong', null, 'Meeting overlay (macOS)'),
-          h('p', { style: { ...muted, marginBottom: 0 } }, 'The overlay displays the transcript and detected questions. Ask and view answers in the Meeting Copilot pane. The overlay may appear in screen shares.'),
-
+          h('strong', null, 'Overlay scope'),
           scopeStale && overlayOn && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'Settings changed — syncing overlay scope…'),
-          (data.overlay_cleanup_error || overlayMsg) && h('p', { role: 'status', style: { ...muted, margin: 0 } }, data.overlay_cleanup_error || overlayMsg),
-          !data.capabilities?.overlay && h('p', { role: 'status', style: { ...muted, margin: 0 } }, 'Overlay helper unavailable. Check the macOS helper build and restart the gateway, then try Show overlay again.'),
           h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
-            h(Button, { variant: overlayOn ? 'secondary' : undefined, disabled: pending || (!data.capabilities?.overlay && !overlayNeedsHide), onClick: toggleOverlay }, overlayNeedsHide ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay'),
             h(Button, { variant: 'secondary', disabled: pending || !overlayOn, onClick: async () => {
               setPending(true); setOverlayMsg('');
               scopeSeq.current += 1;
@@ -1325,7 +1353,9 @@ export default {
             h('span', { id: `${paneEntry.a11yId}-web-query`, 'data-web-query-disclosure': true, style: muted }, 'This query is sent to the web and overrides automatic fallback for this request. Do not include private details. This action stays in the pane so it uses this meeting and only runs when you press Check sources + web.'),
             h(Button, { variant: 'secondary', disabled: busy || unsupported || !web.trim(), onClick: () => assistNow({ web_query: web.trim() }) }, 'Check sources + web'))),
         )),
-        h('p', { style: { ...muted, marginTop: 'auto' } }, 'Read-only assistance. Nothing is spoken, posted, or changed for you. Check suggestions before using them.'));
+        h('details', null, h('summary', { style: { cursor: 'pointer', ...muted } }, 'Help'),
+          h('p', { style: muted }, 'The read-only macOS overlay shows transcript and detected questions; ask in this pane. Press ⌃⌥⌘O (Control + Option + Command + O) to interact temporarily, drag the header, use position presets, or toggle Show in recordings. It returns to click-through automatically.'),
+          h('p', { style: muted }, 'Closing the pane initiates pause or detach; check stop status before assuming audio is off. Pause may discard the last few seconds. Resume keeps this meeting; New meeting, different capture settings, or Clear starts fresh. No extra audio files are saved by Copilot.')));
     }
     const paneId = `${ID}:pane`;
     const visibility = typeof host.paneVisibility === 'function' ? host.paneVisibility(paneId) : null;

@@ -91,13 +91,19 @@ have permission from participants and have checked the chosen source.
 | Windows native | Experimental SoundCard/WASAPI capture, with optional dependencies in `requirements-audio.txt`. Consult [Windows audio](audio.md). Desktop setup is being verified separately; prior standalone synthetic checks do not prove the complete Desktop flow. |
 | Meetily | Optional, unofficial attachment to an explicitly chosen active JSON recording. Meetily owns its recording files and retention. See [adapter setup](meetily.md). |
 
-In **Settings → Plugins → Meeting Copilot → Transcript source**, choose the
+In **Settings → Plugins → Meeting Copilot → Transcript source**, review the
 capture source and available audio/transcription defaults. On older hosts use
-the pane's **Transcript source** controls instead. The initial source is Meetily;
-select your intended source explicitly. Local Whisper is independent of the answer
-API key. Where offered, optional Meta transcription sends meeting audio off-device
-and requires a separate explicit choice and configured key. Model preparation may
-download weights. No compiled helper executable is committed to this repository.
+the pane's **Transcript source** controls instead. Without a saved choice, the
+pane selects macOS or experimental Windows capture when backend capabilities
+identify that platform. **Microphone + system audio** and local Whisper are the
+defaults unless separately saved choices say otherwise. This is a selection, not
+proof that the capture route is ready. If the platform
+cannot be identified, choose a source explicitly. Saved source and audio choices
+are not changed; Meetily still requires explicit selection and attachment.
+Local Whisper is independent of the answer API key. Optional Meta transcription
+sends meeting audio off-device and requires a separate explicit choice and key.
+Model preparation may download weights. No compiled helper executable is
+committed to this repository.
 
 Pause capture and wait for a confirmed idle status before changing transcript
 settings. The pane shows the selected source and cloud disclosure; after changing
