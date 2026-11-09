@@ -10,7 +10,7 @@ For native Windows, follow the [Windows setup guide](windows-setup.md).
 Use Hermes 0.22.7 or newer. The plugin ID is `meeting-copilot-live`.
 
 ```sh
-hermes plugins install adam4788/meeting-copilot --ref 9a261fd4e549f7ce1715fc39ee49b5a2907d42c6 --enable
+hermes plugins install adam4788/meeting-copilot --ref c5aa3cf85bd94ce7134925d0ebc0c1c5a17c9f12 --enable
 hermes plugins doctor meeting-copilot-live --ci
 ```
 
