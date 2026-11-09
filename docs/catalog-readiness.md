@@ -20,9 +20,13 @@ Validate a clean export of the exact commit to be pinned as well.
 The proposed upstream change is one file,
 `plugin-catalog/meeting-copilot-live.yaml`, in NousResearch/hermes-agent. It must
 contain a full 40-character SHA reachable in Adam's public repository. BYOK
-source is published at `9a261fd4e549f7ce1715fc39ee49b5a2907d42c6`. Publication
-is separate from admission: the actual release tree still needs independent
-validation, a public pin, and review. No catalog PR is made by preflight.
+source is published at `c5aa3cf85bd94ce7134925d0ebc0c1c5a17c9f12`. Publication
+is separate from admission. A local 61-file runtime export from that revision
+passed doctor and `validate --install-deps` on November 9, including a safe
+security scan; see [verification](verification.md). That export has not been
+published as its own release tree. A catalog submission still needs the exact
+public release pin, disclosures and maintainer review. No catalog PR is made by
+preflight.
 A repository's own catalog folder does not list the plugin.
 
 ## Installation disclosures
