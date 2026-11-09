@@ -389,6 +389,49 @@ def _clean_url(url, _depth=0):
 _USE_HOST = object()
 
 
+def _effective_hermes_home():
+    """Ask the host for the current task's home; never guess a host path."""
+    from hermes_constants import get_hermes_home
+    home = get_hermes_home()
+    if not isinstance(home, (str, os.PathLike)) or not os.fspath(home):
+        raise ValueError('Hermes home is unavailable.')
+    path = Path(home).expanduser()
+    # Keep the original profile path for the named-profile guard: resolving
+    # a named symlink first could disguise it as the primary home.
+    _require_default_profile(path)
+    return _require_default_profile(path.resolve())
+
+
+def _require_default_profile(home):
+    # Named profiles are not supported by this history adapter. In particular,
+    # never replace a named child's home with its primary parent's state.db.
+    if ('profiles' in {part.lower() for part in home.parts} or
+            os.environ.get('HERMES_PROFILE', '').lower() not in ('', 'default') or
+            os.environ.get('HERMES_PROFILE_NAME', '').lower() not in ('', 'default')):
+        raise ValueError('Meeting Copilot only supports the default Hermes profile')
+    return home
+
+
+def _validated_host_scope_home():
+    """Capture the home authenticated by the host for this admitted request."""
+    try:
+        from agent.secret_scope import current_secret_scope, current_secret_scope_home
+        scope = current_secret_scope()
+        stamped = current_secret_scope_home()
+        if scope is None or not isinstance(stamped, (str, os.PathLike)) or not os.fspath(stamped):
+            raise ValueError()
+        stamped_path = Path(stamped).expanduser()
+        _require_default_profile(stamped_path)
+        home = stamped_path.resolve()
+        if home != _effective_hermes_home():
+            raise ValueError()
+        return _require_default_profile(home)
+    except Exception:
+        # No process environment or primary-profile fallback on a missing,
+        # incompatible, unsupported, or mismatched host scope.
+        raise ValueError('Hermes default-profile credential scope is unavailable or mismatched.') from None
+
+
 class KnowledgeEngine:
     supports_transcript_snapshot = True
     def __init__(self, project_root=None, hermes_home=None, _completion=None,
@@ -415,10 +458,22 @@ class KnowledgeEngine:
         if _standalone or _completion is not None or _search is not None or _history is not _USE_HOST:
             self.hermes_home = Path(hermes_home).resolve() if hermes_home else None
         else:
-            default_home = Path(os.environ.get('LOCALAPPDATA', Path.home() / 'AppData' / 'Local')) / 'hermes' if os.name == 'nt' else Path.home() / '.hermes'
-            self.hermes_home = Path(hermes_home or os.environ.get('HERMES_HOME', default_home)).resolve()
-            if 'profiles' in {part.lower() for part in self.hermes_home.parts} or any(os.environ.get(key, '').lower() not in ('', 'default') for key in ('HERMES_PROFILE_NAME', 'HERMES_PROFILE')):
-                raise ValueError('Only the default Hermes profile is supported')
+            if hermes_home is not None:
+                path = Path(hermes_home).expanduser()
+                _require_default_profile(path)
+                home = path.resolve()
+            else:
+                try:
+                    home = _effective_hermes_home()
+                except ValueError:
+                    raise
+                except Exception:
+                    # Non-history operations can still run offline; host
+                    # history must fail rather than guess another profile.
+                    home = None
+            if home is not None:
+                _require_default_profile(home)
+            self.hermes_home = home
         self._cache = {}
         self._token_cache = {}
         self._lock = threading.RLock()
@@ -588,6 +643,8 @@ class KnowledgeEngine:
                     'updated_at': updated,
                 })
             return cleaned
+        if self.hermes_home is None:
+            raise ValueError('Hermes home is unavailable for history.')
         path = self.hermes_home / 'state.db'
         if not path.is_file():
             return []

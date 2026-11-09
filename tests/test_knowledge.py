@@ -118,7 +118,10 @@ class KnowledgeTests(unittest.TestCase):
     def test_other_profile_denied_and_generic_discovery(self):
         with self.assertRaises(ValueError):
             KnowledgeEngine(self.projects, self.root / 'profiles' / 'other')
-        with patch.dict(os.environ, {'MEETING_COPILOT_PROJECT_ROOT': str(self.projects), 'HERMES_HOME': str(self.home)}):
+        # Generic discovery must use the host API, not independently interpret
+        # HERMES_HOME. Keep this unit test offline when Hermes is not installed.
+        with patch.dict(os.environ, {'MEETING_COPILOT_PROJECT_ROOT': str(self.projects), 'HERMES_HOME': str(self.home)}), \
+             patch('knowledge._effective_hermes_home', return_value=self.home.resolve()):
             engine = KnowledgeEngine()
         self.assertEqual(engine.project_root, self.projects.resolve())
         self.assertEqual(engine.hermes_home, self.home.resolve())

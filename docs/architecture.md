@@ -60,9 +60,9 @@ write business-system records. Evidence is untrusted. Citations do not guarantee
 correctness, and filtering cannot guarantee all sensitive text is removed.
 
 Hermes owns plugin secrets. Production code obtains bound scoped settings and
-does not edit credential stores. Standalone CLI BYOK explicitly uses process
-environment credentials. Pause, Clear, or key changes cannot recall a submitted
-provider request.
+does not edit credential stores. The standalone CLI is offline-only, uses no
+provider credentials, and is separate from the Desktop BYOK route. Pause, Clear,
+or key changes cannot recall a submitted provider request.
 
 Capture/overlay use child processes; setup may install dependencies and
 compile/sign helpers. A visible stopping state means shutdown is not confirmed.

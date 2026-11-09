@@ -20,7 +20,8 @@ needs finance sign-off before August. Compare the returned extract and source
 with that file. The `fake` provider is an extractive demonstration, not a local
 language model or a live account test. No microphone or API key is needed.
 
-For a fuller synthetic fixture demonstration:
+For a fuller synthetic fixture demonstration, run the included offline helper
+from either the source checkout or runtime release:
 
 ```sh
 python demo_standalone.py
@@ -75,10 +76,12 @@ dropped frames. See [status](../README.md#current-status),
 
 ## Images and demo evidence
 
-Generated hero art is conceptual project artwork, not an actual Hermes screen
-or a verified feature demonstration. Product screenshots, if added, must come
-from an observed interface with synthetic data and identify platform and revision.
-Do not substitute generated UI for a real screenshot.
+The runtime export includes the conceptual hero and a production native-view
+render with only fictional content. The latter was rendered on macOS 27 from
+source `32680e03db334a07dcb904cf63acbff2b8eb25cf`; it is not a live provider,
+capture, or recorder-exclusion test. See [asset provenance](assets/README.md).
+Future screenshots must likewise identify platform/revision and use synthetic
+data. Do not substitute generated UI for a real screenshot.
 
 ## Recent-context quick actions
 

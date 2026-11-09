@@ -1,8 +1,4 @@
-"""Opt-in macOS capture gateway. Standard library only; no Meetily dependency.
-
-Install audio_worker.py and macos_capture alongside this module, and the isolated
-Python 3.12 environment at audio-runtime (or project .venv-audio).
-"""
+"""Opt-in macOS capture gateway. Standard library only; no Meetily dependency."""
 import os
 import json
 import math
@@ -30,10 +26,28 @@ def error_message(code):
     return ERRORS.get(code, ERRORS['worker'])
 
 
-def worker_python(root):
+def _native_runtime():
+    if __package__:
+        from . import native_runtime
+    else:
+        import native_runtime
+    return native_runtime
+
+
+def capture_helper(root, artifacts=None):
+    return (artifacts if artifacts is not None else _native_runtime().artifact_dir(root)) / 'macos_capture'
+
+
+def worker_python(root, artifacts=None):
+    root = Path(root)
     override = os.environ.get('MEETING_COPILOT_AUDIO_PYTHON')
-    candidates = [Path(override)] if override is not None else [
-        root / 'audio-runtime/bin/python', root / '.venv-audio/bin/python']
+    if override is not None:
+        candidates = [Path(override)]
+    elif _native_runtime().is_catalog(root):
+        artifacts = artifacts if artifacts is not None else _native_runtime().artifact_dir(root)
+        candidates = [artifacts / 'audio-runtime/bin/python']
+    else:
+        candidates = [root / 'audio-runtime/bin/python', root / '.venv-audio/bin/python']
     for path in candidates:
         if path.is_absolute() and path.is_file() and os.access(str(path), os.X_OK):
             return str(path)
@@ -165,12 +179,16 @@ class MacOSAudioCapture:
     def devices(self):
         """Static capabilities only. Does not probe TCC or instantiate AV/SC APIs."""
         root = Path(__file__).resolve().parent
+        try:
+            helper_available = capture_helper(root).is_file()
+        except (OSError, ValueError, TypeError, ImportError):
+            helper_available = False
         return {'backend': 'macos-native', 'sources': list(SOURCES),
                 'default_source': 'microphone', 'models': list(MODELS),
                 'providers': list(PROVIDERS), 'asr_modes': list(ASR_MODES),
                 'meta_asr_available': bool(_model_api_key()),
                 'permissions_checked': False,
-                'helper_available': (root / 'macos_capture').is_file(),
+                'helper_available': helper_available,
                 'permission_requirements': {'microphone': 'Microphone',
                                             'system': 'Screen & System Audio Recording'}}
 
@@ -218,6 +236,10 @@ class MacOSAudioCapture:
         if not callable(on_segment) or (on_status is not None and not callable(on_status)):
             raise TypeError('on_segment and on_status must be callable')
         credential_frame = _meta_worker_frame(_model_api_key()) if self.provider == 'meta' else None
+        # Resolve the active profile on the requesting thread. The worker thread
+        # must not inherit unrelated request/credential context variables.
+        root = Path(__file__).resolve().parent
+        artifacts = _native_runtime().artifact_dir(root)
         with self._lock:
             if not self.status()['stop_confirmed']:
                 raise RuntimeError('Audio capture is active or its cleanup is unconfirmed')
@@ -229,15 +251,16 @@ class MacOSAudioCapture:
             self._state, self._error, self._callback_error = 'starting', None, None
             self._last_loss = {}
             self._process = None
-            self._thread = threading.Thread(target=self._run, args=(worker_env(self.provider), credential_frame),
+            self._thread = threading.Thread(target=self._run, args=(worker_env(self.provider), credential_frame, artifacts),
                                             daemon=True, name='macos-audio-worker')
             self._thread.start()
 
-    def _run(self, environment, credential_frame=None):
+    def _run(self, environment, credential_frame=None, artifacts=None):
         process = None
         try:
             root = Path(__file__).resolve().parent
-            command = [worker_python(root), '-u', str(root / 'audio_worker.py'),
+            command = [worker_python(root, artifacts), '-u', str(root / 'audio_worker.py'),
+                       '--helper', str(capture_helper(root, artifacts)),
                        '--model', self.model_size, '--source', self.source, '--language', self.language,
                        '--provider', self.provider, '--asr-mode', self.asr_mode]
             if self._cancel.is_set():

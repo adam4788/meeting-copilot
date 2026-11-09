@@ -8,10 +8,13 @@ but managed installation provides Git provenance and an immutable pin.
 
 ## Managed core installation
 
-In PowerShell, install the published core revision:
+In PowerShell, use an exact reviewed commit from the
+[runtime-release branch](https://github.com/adam4788/meeting-copilot/tree/catalog/runtime-0.1.0):
 
 ```powershell
-hermes plugins install adam4788/meeting-copilot --ref c5aa3cf85bd94ce7134925d0ebc0c1c5a17c9f12 --enable
+$Pin = "REVIEWED_40_CHARACTER_RUNTIME_SHA" # replace before running
+hermes plugins install adam4788/meeting-copilot --ref $Pin --no-enable
+hermes plugins enable meeting-copilot-live
 ```
 
 This is a custom Git source, not an admitted catalog entry. The development tree

@@ -1,64 +1,97 @@
 # Catalog preflight
 
-The manifest declares Hermes Agent `>=0.22.7` and the dashboard's FastAPI
-dependency with an upper bound. The compatibility floor has not been rechecked
-against its oldest supported host in the current guide audit. Hermes must resolve
-dependencies under its own core constraints. The plugin's manifest, dashboard,
-desktop and proposed entry version are all 0.1.0.
+Meeting Copilot is a standalone community plugin, not a Hermes core feature.
+The proposed upstream change is exactly one file,
+`plugin-catalog/meeting-copilot-live.yaml`, in NousResearch/hermes-agent.
+Catalog admission remains a maintainer decision, not a result of this checklist.
 
-Run in an isolated Hermes validation environment:
+## Source and release boundaries
 
-```sh
-hermes plugins doctor /path/to/meeting-copilot --ci
-hermes plugins validate /path/to/meeting-copilot --install-deps
-```
+The catalog pin must be a public, full 40-character SHA of the **runtime release**,
+not a development checkout with a similar version. The release branch is
+[`catalog/runtime-0.1.0`](https://github.com/adam4788/meeting-copilot/tree/catalog/runtime-0.1.0).
+Its `SOURCE_REVISION` identifies the full development commit containing tests,
+mutation probes and exporter source. Both trees remain reviewable.
 
-Registration exposes no tools or hooks and does not open devices. Doctor's
-successful registration is not a live dashboard, device or provider test.
-Validate a clean export of the exact commit to be pinned as well.
+The exporter uses an explicit runtime allowlist. It keeps source, entrypoints,
+text guides, sample documents, license and the reviewed documentation assets;
+it omits development tests and mutation probes. This is a packaging boundary,
+not a scanner ignore. No binaries are shipped and no catalog pin self-updates.
 
-The proposed upstream change is one file,
-`plugin-catalog/meeting-copilot-live.yaml`, in NousResearch/hermes-agent. It must
-contain a full 40-character SHA reachable in Adam's public repository. BYOK
-source is published at `c5aa3cf85bd94ce7134925d0ebc0c1c5a17c9f12`. Publication
-is separate from admission. A local 61-file runtime export from that revision
-passed doctor and `validate --install-deps` on November 9, including a safe
-security scan; see [verification](verification.md). That export has not been
-published as its own release tree. A catalog submission still needs the exact
-public release pin, disclosures and maintainer review. No catalog PR is made by
-preflight.
-A repository's own catalog folder does not list the plugin.
+The plugin manifest, dashboard manifest and Desktop plugin are version 0.1.0.
+The declared host floor is `>=0.22.7`; capability absence must fail closed rather
+than patching a host or borrowing credentials. API dependencies carry upper
+bounds and are resolved under Hermes core constraints.
+
+## Gates before the catalog PR
+
+1. Run the source regression suite and native checks with synthetic fixtures.
+2. Export from a clean, committed source checkout. Compare every runtime source
+   file with the source revision, accounting for the README provenance notice.
+3. Publish the runtime release and clone its exact public SHA into a clean folder.
+4. In an isolated Hermes environment, run:
+
+   ```sh
+   hermes plugins doctor /path/to/exact-runtime-checkout --ci
+   hermes plugins validate /path/to/exact-runtime-checkout --install-deps
+   ```
+
+5. Inspect every warning, then run the catalog's structural validator against
+   the one-file entry. Match the entry's version, floor and capabilities to the
+   pinned `plugin.yaml`. Record the public pin and actual results in the PR.
+
+`--install-deps` can change the **validation environment**. Do not run it in an
+active user's interpreter. Registration declares no tools or hooks and starts
+no devices, model calls or workers. Doctor and validator success do not prove
+live Desktop, provider, recording or transcription quality.
+
+An earlier clean export of source
+`32680e03db334a07dcb904cf63acbff2b8eb25cf` passed doctor and validation with no
+warnings on upstream `6cff782b8d081a0ed382eaf75c432d452cd452cc` and the official
+v0.22.7 checkout `b200f5bc`. That was preliminary evidence, **not validation of a
+later release pin**. The catalog PR must cite the separately validated public
+release. Current rules impose no commit-age waiting period.
 
 ## Installation disclosures
 
 - Explicit questions send bounded transcript/context and retrieved excerpts to
-  the selected OpenAI or OpenRouter HTTPS API; optional explicit Meta routes
-  also contact Meta. Model access, billing and retention are provider-specific.
-  No live OpenAI/OpenRouter result has been verified yet.
+  the selected OpenAI or OpenRouter HTTPS API. Optional explicit Meta routes
+  also contact Meta. Model access, billing and retention are provider-specific;
+  live OpenAI/OpenRouter account responses remain unverified.
 - Capture requires consent and Start. Optional Meta transcription sends audio
-  off-device; local Whisper uses an isolated Python audio runtime and model
-  cache. Initial model preparation can download weights. Native helpers are
-  compiled from reviewable Swift source locally; no compiled helpers are
-  committed. Native frame loss remains an unresolved reliability limitation.
-- Retrieval reads selected project text, and prior Hermes session SQLite data
-  only when history is enabled. Web opt-in may send a public query through the
-  host search dispatcher. These reads can extend outside plugin-owned data.
-  Keep history excluded and web off for confidential project-only use.
-- Native capture/overlay and audio workers are child processes. Local setup
-  compiles/signs native source and installs bounded audio dependencies in a
-  separate runtime. No capture starts at import, registration or validation.
-- API secrets are declared in Hermes-managed plugin settings and obtained via
-  its scoped secret API. The plugin does not edit credential stores. The
-  standalone CLI is offline-only and does not accept provider credentials.
-- The initially proposed catalog platform is macOS, the device-tested path.
-  Windows native capture remains experimental and needs its documented audio
-  dependencies and hardware verification; they are not silently installed into
-  Hermes by this macOS catalog manifest. Meetily attachment is optional.
+  off-device. Local Whisper uses an isolated audio environment and model cache;
+  initial model preparation may download weights.
+- macOS audio setup targets Apple Silicon and requires preinstalled CPython 3.12,
+  uv and Apple Command Line Tools with the macOS 26 SDK. It installs the committed
+  `requirements-macos-audio.lock` from official PyPI with SHA-256 verification and
+  compiles/signs reviewable native source. Automatic interpreter downloads are
+  disabled. Catalog artifacts live outside the Git checkout in profile-owned,
+  version-bound storage so updates cannot carry stale helpers or venv symlinks;
+  rerun preparation after updating the runtime.
+- Capture, transcription and the overlay use child processes only after explicit
+  actions. Setup does not start capture. There is no telemetry, self-update,
+  credential-store modification or unattended recording.
+- Retrieval reads selected project text outside plugin-owned storage and, only
+  when enabled, eligible prior-session SQLite data. Web opt-in may send a public
+  query through the profile-scoped host search dispatcher. Keep history and web
+  excluded for confidential project-only use.
+- Secrets stay in Hermes-managed settings and require a valid admitted request
+  scope. Missing or incompatible scopes fail closed. Isolated-child and
+  secondary-profile BYOK behavior remains limited; see
+  [compatibility](catalog-compatibility.md).
+- The proposed catalog platform is macOS. Native audio can lose frames and
+  long-call reliability is unestablished. Windows source remains experimental;
+  its hardware/Desktop path is not claimed by a macOS catalog listing.
+- The overlay's recording exclusion is best effort. Hide it and verify it is gone
+  when it must not appear. Clipboard exports require explicit action and may
+  include confidential excerpts retained by clipboard history or sync.
 
-See [compatibility cautions](catalog-compatibility.md): isolated host mode lacks
-the request credential scope in the inspected version, and development
-mutation/probe helpers remain visible to scanners. Passing validation does not constitute maintainer
-approval. No telemetry, self-update, credential changes or unattended recording
-are introduced by this preflight.
+The [native preview](assets/overlay-controls.png) uses only fictional strings;
+[asset provenance](assets/README.md) identifies its platform and source. It is
+not a live account, device or recorder-exclusion result.
 
-Canonical requirements: [catalog submission](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins/catalog-submission).
+Canonical references: [plugin guide](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins),
+[public API](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins/public-api),
+[Desktop SDK](https://hermes-agent.nousresearch.com/docs/developer-guide/desktop-plugin-sdk),
+[catalog submission](https://hermes-agent.nousresearch.com/docs/developer-guide/plugins/catalog-submission),
+and [admission rules](https://github.com/NousResearch/hermes-agent/blob/main/plugin-catalog/README.md).

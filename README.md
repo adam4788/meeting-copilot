@@ -74,26 +74,34 @@ Local transcription does not make hosted answers local.
 
 ## Install in Hermes Desktop
 
-Requires **Hermes 0.22.7 or newer**. Install the published source at a full revision:
+Requires **Hermes 0.22.7 or newer**. Catalog admission is still pending.
+Use a full 40-character commit from the reviewed
+[runtime-release branch](https://github.com/adam4788/meeting-copilot/tree/catalog/runtime-0.1.0),
+not a floating branch or the development tree. Copy its full SHA before running:
 
 ```sh
-hermes plugins install adam4788/meeting-copilot --ref c5aa3cf85bd94ce7134925d0ebc0c1c5a17c9f12 --enable
+# Replace the quoted placeholder with the runtime commit you reviewed.
+PIN="REVIEWED_40_CHARACTER_RUNTIME_SHA"
+hermes plugins install adam4788/meeting-copilot --ref "$PIN" --no-enable
+hermes plugins enable meeting-copilot-live
 hermes plugins doctor meeting-copilot-live --ci
 ```
 
-Open the command palette and run **Open Meeting Copilot**. Audio preparation is
-separate and platform-specific; installation and doctor do not start recording
-or verify a live provider. See [the setup guide](docs/getting-started.md) before
-enabling capture. Catalog admission has not been established; this is a managed
-Git installation of a community project.
+After maintainers admit the catalog entry, `hermes plugins install
+meeting-copilot-live --no-enable` uses its reviewed pin. This repository does not
+self-update the catalog or bypass installation consent.
 
-The settings layout described below is for this source checkout. The pinned
-published revision above predates this change; installing that revision does
-not install the new layout.
+Open the command palette and run **Open Meeting Copilot**. Agent enablement and
+the Desktop Plugins switch are separate; check both for the intended profile.
+Audio preparation is separate. Its reviewed wheel lock targets Apple Silicon
+and CPython 3.12; setup verifies SHA-256 hashes from official PyPI and builds the
+native helpers from source. Catalog-generated files stay outside the pinned
+checkout in version-bound profile storage; rerun preparation after updating.
+Installation and doctor do not start recording or verify a live provider. See
+[the setup guide](docs/getting-started.md).
 
-Review scanner findings for the pinned source before continuing installation.
-An installed or reloaded plugin does not establish Desktop pane, provider, or
-audio readiness. Windows capture remains experimental.
+Review scanner findings for the exact pin before continuing. A reloaded pane
+is not provider or audio readiness. Windows capture remains experimental.
 
 ## Ask your first question
 
@@ -138,8 +146,28 @@ saved by this plugin; Meetily retains its own files under its own settings.
 Closing the pane initiates pause, and an in-flight provider request cannot be
 recalled. Check stop status instead of assuming the device has stopped.
 
+Registering the plugin starts no workers. After explicit Start/Show, capture,
+transcription and the overlay run as child processes. macOS preparation installs
+declared Python packages into an isolated audio environment and compiles/signs
+reviewable Swift source. It requires a preinstalled Python 3.12, uv and a macOS 26
+SDK; automatic interpreter downloads are disabled. Model preparation may fetch
+Whisper weights. No compiled helper or self-updater is shipped.
+
+API keys stay in Hermes-managed secret settings and are read only in the
+admitted request's bound scope. The plugin does not read or rewrite credential
+stores. The standalone CLI is offline-only. There is no telemetry or automatic
+sending, speaking, posting, capture or cloud-transcription opt-in.
+
 Read [security and privacy](SECURITY.md) and the
 [architecture and data flow](docs/architecture.md) for the complete boundaries.
+
+## Native overlay preview
+
+![Native Meeting Copilot overlay with a move grip, six placement buttons and recording visibility controls above fictional transcript lines.](docs/assets/overlay-controls.png)
+
+*Production native view rendered on macOS 27 with synthetic content, from source
+`32680e03db334a07dcb904cf63acbff2b8eb25cf`. It is not a live meeting or proof of
+recorder exclusion. See [asset provenance](docs/assets/README.md).*
 
 ## Known limits
 

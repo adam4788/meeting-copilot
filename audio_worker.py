@@ -659,6 +659,7 @@ def main(argv=None):
     parser.add_argument('--source', choices=SOURCES, default='microphone')
     parser.add_argument('--language', choices=['en'], default='en')
     parser.add_argument('--file', type=Path, help='Read an existing synthetic/offline WAV instead of opening audio devices')
+    parser.add_argument('--helper', type=Path, help='Prepared native capture helper')
     parser.add_argument('--provider', choices=['local', 'meta'], default='local',
                         help='Transcription provider: local faster-whisper (default) or Meta Muse Voice cloud ASR')
     parser.add_argument('--asr-mode', choices=['ENDPOINTING', 'DIARIZATION', 'PUSH_TO_TALK'], default='ENDPOINTING')
@@ -667,7 +668,7 @@ def main(argv=None):
     validate(args.model, args.source, args.language, args.provider, args.asr_mode)
     if args.file and (args.file.suffix.lower() != '.wav' or not args.file.is_file()):
         parser.error('--file must be an existing WAV')
-    helper = Path(__file__).resolve().with_name('macos_capture')
+    helper = args.helper or Path(__file__).resolve().with_name('macos_capture')
     if not args.file and not helper.is_file():
         emit({'type': 'error', 'code': 'helper', 'message': error_message('helper')})
         return 1
@@ -689,7 +690,7 @@ def main(argv=None):
                     if not stop.is_set():
                         emit(segment)
             elif not stop.is_set():
-                run_capture_meta(args.source, args.asr_mode, api_key, model_id, stop=stop)
+                run_capture_meta(args.source, args.asr_mode, api_key, model_id, helper=helper, stop=stop)
         except meta_asr.MetaAsrError:
             emit({'type': 'error', 'code': 'asr', 'message': error_message('asr')})
             return 1
@@ -710,7 +711,7 @@ def main(argv=None):
             if not stop.is_set():
                 emit(result)
         else:
-            run_capture(model, args.source, args.language, stop=stop)
+            run_capture(model, args.source, args.language, helper=helper, stop=stop)
     except Exception:
         emit({'type': 'error', 'code': 'capture', 'message': error_message('capture')})
         return 1

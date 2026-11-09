@@ -64,6 +64,7 @@ class ExportTests(unittest.TestCase):
         names = set(FILES) | set(ENTRY_FILES) | {
             'tests/verify_overlay_eof.py', 'tests/test_server.py',
             'docs/byok.md', 'docs/assets/unrelated.png',
+            'docs/assets/overlay-controls.png',
         }
         for name in names:
             path = root / name
@@ -82,12 +83,26 @@ class ExportTests(unittest.TestCase):
             export_runtime(source, dest, 'a' * 40, tracked)
             for name in (set(FILES) | set(ENTRY_FILES)) - {'README.md'}:
                 self.assertEqual((source / name).read_bytes(), (dest / name).read_bytes(), name)
+            self.assertTrue({'native_runtime.py', 'requirements-macos-audio.lock'} <= set(FILES))
+            for name in ('native_runtime.py', 'requirements-macos-audio.lock'):
+                self.assertEqual((dest / name).read_bytes(), (source / name).read_bytes())
             self.assertTrue((dest / 'README.md').read_bytes().endswith((source / 'README.md').read_bytes()))
             for name in ('.env', 'tests/verify_overlay_eof.py', 'tests/test_server.py',
                          'docs/assets/unrelated.png'):
                 self.assertFalse((dest / name).exists(), name)
             self.assertTrue((source / 'tests/verify_overlay_eof.py').exists())
             self.assertEqual((dest / 'SOURCE_REVISION').read_text(encoding='utf-8'), 'a' * 40 + '\n')
+
+    def test_reviewed_screenshot_is_in_the_runtime_package(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, dest = root / 'source', root / 'release'
+            tracked = self.fixture(source)
+            export_runtime(source, dest, 'a' * 40, tracked)
+            screenshot = 'docs/assets/overlay-controls.png'
+            self.assertTrue((dest / screenshot).is_file())
+            self.assertEqual((dest / screenshot).read_bytes(), (source / screenshot).read_bytes())
+            self.assertFalse((dest / 'docs/assets/unrelated.png').exists())
 
     def test_missing_source_or_existing_destination_never_overwrites(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -106,8 +121,10 @@ class ExportTests(unittest.TestCase):
                 export_runtime(source, existing, 'a' * 40, tracked)
             self.assertEqual((existing / 'sentinel').read_text(encoding='utf-8'), 'keep')
 
-    def test_tracked_export_has_closed_local_documentation_links(self):
-        tracked = set(subprocess.check_output(['git', 'ls-files', '-z'], cwd=ROOT, text=True).split('\0'))
+    def test_worktree_export_has_closed_local_documentation_links(self):
+        # Exercise packaging before new required files are staged. The export
+        # CLI separately requires a clean tree and uses tracked files only.
+        tracked = set(subprocess.check_output(['git', 'ls-files', '--cached', '--others', '--exclude-standard', '-z'], cwd=ROOT, text=True).split('\0'))
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp) / 'release'
             export_runtime(ROOT, dest, 'a' * 40, tracked)

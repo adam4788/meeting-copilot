@@ -151,6 +151,10 @@ class MeetingState:
         self.pane_seen = self.last_seen
         self.engine_factory = engine_factory
         self.engine = None
+        self._engine_home = None
+        # Bounded by the answer worker limit, not a per-profile cache. Clear
+        # must also invalidate engines displaced while a worker still uses one.
+        self._active_engines = {}
         self.busy = False
         self.result = None
         self.requests = {}
@@ -639,15 +643,26 @@ class MeetingState:
                 self.capture_info = latched
             return {'listening': False, 'stopping': False, 'stop_confirmed': True}
 
-    def get_engine(self):
+    def get_engine(self, hermes_home=None):
         with self.lock:
-            if self.engine is None:
-                if self.engine_factory:
+            if self.engine_factory:
+                # Injected standalone/fake engines do not have a host identity.
+                if self.engine is None:
                     self.engine = self.engine_factory()
-                else:
-                    import importlib
-                    module = importlib.import_module(f'{__package__}.knowledge' if __package__ else 'knowledge')
-                    self.engine = module.KnowledgeEngine()
+                return self.engine
+            import importlib
+            module = importlib.import_module(f'{__package__}.knowledge' if __package__ else 'knowledge')
+            if hermes_home is None:
+                try:
+                    hermes_home = module._effective_hermes_home()
+                except Exception:
+                    # Project discovery can still work without history.
+                    hermes_home = None
+            if self.engine is None or self._engine_home != hermes_home:
+                # Keep a single cached engine, not a profile-indexed cache.
+                # In-flight workers retain their own previous engine reference.
+                self.engine = module.KnowledgeEngine(hermes_home=hermes_home)
+                self._engine_home = self.engine.hermes_home
             return self.engine
 
     def assist(self, question, project=None, web_query=None, all_projects=False, web_fallback=False, answer_provider=None, answer_model=None, request_id=None, row_id=None, transcript=None, expected_generation=None, expected_capture_generation=None, include_history=True, replay_request_id=None):
@@ -666,6 +681,14 @@ class MeetingState:
                 selection.validate_selection(answer_provider, answer_model)
             except ValueError:
                 raise _AnswerRejected(400, 'Choose a supported provider and exact model ID.') from None
+        request_home = None
+        if not self.engine_factory:
+            import importlib
+            module = importlib.import_module(f'{__package__}.knowledge' if __package__ else 'knowledge')
+            try:
+                request_home = module._validated_host_scope_home()
+            except ValueError:
+                raise _AnswerRejected(400, 'Hermes default-profile credential scope is unavailable or mismatched.') from None
         with self.lock:
             # Overlay questions belong to the snapshot the user clicked, not
             # whichever meeting is current when its worker finally arrives.
@@ -771,7 +794,12 @@ class MeetingState:
                     options = {'answer_provider': answer_provider, 'answer_model': answer_model}
                 if not include_history:
                     options['include_history'] = False
-                engine = self.get_engine()
+                engine = self.get_engine(request_home) if not self.engine_factory else self.get_engine()
+                with self.lock:
+                    if entry_ref.get('cancelled') or generation != self.generation:
+                        entry_ref['status'] = 'cancelled'
+                        return
+                    self._active_engines[id(entry_ref)] = engine
                 # Prefer a retrieval-free streaming probe so completed-only routes
                 # never pay for double retrieval + ranking on fallback.
                 # Legacy/fake engines without the probe keep the old behavior:
@@ -978,6 +1006,7 @@ class MeetingState:
                             self.error_request = entry_ref.get('request')
             finally:
                 with self.lock:
+                    self._active_engines.pop(id(entry_ref), None)
                     # Cancelled orphans do not own the busy flag: a blocked
                     # old-generation worker must never wedge the pane busy
                     # after a newer request has already completed.
@@ -1647,15 +1676,28 @@ class MeetingState:
     def _overlay_helper_path(self):
         import os as _os
         from pathlib import Path as _Path
-        override = _os.environ.get('MEETING_COPILOT_OVERLAY_HELPER', '').strip()
-        if override:
-            candidate = _Path(override)
-            if candidate.is_file():
-                return str(candidate)
         here = _Path(__file__).resolve().parent
-        for candidate in (here / 'macos_overlay', here / 'native' / 'macos_overlay'):
-            if candidate.is_file():
-                return str(candidate)
+        import importlib
+        runtime = importlib.import_module(f'{__package__}.native_runtime' if __package__ else 'native_runtime')
+        # Catalog helpers must match the current pin. The legacy override is
+        # still supported for installations using dashboard/core.
+        catalog = runtime.is_catalog(here)
+        if not catalog:
+            override = _os.environ.get('MEETING_COPILOT_OVERLAY_HELPER', '').strip()
+            if override:
+                candidate = _Path(override)
+                if candidate.is_file():
+                    return str(candidate)
+        try:
+            if catalog:
+                candidates = (runtime.artifact_dir(here) / 'macos_overlay',)
+            else:
+                candidates = (here / 'macos_overlay', here / 'native' / 'macos_overlay')
+            for candidate in candidates:
+                if candidate.is_file():
+                    return str(candidate)
+        except (OSError, ValueError, TypeError, RuntimeError):
+            pass
         return None
 
     def status(self, touch=True):
@@ -1777,18 +1819,15 @@ class MeetingState:
 
     def _macos_runtime_ready(self):
         """True only when the macOS worker env and helper look present. No probing."""
-        import os as _os
         from pathlib import Path as _Path
+        import importlib
         try:
             root = _Path(__file__).resolve().parent
-            helper = root / 'macos_capture'
-            worker = root / 'audio_worker.py'
-            runtime = root / 'audio-runtime/bin/python'
-            venv = root / '.venv-audio/bin/python'
-            override = _os.environ.get('MEETING_COPILOT_AUDIO_PYTHON', '').strip()
-            python_ok = (_Path(override).is_file() if override else
-                         (runtime.is_file() or venv.is_file()))
-            return bool(helper.is_file() and worker.is_file() and python_ok)
+            audio = importlib.import_module(f'{__package__}.macos_audio' if __package__ else 'macos_audio')
+            artifacts = audio._native_runtime().artifact_dir(root)
+            helper = audio.capture_helper(root, artifacts)
+            python = audio.worker_python(root, artifacts)
+            return bool(helper.is_file() and (root / 'audio_worker.py').is_file() and python)
         except Exception:
             return False
 
@@ -1970,15 +2009,19 @@ def make_router(state):
             if was_listening:
                 state.capture_generation += 1
             last_args = getattr(state, 'last_start_args', None)
-            try:
-                engine = state.engine
-                invalidator = getattr(engine, 'invalidate_cache', None)
-                if callable(invalidator):
-                    invalidator()
-                elif isinstance(getattr(engine, '_cache', None), dict):
-                    engine._cache.clear()
-            except Exception:
-                pass
+            # An in-flight worker may retain an engine displaced by a later
+            # profile route. Clear every live worker's retrieval caches too.
+            engines = {id(engine): engine for engine in
+                       [state.engine, *state._active_engines.values()] if engine is not None}
+            for engine in engines.values():
+                try:
+                    invalidator = getattr(engine, 'invalidate_cache', None)
+                    if callable(invalidator):
+                        invalidator()
+                    elif isinstance(getattr(engine, '_cache', None), dict):
+                        engine._cache.clear()
+                except Exception:
+                    pass
             state.busy = False
             state.generation += 1
         if was_listening and last_args and state.meetily_clear_error is None and state.overlay_cleanup_error is None:
