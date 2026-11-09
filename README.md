@@ -48,7 +48,10 @@ CI and plugin validation do not prove a complete meeting works on your computer.
 - Keeps past sessions excluded and web search off by default in new panes.
   Broader scopes are explicit choices; saved choices persist.
 - Offers a read-only macOS overlay for the transcript and detected questions.
-  Ask questions in the Desktop pane. The overlay may appear in screen shares.
+  Temporarily enable interaction to drag its header, choose a position preset,
+  or turn **Show in recordings** on. Turning it off only requests best-effort
+  exclusion; the overlay may still appear in captures. Hide it when it must not
+  appear. Ask questions in the Desktop pane.
 
 ```mermaid
 flowchart TD
