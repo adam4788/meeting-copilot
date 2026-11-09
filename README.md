@@ -49,7 +49,10 @@ CI and plugin validation do not prove a complete meeting works on your computer.
 - Keeps past sessions excluded and web search off by default in new panes.
   Broader scopes are explicit choices; saved choices persist.
 - Offers a read-only macOS overlay for the transcript and detected questions.
-  Ask questions in the Desktop pane. The overlay may appear in screen shares.
+  Temporarily enable interaction to drag its header, choose a position preset,
+  or turn **Show in recordings** on. Turning it off only requests best-effort
+  exclusion; the overlay may still appear in captures. Hide it when it must not
+  appear. Ask questions in the Desktop pane.
 
 ```mermaid
 flowchart TD
@@ -84,6 +87,10 @@ or verify a live provider. See [the setup guide](docs/getting-started.md) before
 enabling capture. Catalog admission has not been established; this is a managed
 Git installation of a community project.
 
+The settings layout described below is for this source checkout. The pinned
+published revision above predates this change; installing that revision does
+not install the new layout.
+
 Review scanner findings for the pinned source before continuing installation.
 An installed or reloaded plugin does not establish Desktop pane, provider, or
 audio readiness. Windows capture remains experimental.
@@ -93,16 +100,18 @@ audio readiness. Windows capture remains experimental.
 1. In **Settings → Plugins → Meeting Copilot**, open the plugin's agent settings
    for the default profile and save an OpenAI or OpenRouter key in its secret
    field. Reopen the pane; never put keys in chat or model fields.
-2. In the plugin settings page, choose the matching answer provider and an exact
-   model ID supported by your account's Chat Completions API. Older Desktop hosts
-   without plugin settings pages keep **Answer setup** in the pane.
-3. Select one project. Keep **Exclude past sessions** checked, automatic web
-   fallback off, and the specific public web query empty.
+2. From the pane, use **Open settings** (or navigate to **Settings → Plugins →
+   Meeting Copilot**). Choose the matching answer provider and exact model ID,
+   and select a transcript source and audio/transcription defaults if needed.
+   Older Desktop hosts without plugin settings pages keep these controls in the pane.
+3. In settings, select one project, keep **Exclude past sessions** checked and
+   automatic web fallback off. Keep the pane's specific public web query empty.
 4. Type a question about a synthetic project file and choose **Suggest answer**.
    Open **Evidence** and compare the answer with its sources.
-5. To add meeting context, prepare the platform's transcript source, confirm
-   participant permission, and explicitly start capture. Pause when finished
-   and check that stopping is confirmed.
+5. To add meeting context, prepare the platform's transcript source, select any
+   active Meetily recording in the pane, confirm participant permission, and
+   explicitly start capture. Pause when finished and check that stopping is
+   confirmed. After changing capture settings, confirm permission again.
 
 Start with [the synthetic walkthrough](docs/demo.md). It also includes an offline CLI
 demo that needs no API key, audio device, or Hermes installation.

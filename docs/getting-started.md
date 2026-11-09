@@ -18,6 +18,10 @@ Run **Open Meeting Copilot** from the command palette. Desktop settings labels
 may vary by Hermes version. Find this plugin's settings rather than entering
 credentials into the Copilot pane.
 
+This guide describes the layout in this source checkout. The pinned published
+revision above predates the settings-page-only layout; install a revision that
+contains the change before expecting that layout.
+
 The manifest declares FastAPI plus Windows-only NumPy, SoundCard and
 faster-whisper dependencies; Hermes resolves them under its core constraints. Doctor checks registration and setup. It does not test your API
 account, audio devices, or meeting accuracy. Catalog admission is a separate
@@ -35,9 +39,10 @@ verify the Desktop pane, a provider account, or native audio on your machine.
    field and save. Never paste keys into chat, questions, or model fields.
 2. Reopen the pane after changing keys. First finish active requests and pause
    capture; admitted requests retain their credential snapshots.
-3. On the plugin settings page, choose **Answer provider** and enter the exact
-   **Answer model** ID your account supports. Older Desktop hosts without
-   plugin settings pages keep **Answer setup** in the pane.
+3. Use **Open settings** in the pane or navigate to **Settings → Plugins →
+   Meeting Copilot**. Choose **Answer provider** and enter the exact **Answer
+   model** ID your account supports. Older Desktop hosts without plugin settings
+   pages keep **Answer setup** and **Transcript source** in the pane.
 
 Keys, credits, and Chat Completions compatibility depend on the account. There
 is no account model discovery or automatic provider/model fallback. A saved key
@@ -64,9 +69,11 @@ Hidden paths, symlinks, dependency trees, and common credential filenames are
 excluded. Filtering is best effort, so keep secrets out of searchable material.
 
 In the plugin settings, select one project in **Search scope**, keep **Exclude
-past sessions** checked, leave **Automatic web fallback** off, and leave any
-specific public web query empty. A fresh pane excludes history and web; saved
-scope choices persist. **All projects + sessions** can include unrelated evidence.
+past sessions** checked, and leave **Automatic web fallback** off. The pane's
+optional **Search online with a specific query** is an explicit per-request
+action; leave it empty for this narrow test. A fresh pane excludes history and
+web; saved scope choices persist. **All projects + sessions** can include
+unrelated evidence.
 
 If a project is missing, check the root and child-directory layout. An already
 running backend will not automatically pick up an environment change. Arrange
@@ -84,12 +91,19 @@ have permission from participants and have checked the chosen source.
 | Windows native | Experimental SoundCard/WASAPI capture, with optional dependencies in `requirements-audio.txt`. Consult [Windows audio](audio.md). Desktop setup is being verified separately; prior standalone synthetic checks do not prove the complete Desktop flow. |
 | Meetily | Optional, unofficial attachment to an explicitly chosen active JSON recording. Meetily owns its recording files and retention. See [adapter setup](meetily.md). |
 
-In **Transcript source**, choose the capture source and available audio settings.
-The current pane defaults to Meetily; select your intended source explicitly.
-Local Whisper is independent of the answer API key. Where offered, optional
-Meta transcription sends meeting audio off-device and requires a separate
-explicit choice and configured key. Model preparation may download weights.
-No compiled helper executable is committed to this repository.
+In **Settings → Plugins → Meeting Copilot → Transcript source**, choose the
+capture source and available audio/transcription defaults. On older hosts use
+the pane's **Transcript source** controls instead. The initial source is Meetily;
+select your intended source explicitly. Local Whisper is independent of the answer
+API key. Where offered, optional Meta transcription sends meeting audio off-device
+and requires a separate explicit choice and configured key. Model preparation may
+download weights. No compiled helper executable is committed to this repository.
+
+Pause capture and wait for a confirmed idle status before changing transcript
+settings. The pane shows the selected source and cloud disclosure; after changing
+capture settings, review it and confirm permission again. Opening Settings may
+unmount the pane and initiate pause; verify the stop status before restarting.
+Editing defaults does not start capture or submit an answer.
 
 For an existing custom local installation, `python install.py` backs up replaced
 plugin files and preserves configuration. Close the pane and finish active
@@ -98,8 +112,9 @@ code. This legacy developer path is separate from managed Git installation.
 
 ## Listen, ask, and stop
 
-1. Confirm **Permission check**, then choose **Start listening** or the Meetily
-   attachment action. Approve any actual OS recording prompt yourself.
+1. If using Meetily, select the active recording in the pane. Confirm **Permission
+   check**, then choose **Start listening** or the Meetily attachment action.
+   Approve any actual OS recording prompt yourself.
 2. Type a question, or leave it blank to ask about the latest conversation, and
    choose **Suggest answer**. Inspect **Evidence**, warnings, and uncertainty.
 3. Use Pause/Detach when finished. If stopping is still pending, follow the pane's
@@ -109,6 +124,30 @@ Closing the pane initiates pause; it is not an instant physical-stop guarantee.
 Pause does not erase the transcript. Clear removes the plugin's buffered content
 and results, but cannot recall a submitted provider request or delete Meetily
 source files. A retry explicitly resends saved context.
+
+## Move and record the overlay (macOS)
+
+Choose **Show overlay** in the pane. The window starts click-through so it does
+not intercept your meeting app. Press **Control + Option + Command + O**
+(**⌃⌥⌘O**) to interact temporarily; press it again to return early.
+
+- **Drag the header/grip** to place the overlay freely.
+- **Position presets** give one-click corner and centered placements. Top center
+  keeps reference text near your camera; bottom center works like captions;
+  corners leave the main presentation area clear. Placement stays within the
+  usable area of the overlay's current display.
+- **Show in recordings: on** allows the normal window-sharing behavior for demos
+  and recordings. Your recorder must still capture the display/window containing
+  it; recording a different app's window will not necessarily include it.
+- **Show in recordings: off** requests the legacy macOS exclusion behavior. It is
+  **best effort, not a privacy guarantee**: modern screen recorders may still
+  include the overlay. Use the pane's **Hide overlay** action and verify that the
+  window is gone whenever it must not be captured.
+
+These controls change only the floating window. They do not start audio capture,
+request an answer, change provider settings, or alter the meeting app's recording.
+Interaction returns to click-through automatically. Recording visibility starts
+off at each helper launch; do not treat that default as proof of capture exclusion.
 
 ## When something is unavailable
 
