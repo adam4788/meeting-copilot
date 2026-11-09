@@ -1,5 +1,6 @@
 """Synthetic public host APIs with real route, SQLite and fake HTTPS."""
 import contextvars
+from contextlib import closing
 import json
 import os
 import sqlite3
@@ -30,12 +31,14 @@ class ScopedProductionHistoryTests(unittest.TestCase):
         self.suffixed = self.root / '.hermes-synthetic'
         self.other = self.root / 'independent-home'
         self.named = self.suffixed / 'profiles' / 'named'
+        self.fixture_connections = []
         for home, marker in ((self.primary, 'PRIMARYORCHID'),
                              (self.suffixed, 'SUFFIXORCHID'),
                              (self.other, 'OTHERORCHID'),
                              (self.named, 'NAMEDORCHID')):
             home.mkdir(parents=True)
-            with sqlite3.connect(home / 'state.db') as db:
+            with closing(sqlite3.connect(home / 'state.db')) as db, db:
+                self.fixture_connections.append(db)
                 db.executescript('CREATE TABLE sessions(id TEXT,title TEXT,profile_name TEXT); '
                                  'CREATE TABLE messages(id INTEGER,session_id TEXT,role TEXT,content TEXT,timestamp REAL);')
                 db.execute('INSERT INTO sessions VALUES (?,?,?)', ('s1', 'fictional', 'default'))
@@ -126,6 +129,11 @@ class ScopedProductionHistoryTests(unittest.TestCase):
                 return entry
             time.sleep(.01)
         self.fail('answer did not finish')
+
+    def test_fixture_databases_are_closed_before_directory_cleanup(self):
+        for connection in self.fixture_connections:
+            with self.assertRaises(sqlite3.ProgrammingError):
+                connection.execute('SELECT 1')
 
     def test_suffixed_history_not_unsuffixed_reaches_provider(self):
         # No context override: the host API resolves HOME + data-dir suffix.
