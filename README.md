@@ -103,6 +103,11 @@ audio readiness. Windows capture remains experimental.
    Meeting Copilot**). Choose the matching answer provider and exact model ID,
    and select a transcript source and audio/transcription defaults if needed.
    Older Desktop hosts without plugin settings pages keep these controls in the pane.
+   With no saved source choice, the pane selects the local macOS or experimental
+   Windows capture route when backend capabilities identify the platform. Both
+   microphone and system audio and local transcription are the defaults unless
+   separately saved choices say otherwise. An unknown platform needs an explicit
+   source choice; saved choices are retained.
 3. In settings, select one project, keep **Exclude past sessions** checked and
    automatic web fallback off. Keep the pane's specific public web query empty.
 4. Type a question about a synthetic project file and choose **Suggest answer**.
