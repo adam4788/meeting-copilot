@@ -1,0 +1,26 @@
+name: meeting-copilot-live
+label: Meeting Copilot
+version: 0.1.0
+author: Adam Nugroho
+description: Read-only live meeting answers grounded in project files and past sessions.
+requires_hermes: ">=0.22.7"
+python_dependencies:
+  - "fastapi>=0.115,<1"
+  - "numpy>=1.26,<3; sys_platform == 'win32'"
+  - "SoundCard>=0.4.5,<1; sys_platform == 'win32'"
+  - "faster-whisper>=1.2,<2; sys_platform == 'win32'"
+provides_tools: []
+provides_hooks: []
+config_schema:
+  openai_api_key:
+    type: secret
+    env: OPENAI_API_KEY
+    label: OpenAI API key
+  openrouter_api_key:
+    type: secret
+    env: OPENROUTER_API_KEY
+    label: OpenRouter API key
+  meta_api_key:
+    type: secret
+    env: MODEL_API_KEY
+    label: Optional Meta API key
