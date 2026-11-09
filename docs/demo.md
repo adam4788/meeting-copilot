@@ -20,9 +20,8 @@ needs finance sign-off before August. Compare the returned extract and source
 with that file. The `fake` provider is an extractive demonstration, not a local
 language model or a live account test. No microphone or API key is needed.
 
-For a fuller synthetic fixture demonstration, use the full development checkout
-at the runtime package's `SOURCE_REVISION` (this helper is deliberately not
-included in the catalog runtime):
+For a fuller synthetic fixture demonstration, run the included offline helper
+from either the source checkout or runtime release:
 
 ```sh
 python demo_standalone.py
