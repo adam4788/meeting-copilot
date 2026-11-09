@@ -30,6 +30,8 @@ class PreparationTests(unittest.TestCase):
             overlay_compile = next(argv for argv in compilers if any('macos_overlay.swift' in a for a in argv))
             self.assertIn('-parse-as-library', overlay_compile)
             self.assertTrue((core / 'native/CaptureInfo.plist').is_file())
+            venv = next(argv for argv in calls if 'venv' in argv)
+            self.assertIn('--no-python-downloads', venv, 'setup must not fetch an unpinned interpreter')
             self.assertFalse(any('--start' in argv for argv in calls))
             self.assertFalse(any('audio_worker.py' in argv for argv in calls))
 
@@ -55,4 +57,6 @@ class PreparationTests(unittest.TestCase):
             self.assertEqual(Path(result['runtime']).parent.parent,plugin.resolve() / 'audio-runtime')
             self.assertFalse((plugin / 'dashboard/core').exists())
             self.assertFalse(result['capture_started'])
+            venv = next(argv for argv in calls if 'venv' in argv)
+            self.assertIn('--no-python-downloads', venv, 'setup must not fetch an unpinned interpreter')
             self.assertFalse(any('--start' in argv for argv in calls))

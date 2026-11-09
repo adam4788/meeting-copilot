@@ -5,13 +5,19 @@ It is an abstract audio/document illustration, with no product UI, private
 meeting information, or embedded product claims. It is used in the README
 and brand guide without cropping or changing the original PNG bytes.
 
-| Repository file | Role | Dimensions |
-| --- | --- | --- |
-| [meeting-copilot-hero.png](meeting-copilot-hero.png) | Supplied GPT-generated conceptual README artwork | 2172 × 724 pixels, 3:1 aspect ratio, PNG, 2,557,766 bytes |
+- [meeting-copilot-hero.png](meeting-copilot-hero.png): supplied GPT-generated
+  conceptual README artwork, 2172 × 724 pixels. It is not a product screenshot.
+- [overlay-controls.png](overlay-controls.png): production native SwiftUI overlay
+  rendered through `NSHostingView` on macOS 27 (arm64), using only fictional
+  transcript strings. It shows the interaction grip, six placement buttons and
+  recording-policy toggle. The 880 × 760 PNG is a 2× rendering of a 440 × 380
+  panel from source `32680e03db334a07dcb904cf63acbff2b8eb25cf`; no native overlay
+  source changed between that commit and this packaging audit. It is not a
+  live meeting or proof of recorder exclusion. The PNG contains no textual
+  metadata and no unrelated application UI.
 
 The workflow remains editable Mermaid text, and the wordmark uses plain text.
-No additional generated illustration or fake screenshot is needed. Later real
-screenshots should identify platform/revision and contain only synthetic data.
+No generated UI is presented as a real product screenshot.
 
 Hero provenance: supplied GPT-generated conceptual artwork, manually saved by
 the project owner as a local file for this documentation update. The original
@@ -29,8 +35,9 @@ screenshot.** Keep any future background derivative separate from this source.
 
 ## Packaging
 
-The runtime exporter explicitly includes this image so its README and brand
-guide retain working relative references. See [development](../development.md#runtime-source-export).
+The runtime exporter explicitly includes the hero and reviewed overlay render so
+its documentation retains working relative references. Other assets are excluded
+unless deliberately allowlisted. See [development](../development.md#runtime-source-export).
 
 Follow the [brand guide](../brand-guide.md). Inspiration:
 [Nous Research](https://nousresearch.com/). No Nous seal, logo, illustration,

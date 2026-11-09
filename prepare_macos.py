@@ -28,7 +28,7 @@ def prepare(home, run=subprocess.run):
     runtime = core / 'audio-runtime'
     python = runtime / 'bin/python'
     if not python.is_file():
-        run([uv, 'venv', '--python', '3.12', str(runtime)], check=True)
+        run([uv, 'venv', '--python', '3.12', '--no-python-downloads', str(runtime)], check=True)
     run([uv, 'pip', 'install', '--python', str(python), '-r', str(core / 'requirements-macos-audio.txt')], check=True)
     info = core / 'native/CaptureInfo.plist'
     info.write_bytes(plistlib.dumps({

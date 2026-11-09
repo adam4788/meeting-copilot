@@ -13,6 +13,8 @@ never logged or embedded in error messages.
 import asyncio
 import json
 import os
+import urllib.error
+import urllib.request
 import uuid
 
 REALTIME_URL = 'wss://api.meta.ai/v1/asr/realtime'
@@ -24,6 +26,10 @@ MAX_TEXT = 8000
 
 class MetaAsrError(RuntimeError):
     """Sanitized ASR failure (never carries key material)."""
+
+
+class _RedirectBlocked(Exception):
+    pass
 
 
 def resample_to_24k(samples):
@@ -46,7 +52,7 @@ def build_handshake(api_key, model=DEFAULT_MODEL, mode='ENDPOINTING', language='
     if not api_key:
         raise MetaAsrError('Meta ASR requires MODEL_API_KEY')
     if mode not in ASR_MODES:
-        raise MetaAsrError(f'Unsupported ASR mode: {mode}')
+        raise MetaAsrError('Unsupported ASR mode')
     return {
         'authorization': {'accessToken': f'Bearer {api_key}'},
         'audioEncoding': 'PCM_24KHZ',
@@ -76,7 +82,7 @@ class EventMapper:
             return None
         kind = event.get('type')
         if kind == 'error':
-            raise MetaAsrError(str(event.get('message') or 'Meta ASR error')[:200])
+            raise MetaAsrError('Meta ASR provider returned an error')
         if kind == 'speechStart':
             self._current_turn = event.get('turnId')
             return None
@@ -115,36 +121,80 @@ async def run_session(pcm_queue, emit, api_key, model=DEFAULT_MODEL,
     """
     import time as _time
     clock = clock or _time.time
+    handshake = json.dumps(build_handshake(api_key, model, mode))
     if connect is None:
-        import websockets
+        try:
+            import websockets
+            version = int(getattr(websockets, '__version__').split('.')[0])
+            if not 12 <= version < 16:
+                raise ValueError()
+
+            # Use each version's default connector so existing transport and
+            # proxy behavior stays intact. Override its redirect hook only on
+            # this connector, never on the library's global defaults.
+            if version >= 14:
+                from websockets.asyncio.client import connect as modern_connect
+                from websockets.exceptions import InvalidStatus
+                if not callable(getattr(modern_connect, 'process_redirect', None)):
+                    raise ValueError()
+
+                class NoRedirectModern(modern_connect):
+                    def process_redirect(self, exc):
+                        if isinstance(exc, InvalidStatus) and 300 <= exc.response.status_code < 400:
+                            return _RedirectBlocked()
+                        return exc
+                connector_cls = NoRedirectModern
+            else:
+                from websockets.legacy.client import connect as legacy_connect
+                if not callable(getattr(legacy_connect, 'handle_redirect', None)):
+                    raise ValueError()
+
+                class NoRedirectLegacy(legacy_connect):
+                    def handle_redirect(self, uri):
+                        raise _RedirectBlocked()
+                connector_cls = NoRedirectLegacy
+        except Exception:
+            raise MetaAsrError('Meta ASR requires websockets >=12,<16 with redirect hook support') from None
         session_id = f'mc-{uuid.uuid4()}'
-        connect = lambda: websockets.connect(  # noqa: E731
+        connect = lambda: connector_cls(  # noqa: E731
             f'{REALTIME_URL}?sessionId={session_id}', open_timeout=30)
     mapper = EventMapper(default_speaker)
-    async with connect() as ws:
-        await ws.send(json.dumps(build_handshake(api_key, model, mode)))
-        ack = json.loads(await ws.recv())
-        if not isinstance(ack, dict) or 'sessionId' not in ack:
-            raise MetaAsrError('Meta ASR handshake failed')
+    try:
+        async with connect() as ws:
+            await ws.send(handshake)
+            ack = json.loads(await ws.recv())
+            if not isinstance(ack, dict) or 'sessionId' not in ack:
+                raise MetaAsrError('Meta ASR handshake failed')
 
-        async def sender():
-            while True:
-                frame = await pcm_queue.get()
-                if frame is None:
-                    await ws.send(json.dumps({'type': 'endStream'}))
-                    return
-                await ws.send(frame)
+            async def sender():
+                while True:
+                    frame = await pcm_queue.get()
+                    if frame is None:
+                        await ws.send(json.dumps({'type': 'endStream'}))
+                        return
+                    await ws.send(frame)
 
-        send_task = asyncio.ensure_future(sender())
-        try:
-            async for message in ws:
-                if isinstance(message, bytes):
-                    continue
-                segment = mapper.map(json.loads(message), clock())
-                if segment is not None:
-                    emit(segment)
-        finally:
-            send_task.cancel()
+            send_task = asyncio.ensure_future(sender())
+            try:
+                async for message in ws:
+                    if isinstance(message, bytes):
+                        continue
+                    segment = mapper.map(json.loads(message), clock())
+                    if segment is not None:
+                        emit(segment)
+            finally:
+                send_task.cancel()
+    except asyncio.CancelledError:
+        raise
+    except _RedirectBlocked:
+        raise MetaAsrError('Meta ASR WebSocket redirects are not allowed') from None
+    except Exception:
+        raise MetaAsrError('Meta ASR realtime transcription failed; check the connection and retry') from None
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def transcribe_file(path, api_key, model=DEFAULT_MODEL, mode='ENDPOINTING',
@@ -155,7 +205,6 @@ def transcribe_file(path, api_key, model=DEFAULT_MODEL, mode='ENDPOINTING',
     (a callable taking a urllib Request and returning a response with
     .read()). The WAV must be mono 16-bit PCM at 16/24 kHz.
     """
-    import urllib.request
     import wave
     if not api_key:
         raise MetaAsrError('Meta ASR requires MODEL_API_KEY')
@@ -185,14 +234,18 @@ def transcribe_file(path, api_key, model=DEFAULT_MODEL, mode='ENDPOINTING',
         TRANSCRIBE_URL, data=body, method='POST',
         headers={'Authorization': f'Bearer {api_key}',
                  'Content-Type': f'multipart/form-data; boundary={boundary}'})
-    open_fn = opener or urllib.request.urlopen
+    open_fn = opener if opener is not None else urllib.request.build_opener(_NoRedirect()).open
     try:
         with open_fn(request) as response:
             payload = json.loads(response.read().decode('utf-8', 'replace'))
-    except MetaAsrError:
-        raise
-    except Exception as exc:
-        raise MetaAsrError(f'Meta ASR file transcription failed ({type(exc).__name__})') from None
+    except urllib.error.HTTPError as exc:
+        is_redirect = 300 <= exc.code < 400
+        exc.close()
+        if is_redirect:
+            raise MetaAsrError('Meta ASR file transcription redirects are not allowed') from None
+        raise MetaAsrError('Meta ASR file transcription failed; check the connection and retry') from None
+    except Exception:
+        raise MetaAsrError('Meta ASR file transcription failed; check the connection and retry') from None
     segments = []
     for turn in payload.get('turns') or []:
         text = str(turn.get('transcript') or '').strip()

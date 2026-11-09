@@ -492,21 +492,51 @@ test('live capture error offers a status recheck, not a false restart label', as
   assert.ok(!requests.some(r => r.path === '/start' || r.path === '/assist'));
 });
 
+// Public host atoms and epoch change synchronously before the next React render.
+// `connectionId` identifies the actual source even for equal profile names.
+function publicRoute(profile = 'alpha', connectionId = 'source-a') {
+  const listeners = new Set();
+  const route = { profile, connectionId, epoch: 1 };
+  route.profileAtom = {
+    get: () => route.profile,
+    listen: listener => { listeners.add(listener); return () => listeners.delete(listener); },
+    subscribe: listener => { listeners.add(listener); return () => listeners.delete(listener); },
+  };
+  route.connectionAtom = {
+    get: () => route.connectionId,
+    listen: listener => { listeners.add(listener); return () => listeners.delete(listener); },
+    subscribe: listener => { listeners.add(listener); return () => listeners.delete(listener); },
+  };
+  route.beginActivation = () => { route.epoch += 1; };
+  route.finishActivation = (nextProfile, nextConnection) => {
+    route.profile = nextProfile; route.connectionId = nextConnection;
+    for (const listener of [...listeners]) listener(route.profile);
+  };
+  route.activate = (nextProfile, nextConnection) => {
+    route.beginActivation(); route.finishActivation(nextProfile, nextConnection);
+  };
+  return route;
+}
+
 // Exercise the real uncompiled pane with lightweight React/SDK stand-ins.
 // This checks rendering/request contracts, not visual acceptance.
 function pane(scope, supported = true, fallback = true, web = '', settings = {}, respond = {}, statusExtra = {}, browserGlobals = {}, qcBehavior = {}) {
   let registered;
+  let paneGeneration = 0;
   let stateIndex = 0;
   let values = [];
-  const paneValues = values, settingsValues = [];
+  let paneValues = values;
+  const settingsValues = [];
   const requests = [];
   const queryOptions = [];
   const contributions = [];
   const revealed = [], navigations = [], hostDisposers = [];
   const notices = [];
   const cacheListeners = new Set();
+  const keyedCache = new Map();
   let effects = [];
-  const paneEffects = effects, settingsEffects = [];
+  let paneEffects = effects;
+  const settingsEffects = [];
   const delayedPaneEffects = [];
   let effectIndex = 0;
   let pendingEffects = [];
@@ -522,8 +552,17 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
   let visible = false;
   const visibility = { get: () => visible };
   let preferenceAtom;
+  // Public SDK shape: route changes update the active source/profile and bump
+  // the same activation epoch consumed by gatewayActivationEpoch().
+  const route = qcBehavior.route || publicRoute();
+  const sdk = qcBehavior.legacySdk ? {} : {
+    gatewayActivationEpoch: () => route.epoch,
+    useGatewayActivationEpoch: () => route.epoch,
+  };
+  const activeStatus = () => qcBehavior.statusForRoute?.(route) || statusExtra;
   const ctx = {
     ...(qcBehavior.storage ? { storage: qcBehavior.storage } : {}),
+    ...(qcBehavior.os ? { os: qcBehavior.os } : {}),
     onDispose: dispose => hostDisposers.push(dispose),
     rest: async (path, options = {}) => {
       requests.push({ path, ...options });
@@ -541,8 +580,13 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
         contributions.splice(index, 1);
         if (item.area === 'panes') {
           visible = false;
-          for (const effect of effects) effect?.cleanup?.();
-          effects.length = 0; values.length = 0;
+          // A remounted React component has new hook slots. Retained setters
+          // from the old tree must never mutate the replacement's state.
+          const oldValues = paneValues, oldEffects = paneEffects;
+          for (const effect of oldEffects) effect?.cleanup?.();
+          paneValues = []; paneEffects = []; paneGeneration += 1;
+          if (values === oldValues) values = paneValues;
+          if (effects === oldEffects) effects = paneEffects;
         }
       };
     },
@@ -562,7 +606,7 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
   const source = readFileSync(new URL('../desktop/plugin.js', import.meta.url), 'utf8')
     .replace(/^import .*;\r?\n/gm, '').replace('export default', 'const plugin =');
   const unregister = vm.runInNewContext(source + '\nplugin.register(ctx);', {
-    ctx, h, crypto: webcrypto,
+    ctx, h, crypto: webcrypto, sdk,
     atom: initial => {
       if (typeof initial !== 'object') { let value = initial; return { get: () => value, set: next => { value = next; } }; }
       const overrides = qcBehavior.noSeedOverrides ? {} : { 0: scope, ...(qcBehavior.freshDefaults ? {} : { 12: 'openai', 13: 'gpt-test', 18: false }), ...settings };
@@ -577,7 +621,8 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
     useState: initial => {
       const i = stateIndex++;
       if (!(i in values)) {
-        const overrides = { 0: scope, 2: web, ...(qcBehavior.freshDefaults ? {} : {12:'openai',13:'gpt-test'}), ...settings };
+        const overrides = { 0: scope, 2: web, ...(qcBehavior.freshDefaults ? {} : {12:'openai',13:'gpt-test'}),
+          ...(!qcBehavior.seedFirstPaneOnly || paneGeneration === 0 ? settings : {}) };
         // Answer preferences now live in a shared atom, not pane hook slots.
         const indexes = [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 14, 15, 16, 17];
         const legacyIndex = indexes[i] ?? i + 4;
@@ -596,20 +641,30 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
     useSyncExternalStore: (_subscribe, snapshot) => snapshot(),
     useQueryClient: () => ({ invalidateQueries: qcBehavior.failInvalidate ? async () => { throw new Error('invalidate failed'); } : async () => {},
       getQueryCache: () => ({ subscribe: listener => { cacheListeners.add(listener); return () => cacheListeners.delete(listener); } }),
-      getQueryState: key => key[1] === 'status'
-        ? ({ error: qcBehavior.statusError, isPending: qcBehavior.statusPending, fetchStatus: qcBehavior.statusFetchStatus || 'idle', data: { listening: false, stopping: false, overlay_shown: false, overlay_stop_confirmed: true, busy: false, requests: {}, capabilities: supported ? { all_projects: true, automatic_web_fallback: true, independent_models: true, history_opt_out: true, macos_transcription: true, overlay: true } : undefined, ...statusExtra } })
+      getQueryState: key => qcBehavior.keyedCache ? keyedCache.get(JSON.stringify(key)) : key[1] === 'status'
+        ? ({ error: qcBehavior.statusError, isPending: qcBehavior.statusPending, fetchStatus: qcBehavior.statusFetchStatus || 'idle', data: { listening: false, stopping: false, overlay_shown: false, overlay_stop_confirmed: true, busy: false, requests: {}, capabilities: supported ? { all_projects: true, automatic_web_fallback: true, independent_models: true, history_opt_out: true, macos_transcription: true, overlay: true } : undefined, ...activeStatus() } })
         : key[1] === 'projects' ? { data: [{ name: 'alpha', path: '/projects/alpha' }], status: 'success' }
         : key[1] === 'models' ? { data: { providers: qcBehavior.providers ?? [{ id: 'openai', label: 'OpenAI API', models: [], custom_model: true, configured: true, status: 'Key available; connection and model unverified' }] }, status: 'success' }
         : undefined }),
-    useQuery: options => { queryOptions.push(options); if (options.queryKey[1] === 'status' && options.enabled !== false) statusQuery = options; return ({ error: options.queryKey[1] === 'status' ? qcBehavior.statusError : null, data: options.queryKey[1] === 'status'
-      ? { overlay_shown: false, overlay_stop_confirmed: true, busy: false, requests: {}, capabilities: supported ? { all_projects: true, automatic_web_fallback: true, independent_models: true, history_opt_out: true, macos_transcription: true, overlay: true, overlay_stream: true, overlay_cancel: true } : undefined, ...statusExtra }
-      : options.queryKey[1] === 'projects' ? [{ name: 'alpha', path: '/projects/alpha' }]
-      : options.queryKey[1] === 'models' ? { providers: qcBehavior.providers ?? [{ id: 'openai', label: 'OpenAI API', models: [], custom_model: true, configured: true, status: 'Key available; connection and model unverified' }] } : [] }); },
-    useValue: atom => atom.get(),
-    host: { notify: notice => notices.push(notice), paneVisibility: () => visibility, revealPane: id => { revealed.push(id); visible = true; }, navigate: path => navigations.push(path) }, Button: 'button', Input: 'input', Textarea: 'textarea', Badge: 'badge', PALETTE_AREA: 'palette',
+    useQuery: options => {
+      queryOptions.push(options);
+      if (options.queryKey[1] === 'status' && options.enabled !== false) statusQuery = options;
+      const result = { ...(qcBehavior.keyedCache ? { status: 'success', fetchStatus: 'idle' } : {}), error: options.queryKey[1] === 'status' ? qcBehavior.statusError : null, data: options.queryKey[1] === 'status'
+        ? { ...(qcBehavior.keyedCache ? { listening: false, stopping: false } : {}), overlay_shown: false, overlay_stop_confirmed: true, busy: false, requests: {}, capabilities: supported ? { all_projects: true, automatic_web_fallback: true, independent_models: true, history_opt_out: true, macos_transcription: true, overlay: true, overlay_stream: true, overlay_cancel: true } : undefined, ...activeStatus() }
+        : options.queryKey[1] === 'projects' ? (qcBehavior.projectsForRoute?.(route) || [{ name: 'alpha', path: '/projects/alpha' }])
+        : options.queryKey[1] === 'models' ? { providers: qcBehavior.providers ?? [{ id: 'openai', label: 'OpenAI API', models: [], custom_model: true, configured: true, status: 'Key available; connection and model unverified' }] } : [] };
+      if (!qcBehavior.keyedCache) return result;
+      const key = JSON.stringify(options.queryKey);
+      if (!keyedCache.has(key)) keyedCache.set(key, result);
+      return keyedCache.get(key);
+    },
+    useValue: atom => { qcBehavior.observedAtoms?.push(atom); return atom.get(); },
+    host: { notify: notice => notices.push(notice), paneVisibility: () => visibility, revealPane: id => { revealed.push(id); visible = true; }, navigate: path => navigations.push(path),
+      state: { profile: route.profileAtom, connectionId: route.connectionAtom }, activeConnectionId: () => route.connectionId }, Button: 'button', Input: 'input', Textarea: 'textarea', Badge: 'badge', PALETTE_AREA: 'palette',
     ...browserGlobals,
   });
   const render = () => {
+    values = paneValues; effects = paneEffects;
     stateIndex = 0; effectIndex = 0; pendingEffects = [];
     const tree = registered.render();
     if (qcBehavior.delayPaneEffects) delayedPaneEffects.push(...pendingEffects);
@@ -626,6 +681,246 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
     unmount: () => { for (const effect of paneEffects) effect?.cleanup?.(); },
     replayEffects: () => { for (const effect of effects) effect?.cleanup?.(); effects.length = 0; return render(); } };
 }
+test('route activation fences a retained retry before rerender and B can ask after reopening', async () => {
+  const route = publicRoute('default', 'source-a');
+  const traffic = [];
+  const prior = { question: 'Synthetic A question', transcript: 'PRIVATE_A', replay_request_id: 'answer-a',
+    project: '/projects/alpha', answer_provider: 'openai', answer_model: 'gpt-test' };
+  const a = { answer_error: 'Synthetic failure', error_source: 'answer', error_request: prior,
+    result: { answer: 'A result', sources: [] }, segments: [{ speaker: 'A', text: 'A transcript' }] };
+  const b = { result: { answer: 'B result', sources: [] } };
+  const ui = pane('/projects/alpha', true, false, '', {}, (path, options) => {
+    traffic.push({ profile: route.profile, source: route.connectionId, epoch: route.epoch, path, body: options.body });
+    if (path === '/overlay/lifecycle') return { revision: 0, epoch: 'backend-epoch' };
+    if (path === '/overlay/claim') return { accepted: true, pane: 'pane-' + route.connectionId };
+    if (path === '/overlay/release') return { accepted: true, stop_confirmed: true, overlay_stop_confirmed: true };
+    if (path === '/assist') return { accepted: true, request_id: 'new-b' };
+    return {};
+  }, {}, { setInterval: () => 0, clearInterval: () => {} },
+  { effects: true, route, statusForRoute: r => r.connectionId === 'source-a' ? a : b });
+  await settle();
+  const retry = button(alertFor(ui.tree, 'Answer failed'), 'Retry').props.onClick;
+  const aKeys = new Map(ui.queryOptions.map(q => [q.queryKey[1], q.queryKey]));
+  assert.match(JSON.stringify(ui.tree), /A result|A transcript/);
+  route.activate('default', 'source-b'); // same profile, different source
+  await retry();
+  assert.equal(traffic.filter(t => t.path === '/assist').length, 0, 'old A retry must not POST to B');
+  assert.doesNotMatch(JSON.stringify(ui.rerender()), /A result|A transcript|PRIVATE_A/);
+  // Reopen after the host's active route settles; the old release must not hit B.
+  command(ui, 'Open Meeting Copilot')();
+  nodes(ui.contributions.find(c => c.area === 'statusBar.right').render()).find(n => n.type === 'button').props.onClick();
+  command(ui, 'Open Meeting Copilot')();
+  let fresh = ui.rerender(); await settle();
+  assert.doesNotMatch(JSON.stringify(fresh), /A result|A transcript|PRIVATE_A/);
+  assert.match(JSON.stringify(fresh), /B result/);
+  for (const kind of ['status', 'projects', 'models', 'recordings']) {
+    const bKey = ui.queryOptions.filter(q => q.queryKey[1] === kind).at(-1).queryKey;
+    assert.notDeepEqual(aKeys.get(kind), bKey, `${kind} cache is activation-scoped`);
+  }
+  assert.ok(!traffic.some(t => t.path === '/overlay/release' && t.source === 'source-b'));
+  await button(fresh, 'Suggest answer').props.onClick();
+  assert.equal(traffic.filter(t => t.path === '/assist').length, 1, 'fresh B pane still works');
+  assert.equal(traffic.find(t => t.path === '/assist').source, 'source-b');
+  assert.equal(traffic.find(t => t.path === '/assist').body.transcript, undefined);
+  ui.unmount();
+});
+
+test('activation and profile changes retire old retry even after switching away and back', async () => {
+  for (const switches of [
+    [['beta', 'source-a']],
+    [['default', 'source-b'], ['default', 'source-a']],
+    [['default', 'source-a']], // same source reactivation increments the epoch too
+  ]) {
+    const route = publicRoute('default', 'source-a');
+    const prior = { question: 'Old', transcript: 'PRIVATE_A', replay_request_id: 'a' };
+    const ui = pane('', true, false, '', {}, {}, { answer_error: 'Failed', error_source: 'answer', error_request: prior }, {}, { route });
+    const retry = button(alertFor(ui.tree, 'Answer failed'), 'Retry').props.onClick;
+    for (const [profile, source] of switches) route.activate(profile, source);
+    await retry();
+    assert.equal(ui.requests.filter(r => r.path === '/assist').length, 0);
+    await assert.rejects(ui.pollStatus(), /retired/i);
+    assert.match(JSON.stringify(ui.rerender()), /Gateway changed/);
+    ui.unmount();
+  }
+});
+
+test('settings observe activation-scoped query caches and old settings callbacks are fenced', async () => {
+  const route = publicRoute('default', 'source-a');
+  const ui = pane('', true, false, '', {}, {}, {}, { setInterval: () => 0, clearInterval: () => {} }, {
+    effects: true, settingsHost: true, route, keyedCache: true,
+    projectsForRoute: r => r.connectionId === 'source-a' ? [{ name: 'SECRET_PROJECT_A', path: '/synthetic/a' }] : [{ name: 'PROJECT_B', path: '/synthetic/b' }],
+  });
+  await settle();
+  const initialSettings = settingsPage(ui).render();
+  assert.match(JSON.stringify(initialSettings), /SECRET_PROJECT_A/);
+  const oldScope = nodes(initialSettings).find(n => n.type === 'select' && n.props['aria-labelledby'] === 'mc-scope-label');
+  route.activate('default', 'source-b');
+  oldScope.props.onChange({ target: { value: '/synthetic/a' } });
+  const retiredSettings = settingsPage(ui).render();
+  assert.doesNotMatch(JSON.stringify(retiredSettings), /SECRET_PROJECT_A|\/synthetic\/a/);
+  command(ui, 'Open Meeting Copilot')();
+  nodes(ui.contributions.find(c => c.area === 'statusBar.right').render()).find(n => n.type === 'button').props.onClick();
+  command(ui, 'Open Meeting Copilot')(); ui.rerender(); await settle();
+  const bSettings = settingsPage(ui).render();
+  assert.match(JSON.stringify(bSettings), /PROJECT_B/);
+  assert.doesNotMatch(JSON.stringify(bSettings), /SECRET_PROJECT_A|\/synthetic\/a/);
+  ui.unmount(); ui.unmountSettings();
+});
+
+test('pane and settings subscribe to the public active-connection atom during same-profile switches', () => {
+  const route = publicRoute('default', 'source-a'), observedAtoms = [];
+  const ui = pane('', true, false, '', {}, {}, {}, {}, { route, observedAtoms, settingsHost: true });
+  assert.ok(observedAtoms.includes(route.connectionAtom), 'pane must subscribe to connection changes after an epoch bump');
+  observedAtoms.length = 0; settingsPage(ui).render();
+  assert.ok(observedAtoms.includes(route.connectionAtom), 'settings must subscribe too');
+  ui.unmount(); ui.unmountSettings();
+});
+
+test('epoch advances before an asynchronous source switch; pane stays retired until reopened', async () => {
+  const route = publicRoute('default', 'source-a');
+  const prior = { question: 'Old', transcript: 'PRIVATE_A', replay_request_id: 'a' };
+  const ui = pane('', true, false, '', {}, {}, { answer_error: 'Failed', error_source: 'answer', error_request: prior }, {}, { route });
+  const retry = button(alertFor(ui.tree, 'Answer failed'), 'Retry').props.onClick;
+  route.beginActivation(); // source/profile are still A while a connection dials
+  await retry(); assert.equal(ui.requests.length, 0);
+  assert.match(JSON.stringify(ui.rerender()), /Gateway changed/);
+  // If the user reopens too early, it is bound to A at the new epoch. When
+  // the connection atom finally publishes B, this pane must retire as well.
+  command(ui, 'Open Meeting Copilot')();
+  nodes(ui.contributions.find(c => c.area === 'statusBar.right').render()).find(n => n.type === 'button').props.onClick();
+  command(ui, 'Open Meeting Copilot')();
+  const early = ui.rerender();
+  const earlyRetry = button(alertFor(early, 'Answer failed'), 'Retry').props.onClick;
+  route.finishActivation('default', 'source-b');
+  await earlyRetry();
+  assert.match(JSON.stringify(ui.rerender()), /Gateway changed/);
+  await retry(); assert.equal(ui.requests.length, 0);
+  ui.unmount();
+});
+
+test('pending A status and admission cannot publish or lock newly opened B', async () => {
+  const route = publicRoute('default', 'source-a'), status = gate(), admission = gate();
+  const traffic = [];
+  const ui = pane('/projects/alpha', true, false, '', {}, (path, options) => {
+    const source = route.connectionId; traffic.push({ source, path, body: options.body });
+    if (source === 'source-a' && path === '/status') return status.promise;
+    if (source === 'source-a' && path === '/assist') return admission.promise;
+    if (path === '/overlay/lifecycle') return { revision: 0, epoch: 'backend-epoch' };
+    if (path === '/overlay/claim') return { pane: `pane-${source}` };
+    if (path === '/assist') return { accepted: true, request_id: 'b' };
+    return {};
+  }, {}, { setInterval: () => 0, clearInterval: () => {} },
+  { effects: true, route, statusForRoute: r => r.connectionId === 'source-a' ? { segments: [{ text: 'PRIVATE_A' }] } : { result: { answer: 'B answer' } } });
+  await settle();
+  const pendingStatus = ui.pollStatus();
+  const pendingAsk = button(ui.tree, 'Suggest answer').props.onClick();
+  await settle();
+  route.activate('default', 'source-b');
+  command(ui, 'Open Meeting Copilot')();
+  nodes(ui.contributions.find(c => c.area === 'statusBar.right').render()).find(n => n.type === 'button').props.onClick();
+  command(ui, 'Open Meeting Copilot')();
+  ui.rerender(); await settle();
+  status.resolve({ result: { answer: 'LATE_PRIVATE_A' }, listening: true });
+  admission.resolve({ accepted: true, request_id: 'late-a' });
+  await assert.rejects(pendingStatus, /retired/i); await pendingAsk;
+  const b = ui.rerender();
+  assert.match(JSON.stringify(b), /B answer/);
+  assert.doesNotMatch(JSON.stringify(b), /PRIVATE_A|late-a|not confirmed/i);
+  await button(b, 'Suggest answer').props.onClick();
+  assert.equal(traffic.filter(t => t.path === '/assist' && t.source === 'source-b').length, 1);
+  assert.ok(!traffic.some(t => t.path === '/overlay/release' && t.source === 'source-b'));
+  ui.unmount();
+});
+
+test('pending and retained A progress polling never targets or publishes into B', async () => {
+  const route = publicRoute('default', 'source-a'), progress = gate(), timers = [], traffic = [];
+  const ui = pane('', true, false, '', { 21: 'request-a', 22: { status: 'streaming', answer: 'A partial' } },
+    (path, options) => {
+      traffic.push({ source: route.connectionId, path, body: options.body });
+      if (path.startsWith('/assist/request-a')) return progress.promise;
+      if (path === '/overlay/lifecycle') return { revision: 0, epoch: 'backend-epoch' };
+      if (path === '/overlay/claim') return { pane: 'pane-' + route.connectionId };
+      return {};
+    }, {}, { setInterval: fn => { timers.push(fn); return timers.length; }, clearInterval: () => {} },
+    { effects: true, route, seedFirstPaneOnly: true, statusForRoute: r => r.connectionId === 'source-b' ? { result: { answer: 'B answer' } } : {} });
+  await settle();
+  assert.equal(traffic.filter(t => t.path.startsWith('/assist/request-a')).length, 1);
+  const oldTimers = [...timers];
+  route.activate('default', 'source-b');
+  command(ui, 'Open Meeting Copilot')();
+  nodes(ui.contributions.find(c => c.area === 'statusBar.right').render()).find(n => n.type === 'button').props.onClick();
+  command(ui, 'Open Meeting Copilot')(); ui.rerender(); await settle();
+  progress.resolve({ status: 'done', answer: 'LATE_PRIVATE_A' });
+  await settle(); for (const timer of oldTimers) await timer(); await settle();
+  const text = JSON.stringify(ui.rerender());
+  assert.match(text, /B answer/); assert.doesNotMatch(text, /LATE_PRIVATE_A|A partial|request-a/);
+  assert.ok(!traffic.some(t => t.source === 'source-b' && t.path.startsWith('/assist/request-a')));
+  assert.ok(!traffic.some(t => t.source === 'source-b' && t.path === '/heartbeat' && t.body?.pane === 'pane-source-a'));
+  ui.unmount();
+});
+
+test('pending restart from A cannot reopen or announce success in B', async () => {
+  const route = publicRoute('default', 'source-a'), release = gate(), entered = gate(), traffic = [];
+  const ui = pane('', true, false, '', {}, (path, options) => {
+    traffic.push({ source: route.connectionId, path, body: options.body });
+    if (path === '/overlay/lifecycle') return { revision: 0, epoch: 'backend-epoch' };
+    if (path === '/overlay/claim') return { pane: 'pane-a' };
+    if (path === '/overlay/release') { entered.resolve(); return release.promise; }
+    return {};
+  }, {}, { setInterval: () => 0, clearInterval: () => {} }, { effects: true, route });
+  await settle();
+  const original = ui.contributions.find(c => c.area === 'panes');
+  const pending = command(ui, 'Restart Meeting Copilot')(); await entered.promise;
+  route.activate('default', 'source-b');
+  release.resolve({ accepted: true, stop_confirmed: true, overlay_stop_confirmed: true });
+  await pending;
+  assert.equal(ui.contributions.find(c => c.area === 'panes'), original, 'old restart cannot reopen on B');
+  assert.ok(!ui.notices.some(n => /pane reopened/i.test(n.message)));
+  assert.ok(!traffic.some(t => t.source === 'source-b'));
+  assert.match(JSON.stringify(ui.rerender()), /Gateway changed/);
+  ui.unmount();
+});
+
+test('late A release diagnostics are not published into B', async () => {
+  const route = publicRoute('default', 'source-a'), release = gate(), entered = gate();
+  const ui = pane('', true, false, '', {}, (path) => {
+    if (path === '/overlay/lifecycle') return { revision: 0, epoch: 'backend-epoch' };
+    if (path === '/overlay/claim') return { pane: 'pane-a' };
+    if (path === '/overlay/release') { entered.resolve(); return release.promise; }
+    return {};
+  }, {}, { setInterval: () => 0, clearInterval: () => {} }, { effects: true, route });
+  await settle();
+  const pending = command(ui, 'Restart Meeting Copilot')(); await entered.promise;
+  route.activate('default', 'source-b'); ui.rerender();
+  release.resolve({ accepted: true, stop_confirmed: false, overlay_stop_confirmed: false, overlay_cleanup_error: 'PRIVATE_A_BACKEND_ERROR' });
+  await pending; await settle();
+  assert.ok(!ui.notices.some(n => /PRIVATE_A_BACKEND_ERROR/.test(n.message)));
+  ui.unmount();
+});
+
+test('pending old claim on route change never releases or heartbeats new backend', async () => {
+  const route = publicRoute('default', 'source-a'), claim = gate(), traffic = [];
+  const ui = pane('', true, false, '', {}, (path, options) => {
+    traffic.push({ source: route.connectionId, path, body: options.body });
+    if (path === '/overlay/lifecycle') return { revision: 0, epoch: 'backend-epoch' };
+    if (path === '/overlay/claim') return claim.promise;
+    return {};
+  }, {}, { setInterval: () => 0, clearInterval: () => {} }, { effects: true, route });
+  await settle(); assert.equal(traffic.filter(t => t.path === '/overlay/claim').length, 1);
+  route.activate('default', 'source-b');
+  ui.unmount(); claim.resolve({ accepted: true, pane: 'A-owner' }); await settle();
+  assert.ok(!traffic.some(t => t.source === 'source-b'));
+  assert.ok(ui.notices.some(n => /previous capture and overlay may still be active/i.test(n.message)));
+});
+
+test('legacy SDK without activation identity shows upgrade error and makes no backend requests', async () => {
+  const ui = pane('', true, false, '', {}, {}, {}, {}, { legacySdk: true, settingsHost: true, effects: true });
+  assert.match(JSON.stringify(ui.tree), /cannot safely identify the active gateway/i);
+  settingsPage(ui).render(); await settle();
+  assert.equal(ui.requests.length, 0);
+  ui.unmount(); ui.unmountSettings();
+});
+
 test('host unload fences retained commands without relying on register return value', async () => {
   const source = readFileSync(new URL('../desktop/plugin.js', import.meta.url), 'utf8')
     .replace(/^import .*;\r?\n/gm, '').replace('export default', 'const plugin =');
@@ -643,7 +938,7 @@ test('host unload fences retained commands without relying on register return va
   const atom = initial => { let value = initial; return { get: () => value, set: next => { value = next; } }; };
   const host = { paneVisibility: () => atom(false), revealPane: id => reveals.push(id), notify: () => {} };
   // The real host tracks ctx registrations and intentionally ignores register's return.
-  vm.runInNewContext(source + '\nplugin.register(ctx);', { ctx, h: () => null, atom, host, PALETTE_AREA: 'palette' });
+  vm.runInNewContext(source + '\nplugin.register(ctx);', { ctx, sdk: {}, h: () => null, atom, host, PALETTE_AREA: 'palette' });
   const restart = contributions.find(item => item.id === 'restart').data.run;
   const open = contributions.find(item => item.id === 'open').data.run;
   for (const dispose of [...disposers]) dispose();
@@ -3610,6 +3905,60 @@ test('evidence export is unavailable without a displayed answer', () => {
   assert.equal(button(empty.tree, 'Copy answer + evidence'), undefined);
   const blank = pane('', true, false, '', {}, {}, { result: { answer: '' } });
   assert.equal(button(blank.tree, 'Copy answer + evidence').props.disabled, true);
+});
+
+test('SDK clipboard handles all explicit copies and preserves sensitive confirmation', async () => {
+  const writes = [], prompts = [];
+  const snapshot = { schema: 'transcript-snapshot-v1', provider_json: '{"secret":"SYNTHETIC"}', segments: [] };
+  const ui = pane('', true, false, '', {}, {}, { result: { answer: 'CURRENT', sources: [], transcript_snapshot: snapshot },
+    recent: [{ answer: 'RECENT', status: 'done' }] },
+    { navigator: {}, window: { confirm: text => { prompts.push(text); return true; } }, setTimeout: () => 0 },
+    { os: { writeClipboard: async text => { writes.push(text); return true; } } });
+  for (const label of ['Copy', 'Copy this answer', 'Copy answer + evidence', 'Copy sent transcript context']) {
+    const copy = button(ui.tree, label); assert.ok(copy, label); await copy.props.onClick();
+  }
+  assert.equal(writes.length, 4);
+  assert.equal(writes[0], 'CURRENT'); assert.equal(writes[1], 'RECENT');
+  assert.match(writes[2], /CURRENT/); assert.equal(writes[3], snapshot.provider_json);
+  assert.equal(prompts.length, 2); assert.match(prompts.join(' '), /confidential/);
+  assert.doesNotMatch(JSON.stringify(ui.rerender()), /Clipboard unavailable/);
+  ui.unmount();
+});
+
+test('SDK clipboard never copies sensitive context without consent or after route changes during confirmation', async () => {
+  for (const mode of ['declined', 'missing', 'route-change']) {
+    const route = publicRoute('default', 'source-a'), writes = [];
+    const snapshot = { schema: 'transcript-snapshot-v1', provider_json: '{"secret":"SYNTHETIC"}', segments: [] };
+    const browser = mode === 'missing' ? { window: {} } : { window: { confirm: () => {
+      if (mode === 'route-change') route.activate('default', 'source-b');
+      return mode !== 'declined';
+    } } };
+    const ui = pane('', true, false, '', {}, {}, { result: { answer: 'CURRENT', sources: [], transcript_snapshot: snapshot } },
+      browser, { route, os: { writeClipboard: async text => { writes.push(text); return true; } } });
+    await button(ui.tree, 'Copy sent transcript context').props.onClick();
+    assert.equal(writes.length, 0, mode); ui.unmount();
+  }
+});
+
+test('SDK clipboard denial or rejection does not fall back to browser clipboard', async () => {
+  for (const writeClipboard of [async () => false, async () => { throw new Error('denied'); }]) {
+    let browserWrites = 0;
+    const ui = pane('', true, false, '', {}, {}, { result: { answer: 'CURRENT', sources: [] } },
+      { navigator: { clipboard: { writeText: async () => browserWrites++ } }, setTimeout: () => 0 },
+      { os: { writeClipboard } });
+    await button(ui.tree, 'Copy').props.onClick();
+    assert.equal(browserWrites, 0, 'explicit SDK failure must not be bypassed');
+    assert.match(JSON.stringify(ui.rerender()), /Clipboard unavailable/);
+    ui.unmount();
+  }
+});
+
+test('legacy browser clipboard fallback is used only when SDK door is absent', async () => {
+  const writes = [];
+  const ui = pane('', true, false, '', {}, {}, { result: { answer: 'CURRENT', sources: [] } },
+    { navigator: { clipboard: { writeText: async value => writes.push(value) } }, setTimeout: () => 0 });
+  await button(ui.tree, 'Copy').props.onClick();
+  assert.deepEqual(writes, ['CURRENT']); ui.unmount();
 });
 
 const sentSnapshotFixture = { schema: 'transcript-snapshot-v1', snapshot_id: 'synthetic-snapshot',

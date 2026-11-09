@@ -64,6 +64,7 @@ class ExportTests(unittest.TestCase):
         names = set(FILES) | set(ENTRY_FILES) | {
             'tests/verify_overlay_eof.py', 'tests/test_server.py',
             'docs/byok.md', 'docs/assets/unrelated.png',
+            'docs/assets/overlay-controls.png',
         }
         for name in names:
             path = root / name
@@ -88,6 +89,17 @@ class ExportTests(unittest.TestCase):
                 self.assertFalse((dest / name).exists(), name)
             self.assertTrue((source / 'tests/verify_overlay_eof.py').exists())
             self.assertEqual((dest / 'SOURCE_REVISION').read_text(encoding='utf-8'), 'a' * 40 + '\n')
+
+    def test_reviewed_screenshot_is_in_the_runtime_package(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, dest = root / 'source', root / 'release'
+            tracked = self.fixture(source)
+            export_runtime(source, dest, 'a' * 40, tracked)
+            screenshot = 'docs/assets/overlay-controls.png'
+            self.assertTrue((dest / screenshot).is_file())
+            self.assertEqual((dest / screenshot).read_bytes(), (source / screenshot).read_bytes())
+            self.assertFalse((dest / 'docs/assets/unrelated.png').exists())
 
     def test_missing_source_or_existing_destination_never_overwrites(self):
         with tempfile.TemporaryDirectory() as tmp:

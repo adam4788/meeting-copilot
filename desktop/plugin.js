@@ -1,5 +1,6 @@
 import { createElement as h, useState, useEffect, useLayoutEffect, useRef, useSyncExternalStore } from 'react';
 import { host, atom, useValue, useQuery, useQueryClient, Button, Input, Textarea, Badge, PALETTE_AREA } from '@hermes/plugin-sdk';
+import * as sdk from '@hermes/plugin-sdk';
 
 const ID = 'meeting-copilot-live';
 const speakerPalette = ['var(--ui-accent)', 'var(--ui-green, var(--ui-accent))', 'var(--ui-orange, var(--ui-accent))', 'var(--ui-red, var(--ui-accent))', 'var(--ui-cyan, var(--ui-accent))', 'var(--ui-purple, var(--ui-accent))'];
@@ -68,6 +69,27 @@ export default {
     let active = true;
     let paneRegistration = null;
     let paneIds = 0;
+    // ctx.rest always uses the host's *current* route; it cannot pin an old
+    // source. Require both the canonical epoch and its reactive hook rather
+    // than pretending a profile label can detect source swaps or away/back.
+    const routeSupported = typeof sdk.gatewayActivationEpoch === 'function' && typeof sdk.useGatewayActivationEpoch === 'function'
+      && typeof host.activeConnectionId === 'function' && typeof host.state?.profile?.get === 'function'
+      && typeof host.state?.connectionId?.get === 'function';
+    function currentBinding() {
+      if (!routeSupported) return null;
+      try {
+        const epoch = sdk.gatewayActivationEpoch();
+        const profile = host.state.profile.get();
+        const connectionId = host.activeConnectionId();
+        if (!Number.isSafeInteger(epoch) || typeof profile !== 'string' || !(connectionId === null || typeof connectionId === 'string')
+            || sdk.gatewayActivationEpoch() !== epoch) return null;
+        return { epoch, profile, connectionId };
+      } catch (_) { return null; }
+    }
+    const sameBinding = (a, b) => !!a && !!b && a.epoch === b.epoch && a.profile === b.profile && a.connectionId === b.connectionId;
+    const bindingCurrent = binding => sameBinding(binding, currentBinding());
+    const bindingKey = (binding, kind) => binding ? [ID, kind, binding.connectionId, binding.profile, binding.epoch] : [ID, kind, 'inactive'];
+    const cacheKey = kind => bindingKey(bindingCurrent(paneRegistration?.binding) ? paneRegistration.binding : null, kind);
     const registered = () => active && order.registration === registration;
     const lifecycles = new Set();
     const notify = (kind, message) => { try { host.notify({ kind, message }); } catch (e) {} };
@@ -154,11 +176,12 @@ export default {
     }
     // Synchronous local locks cover the gaps before React renders or a status
     // poll can observe a Show/answer admission. They never hold meeting data.
-    const safety = { overlayAction: false, overlayVisible: false, overlayUnknown: false, overlayToken: 0, answer: false, answerKnown: false, answerToken: 0,
-      captureAction: false, captureUnknown: false, captureToken: 0, captureReleasePending: false, captureReleased: false };
+    const newSafety = () => ({ overlayAction: false, overlayVisible: false, overlayUnknown: false, overlayToken: 0, answer: false, answerKnown: false, answerToken: 0,
+      captureAction: false, captureUnknown: false, captureToken: 0, captureReleasePending: false, captureReleased: false });
+    let safety = newSafety(), safetyBinding = null;
     const safetySignal = atom(0);
     const signalSafety = () => safetySignal.set(safetySignal.get() + 1);
-    async function checkedStatus(api) {
+    async function checkedStatus(api, safety) {
       // Only a GET begun after the operation can settle a local uncertainty.
       const overlayToken = safety.overlayToken, answerToken = safety.answerToken, captureToken = safety.captureToken;
       const overlayWasActive = safety.overlayAction, captureWasActive = safety.captureAction || safety.captureReleasePending;
@@ -185,14 +208,14 @@ export default {
       return result;
     }
     function hasMountedPane() {
-      return !!(registered() && paneRegistration?.active && paneRegistration.life?.mounted);
+      return !!(registered() && paneRegistration?.active && bindingCurrent(paneRegistration.binding) && paneRegistration.life?.mounted);
     }
     function mayChangePreferences(qc, status, live = () => true) {
       if (!registered() || !live()) return false;
       // With no mounted pane these are deferred defaults only. Do not poll the
       // legacy /status endpoint: before a pane claim it can renew capture.
       if (!hasMountedPane()) return true;
-      const latest = typeof qc.getQueryState === 'function' ? qc.getQueryState([ID, 'status']) : null;
+      const latest = typeof qc.getQueryState === 'function' ? qc.getQueryState(cacheKey('status')) : null;
       const state = latest || status;
       const data = state?.data;
       return !!(!state?.error && state?.status !== 'error' && state?.status !== 'pending' && !state?.isPending
@@ -207,7 +230,7 @@ export default {
     };
     function mayChangeCapture(qc, status, live = () => true) {
       if (!registered() || !live() || safety.captureAction || safety.captureUnknown) return false;
-      const state = qc.getQueryState?.([ID, 'status']) || status;
+      const state = qc.getQueryState?.(cacheKey('status')) || status;
       if (!hasMountedPane()) return safety.captureReleased || (state?.data?.listening !== true && state?.data?.stopping !== true); // deferred defaults, never a capture action
       return captureStatusIdle(state);
     }
@@ -229,7 +252,7 @@ export default {
     // renew an old capture lease after its pane has gone away.
     const emptyQuery = Object.freeze({ data: undefined, error: null, status: 'pending' });
     function useCachedQuery(qc, kind) {
-      const snapshot = () => qc.getQueryState?.([ID, kind]) || emptyQuery;
+      const snapshot = () => qc.getQueryState?.(cacheKey(kind)) || emptyQuery;
       const state = useSyncExternalStore(listener => qc.getQueryCache?.()?.subscribe(listener) || (() => {}), snapshot, snapshot);
       return { ...state, isPending: !!state.isPending || state.status === 'pending' };
     }
@@ -256,7 +279,7 @@ export default {
               const value = e.target.value;
               const known = entries.some(p => (typeof p === 'string' ? p : (p.path || p.name)) === value);
               const isMounted = hasMountedPane();
-              const latest = typeof qc.getQueryState === 'function' ? qc.getQueryState([ID, 'status']) : status;
+              const latest = typeof qc.getQueryState === 'function' ? qc.getQueryState(cacheKey('status')) : status;
               if ((!isMounted || !projects.isPending) && (value === '' || (value === '__all_projects__' && (!isMounted || latest?.data?.capabilities?.all_projects)) || known || value === project)) change({ project: value });
             } },
             h('option', { value: '' }, 'Past sessions only'),
@@ -293,7 +316,7 @@ export default {
       const locked = !mayChangeCapture(qc, status, live);
       const change = (field, value, choices) => {
         if (!choices.includes(value) || !mayChangeCapture(qc, status, live)) return;
-        const latest = qc.getQueryState?.([ID, 'status']) || status;
+        const latest = qc.getQueryState?.(cacheKey('status')) || status;
         const caps = latest?.data?.capabilities || {};
         if (hasMountedPane() && ((field === 'backend' && value === 'macos' && !caps.macos_transcription) ||
             (field === 'backend' && value === 'native' && caps.windows_transcription !== true) ||
@@ -333,6 +356,8 @@ export default {
           backend === 'macos' && transcriptionProvider === 'meta' && h('span', { role: 'status', style: muted }, 'Cloud transcription: meeting audio is sent to Meta (muse-voice-transcribe) while listening. Only final turns are kept; the API key stays in managed secret settings.')));
     }
     function SettingsPage() {
+      if (routeSupported) { sdk.useGatewayActivationEpoch(); useValue(host.state.profile); useValue(host.state.connectionId); }
+      const settingsBinding = currentBinding();
       const qc = useQueryClient();
       const live = useRef(true);
       useEffect(() => { live.current = true; return () => { live.current = false; }; }, []);
@@ -344,9 +369,9 @@ export default {
       const models = useCachedQuery(qc, 'models');
       return h('section', { style: { display: 'grid', gap: 14, maxWidth: 720, padding: 16 } },
         h('h2', { style: { margin: 0 } }, 'Meeting Copilot settings'),
-        h(CapturePreferences, { prefs, status, qc, live: () => live.current }),
+        h(CapturePreferences, { prefs, status, qc, live: () => live.current && bindingCurrent(settingsBinding) }),
         h('h3', { style: { margin: 0 } }, 'Answer setup'),
-        h(AnswerPreferences, { prefs, status, projects, models, qc, live: () => live.current }));
+        h(AnswerPreferences, { prefs, status, projects, models, qc, live: () => live.current && bindingCurrent(settingsBinding) }));
     }
     if (typeof ctx.registerSettingsPage === 'function') {
       try {
@@ -357,7 +382,17 @@ export default {
     function releaseOverlayPane(life) {
       lifecycles.delete(life);
       if (life.release) return life.release;
-      if (!life.pane) return Promise.resolve({ accepted: false });
+      if (!life.pane) {
+        if (life.claimAttempted && !bindingCurrent(life.binding)) notify('warning', 'Gateway changed during pane authorization. The previous capture and overlay may still be active; verify the OS audio indicator and previous gateway.');
+        return Promise.resolve({ accepted: false });
+      }
+      // There is no public route-pinned ctx.rest. Never let old teardown hit
+      // the newly active backend; the old lease expires, but stop is unproved.
+      if (!bindingCurrent(life.binding)) {
+        notify('warning', 'Gateway changed; the previous capture and overlay could not be released on their original backend. Lease expiry initiates stop but cannot guarantee physical shutdown. Verify the OS audio indicator and previous gateway.');
+        return Promise.resolve({ accepted: false, routeChanged: true });
+      }
+      const safety = life.safety;
       const overlayToken = ++safety.overlayToken;
       // A late claim from an older lifecycle may release its own pane but must
       // not alter capture evidence belonging to a newer pane.
@@ -381,6 +416,7 @@ export default {
         signalSafety();
       };
       life.release.then(result => {
+        if (!bindingCurrent(life.binding)) return;
         finishCaptureRelease(result);
         if (overlayToken === safety.overlayToken && result?.accepted === true && result?.overlay_stop_confirmed === true) {
           safety.overlayVisible = false; safety.overlayUnknown = false;
@@ -388,7 +424,7 @@ export default {
         }
         if (result?.stop_confirmed === false || result?.stopping) warnStop();
         if (result?.overlay_stop_confirmed === false) notify('warning', result.overlay_cleanup_error || 'Overlay shutdown is not confirmed. Reopen the pane and Retry hide overlay.');
-      }, () => { finishCaptureRelease(null); warnStop(); });
+      }, () => { if (bindingCurrent(life.binding)) { finishCaptureRelease(null); warnStop(); } });
       return life.release;
     }
     // Trust only diagnostics created here, never transport exception text.
@@ -401,9 +437,32 @@ export default {
     function MeetingPane({ registration: paneEntry }) {
       // Fence all outbound work, including previously captured Assist/retry
       // callbacks. Release uses the registration-level request, never fallback.
-      const usable = () => registered() && paneEntry.active && !paneEntry.retired;
-      const api = (path, body) => (active && (usable() || (path === '/status' && body === undefined))) ? request(path, body)
-        : Promise.reject(new Error('This pane is retired. Close and reopen it.'));
+      const safety = paneEntry.safety;
+      const cacheKey = kind => bindingKey(paneEntry.binding, kind);
+      const usable = () => registered() && paneEntry.active && !paneEntry.retired && bindingCurrent(paneEntry.binding);
+      const api = async (path, body) => {
+        const statusRead = path === '/status' && body === undefined;
+        const mayReadStatus = () => active && statusRead && bindingCurrent(paneEntry.binding);
+        if (!usable() && !mayReadStatus()) throw new Error('This pane is retired. Close and reopen it.');
+        const result = await request(path, body);
+        // A late same-route claim must expose its exact owner to cleanup even
+        // after unload. It must never be released through a different route.
+        const lateClaim = path === '/overlay/claim' && bindingCurrent(paneEntry.binding);
+        if (!usable() && !mayReadStatus() && !lateClaim) throw new Error('This pane is retired. Close and reopen it.');
+        return result;
+      };
+      async function writeClipboard(text) {
+        if (!usable()) throw new Error('This pane is retired.');
+        if (typeof ctx.os?.writeClipboard === 'function') {
+          // A false result (or rejection) is a failure, not permission to
+          // bypass the host's clipboard decision via a second door.
+          if (await ctx.os.writeClipboard(text) !== true) throw new Error('Clipboard unavailable.');
+        } else {
+          // Older hosts without the SDK door may expose the browser API.
+          if (typeof navigator === 'undefined' || typeof navigator.clipboard?.writeText !== 'function') throw new Error('Clipboard unavailable.');
+          await navigator.clipboard.writeText(text);
+        }
+      }
       const qc = useQueryClient();
       const saved = preferences.get();
       const prefs = useValue(preferences);
@@ -433,7 +492,7 @@ export default {
       const [persistWarning, setPersistWarning] = useState('');
 
 
-      const status = useQuery({ queryKey: [ID, 'status'], queryFn: () => checkedStatus(api), refetchInterval: 2500, retry: 1 });
+      const status = useQuery({ queryKey: cacheKey('status'), queryFn: () => checkedStatus(api, safety), refetchInterval: 2500, retry: 1 });
       const backend = (settingsAvailable ? prefs.backend : fallbackBackend) || defaultBackend(status.data?.capabilities);
       // Keep the overlay lease alive while the pane is visible; overlay helper
       // polls use touch=false so only this heartbeat extends the 30s watchdog.
@@ -454,10 +513,10 @@ export default {
         const timer = setInterval(beat, 10000);
         return () => clearInterval(timer);
       }, [!!status.error]);
-      const projects = useQuery({ queryKey: [ID, 'projects'], queryFn: () => api('/projects'), staleTime: 60000, refetchInterval: query => query.state.error ? 5000 : false, retry: 3 });
-      const recordings = useQuery({ queryKey: [ID, 'recordings'], queryFn: () => api('/recordings'), refetchInterval: backend === 'meetily' ? 5000 : false, enabled: backend === 'meetily', retry: 1 });
+      const projects = useQuery({ queryKey: cacheKey('projects'), queryFn: () => api('/projects'), staleTime: 60000, refetchInterval: query => query.state.error ? 5000 : false, retry: 3 });
+      const recordings = useQuery({ queryKey: cacheKey('recordings'), queryFn: () => api('/recordings'), refetchInterval: backend === 'meetily' ? 5000 : false, enabled: backend === 'meetily', retry: 1 });
       const data = status.data || {};
-      const modelCatalog = useQuery({ queryKey: [ID, 'models'], queryFn: () => api('/models'), enabled: !!data.capabilities?.independent_models, staleTime: 60000, retry: 1 });
+      const modelCatalog = useQuery({ queryKey: cacheKey('models'), queryFn: () => api('/models'), enabled: !!data.capabilities?.independent_models, staleTime: 60000, retry: 1 });
       const providers = modelCatalog.data?.providers || [];
       const answerProviderAvailable = ['openai', 'openrouter'].includes(answerProvider) && providers.some(p => p.id === answerProvider);
       const busy = pending || data.busy;
@@ -493,9 +552,10 @@ export default {
       // Owner is minted by Show, not a pane-local counter that resets on remount.
       function newOverlayLifecycle() {
         const life = { at: 0, owner: null, pane: null, claim: null, action: 0, overlayGeneration: 0,
+          binding: paneEntry.binding, safety,
           creation: ++order.next,
           alive: true, syncedKey: null, released: false,
-          get mounted() { return this.alive && registered() && paneEntry.active && paneRegistration === paneEntry; },
+          get mounted() { return this.alive && registered() && paneEntry.active && paneRegistration === paneEntry && bindingCurrent(this.binding); },
           set mounted(value) { this.alive = value; } };
         // Retire older release/GET evidence before the new pane can claim.
         safety.captureToken += 1; safety.captureReleasePending = false; safety.captureReleased = false;
@@ -618,7 +678,7 @@ export default {
           return false;
         }
         finally { setPending(false); }
-        try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }); }
+        try { await qc.invalidateQueries({ queryKey: cacheKey('status') }); }
         catch (e) {}
         return true;
       }
@@ -705,7 +765,7 @@ export default {
             setOverlayOn(true); setScopeStale(false);
             setOverlayMsg('Read-only overlay shown. Ask questions in the Meeting Copilot pane.');
           }
-          await qc.invalidateQueries({ queryKey: [ID, 'status'] });
+          await qc.invalidateQueries({ queryKey: cacheKey('status') });
         } catch (e) { safety.overlayUnknown = true; if (life.mounted) {
           setOverlayMsg('Overlay action not confirmed. Retry Show / Hide overlay; if it still fails, close and reopen this pane. Check the macOS helper and backend connection. A window may still be visible: verify before screen-sharing.');
           if (!overlayOn) setOverlayOn(false);
@@ -717,7 +777,7 @@ export default {
           if (!usable() || !actionLife.mounted || overlayActionAt.current !== actionLife) return false;
           if (token === undefined ? (safety.captureAction || safety.captureUnknown)
               : (!safety.captureAction || safety.captureToken !== token)) return false;
-          const latest = qc.getQueryState?.([ID, 'status']) || status;
+          const latest = qc.getQueryState?.(cacheKey('status')) || status;
           const caps = latest?.data?.capabilities || {};
           const current = settingsAvailable ? effectiveCapture(preferences.get(), caps)
             : { ...captureInput.current.source, backend: captureInput.current.explicitBackend || defaultBackend(caps) };
@@ -811,9 +871,9 @@ export default {
         // Read the shared atom at the action, not the pane render that created
         // this callback: Settings and pane are independent React roots.
         const currentPrefs = preferences.get();
-        const latestState = typeof qc.getQueryState === 'function' ? qc.getQueryState([ID, 'status']) : status;
+        const latestState = typeof qc.getQueryState === 'function' ? qc.getQueryState(cacheKey('status')) : status;
         const currentData = latestState?.data || data;
-        const catalog = typeof qc.getQueryData === 'function' ? qc.getQueryData([ID, 'models']) : null;
+        const catalog = typeof qc.getQueryData === 'function' ? qc.getQueryData(cacheKey('models')) : null;
         const currentProviders = catalog?.providers || providers;
         const isAll = currentPrefs.project === '__all_projects__';
         const invalid = (isAll && !currentData.capabilities?.all_projects) ||
@@ -843,7 +903,7 @@ export default {
         }
         catch (e) { setAnswerUncertain(true); setError('Answer submission was not confirmed. Check the backend connection and recheck status; the request may already be running or complete. Review the result before asking again.'); setAssistFailed(true); }
         finally { answerSubmitting.current = false; setPending(false); }
-        try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }); }
+        try { await qc.invalidateQueries({ queryKey: cacheKey('status') }); }
         catch (e) {}
       }
       // Exact replay: resend a stored request verbatim (question, scope,
@@ -880,7 +940,7 @@ export default {
         finally { answerSubmitting.current = false; setPending(false); }
         // Same split as a fresh ask: a replayed request that the backend
         // accepted must not become a duplicate through a failed refresh.
-        try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }); }
+        try { await qc.invalidateQueries({ queryKey: cacheKey('status') }); }
         catch (e) {}
       }
       const [progressRetry, setProgressRetry] = useState(0);
@@ -895,14 +955,14 @@ export default {
           if (inFlight || paused) return;
           inFlight = true;
           try {
-            const entry = await ctx.rest(`/assist/${trackedRequest}?missing=sentinel-v1`);
+            const entry = await api(`/assist/${trackedRequest}?missing=sentinel-v1`);
             if (!alive) return;
             if (entry?.contract === 'answer-progress-v1' && entry.status === 'missing') {
               safety.answer = false;
               signalSafety();
               setTrackedRequest(null); setLiveEntry(null);
               setError('That answer is no longer available (new meeting or restart cleared it). Ask again.');
-              try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }); } catch (ignored) {}
+              try { await qc.invalidateQueries({ queryKey: cacheKey('status') }); } catch (ignored) {}
               return;
             }
             if (!entry) {
@@ -911,7 +971,7 @@ export default {
               if (++misses >= 2) {
                 setTrackedRequest(null); setLiveEntry(null);
                 setError('That answer is no longer available (new meeting or restart cleared it). Ask again.');
-                try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }); } catch (ignored) {}
+                try { await qc.invalidateQueries({ queryKey: cacheKey('status') }); } catch (ignored) {}
               }
               return;
             }
@@ -928,7 +988,7 @@ export default {
               setTrackedRequest(null);
               // TanStack invalidate resolves on refetch failure by default.
               // Keep terminal progress independently of the status cache.
-              try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }, { throwOnError: true }); } catch (ignored) {}
+              try { await qc.invalidateQueries({ queryKey: cacheKey('status') }, { throwOnError: true }); } catch (ignored) {}
             }
           } catch (e) {
             // Older Desktop bridges expose only a plain Error, even for HTTP
@@ -1033,7 +1093,7 @@ export default {
         // effective-source transition synchronously, including away-and-back.
         const observeSource = () => {
           if (!usable() || !actionLife.mounted || overlayActionAt.current !== actionLife) return;
-          const latest = qc.getQueryState?.([ID, 'status']) || status;
+          const latest = qc.getQueryState?.(cacheKey('status')) || status;
           const next = (settingsAvailable ? preferences.get().backend : captureInput.current.explicitBackend)
             || defaultBackend(latest?.data?.capabilities);
           if (sourceVersion.current.backend === next) return;
@@ -1061,8 +1121,8 @@ export default {
         h(Button, { variant: 'secondary', disabled: typeof snapshot.provider_json !== 'string' || snapshot.provider_json.length > 16000, onClick: async () => {
           if (!usable() || typeof snapshot.provider_json !== 'string' || snapshot.provider_json.length > 16000) return;
           if (typeof window === 'undefined' || typeof window.confirm !== 'function' || !window.confirm('Copy the exact transcript context sent for this answer? It can contain confidential meeting text and metadata. Clipboard history or sync may retain it. Review before sharing.')) return;
-          try { await navigator.clipboard.writeText(snapshot.provider_json); notify('info', 'Sent transcript context copied. Review before sharing.'); }
-          catch (_) { setError('Clipboard unavailable. Select and copy the sent context manually.'); }
+          try { await writeClipboard(snapshot.provider_json); if (usable()) notify('info', 'Sent transcript context copied. Review before sharing.'); }
+          catch (_) { if (usable()) setError('Clipboard unavailable. Select and copy the sent context manually.'); }
         } }, 'Copy sent transcript context'));
       const evidenceItem = (s, i) => {
         const excerpt = evidenceExcerpt(s.text);
@@ -1082,7 +1142,7 @@ export default {
         ? (data.error_request ? answerFailure() : data.error) : null;
       const captureError = data.capture_error || (data.error_source === 'capture' ? data.error : null);
       const recheckStatus = async () => {
-        try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }, { throwOnError: true }); }
+        try { await qc.invalidateQueries({ queryKey: cacheKey('status') }, { throwOnError: true }); }
         catch (_) { setError('Backend unavailable. Check the backend connection, installation, and plugin enablement.'); }
       };
       const errorCard = (message, label, onClick, disabled = false) => message && h('div', { role: 'alert', style: card },
@@ -1128,7 +1188,7 @@ export default {
               if (e.target.checked && (!usable() || !actionLife.mounted || overlayActionAt.current !== actionLife ||
                   captureInput.current.recording !== recording || captureRevision !== renderedCaptureRevision || sourceVersion.current.revision !== renderedSourceRevision ||
                   (!settingsAvailable && captureKey(captureInput.current.source) !== captureKey(renderedCapture)) ||
-                  (settingsAvailable && captureKey(effectiveCapture(preferences.get(), (qc.getQueryState?.([ID, 'status']) || status)?.data?.capabilities)) !== captureKey(renderedCapture)))) return;
+                  (settingsAvailable && captureKey(effectiveCapture(preferences.get(), (qc.getQueryState?.(cacheKey('status')) || status)?.data?.capabilities)) !== captureKey(renderedCapture)))) return;
               consentPrefs.current = e.target.checked ? { key: captureKey(renderedCapture), revision: renderedCaptureRevision, sourceRevision: renderedSourceRevision } : null;
               setConsent(e.target.checked);
               setConsentRevision(value => value + 1);
@@ -1167,7 +1227,7 @@ export default {
             setAssistFailed(false); setProgressPaused(false);
             setProgressRetry(value => value + 1);
             try {
-              await qc.invalidateQueries({ queryKey: [ID, 'status'] }, { throwOnError: true });
+              await qc.invalidateQueries({ queryKey: cacheKey('status') }, { throwOnError: true });
               // Only recovered progress/terminal evidence clears this message.
               // A successful status refresh alone does not prove recovery.
             } catch (_) { setError(data.stopping ? 'Backend status unavailable. Check the connection and recheck status; stopping is not yet confirmed.' : 'Answer progress unavailable. Recheck status or explicitly reset local tracking after reviewing the uncertainty.'); }
@@ -1250,17 +1310,17 @@ export default {
               // An explicit reset permits a new authoritative read, never an
               // automatic resend or a release based on a pre-admission cache.
               safety.answerKnown = true; safety.answerToken += 1; signalSafety();
-              try { await checkedStatus(api); } catch (_) {}
+              try { await checkedStatus(api, safety); } catch (_) {}
             }
           } }, 'Reset local answer tracking'),
           cancellableId && h(Button, { variant: 'secondary', onClick: async () => {
               try { await api('/assist/cancel', { request_id: cancellableId }); }
               catch (e) { setError('Cancellation was not confirmed. The answer may still be running; recheck status before asking again.'); setAssistFailed(true); return; }
               setTrackedRequest(null); setLiveEntry(null);
-              try { await qc.invalidateQueries({ queryKey: [ID, 'status'] }); }
+              try { await qc.invalidateQueries({ queryKey: cacheKey('status') }); }
               catch (e) { setError('Answer progress unavailable after cancellation. Recheck status before asking again.'); }
             } }, 'Cancel answer'),
-          result?.answer && h(Button, { variant: 'secondary', onClick: async () => { if (!usable()) return; try { await navigator.clipboard.writeText(result.answer); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch (e) { setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, copied ? 'Copied ✓' : 'Copy'),
+          result?.answer && h(Button, { variant: 'secondary', onClick: async () => { if (!usable()) return; try { await writeClipboard(result.answer); if (usable()) { setCopied(true); setTimeout(() => { if (usable()) setCopied(false); }, 2000); } } catch (e) { if (usable()) setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, copied ? 'Copied ✓' : 'Copy'),
           question && h(Button, { variant: 'secondary', disabled: busy, onClick: () => { setQuestion(''); composerRef.current?.querySelector('textarea')?.focus(); } }, 'Clear question')),
         currentLive && ['error', 'cancelled'].includes(currentLive.status) && !data.error && h('section', { style: card, 'aria-live': 'polite', 'data-terminal-answer': true },
           h('p', null, currentLive.status === 'error' ? answerFailure() : 'Answer cancelled.'),
@@ -1275,8 +1335,8 @@ export default {
           h(Button, { variant: 'secondary', disabled: !result.answer, onClick: async () => {
             if (!usable()) return;
             if (typeof window === 'undefined' || typeof window.confirm !== 'function' || !window.confirm('Copy this answer and its source excerpts (up to 2,050 characters per source)? The clipboard may include confidential project text or links. Review before sharing. No new model request is sent.')) return;
-            try { await navigator.clipboard.writeText(evidenceReport(result)); notify('info', 'Answer and evidence copied. Review before sharing.'); }
-            catch (_) { setError('Clipboard unavailable. Select and copy the answer and evidence manually.'); }
+            try { await writeClipboard(evidenceReport(result)); if (usable()) notify('info', 'Answer and evidence copied. Review before sharing.'); }
+            catch (_) { if (usable()) setError('Clipboard unavailable. Select and copy the answer and evidence manually.'); }
           } }, 'Copy answer + evidence'),
           h('div', { style: { display: 'flex', justifyContent: 'space-between' } }, h('strong', null, 'Suggested answer'), h('span', { style: muted }, `${Number.isFinite(result.elapsed_seconds) ? `${result.elapsed_seconds.toFixed(1)}s` : ''}${result.model_route ? ` · ${result.model_route}` : ''}`)),
           h('div', { style: { whiteSpace: 'pre-wrap', lineHeight: 1.65, paddingTop: 10 } }, result.answer),
@@ -1327,7 +1387,7 @@ export default {
               h('p', { style: muted }, 'Excerpts are limited to 2,050 characters per source.'),
               ...(entry.sources || []).slice(0, 9).map(evidenceItem)),
             h('div', { style: { paddingTop: 8, display: 'flex', gap: 8, flexWrap: 'wrap' } },
-              entry.answer && h(Button, { variant: 'secondary', onClick: async () => { if (!usable()) return; try { await navigator.clipboard.writeText(entry.answer); } catch (e) { setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, 'Copy this answer'),
+              entry.answer && h(Button, { variant: 'secondary', onClick: async () => { if (!usable()) return; try { await writeClipboard(entry.answer); } catch (e) { if (usable()) setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, 'Copy this answer'),
               entry.request && h(Button, { variant: 'secondary', disabled: answerBlocked, onClick: () => replayRequest(entry.request) }, /partial|interrupt|unavailable|failed|error/i.test((entry.warnings || []).join(' ') + ' ' + (entry.status || '')) ? 'Retry for the complete response' : 'Ask again'))))),
         h('details', { open: setupOpen, onToggle: e => setSetupOpen(e.currentTarget.open), style: { border: '1px solid var(--ui-stroke-secondary)', borderRadius: 12, padding: '2px 14px 14px', background: 'var(--ui-bg-card)' } },
         h('summary', { style: { cursor: 'pointer', fontWeight: 700, color: 'var(--ui-text-primary)', padding: '12px 0', fontSize: 14 } }, `${setupOpen ? '\u25be' : '\u25b8'} ${settingsAvailable ? 'More actions' : 'Answer setup'}`),
@@ -1357,13 +1417,37 @@ export default {
           h('p', { style: muted }, 'The read-only macOS overlay shows transcript and detected questions; ask in this pane. Press ⌃⌥⌘O (Control + Option + Command + O) to interact temporarily, drag the header, use position presets, or toggle Show in recordings. It returns to click-through automatically.'),
           h('p', { style: muted }, 'Closing the pane initiates pause or detach; check stop status before assuming audio is off. Pause may discard the last few seconds. Resume keeps this meeting; New meeting, different capture settings, or Clear starts fresh. No extra audio files are saved by Copilot.')));
     }
+    // Keep the pane bound to the activation on which it mounted. An epoch may
+    // advance before an asynchronous source swap finishes, so auto-remounting
+    // immediately could bind the new epoch to the old socket. Require an
+    // explicit close/reopen after the user has selected the destination.
+    function RoutePane({ registration: entry }) {
+      if (routeSupported) {
+        sdk.useGatewayActivationEpoch();
+        useValue(host.state.profile);
+        // Activation may finish later, after the epoch notification. The
+        // public connection atom also repaints a pane reopened mid-dial.
+        useValue(host.state.connectionId);
+      }
+      const binding = currentBinding();
+      if (!entry.binding && binding) {
+        entry.binding = binding;
+        if (!sameBinding(safetyBinding, binding)) { safety = newSafety(); safetyBinding = binding; }
+        entry.safety = safety;
+      }
+      if (!entry.binding) return h('div', { role: 'alert', style: card },
+        'This Desktop cannot safely identify the active gateway. Update Hermes Desktop before using Meeting Copilot.');
+      if (!bindingCurrent(entry.binding)) return h('div', { role: 'alert', style: card },
+        'Gateway changed. This pane is retired; close and reopen Meeting Copilot after the switch. Previous capture or overlay shutdown is not confirmed; verify the OS audio indicator and previous gateway.');
+      return h(MeetingPane, { registration: entry });
+    }
     const paneId = `${ID}:pane`;
     const visibility = typeof host.paneVisibility === 'function' ? host.paneVisibility(paneId) : null;
     const registerPane = () => {
       const entry = { active: true, life: null, a11yId: `${ID}-pane-${registration}-${++paneIds}` };
       paneRegistration = entry;
       const remove = ctx.register({ id: 'pane', area: 'panes', title: 'Meeting Copilot', data: { placement: 'right', width: '440px' },
-        render: () => registered() && entry.active && paneRegistration === entry ? h(MeetingPane, { registration: entry }) : null });
+        render: () => registered() && entry.active && paneRegistration === entry ? h(RoutePane, { registration: entry }) : null });
       return () => {
         if (!registered() || paneRegistration !== entry || !entry.active) return;
         entry.active = false;
@@ -1395,7 +1479,7 @@ export default {
       entry.restarting = true;
       entry.retire?.('Restart in progress. Capture pause is not confirmed; all actions are disabled.');
       const life = entry.life;
-      const current = () => registered() && paneRegistration === entry && removePane === remove && entry.life === life;
+      const current = () => registered() && paneRegistration === entry && removePane === remove && entry.life === life && bindingCurrent(entry.binding);
       try {
         if (life) {
           // Retire callbacks/heartbeats BEFORE awaiting. A new pane may open
