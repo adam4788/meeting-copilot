@@ -125,6 +125,30 @@ Pause does not erase the transcript. Clear removes the plugin's buffered content
 and results, but cannot recall a submitted provider request or delete Meetily
 source files. A retry explicitly resends saved context.
 
+## Move and record the overlay (macOS)
+
+Choose **Show overlay** in the pane. The window starts click-through so it does
+not intercept your meeting app. Press **Control + Option + Command + O**
+(**⌃⌥⌘O**) to interact temporarily; press it again to return early.
+
+- **Drag the header/grip** to place the overlay freely.
+- **Position presets** give one-click corner and centered placements. Top center
+  keeps reference text near your camera; bottom center works like captions;
+  corners leave the main presentation area clear. Placement stays within the
+  usable area of the overlay's current display.
+- **Show in recordings: on** allows the normal window-sharing behavior for demos
+  and recordings. Your recorder must still capture the display/window containing
+  it; recording a different app's window will not necessarily include it.
+- **Show in recordings: off** requests the legacy macOS exclusion behavior. It is
+  **best effort, not a privacy guarantee**: modern screen recorders may still
+  include the overlay. Use the pane's **Hide overlay** action and verify that the
+  window is gone whenever it must not be captured.
+
+These controls change only the floating window. They do not start audio capture,
+request an answer, change provider settings, or alter the meeting app's recording.
+Interaction returns to click-through automatically. Recording visibility starts
+off at each helper launch; do not treat that default as proof of capture exclusion.
+
 ## When something is unavailable
 
 | Symptom | Check |

@@ -2525,6 +2525,18 @@ test('explicit persisted cloud preference survives unrelated preference edits an
   ui.unmount();
 });
 
+test('overlay arrangement and recording guidance is visible beside the quick control', () => {
+  const ui = pane('', true, false, '', {}, {}, {}, {}, { settingsHost: true });
+  const capture = nodes(ui.tree).find(n => n.props['aria-label'] === 'Capture session');
+  const text = JSON.stringify(disclosedNodes(capture));
+  assert.match(text, /⌃⌥⌘O/);
+  assert.match(text, /drag.*position presets/i);
+  assert.match(text, /Show in recordings/);
+  assert.match(text, /exclusion.*best.effort.*not a guarantee/i);
+  assert.ok(button(capture, 'Show overlay'));
+  assert.equal(ui.requests.some(r => r.path === '/start' || r.path === '/assist'), false);
+});
+
 test('quick overlay failure and screen-share privacy warning are disclosed without opening details', async () => {
   const ui = pane('', true, false, '', {}, {
     '/overlay/show': () => { throw new Error('fake-sensitive-transport-detail'); },
