@@ -13,7 +13,7 @@ import prepare_macos
 class PreparationTests(unittest.TestCase):
     def test_preparation_compiles_usage_metadata_and_never_starts_capture(self):
         with tempfile.TemporaryDirectory() as tmp:
-            core = Path(tmp) / 'plugins/meeting-copilot-live/dashboard/core'
+            core = Path(tmp).resolve() / 'plugins/meeting-copilot-live/dashboard/core'
             (core / 'native').mkdir(parents=True)
             for name in ('audio_worker.py', 'overlay_bridge.py', 'native/macos_capture.swift',
                          'native/macos_overlay.swift', 'requirements-macos-audio.txt',
@@ -68,7 +68,7 @@ class PreparationTests(unittest.TestCase):
 
     def test_cli_does_not_create_bytecode_in_checkout(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             source = Path(prepare_macos.__file__).resolve().parent
             for name in ('prepare_macos.py', 'native_runtime.py'):
                 shutil.copyfile(source / name, root / name)
@@ -80,7 +80,7 @@ class PreparationTests(unittest.TestCase):
 
     def test_catalog_setup_leaves_checkout_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp:
-            plugin = Path(tmp) / 'plugins/meeting-copilot-live'
+            plugin = Path(tmp).resolve() / 'plugins/meeting-copilot-live'
             (plugin / 'native').mkdir(parents=True)
             for name in ('plugin.yaml', 'audio_worker.py', 'overlay_bridge.py',
                          'native/macos_capture.swift', 'native/macos_overlay.swift',

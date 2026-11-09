@@ -21,7 +21,7 @@ class NativeRuntimeTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.home = Path(self.tmp.name) / 'profile'
+        self.home = Path(self.tmp.name).resolve() / 'profile'
         self.plugin = self.home / 'plugins/meeting-copilot-live'
         (self.plugin / 'native').mkdir(parents=True)
         for name in ('plugin.yaml', 'audio_worker.py', 'overlay_bridge.py',
