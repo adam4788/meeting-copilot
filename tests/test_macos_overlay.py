@@ -69,7 +69,7 @@ class OverlayProtocolTests(unittest.TestCase):
     """Source-level presentation and wire contracts; run on all platforms."""
 
     def test_overlay_background_is_translucent_without_dimming_text(self):
-        source = SOURCE.read_text()
+        source = SOURCE.read_text(encoding='utf-8')
         self.assertIn('.background(Color.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 14))', source)
         self.assertNotIn('NSVisualEffectView(', source, 'a material underlay obscures the desktop')
         self.assertNotIn('window.alphaValue', source, 'window opacity also fades text and controls')
@@ -77,14 +77,14 @@ class OverlayProtocolTests(unittest.TestCase):
         self.assertIn('.preferredColorScheme(.dark)', source)
 
     def test_snapshot_protocol_carries_streaming_identity_and_share_warning(self):
-        source = SOURCE.read_text()
+        source = SOURCE.read_text(encoding='utf-8')
         for token in ('"completed_only"', 'share_warning', 'shareWarning', 'Streaming answer',
                       'ignoresMouseEvents = true', 'sharingType = .none'):
             self.assertIn(token, source)
         self.assertRegex(source, r'sharingType\s*=\s*\.none')
 
     def test_controls_explain_temporary_interaction_and_best_effort_exclusion(self):
-        source = SOURCE.read_text()
+        source = SOURCE.read_text(encoding='utf-8')
         for label in ('Drag to move', '⌃⌥⌘O', 'Top left', 'Top center', 'Top right',
                       'Bottom left', 'Bottom center', 'Bottom right', 'Show in recordings',
                       'Exclusion is best effort', 'Hide it in the pane'):
@@ -96,7 +96,7 @@ class OverlayProtocolTests(unittest.TestCase):
         self.assertNotIn('Private mode', source)
 
     def test_privacy_controls_are_pinned_above_scrollable_content(self):
-        source = SOURCE.read_text().split('struct OverlayView: View {', 1)[1].split('// Route only', 1)[0]
+        source = SOURCE.read_text(encoding='utf-8').split('struct OverlayView: View {', 1)[1].split('// Route only', 1)[0]
         pinned, content = source.split('ScrollView {', 1)
         self.assertIn('Toggle("Show in recordings"', pinned)
         self.assertIn('Exclusion is best effort', pinned)
@@ -106,7 +106,7 @@ class OverlayProtocolTests(unittest.TestCase):
                         'detected questions must not be pushed below the transcript')
 
     def test_overlay_never_initiates_answer_from_a_row(self):
-        source = SOURCE.read_text()
+        source = SOURCE.read_text(encoding='utf-8')
         self.assertNotIn('Button(action: { model.click(', source)
         self.assertNotIn('"type": "click"', source)
 
