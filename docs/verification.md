@@ -31,7 +31,7 @@ checkpoint. Follow the [Windows setup troubleshooting](windows-setup.md#desktop-
 
 ## Evidence build: 9a261fd (2026-11-08)
 
-The installation guides pin `9a261fd4e549f7ce1715fc39ee49b5a2907d42c6`, which
+This historical checkpoint used `9a261fd4e549f7ce1715fc39ee49b5a2907d42c6`, which
 adds portable answer/evidence copy and immutable per-answer transcript context.
 Its exact runtime export passed doctor discovery/import/registration and catalog
 validation including dependency preparation; security scan reported SAFE. Two
@@ -49,3 +49,42 @@ runs are available in [Actions](https://github.com/adam4788/meeting-copilot/acti
 Backend timestamps remain uninterpreted, and a valid reference is not proof that
 a model's claim is true. No new physical recording, live provider account test,
 or successful packaged Windows activation is claimed by this build.
+
+## Settings and lifecycle checkpoint: c5aa3cf (2026-11-08)
+
+The installation guides now pin
+`c5aa3cf85bd94ce7134925d0ebc0c1c5a17c9f12`.
+[PR #8](https://github.com/adam4788/meeting-copilot/pull/8) moves answer
+preferences into native plugin settings, hardens capture/error reporting, and
+improves transcript/evidence export.
+[PR #9](https://github.com/adam4788/meeting-copilot/pull/9) registers the host's
+explicit disposer, releases owned/in-flight pane claims, and prevents retained
+callbacks from reopening or using an unloaded plugin.
+
+[All five main-commit CI jobs passed](https://github.com/adam4788/meeting-copilot/actions/runs/42535380563):
+Windows/Linux Python 3.11 and 3.12, plus macOS tests and helper build/self-test.
+The final PR-head checks passed too; failures on earlier PR revisions do not
+describe this commit. The PR #9 synthetic checkpoint reports 886 Python tests
+run (23 skipped) and 200 Desktop tests passed. Those checks exercise fixtures,
+including host unload during synthetic backend capture, not a physical device
+or a live provider account.
+
+An independent macOS check on November 9 repeated 886 Python 3.11 tests
+(23 skipped), all 200 Desktop tests under Node 22, and all three runtime-export
+checks. The fake-provider walkthrough also completed, explicitly without a model
+call. The clean source exported 61 runtime files. Doctor passed discovery,
+manifest parsing, import and registration in a disposable Hermes home; it warned
+that the conditional Windows-only SoundCard dependency was not installed on
+macOS. The official `validate --install-deps` then completed dependency
+resolution/installation and passed all admission checks; the security scan
+reported safe. Validation reports isolated plugin-host mode with buffered
+dashboard responses. This does not establish request-scoped BYOK handoff; the
+[compatibility caveat](catalog-compatibility.md) still applies. No repair of the
+active runtime was performed. The validated export is local and unpublished;
+its source revision is the public pin above, not a separate catalog release.
+
+Installation is a separate step. A machine may still have an older plugin even
+when its Hermes application has been updated. Check the installed plugin against
+the pinned source; matching files alone do not prove the running process loaded
+them. No complete live meeting, Windows native capture, OpenAI/OpenRouter
+response, or long-call reliability is established by this checkpoint.
