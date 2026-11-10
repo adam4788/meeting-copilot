@@ -205,6 +205,31 @@ class GatewayTests(unittest.TestCase):
             self.assertNotIn('PYTHONHOME', env)
             self.assertEqual(env.get('PATH'), os.environ.get('PATH'))
 
+    def test_worker_env_is_an_exact_allowlist_for_each_provider(self):
+        from macos_audio import worker_env
+        ordinary = {'PATH': '/usr/bin', 'HOME': '/synthetic/home',
+                    'USER': 'synthetic', 'TMPDIR': '/tmp', 'LANG': 'en_US.UTF-8',
+                    'LC_CTYPE': 'UTF-8', '__CF_USER_TEXT_ENCODING': '0:0:0'}
+        model = {'HF_HOME': '/synthetic/cache', 'HF_HUB_CACHE': '/synthetic/hub',
+                 'HF_HUB_OFFLINE': '1'}
+        forbidden = {key: 'synthetic-not-a-real-secret' for key in (
+            'TELEGRAM_BOT_TOKEN', 'SLACK_BOT_TOKEN', 'GITHUB_TOKEN', 'HF_TOKEN',
+            'AWS_SECRET_ACCESS_KEY', 'MODEL_API_KEY', 'OPENAI_API_KEY',
+            'HERMES_HOME', 'HERMES_LAUNCHD_LABEL', 'PYTHONPATH', 'PYTHONHOME',
+            'DYLD_INSERT_LIBRARIES', 'LD_PRELOAD', 'HTTP_PROXY', 'HTTPS_PROXY',
+            'HF_TOKEN_PATH', 'HF_HUB_TOKEN', 'HF_HUB_ACCESS_TOKEN',
+            'HF_ENDPOINT', 'LC_CUSTOM_SECRET', 'UNRELATED_FUTURE_CREDENTIAL')}
+        parent = {**ordinary, **model, **forbidden,
+                  'HF_HUB_DISABLE_IMPLICIT_TOKEN': '0'}
+        with patch.dict(os.environ, parent, clear=True):
+            for provider in ('local', 'meta'):
+                with self.subTest(provider=provider):
+                    expected = {**ordinary, 'HF_HUB_DISABLE_IMPLICIT_TOKEN': '1'}
+                    if provider == 'local':
+                        expected.update(model)
+                    self.assertEqual(worker_env(provider), expected)
+            self.assertEqual(dict(os.environ), parent)
+
     def test_worker_spawn_uses_hermetic_env(self):
         import subprocess
         import sys
@@ -219,7 +244,9 @@ class GatewayTests(unittest.TestCase):
         started = threading.Event()
         with patch.dict(os.environ, {'MEETING_COPILOT_AUDIO_PYTHON': sys.executable,
                                       'PYTHONPATH': '/host/venv-3.14/site-packages',
-                                      'PYTHONHOME': '/host'}), \
+                                      'PYTHONHOME': '/host',
+                                      'TELEGRAM_BOT_TOKEN': 'synthetic-token',
+                                      'AWS_SECRET_ACCESS_KEY': 'synthetic-key'}), \
                 patch('subprocess.Popen', factory):
             capture = MacOSAudioCapture()
             capture.start(print, lambda value: started.set() if value['state'] == 'running' else None)
@@ -227,6 +254,9 @@ class GatewayTests(unittest.TestCase):
             capture.stop()
         self.assertNotIn('PYTHONPATH', seen)
         self.assertNotIn('PYTHONHOME', seen)
+        self.assertNotIn('TELEGRAM_BOT_TOKEN', seen)
+        self.assertNotIn('AWS_SECRET_ACCESS_KEY', seen)
+        self.assertEqual(seen['HF_HUB_DISABLE_IMPLICIT_TOKEN'], '1')
 
     def test_worker_error_is_sanitized_and_callbacks_are_contained(self):
         import subprocess
