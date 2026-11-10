@@ -4076,3 +4076,25 @@ test('snapshot retry forwards only server replay identity and original text, nev
   assert.equal(request.body.transcript, 'saved input');
   assert.equal(request.body.transcript_snapshot, undefined);
 });
+
+test('visual workspace keeps capture and privacy controls disclosed and styles scoped', () => {
+  const ui = pane('', true, false, '', {}, {}, { listening: true, backend: 'macos' });
+  assert.equal(ui.tree.props.className, 'mc-workspace');
+  assert.ok(nodes(ui.tree).find(n => n.type === 'h1' && n.children.includes('Meeting Copilot')));
+  assert.ok(disclosedNodes(ui.tree).find(n => n.type === 'button' && n.children.includes('Pause listening')));
+  assert.match(JSON.stringify(disclosedNodes(ui.tree)), /Screen-share privacy/);
+  const css = nodes(ui.tree).find(n => n.type === 'style').children.join('');
+  assert.match(css, /\.mc-workspace .*focus-visible/);
+  assert.match(css, /@container \(max-width: 300px\)/);
+  assert.match(css, /prefers-reduced-motion/);
+  assert.equal(ui.requests.length, 0);
+});
+test('visual answer card retains full evidence and empty state never replaces an answer', () => {
+  const empty = pane('').tree;
+  assert.ok(nodes(empty).find(n => n.props.className === 'mc-empty'));
+  const ui = pane('', true, false, '', {}, {}, { result: { answer: 'Synthetic answer [1].', sources: [{ title: 'Synthetic source', text: 'Synthetic evidence.', source: 'demo/launch.md' }] } });
+  assert.equal(nodes(ui.tree).filter(n => n.props.className === 'mc-empty').length, 0);
+  assert.equal(nodes(ui.tree).find(n => n.props['data-answer-result']).props.className, 'mc-answer');
+  assert.ok(nodes(ui.tree).find(n => n.props.className === 'mc-evidence-card'));
+  assert.match(JSON.stringify(ui.tree), /Synthetic evidence/);
+});
