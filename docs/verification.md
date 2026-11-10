@@ -88,3 +88,20 @@ when its Hermes application has been updated. Check the installed plugin against
 the pinned source; matching files alone do not prove the running process loaded
 them. No complete live meeting, Windows native capture, OpenAI/OpenRouter
 response, or long-call reliability is established by this checkpoint.
+
+## Desktop visual refresh (November 10)
+
+The pane uses a theme-aware workspace header, a visible capture card, distinct
+question and answer surfaces, evidence cards, and transcript/history containers.
+Focus outlines and narrow-pane wrapping are scoped to this plugin. Answer auto-scroll
+respects reduced-motion preferences. Capture, consent, request scoping, settings,
+copy confirmations, and privacy disclosures keep their existing behavior.
+
+A local browser review used fictional content rendered through the Desktop test
+harness with semantic stand-ins for SDK controls. Reviewed the dark 440px answer
+and expanded evidence, light 320px paused layout, and visible stop-unconfirmed
+warning/Retry stop. This is layout evidence, not a real Hermes runtime, provider,
+audio, or end-to-end meeting test. Actual SDK rendering still needs a post-update
+smoke test. Final local checks passed: 925 Python tests (24 platform/opt-in skips),
+283 Desktop tests, JavaScript syntax, and `git diff --check`. The local run used
+Python 3.11 and Node 26.7.0; Node 22 compatibility remains a CI check.

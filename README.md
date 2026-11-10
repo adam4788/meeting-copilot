@@ -1,4 +1,4 @@
-> Runtime-only source release. Development tests and mutation probes are retained in source commit `f5f038ecabf28dfb161f9a9fc8166392e34dcac5`. Their omission is an explicit packaging boundary, not a scanner suppression.
+> Runtime-only source release. Development tests and mutation probes are retained in source commit `b2674e50637dc1417fa82803e57e8ffc2e1e0f61`. Their omission is an explicit packaging boundary, not a scanner suppression.
 
 # Meeting Copilot
 
