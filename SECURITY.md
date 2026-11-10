@@ -49,8 +49,12 @@ credential snapshots; a submitted request cannot be recalled by changing keys.
 
 The standalone CLI is offline-only and does not read provider credentials.
 For optional Meta transcription, the authenticated parent passes the scoped
-key once over a private worker pipe, not through the worker environment. See
-[BYOK boundaries](docs/byok.md) and the [optional Meta route](docs/meta-api-key.md).
+key once over a private worker pipe, not through the worker environment. Audio
+workers inherit only explicitly named OS/locale settings and, for local models,
+`HF_HOME`, `HF_HUB_CACHE` and `HF_HUB_OFFLINE`. Unrelated host secrets, Python
+loader overrides and arbitrary `HF_HUB_*` values are excluded. Implicit Hugging
+Face cached-token use is disabled because the supported Whisper weights are public.
+See [BYOK boundaries](docs/byok.md) and the [optional Meta route](docs/meta-api-key.md).
 
 ## Limitations
 

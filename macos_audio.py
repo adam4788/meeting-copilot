@@ -142,11 +142,24 @@ def clean_writer_timing(value):
 
 
 def worker_env(provider='local'):
-    """Hermetic env for the isolated worker: never inherit the launcher's
-    PYTHONPATH/PYTHONHOME (e.g. Hermes's own 3.14 site-packages), which would
-    shadow the audio-runtime's 3.12 packages and break model loading."""
-    env = {k: v for k, v in os.environ.items()
-           if k not in ('PYTHONPATH', 'PYTHONHOME', 'MODEL_API_KEY', 'HERMES_LAUNCHD_LABEL') and not k.endswith(('_API_KEY', '_ACCESS_TOKEN', '_AUTH_TOKEN', '_SECRET_KEY'))}
+    """Pass only named OS/locale and public-model cache settings to workers.
+
+    Never inherit host credentials or Python/dynamic-loader configuration.
+    Meta credentials use the separate, request-scoped stdin handoff. Keep model
+    settings explicit: HF_HUB_* can contain credentials and is not a safe prefix.
+    """
+    allowed = {
+        'PATH', 'HOME', 'USER', 'LOGNAME', 'TMPDIR', 'LANG',
+        'LC_ALL', 'LC_CTYPE', 'LC_MESSAGES', 'LC_NUMERIC', 'LC_TIME',
+        'LC_COLLATE', 'LC_MONETARY', 'LC_PAPER', 'LC_NAME', 'LC_ADDRESS',
+        'LC_TELEPHONE', 'LC_MEASUREMENT', 'LC_IDENTIFICATION',
+        '__CF_USER_TEXT_ENCODING',
+    }
+    if provider == 'local':
+        allowed.update({'HF_HOME', 'HF_HUB_CACHE', 'HF_HUB_OFFLINE'})
+    env = {key: value for key, value in os.environ.items() if key in allowed}
+    # Public Whisper weights need no account token, including cached logins.
+    env['HF_HUB_DISABLE_IMPLICIT_TOKEN'] = '1'
     return env
 
 

@@ -14,11 +14,11 @@ class CredentialRuntimeTests(unittest.TestCase):
         ambient={'OPENAI_API_KEY':'synthetic-openai','OPENROUTER_API_KEY':'synthetic-router','MODEL_API_KEY':'synthetic-meta','ANTHROPIC_API_KEY':'synthetic-other','AWS_SECRET_KEY':'synthetic-aws','PYTHONPATH':'bad','PYTHONHOME':'bad','PATH':'runtime-path'}
         with patch.dict(os.environ,ambient,clear=True),patch.object(macos_audio,'_model_api_key',side_effect=AssertionError('local ASR must not load keys')):
             env=macos_audio.worker_env('local')
-        self.assertEqual(env,{'PATH':'runtime-path'})
+        self.assertEqual(env,{'PATH':'runtime-path','HF_HUB_DISABLE_IMPLICIT_TOKEN':'1'})
     def test_meta_worker_environment_contains_no_provider_key(self):
         with patch.dict(os.environ,{'OPENAI_API_KEY':'synthetic-openai','OPENROUTER_API_KEY':'synthetic-router','MODEL_API_KEY':'synthetic-owner'},clear=True),patch.object(macos_audio,'_model_api_key',side_effect=AssertionError('environment builder must not resolve keys')):
             env=macos_audio.worker_env('meta')
-        self.assertEqual(env,{})
+        self.assertEqual(env,{'HF_HUB_DISABLE_IMPLICIT_TOKEN':'1'})
     def test_no_import_time_file_read_or_environment_mutation(self):
         import importlib,meta_models
         before=dict(os.environ)
