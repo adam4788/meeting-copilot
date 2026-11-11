@@ -22,7 +22,7 @@ def windows_readiness():
         return {'ready': False, 'detail': 'Windows capture needs optional audio dependencies in the gateway interpreter: '
                 + ', '.join(missing) + '. See the Windows setup guide. Capture remains unavailable.'}
     return {'ready': True, 'detail': 'Experimental Windows capture: dependencies found; hardware unverified. '
-            'First Start may download local Whisper weights. System capture includes all audio on the default output.'}
+            'Complete device/privacy preflight is unavailable, so native Start remains blocked; use an active Meetily recording. System capture would include all audio on the default output.'}
 
 
 class AudioCapture:

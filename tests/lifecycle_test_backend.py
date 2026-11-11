@@ -21,6 +21,7 @@ with warnings.catch_warnings():
     )
     from fastapi.testclient import TestClient
 import server
+from tests.thread_test_support import synthetic_ready_preflight
 
 
 class TickComplete(Exception):
@@ -41,6 +42,10 @@ class Audio:
 
 
 class State(server.MeetingState):
+    def capture_preflight(self, *args, **kwargs):
+        # The bridge exercises lifecycle behavior with synthetic capture only.
+        return synthetic_ready_preflight(*args, **kwargs)
+
     def watchdog(self, capture_generation=None):
         # Production launches a daemon. The test drives its real implementation
         # one iteration at a time, on demand, rather than racing wall time.

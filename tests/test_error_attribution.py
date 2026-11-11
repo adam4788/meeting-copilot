@@ -1,4 +1,5 @@
 """Offline error provenance regressions; no audio or provider services."""
+from tests.thread_test_support import mock_capture_preflight
 import threading
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,6 +10,10 @@ from tests.thread_test_support import CheckedThreads
 
 
 class ErrorAttributionTests(CheckedThreads):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_synchronous_new_startup_failure_and_pending_stop_survive_start(self):
         from fastapi import HTTPException
         for unconfirmed in (False, True):

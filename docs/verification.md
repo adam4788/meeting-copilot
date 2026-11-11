@@ -7,8 +7,8 @@ output of the current run for test counts and platform skips.
 Earlier checkpoints include headless Swift helper checks, synthetic file
 transcription, and limited device observations. They do not establish current
 Windows Desktop capture, live OpenAI/OpenRouter responses, visual acceptance,
-multi-speaker accuracy, or long-call reliability. macOS native frame loss remains
-unresolved; see the [backpressure investigation](native-backpressure.md).
+multi-speaker accuracy, or long-call reliability. See the newer bounded Mac
+checkpoint below and the [backpressure investigation](native-backpressure.md).
 
 [Development](development.md) describes repeatable offline checks. Prior
 checkpoint details, including superseded provider and credential designs, remain
@@ -105,3 +105,38 @@ audio, or end-to-end meeting test. Actual SDK rendering still needs a post-updat
 smoke test. Final local checks passed: 925 Python tests (24 platform/opt-in skips),
 283 Desktop tests, JavaScript syntax, and `git diff --check`. The local run used
 Python 3.11 and Node 26.7.0; Node 22 compatibility remains a CI check.
+
+
+## Bounded Mac and generated-audio checkpoint: 0747967
+
+Local source `074796717792f3e425f107bc6e1a37239ee1a7eb` passed 1,031 Python tests
+(24 platform/optional-host skips) and 327 Node tests. Independent source/safety
+review covered capture preflight, consent and stale-request fencing, cache-only
+Whisper loading, multichannel normalization, shutdown, Google admission and
+compact-pane safety cues. Hosted CI and catalog validation remain separate gates.
+
+A generated, nonpersonal 38.4-second English meeting fixture was replayed through
+the actual isolated worker, without microphone/system capture:
+
+| Route | Normalized reference comparison | Wall time | Outcome |
+| --- | --- | --- | --- |
+| Local `tiny.en` | 119 reference words; one insertion; 0.84% WER | 39.605 s | Five completed chunks, no empty chunks, drops or errors; clean stop |
+| Google `gemini-3.5-transcribe-live` | 119 reference words matched; 0% WER | 44.179 s | One final event; all reference facts and final words matched; worker stopped |
+
+Normalization ignores case/punctuation and treats “12” as “twelve”. These are
+observations from **one controlled fixture**, not a general accuracy claim,
+independent speaker identification or proof of live meeting/system-audio capture.
+The Google request sent 1,228,800 PCM bytes and returned 685 final text characters.
+Its $1 local reservation is **not the charge**; actual billing was not reported.
+The protocol's final tail remains explicitly unconfirmed even though this fixture's
+reference ending was present. No answer-model call was part of this comparison.
+
+Separate short consented Mac observations showed microphone transcription working
+and zero observed native/worker drops after the normalization/batching fixes.
+System audio was still silent in one setup. No blanket platform restriction,
+long-call reliability or complete live-meeting success is claimed. The compact
+pane's sticky header uses the host's opaque elevated surface, not its translucent
+card color, to keep status and Pause legible while scrolling.
+
+Publication of this source does not itself update the runtime branch or catalog.
+Use only an independently validated public runtime pin for catalog installation.

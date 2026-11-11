@@ -54,12 +54,15 @@ release. Current rules impose no commit-age waiting period.
 
 ## Installation disclosures
 
-- Explicit questions send bounded transcript/context and retrieved excerpts to
-  the selected OpenAI or OpenRouter HTTPS API. Optional explicit Meta routes
-  also contact Meta. Model access, billing and retention are provider-specific;
-  live OpenAI/OpenRouter account responses remain unverified.
-- Capture requires consent and Start. Optional Meta transcription sends audio
-  off-device. Local Whisper uses an isolated audio environment and model cache;
+- Explicit questions send bounded transcript/context and retrieved excerpts
+  through the supported Hermes default route or the selected OpenAI/OpenRouter
+  HTTPS API. Explicit Meta and Google transcription routes send audio off-device.
+  Model access, billing and retention are provider-specific; live OpenAI/OpenRouter
+  account responses remain unverified. See [the bounded Google preview](google-transcription.md)
+  and its generated-audio evidence, limits and reservation-versus-billing distinction.
+- Capture requires consent and Start. Optional Meta or Google transcription sends
+  audio off-device. Google is a 60-second-per-source preview with a shared four-stream
+  admission allowance; source labels are not speaker diarization. Local Whisper uses an isolated audio environment and model cache;
   initial model preparation may download weights.
 - macOS audio setup targets Apple Silicon and requires preinstalled CPython 3.12,
   uv and Apple Command Line Tools with the macOS 26 SDK. It installs the committed

@@ -41,7 +41,7 @@ def writer_source(root):
     # Extract the real bounded queue and serialization/write/loss code. A changed
     # production boundary fails loudly rather than silently testing an old copy.
     start = native.index('private let writer =')
-    end = native.index('private var terminating =')
+    end = native.index('// Coalesce tiny hardware callbacks')
     return 'import Foundation\n' + native[start:end] + DRIVER
 
 

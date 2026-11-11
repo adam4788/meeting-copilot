@@ -1,4 +1,5 @@
 """Deterministic overlay privacy regressions; no devices or live providers."""
+from tests.thread_test_support import mock_capture_preflight
 import json
 import threading
 import unittest
@@ -10,6 +11,10 @@ import server
 
 
 class PrivacyTests(CheckedThreads):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def make_backend(self):
         engine = Mock()
         engine.supports_streaming.return_value = False

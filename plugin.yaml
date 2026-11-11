@@ -24,3 +24,7 @@ config_schema:
     type: secret
     env: MODEL_API_KEY
     label: Optional Meta API key
+  google_transcription_api_key:
+    type: secret
+    env: MEETING_COPILOT_GEMINI_API_KEY
+    label: Optional Google Gemini transcription API key

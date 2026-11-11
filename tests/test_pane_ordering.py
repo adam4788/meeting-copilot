@@ -1,4 +1,5 @@
 """Offline HTTP lifecycle reproductions; assertions run on the test thread."""
+from tests.thread_test_support import mock_capture_preflight
 from unittest.mock import Mock, patch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -7,6 +8,10 @@ from tests.thread_test_support import CheckedThreads
 
 
 class PaneOrderingTests(CheckedThreads):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def client(self, state):
         app = FastAPI()
         app.include_router(server.make_router(state))

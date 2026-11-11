@@ -838,6 +838,10 @@ class KnowledgeEngine:
         # A fallback answer arrived completed, even on a streaming-capable
         # route: report what this answer did, not what the route could do.
         streaming = False if prepared is not None else _completion_supports_streaming(complete)
+        if answer_provider == 'hermes':
+            reported_route = getattr(complete, 'model_route', None)
+            model_route = reported_route if isinstance(reported_route, str) and reported_route else 'hermes/default (host route unreported)'
+            warnings.append('Uses the current Hermes default and host routing/fallback policy. Retrying uses the current default, which may have changed.')
         return {'answer': text, 'sources': sources, 'elapsed_seconds': round(time.monotonic() - started, 3), 'warnings': warnings, 'web_search': web, 'model_route': model_route,
                 'streaming': streaming, 'completed_only': not streaming, 'provider_error': provider_error,
                 'transcript_snapshot': transcript_snapshot.public() if transcript_snapshot is not None and provider_error is None else None}

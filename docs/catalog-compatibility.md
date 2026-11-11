@@ -9,7 +9,19 @@ with the public `agent.secret_scope.get_secret` API only inside a host-bound
 profile scope. The plugin checks the scope's home, uses strict scope semantics,
 and rejects absent or mismatched scopes and missing keys; it does not borrow
 the process environment. An admitted request may finish with its existing host
-scope after a key change. Provider/model selection remains explicit.
+scope after a key change. Explicit BYOK selections remain fixed routes. New preferences select Follow
+Hermes default, implemented only through the genuine registration-supplied
+public `ctx.llm`, not direct construction or host registry lookup. The plugin's
+own loader shares that facade with the dashboard runtime for the same root and
+source version, and unload revokes it. Readiness checks require matching
+registration and request homes. No core secret is copied.
+
+The default route is completed-only and follows the host's configured main model
+and routing/fallback policy at call time. It fails closed if registration did not
+run in this process, if the request scope is absent/mismatched, or if the supplied
+facade is remote/isolated. A detached worker cannot safely use an isolated parent
+RPC context after its admitting HTTP request returns. Explicit BYOK failure never
+falls back to Hermes. Default retries use the then-current host configuration.
 
 The floating overlay is read-only. It retains no pane credential context and
 cannot initiate answers, including when an older helper sends a click. Ask from

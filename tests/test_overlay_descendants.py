@@ -1,4 +1,5 @@
 """Real, inert process families; no UI or signaling of unrelated processes."""
+from tests.thread_test_support import mock_capture_preflight
 import os
 from pathlib import Path
 import sys
@@ -116,6 +117,10 @@ time.sleep(20)
 
 @unittest.skipUnless(sys.platform in ('darwin', 'linux'), 'POSIX process groups required')
 class OverlayDescendantTests(CheckedThreads):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_controller_does_not_infer_shutdown_from_exited_parent(self):
         with real_family(parent_exits=True) as (bridge, process, root):
             state = server.MeetingState()

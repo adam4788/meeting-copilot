@@ -46,10 +46,19 @@ def _discover_models():
         from .byok import catalog
     except ImportError:
         from byok import catalog
-    return catalog()
+    try:
+        from .host_default import catalog_entry
+    except ImportError:
+        from host_default import catalog_entry
+    result = catalog()
+    return {**result, 'providers': [catalog_entry(), *result['providers']]}
 
 
 def validate_selection(provider, model):
+    if provider == 'hermes':
+        if model != 'default':
+            raise ValueError('Choose Follow Hermes default or an explicit provider/model override.')
+        return provider, model
     try:
         from .byok import validate
     except ImportError:
@@ -67,6 +76,12 @@ def validate_selection(provider, model):
 
 def selected_completion(provider, model):
     provider, model = validate_selection(provider, model)
+    if provider == 'hermes':
+        try:
+            from .host_default import completion
+        except ImportError:
+            from host_default import completion
+        return completion()
     if provider == 'meta':
         try:
             from .meta_models import meta_completion

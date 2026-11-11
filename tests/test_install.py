@@ -38,6 +38,9 @@ class InstallerTests(unittest.TestCase):
             for name in install.FILES:
                 (source / name).parent.mkdir(parents=True, exist_ok=True)
                 (source / name).write_text('# Synthetic fixture\n', encoding='utf-8')
+            (source / 'dashboard').mkdir()
+            for name in ('__init__.py', 'dashboard/plugin_api.py'):
+                (source / name).write_text((Path(__file__).parent.parent / name).read_text())
             (source / 'desktop/plugin.js').write_text('export default {};\n', encoding='utf-8')
             (source / 'plugin.yaml').write_text((Path(__file__).parent.parent / 'plugin.yaml').read_text())
             original = (home / 'config.yaml').read_bytes()
@@ -57,7 +60,9 @@ class InstallerTests(unittest.TestCase):
             for name in install.FILES:
                 self.assertEqual((backend / 'core' / name).read_bytes(), (source / name).read_bytes())
             self.assertTrue((home / 'desktop-plugins/meeting-copilot-live/plugin.js').is_file())
+            (source / 'dashboard/plugin_api.py').write_text((source / 'dashboard/plugin_api.py').read_text() + '\n# New loader revision\n')
             second = install.install(source, home)
+            self.assertNotEqual(json.loads((backend / 'manifest.json').read_text())['api'], api_file)
             self.assertTrue(Path(second['backup']).is_dir())
             self.assertEqual((home / 'config.yaml').read_bytes(), original)
 

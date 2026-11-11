@@ -1,4 +1,5 @@
 """Inert real helpers: protocol bytes and live display stdout health."""
+from tests.thread_test_support import mock_capture_preflight
 import os
 from pathlib import Path
 import subprocess
@@ -84,6 +85,10 @@ time.sleep(20)
 
 @unittest.skipUnless(sys.platform in ('darwin', 'linux'), 'POSIX pipe/select helper required')
 class ChannelHealthTests(CheckedThreads):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_fresh_direct_show_rejects_active_stdout_eof(self):
         with closing_display() as (bridge, children, close_stdout):
             push = bridge.push

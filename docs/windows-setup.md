@@ -1,5 +1,10 @@
 # Windows Desktop setup
 
+> Current safety limit: native Windows Start is blocked because complete
+> nonprompting device/privacy readiness checks are unavailable. Use an accessible
+> active Meetily recording. The instructions below prepare dependencies only and
+> do not bypass the required [preflight](preflight.md).
+
 Requires native Hermes Desktop / Agent 0.22.7 or newer. Check the installed
 version with `hermes --version`. Native Windows normally stores data in
 `$env:LOCALAPPDATA\hermes`; an explicit `HERMES_HOME` selects the active profile.

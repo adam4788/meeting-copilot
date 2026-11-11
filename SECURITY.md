@@ -2,7 +2,7 @@
 
 ## Data flow
 
-- Microphone and loopback audio are processed locally after explicit consent when using native capture with local transcription. Optional explicit Meta transcription sends audio off-device; local model preparation may download weights.
+- Microphone and loopback audio are processed locally after explicit consent when using native capture with local transcription. Optional explicit Meta or Google transcription sends audio off-device; local model preparation may download weights.
 - The optional, unofficial Meetily adapter reads only an explicitly attached active recording's live JSON snapshots. Meetily independently saves audio/transcripts according to its own settings; this project does not erase or change those files.
 - This project does not write additional raw audio or transcripts to disk. Transcripts and
   answer results remain in bounded process memory until cleared or the process exits.
@@ -36,14 +36,22 @@ default profile. Production requests use `agent.secret_scope.get_secret` in a
 bound host scope; unavailable scopes fail closed. The plugin does not edit
 credential stores. The old in-pane editor and startup dotenv bridge are retired.
 
-Choose an explicit provider and exact model ID, transcript source and audio
+New preferences follow the current Hermes default through the genuine
+registration-supplied public LLM facade, only in a matching host-bound profile
+scope and supported nonisolated runtime. Hermes owns its credentials and
+routing/fallback policy; Copilot never copies core secrets. Missing registration,
+remote isolation or an unavailable scope blocks that route. Existing explicit
+provider choices are retained. Retries in default mode use the current Hermes
+default, which may differ from the original request.
+
+You can instead choose an explicit BYOK provider and exact model ID. Set transcript source and audio
 defaults in **Settings → Plugins → Meeting Copilot** (or the pane's Answer
 setup and Transcript source on older Desktop hosts). The pane retains live
 controls, active recording selection, explicit consent, privacy disclosures, and
 the optional per-request public web query. On modern hosts, changes to capture
 defaults require fresh permission confirmation in the pane. On older hosts,
 review permission again after changing capture choices. There is no
-generic host-model fallback. After changing keys, finish requests, pause capture,
+implicit fallback from a failed BYOK route to the host default. After changing keys, finish requests, pause capture,
 and reopen the pane. Already admitted workers retain their
 credential snapshots; a submitted request cannot be recalled by changing keys.
 
@@ -55,6 +63,25 @@ workers inherit only explicitly named OS/locale settings and, for local models,
 loader overrides and arbitrary `HF_HUB_*` values are excluded. Implicit Hugging
 Face cached-token use is disabled because the supported Whisper weights are public.
 See [BYOK boundaries](docs/byok.md) and the [optional Meta route](docs/meta-api-key.md).
+
+## Readiness and explicit setup
+
+Capture preflight is read-only and fail-closed. It checks source-specific local
+requirements and consent without capture, permission prompts, downloads or
+provider calls. Start independently rechecks. Unknown Windows device/privacy
+readiness blocks native capture; Meetily remains an explicit alternative.
+**Request macOS permissions…** is a separate user-confirmed setup action which
+may show OS prompts but never starts capture. Explicit model preparation may
+download public weights; it is not invoked by checks or Start.
+
+**Load model options…** is also explicit. The selected provider receives only
+its own host-scoped saved key at a fixed HTTPS listing endpoint, not meeting or
+project content. No redirects, fallback provider, persistent catalog, automatic
+refresh or model selection is used. OpenAI listing is key-visible metadata;
+OpenRouter listing is a public catalog, not proof of account entitlements. Both
+leave credits and Chat Completions compatibility unverified. Discarded or timed-out
+requests cannot be recalled, but their results never change the chosen model.
+See [preflight and options](docs/preflight.md).
 
 ## Limitations
 
@@ -89,3 +116,16 @@ meeting context. Dragging and position presets only rearrange the window.
 For security-sensitive findings, use GitHub's private vulnerability reporting if
 available rather than posting secrets or exploit details in a public issue.
 Maintainer: [Adam Nugroho](https://github.com/adam4788).
+
+## Google preview boundary
+
+The [Google transcription preview](docs/google-transcription.md) uses a separate
+plugin-scoped secret, fixed official WebSocket origin/header auth and no retries.
+Explicit selection and fresh consent are required; source labels are not people.
+Free-tier audio may improve Google products. A durable shared local $4 reservation
+ledger admits at most four 60-second stream attempts, counting both sources and
+uncertain failures. This is not a guaranteed provider bill cap. The explicit
+synthetic WAV endpoint accepts bounded bytes only, never file paths; it shares
+Pause/lease/teardown cancellation and cannot start devices or append to meetings.
+Scoped-key changes retire an active synthetic test. No API key enters a URL,
+worker environment, log, fixture, preview ledger or result.
