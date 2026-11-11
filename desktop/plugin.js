@@ -101,8 +101,8 @@ export default {
   version: '0.1.0',
   register(ctx) {
     function MetaKeySettings() {
-      return h('section', { style: card }, h('strong', null, 'Bring your own API key'),
-        h('p', { style: muted }, 'Configure OpenAI or OpenRouter in Hermes Settings → Plugins → meeting-copilot-live (default profile; Agent settings on newer hosts). Keys stay in Hermes-managed secret settings. Never enter keys in chat or model fields. Reopen the pane after changing keys. Local transcription does not use an answer key.'));
+      return h('section', { style: card }, h('strong', null, 'Optional API key overrides'),
+        h('p', { style: muted }, 'Follow Hermes default uses host-owned credentials when supported. For an explicit OpenAI or OpenRouter override, configure its key in Hermes Settings → Plugins → meeting-copilot-live (default profile; Agent settings on newer hosts). Keys stay in Hermes-managed secret settings. Never enter keys in chat or model fields. Reopen the pane after changing keys. Local transcription does not use an answer key.'));
     }
     const request = (path, body) => ctx.rest(path, body === undefined ? {} : { method: 'POST', body });
     // Survives plugin unregister/re-register in the SAME renderer. Neither a
@@ -168,9 +168,11 @@ export default {
               if (typeof old?.[k] === 'string') out[k] = old[k].slice(0, 500);
           } catch (_) {}
         }
-        if (!['openai', 'openrouter'].includes(out.answerProvider)) { delete out.answerProvider; delete out.answerModel; }
+        if (out.answerProvider !== undefined && !['hermes', 'openai', 'openrouter'].includes(out.answerProvider)) { out.answerProvider = ''; out.answerModel = ''; }
         for (const key of Object.keys(out)) if (key === 'project' ? secretPath(out[key]) : secretLike(out[key])) delete out[key];
         if (out.answerModel && !safeModel(out.answerModel)) delete out.answerModel;
+        if (out.answerProvider === 'hermes') out.answerModel = 'default';
+        else if (out.answerProvider !== undefined && !out.answerModel) out.answerModel = '';
         for (const [key, choices] of Object.entries({ backend: ['meetily', 'macos', 'native'], audioSource: ['microphone', 'system', 'both'],
           transcriptionModel: ['tiny.en', 'base.en', 'small.en'], transcriptionProvider: ['local', 'meta'], asrMode: ['ENDPOINTING', 'DIARIZATION', 'PUSH_TO_TALK'] })) {
           if (out[key] !== undefined && !choices.includes(out[key])) delete out[key];
@@ -189,9 +191,10 @@ export default {
       return mac === windows ? '' : mac ? 'macos' : 'native';
     }
     const effectiveCapture = (prefs, caps) => ({ ...prefs, backend: prefs.backend || defaultBackend(caps) });
-    const preferences = atom({ project: '', backend: '', webFallback: false, transcriptionModel: 'base.en', audioSource: 'both', answerProvider: '', answerModel: '', transcriptionProvider: 'local', asrMode: 'ENDPOINTING', ...loaded,
+    const preferences = atom({ project: '', backend: '', webFallback: false, transcriptionModel: 'base.en', audioSource: 'both', answerProvider: 'hermes', answerModel: 'default', transcriptionProvider: 'local', asrMode: 'ENDPOINTING', ...loaded,
       excludeHistory: loaded.excludeHistory !== undefined ? loaded.excludeHistory : !loaded.webFallback });
     const storageFailed = atom(false);
+    let answerRevision = 0;
     let captureRevision = 0; // memory-only consent fence; never persist consent
     function savePreferences(patch) {
       if (Object.entries(patch).some(([key, value]) => (key === 'project' ? secretPath(value) : secretLike(value)) || (key === 'answerModel' && !safeModel(value)))) {
@@ -201,6 +204,7 @@ export default {
       const previous = preferences.get();
       const next = { ...previous, ...patch };
       if (['backend', 'audioSource', 'transcriptionModel', 'transcriptionProvider', 'asrMode'].some(key => previous[key] !== next[key])) captureRevision++;
+      if (['answerProvider', 'answerModel'].some(key => previous[key] !== next[key])) answerRevision++;
       preferences.set(next);
       const safe = {};
       for (const key of preferenceFields) if (next[key] !== undefined && !(key === 'backend' && !next[key])) safe[key] = next[key];
@@ -221,7 +225,7 @@ export default {
     // Synchronous local locks cover the gaps before React renders or a status
     // poll can observe a Show/answer admission. They never hold meeting data.
     const newSafety = () => ({ overlayAction: false, overlayVisible: false, overlayUnknown: false, overlayToken: 0, answer: false, answerKnown: false, answerToken: 0,
-      captureAction: false, captureUnknown: false, captureToken: 0, captureReleasePending: false, captureReleased: false });
+      permissionAction: false, captureAction: false, captureUnknown: false, captureToken: 0, captureReleasePending: false, captureReleased: false });
     let safety = newSafety(), safetyBinding = null;
     const safetySignal = atom(0);
     const signalSafety = () => safetySignal.set(safetySignal.get() + 1);
@@ -306,10 +310,40 @@ export default {
       const { project, excludeHistory, answerProvider, answerModel, webFallback } = prefs;
       const allProjects = project === '__all_projects__';
       const mounted = hasMountedPane();
-      const providers = mounted ? (models.data?.providers || []) : [{ id: 'openai', label: 'OpenAI API' }, { id: 'openrouter', label: 'OpenRouter' }];
+      const providers = mounted ? (models.data?.providers || []) : [{ id: 'hermes', label: 'Follow Hermes default' }, { id: 'openai', label: 'OpenAI API' }, { id: 'openrouter', label: 'OpenRouter' }];
       const entries = Array.isArray(projects.data) ? projects.data : (projects.data?.projects || []);
       const locked = !mayChangePreferences(qc, status, live);
       const change = patch => updatePreferences(patch, qc, status, live);
+      const [discovery, setDiscovery] = useState(null);
+      const discoveryRequest = useRef(null);
+      const chosenProvider = providers.find(p => p.id === answerProvider);
+      const currentDiscovery = discovery?.provider === answerProvider && discovery?.pane === paneRegistration
+        && bindingCurrent(discovery?.binding) ? discovery : null;
+      const listedModels = currentDiscovery?.models || [];
+      async function loadModels() {
+        const pane = paneRegistration, binding = pane?.binding, provider = preferences.get().answerProvider, revision = answerRevision;
+        const allowed = () => hasMountedPane() && paneRegistration === pane && bindingCurrent(binding)
+          && preferences.get().answerProvider === provider && answerRevision === revision && mayChangePreferences(qc, status, live);
+        if (!['openai', 'openrouter'].includes(provider) || discoveryRequest.current || !allowed() || provider !== answerProvider || chosenProvider?.configured !== true
+            || data.capabilities?.model_discovery !== true) return;
+        const label = provider === 'openai' ? 'OpenAI' : 'OpenRouter';
+        if (typeof window === 'undefined' || typeof window.confirm !== 'function' || !window.confirm(
+          `Load model options from ${label}? This sends the selected provider's saved API key to its official HTTPS model-list endpoint. No meeting, question or project content is sent. ${provider === 'openrouter' ? 'OpenRouter returns a public catalog, not proof of your account access.' : 'The list does not verify Chat Completions access or credits.'}`)) return;
+        if (!allowed()) return;
+        const token = {}; discoveryRequest.current = token;
+        setDiscovery({ provider, pane, binding, loading: true });
+        try {
+          const result = await request('/models/discover', { provider, consent: true });
+          if (!allowed() || discoveryRequest.current !== token) return;
+          if (result?.provider !== provider || !Array.isArray(result.models) || result.models.length > 2000
+              || result.models.some(id => typeof id !== 'string' || !id || !safeModel(id))) throw new Error('Invalid model listing');
+          setDiscovery({ provider, pane, binding, models: [...new Set(result.models)], status: result.status,
+            empty: result.models.length === 0 });
+        } catch (_) {
+          if (allowed() && discoveryRequest.current === token) setDiscovery({ provider, pane, binding,
+            error: 'Model options could not be loaded. Check provider setup and connection, then retry or enter an exact model ID manually.' });
+        } finally { if (discoveryRequest.current === token) { discoveryRequest.current = null; setDiscovery(current => current?.loading ? null : current); } }
+      }
       return h('div', { style: { display: 'grid', gap: 14 }, 'aria-label': 'Answer preferences' },
         h('p', { style: { ...muted, margin: 0 } }, 'These preferences apply to future answers. Changing them does not start capture or send a request.'),
         unsaved && h('p', { role: 'alert', style: { ...muted, margin: 0 } }, 'Preferences could not be saved. They apply only for this session.'),
@@ -341,11 +375,22 @@ export default {
           h('strong', null, 'Answer model'),
           h('label', { style: { display: 'grid', gap: 6 } }, h('span', { id: 'mc-provider-label' }, 'Answer provider'),
             h('select', { style: selectStyle, value: answerProvider, disabled: locked || (mounted && !data.capabilities?.independent_models), 'aria-labelledby': 'mc-provider-label',
-              onChange: e => { if ((!hasMountedPane() || data.capabilities?.independent_models) && ['', 'openai', 'openrouter'].includes(e.target.value)) change({ answerProvider: e.target.value, answerModel: '' }); } },
-              h('option', { value: '' }, 'Choose provider…'), ...providers.map(p => h('option', { value: p.id, key: p.id }, p.label || p.id)))),
-          answerProvider && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Answer model'),
+              onChange: e => { if ((!hasMountedPane() || data.capabilities?.independent_models) && ['', 'hermes', 'openai', 'openrouter'].includes(e.target.value)) change({ answerProvider: e.target.value, answerModel: e.target.value === 'hermes' ? 'default' : '' }); } },
+              h('option', { value: '' }, 'Choose provider…'), ...providers.map(p => h('option', { value: p.id, key: p.id, disabled: mounted && p.configured !== true }, (p.label || p.id) + (mounted && p.configured !== true ? (p.id === 'hermes' ? ' — unavailable in this host' : ' — key unavailable') : ''))))),
+          answerProvider && answerProvider !== 'hermes' && h(Button, { variant: 'secondary', disabled: locked || !mounted || chosenProvider?.configured !== true || data.capabilities?.model_discovery !== true || !!currentDiscovery?.loading,
+            onClick: loadModels }, currentDiscovery?.loading ? 'Loading model options…' : 'Load model options…'),
+          answerProvider && answerProvider !== 'hermes' && h('p', { style: muted }, 'Model options are loaded only when you ask. Your saved key goes only to the selected provider; no meeting or project content is sent. Access, credits and Chat Completions compatibility remain unverified.'),
+          listedModels.length > 0 && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Listed model options'),
+            h('select', { style: selectStyle, value: listedModels.includes(answerModel) ? answerModel : '', disabled: locked,
+              'aria-label': 'Listed model options', onChange: e => { if (preferences.get().answerProvider === answerProvider && listedModels.includes(e.target.value) && currentDiscovery?.pane === paneRegistration && bindingCurrent(currentDiscovery?.binding)) change({ answerModel: e.target.value }); } },
+              h('option', { value: '' }, 'Choose a listed model…'), ...listedModels.map(id => h('option', { key: id, value: id }, id)))),
+          currentDiscovery?.status && h('p', { role: 'status', style: muted }, currentDiscovery.status),
+          currentDiscovery?.empty && h('p', { role: 'status', style: muted }, 'No text model options were returned. You can enter an exact compatible model ID manually.'),
+          currentDiscovery?.error && h('p', { role: 'alert', style: muted }, currentDiscovery.error),
+          answerProvider === 'hermes' && h('p', { role: 'status', style: muted }, 'Answers follow your current Hermes default model and Hermes routing/fallback settings. Hermes keeps its own credentials; no separate answer key is needed. Changing the Hermes default also affects future answers and retries. If this host cannot provide the scoped route, choose an explicit provider below.'),
+          answerProvider && answerProvider !== 'hermes' && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Answer model'),
             h('input', { style: selectStyle, value: answerModel, disabled: locked, maxLength: 200, placeholder: 'Exact model ID from your provider', onChange: e => change({ answerModel: e.target.value.slice(0, 200) }), 'aria-label': 'Answer model', autoComplete: 'off' })),
-          answerProvider && h('p', { role: 'status', style: muted }, mounted ? (providers.find(p => p.id === answerProvider)?.status || 'Provider unavailable; choose OpenAI or OpenRouter.') : 'Provider readiness will be checked when you open the pane.'),
+          answerProvider && h('p', { role: 'status', style: muted }, mounted ? (providers.find(p => p.id === answerProvider)?.status || 'Answer route unavailable; choose a configured supported provider.') : 'Provider readiness will be checked when you open the pane.'),
           models.error && h('p', { role: 'alert', style: { ...muted, margin: 0 } }, 'Provider readiness unavailable. Check Hermes plugin secret settings.'),
           h('p', { style: { ...muted, margin: 0 } }, 'Only for Copilot answers, not chat or transcription.')),
         h('label', { style: { ...muted, display: 'flex', gap: 8, alignItems: 'flex-start', border: '1px solid var(--ui-stroke-secondary)', borderRadius: 10, padding: '10px 12px', background: 'var(--ui-bg-card)' } },
@@ -392,8 +437,8 @@ export default {
           (backend === 'native' || transcriptionProvider === 'local') && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Local transcription model'),
             h('select', { style: selectStyle, value: transcriptionModel, disabled: locked, 'aria-label': 'Local transcription model', onChange: e => change('transcriptionModel', e.target.value, ['tiny.en', 'base.en', 'small.en']) },
               h('option', { value: 'tiny.en' }, 'Whisper tiny.en — fastest'), h('option', { value: 'base.en' }, 'Whisper base.en — balanced'), h('option', { value: 'small.en' }, 'Whisper small.en — higher accuracy'))),
-          backend === 'native' && h('span', { style: muted }, 'Local transcription uses the default microphone and all audio on the default output, according to Audio source. First Start may download Whisper weights. ', data.capabilities?.windows_detail || 'Experimental; hardware is unverified.'),
-          backend === 'macos' && transcriptionProvider === 'local' && h('span', { style: muted }, 'Runs on this Mac without Meetily. First use may download the model. Microphone or screen and system audio permission is required.'),
+          backend === 'native' && h('span', { style: muted }, 'Local transcription uses the default microphone and all audio on the default output, according to Audio source. Prepare Whisper weights before Start. ', data.capabilities?.windows_detail || 'Experimental; hardware is unverified.'),
+          backend === 'macos' && transcriptionProvider === 'local' && h('span', { style: muted }, 'Runs on this Mac without Meetily. Prepare the selected model before Start. Microphone or screen and system audio permission is required.'),
           backend === 'macos' && transcriptionProvider === 'meta' && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Meta ASR mode'),
             h('select', { style: selectStyle, value: asrMode, disabled: locked, 'aria-label': 'Meta ASR mode', onChange: e => change('asrMode', e.target.value, ['ENDPOINTING', 'DIARIZATION', 'PUSH_TO_TALK']) },
               h('option', { value: 'ENDPOINTING' }, 'Endpointing — one segment per utterance'), h('option', { value: 'DIARIZATION' }, 'Diarization — speaker labels per source'), h('option', { value: 'PUSH_TO_TALK' }, 'Push-to-talk — single-turn finals'))),
@@ -562,7 +607,7 @@ export default {
       const data = status.data || {};
       const modelCatalog = useQuery({ queryKey: cacheKey('models'), queryFn: () => api('/models'), enabled: !!data.capabilities?.independent_models, staleTime: 60000, retry: 1 });
       const providers = modelCatalog.data?.providers || [];
-      const answerProviderAvailable = ['openai', 'openrouter'].includes(answerProvider) && providers.some(p => p.id === answerProvider);
+      const answerProviderAvailable = ['hermes', 'openai', 'openrouter'].includes(answerProvider) && !modelCatalog.error && providers.some(p => p.id === answerProvider && p.configured === true);
       const busy = pending || data.busy;
       const allProjects = project === '__all_projects__';
       // Suggest answers stay local-first; explicit web queries stay in the pane.
@@ -818,14 +863,14 @@ export default {
       }
       async function startCapture(newMeeting = false) {
         const canStartCurrent = token => {
-          if (!usable() || !actionLife.mounted || overlayActionAt.current !== actionLife) return false;
+          if (!usable() || safety.permissionAction || !actionLife.mounted || overlayActionAt.current !== actionLife) return false;
           if (token === undefined ? (safety.captureAction || safety.captureUnknown)
               : (!safety.captureAction || safety.captureToken !== token)) return false;
           const latest = qc.getQueryState?.(cacheKey('status')) || status;
           const caps = latest?.data?.capabilities || {};
           const current = settingsAvailable ? effectiveCapture(preferences.get(), caps)
             : { ...captureInput.current.source, backend: captureInput.current.explicitBackend || defaultBackend(caps) };
-          return !!(captureStatusIdle(latest) && !latest?.data?.overlay_cleanup_error && !actionLife.credentialShutdownUnconfirmed &&
+          return !!(freshPreflight() && captureStatusIdle(latest) && !latest?.data?.overlay_cleanup_error && !actionLife.credentialShutdownUnconfirmed &&
             consentPrefs.current && captureKey(current) === captureKey(renderedCapture) && captureInput.current.recording === recording &&
             captureRevision === renderedCaptureRevision && consentPrefs.current.revision === captureRevision && consentPrefs.current.key === captureKey(current) &&
             sourceVersion.current.revision === renderedSourceRevision && consentPrefs.current.sourceRevision === renderedSourceRevision &&
@@ -922,8 +967,8 @@ export default {
         const isAll = currentPrefs.project === '__all_projects__';
         const invalid = (isAll && !currentData.capabilities?.all_projects) ||
           (currentPrefs.webFallback && !currentData.capabilities?.automatic_web_fallback) ||
-          !['openai', 'openrouter'].includes(currentPrefs.answerProvider) || !currentPrefs.answerModel ||
-          !currentProviders.some(p => p.id === currentPrefs.answerProvider) || !currentData.capabilities?.independent_models ||
+          !['hermes', 'openai', 'openrouter'].includes(currentPrefs.answerProvider) || !currentPrefs.answerModel ||
+          !currentProviders.some(p => p.id === currentPrefs.answerProvider && p.configured === true) || !currentData.capabilities?.independent_models ||
           (currentPrefs.excludeHistory && (!currentData.capabilities?.history_opt_out || !currentPrefs.project || isAll || currentPrefs.webFallback || web.trim() || extra.web_query || (scopeOverride && scopeOverride.include_history !== false)));
         if (invalid || latestState?.error || currentData.busy || Object.keys(currentData.requests || {}).length) {
           setError('Answer was not sent. Check the current answer settings and wait for any active answer to finish.');
@@ -1152,6 +1197,40 @@ export default {
         return () => unsubscribe?.();
       }, [qc, actionLife]);
       const consentValid = consent && consentPrefs.current?.key === captureKey(renderedCapture) && consentPrefs.current?.revision === renderedCaptureRevision && consentPrefs.current?.sourceRevision === renderedSourceRevision;
+      const preflightBody = { consent: !!consentValid, backend, recording_id: recording || null,
+        transcription_model: transcriptionModel, audio_source: audioSource,
+        transcription_provider: backend === 'native' ? 'local' : transcriptionProvider,
+        asr_mode: backend === 'native' ? 'ENDPOINTING' : asrMode };
+      const preflightSignature = JSON.stringify([preflightBody, renderedCaptureRevision, renderedSourceRevision, captureInput.current.revision]);
+      const preflightKey = [...cacheKey('preflight'), preflightSignature];
+      const preflight = useQuery({ queryKey: preflightKey, enabled: !!backend && data.capabilities?.capture_preflight === 1 && !data.listening && !data.stopping && !status.error,
+        queryFn: async () => {
+          const result = await api('/preflight', preflightBody);
+          return { ...result, receivedAt: Date.now(), signature: preflightSignature };
+        }, staleTime: 15000, refetchOnWindowFocus: false, retry: false });
+      function freshPreflight() {
+        const current = qc.getQueryState?.(preflightKey) || preflight;
+        const report = current?.data, age = Date.now() - report?.receivedAt;
+        return (qc.getQueryState?.(cacheKey('status')) || status)?.data?.capabilities?.capture_preflight === 1 && !current?.error && current?.status !== 'error' && !current?.isPending
+          && current?.fetchStatus !== 'fetching' && report?.version === 1 && report.ready === true
+          && report.signature === preflightSignature && Number.isFinite(age) && age >= 0 && age < 15000
+          && Array.isArray(report.checks) && report.checks.length > 0 && report.checks.every(c => c?.status === 'ready');
+      }
+      async function requestPermissions() {
+        if (!usable() || safety.permissionAction || backend !== 'macos' || !captureStatusIdle(qc.getQueryState?.(cacheKey('status')) || status) || safety.captureAction) return;
+        if (typeof window === 'undefined' || typeof window.confirm !== 'function' || !window.confirm(
+          'Request macOS permissions for the selected audio source? macOS may show microphone and screen/system audio permission dialogs. No recording starts. Review each OS prompt yourself, then recheck required settings.')) return;
+        const source = captureKey(renderedCapture), revision = captureRevision, life = overlayActionAt.current;
+        safety.permissionAction = true; signalSafety(); setPending(true);
+        try {
+          const pane = await claimOverlayPane(life);
+          const current = settingsAvailable ? effectiveCapture(preferences.get(), data.capabilities) : captureInput.current.source;
+          if (!usable() || !life.mounted || life !== overlayActionAt.current || source !== captureKey(current) || revision !== captureRevision || !captureStatusIdle(qc.getQueryState?.(cacheKey('status')) || status)) return;
+          const result = await api('/permissions/request', { pane, action: ++life.action, audio_source: audioSource, consent: true });
+          if (usable() && life.mounted) { setError(result?.status === 'completed' ? 'Permission request finished. Review macOS settings, then recheck required settings.' : 'Permission setup is not confirmed. Finish or dismiss any existing OS prompt, check macOS Privacy & Security and recheck settings.'); await qc.invalidateQueries({ queryKey: cacheKey('preflight') }); }
+        } catch (_) { if (usable() && life.mounted) setError('Permission setup was not confirmed. Check macOS Privacy & Security, then recheck required settings. No capture was requested.'); }
+        finally { safety.permissionAction = false; signalSafety(); if (life.mounted) setPending(false); }
+      }
       paneEntry.retire = message => { paneEntry.retired = message; setRetirement(message); };
       if (paneEntry.retired) return h('section', { role: 'alert', style: card },
         h('strong', null, 'Meeting Copilot pane retired — actions disabled'),
@@ -1205,7 +1284,7 @@ export default {
       const sourceSummary = !backend ? 'Not identified — choose a capture source'
         : backend === 'meetily' ? (recording ? 'Meetily · recording selected' : 'Meetily — choose an active recording below')
         : `${backend === 'macos' ? 'macOS' : 'Windows'} · ${{ microphone: 'Microphone', system: 'System audio', both: 'Microphone + system audio' }[audioSource] || audioSource} · ${cloudAudioSelected ? `Meta (${asrMode})` : `Local transcription (${transcriptionModel})`}`;
-      const captureBlocked = !backend || overlayNeedsHide || cloudUnavailable || windowsUnavailable || !consentValid || (backend === 'meetily' && !recording)
+      const captureBlocked = !freshPreflight() || !captureStatusIdle(status) || !backend || overlayNeedsHide || cloudUnavailable || windowsUnavailable || !consentValid || (backend === 'meetily' && !recording)
         || (settingsAvailable && !mayChangeCapture(qc, status, () => usable() && actionLife.mounted && overlayActionAt.current === actionLife))
         || (backend === 'macos' && !data.capabilities?.macos_transcription);
       const hasRecentTranscript = Array.isArray(data.segments) && data.segments.slice(-40)
@@ -1244,6 +1323,19 @@ export default {
               setConsentRevision(value => value + 1);
             }, 'aria-describedby': cloudAudioDisclosed ? `${paneEntry.a11yId}-cloud-audio` : undefined }),
             h('span', null, h('strong', null, 'Permission check. '), 'I have permission to capture/read this meeting and use its context with my configured model.')),
+          !data.listening && h('section', { style: { display: 'grid', gap: 6 }, 'aria-label': 'Required capture checks' },
+            h('strong', null, 'Required capture checks'),
+            h('p', { style: { ...muted, margin: 0 } }, 'Checks never record, request OS permission, download models or contact answer providers. Start rechecks the backend before recording. Answer setup is separate.'),
+            data.capabilities?.capture_preflight !== 1 ? h('p', { role: 'alert', style: muted }, 'This backend does not support capture preflight. Update the plugin and reopen the pane before Start.')
+              : preflight.error ? h('p', { role: 'alert', style: muted }, 'Required checks are unavailable. Restore the backend connection and recheck before Start.')
+              : preflight.isPending || !preflight.data ? h('p', { role: 'status', style: muted }, 'Checking required settings…')
+              : h('ul', { style: { ...muted, margin: 0, paddingLeft: 20 } }, ...(Array.isArray(preflight.data.checks) ? preflight.data.checks : []).map(c =>
+                  h('li', { key: c.id }, `${c.status === 'ready' ? 'Ready' : c.status === 'blocked' ? 'Needs setup' : 'Not verified'}: ${c.label}. ${c.detail}`))),
+            preflight.data && !freshPreflight() && h('p', { role: 'status', style: muted }, 'Start stays disabled until all required checks pass for the current settings. Checks expire after 15 seconds; recheck if needed.'),
+            h(Button, { variant: 'secondary', disabled: pending || !backend || status.error || data.capabilities?.capture_preflight !== 1,
+              onClick: () => { if (usable()) return qc.invalidateQueries({ queryKey: cacheKey('preflight') }); } }, 'Recheck required settings'),
+            backend === 'macos' && h(Button, { variant: 'secondary', disabled: pending || !captureStatusIdle(status) || data.capabilities?.capture_preflight !== 1,
+              onClick: requestPermissions }, 'Request macOS permissions…')),
           cloudAudioDisclosed && h('p', { id: `${paneEntry.a11yId}-cloud-audio`, 'data-cloud-capture-disclosure': true, role: 'status', style: { ...muted, margin: 0 } }, `Cloud transcription ${cloudAudioActive ? 'active' : 'selected'}: meeting audio is sent to Meta while listening. ${data.listening ? 'Pause to change' : 'Change'} the provider in ${settingsAvailable ? 'Meeting Copilot settings' : 'Transcript source below'}.`),
           data.listening && data.backend === 'macos' && !data.last_session?.transcription_provider && h('p', { role: 'status', style: muted }, 'The active transcription provider is not confirmed. Check capture status and pause if unsure.'),
           cloudUnavailable && h('p', { role: 'status', style: muted }, `Meta cloud transcription is unavailable. Choose Local in ${settingsAvailable ? 'Meeting Copilot settings' : 'Transcript source'}, or configure a Meta key and recheck backend readiness before Start.`),
@@ -1314,8 +1406,8 @@ export default {
               h('option', { value: 'meta', disabled: !data.capabilities?.meta_asr, title: data.capabilities?.meta_asr ? '' : 'Set the Meta API key in Hermes Settings → Plugins → meeting-copilot-live, then reopen this pane.' }, 'Meta Muse Voice — cloud transcription'))),
             (backend === 'native' || transcriptionProvider === 'local') && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Local transcription model'), h('select', { style: selectStyle, value: transcriptionModel, disabled: data.listening, onChange: e => changeCaptureInput('transcriptionModel', e.target.value, setTranscriptionModel), 'aria-label': 'Local transcription model' },
               h('option', { value: 'tiny.en' }, 'Whisper tiny.en — fastest'), h('option', { value: 'base.en' }, 'Whisper base.en — balanced'), h('option', { value: 'small.en' }, 'Whisper small.en — higher accuracy'))),
-            backend === 'native' && h('span', { style: muted }, 'Local transcription uses the default microphone and all audio on the default output, according to Audio source. First Start may download Whisper weights. ', data.capabilities?.windows_detail || 'Experimental; hardware is unverified.'),
-            backend === 'macos' && transcriptionProvider === 'local' && h('span', { style: muted }, 'Runs on this Mac without Meetily. First use may download the model. Microphone or screen and system audio permission is required.'),
+            backend === 'native' && h('span', { style: muted }, 'Local transcription uses the default microphone and all audio on the default output, according to Audio source. Prepare Whisper weights before Start. ', data.capabilities?.windows_detail || 'Experimental; hardware is unverified.'),
+            backend === 'macos' && transcriptionProvider === 'local' && h('span', { style: muted }, 'Runs on this Mac without Meetily. Prepare the selected model before Start. Microphone or screen and system audio permission is required.'),
             backend === 'macos' && transcriptionProvider === 'meta' && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Meta ASR mode'), h('select', { style: selectStyle, value: asrMode, disabled: data.listening, onChange: e => changeCaptureInput('asrMode', e.target.value, setAsrMode), 'aria-label': 'Meta ASR mode' },
               h('option', { value: 'ENDPOINTING' }, 'Endpointing — one segment per utterance'),
               h('option', { value: 'DIARIZATION' }, 'Diarization — speaker labels per source'),

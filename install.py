@@ -8,7 +8,7 @@ from pathlib import Path
 import shutil
 import sys
 
-FILES = ('transcript_snapshot.py', 'server.py', 'credentials.py', 'byok.py', 'knowledge.py', 'web_policy.py', 'audio.py', 'meetily.py',
+FILES = ('host_default.py', 'runtime_loader.py', 'capture_preflight.py', 'transcript_snapshot.py', 'server.py', 'credentials.py', 'byok.py', 'knowledge.py', 'web_policy.py', 'audio.py', 'meetily.py',
          'macos_audio.py', 'audio_worker.py', 'native_runtime.py', 'model_selection.py', 'meta_models.py', 'meta_asr.py',
          'overlay_bridge.py', 'answer_core.py', 'hermes_adapters.py', 'ask.py', 'eval_retrieval.py',
          'demo_standalone.py',
@@ -18,10 +18,11 @@ FILES = ('transcript_snapshot.py', 'server.py', 'credentials.py', 'byok.py', 'kn
 
 def install(source, home):
     source, home = Path(source).resolve(), Path(home).expanduser().resolve()
-    for name in (*FILES, 'desktop/plugin.js', 'plugin.yaml'):
+    for name in (*FILES, '__init__.py', 'dashboard/plugin_api.py', 'desktop/plugin.js', 'plugin.yaml'):
         if not (source / name).is_file():
             raise FileNotFoundError(f'Required source missing: {name}')
-    build = hashlib.sha256(b''.join((source / name).read_bytes() for name in FILES)).hexdigest()[:16]
+    build_inputs = (*FILES, '__init__.py', 'dashboard/plugin_api.py')
+    build = hashlib.sha256(b''.join((source / name).read_bytes() for name in build_inputs)).hexdigest()[:16]
     api_file = f'plugin_api_{build}.py'
     target = home / 'plugins' / 'meeting-copilot-live'
     desktop = home / 'desktop-plugins' / 'meeting-copilot-live'
@@ -37,7 +38,7 @@ def install(source, home):
         (core / name).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source / name, core / name)
     (core / '__init__.py').write_text('', encoding='utf-8')
-    (target / '__init__.py').write_text('def register(ctx):\n    pass\n', encoding='utf-8')
+    shutil.copy2(source / '__init__.py', target / '__init__.py')
     shutil.copy2(source / 'plugin.yaml', target / 'plugin.yaml')
     dashboard = target / 'dashboard'
     (dashboard / 'manifest.json').write_text(json.dumps({
@@ -46,22 +47,7 @@ def install(source, home):
     }, indent=2), encoding='utf-8')
     (dashboard / 'dist').mkdir(exist_ok=True)
     (dashboard / 'dist' / 'index.js').write_text('// Desktop-only UI; API manifest intentionally has no dashboard tab.\n', encoding='utf-8')
-    (dashboard / api_file).write_text('''"""Load a profile-specific package without mutating sys.path."""
-import hashlib
-import importlib.util
-import sys
-from pathlib import Path
-
-root = Path(__file__).resolve().parent / 'core'
-name = '_meeting_copilot_' + hashlib.sha256((str(root) + Path(__file__).stem).encode()).hexdigest()[:20]
-if name not in sys.modules:
-    spec = importlib.util.spec_from_file_location(name, root / '__init__.py', submodule_search_locations=[str(root)])
-    package = importlib.util.module_from_spec(spec)
-    sys.modules[name] = package
-    spec.loader.exec_module(package)
-from importlib import import_module
-router = import_module(name + '.server').router
-''', encoding='utf-8')
+    shutil.copy2(source / 'dashboard/plugin_api.py', dashboard / api_file)
     shutil.copy2(source / 'desktop' / 'plugin.js', desktop / 'plugin.js')
     return {'backend': str(target), 'desktop': str(desktop), 'backup': str(backup) if backup.exists() else None}
 

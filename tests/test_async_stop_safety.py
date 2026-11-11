@@ -1,4 +1,5 @@
 """Actual adapter/parser/router fault paths; synthetic I/O only, no capture."""
+from tests.thread_test_support import mock_capture_preflight
 import io
 import json
 import subprocess
@@ -48,6 +49,10 @@ class ParserWorker:
 
 
 class AsyncStopSafetyTests(CheckedThreads):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def client(self, state):
         app = FastAPI()
         app.include_router(server.make_router(state))

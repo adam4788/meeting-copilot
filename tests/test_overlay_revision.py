@@ -1,4 +1,5 @@
 """Deterministic follow-up regressions; no live app, capture or providers."""
+from tests.thread_test_support import mock_capture_preflight
 import json
 import os
 import select
@@ -15,6 +16,10 @@ from tests.test_overlay_blockers import click
 
 
 class RevisionTests(CheckedThreads):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     backend = blockers.BlockerTests.backend
     join = blockers.BlockerTests.join
 

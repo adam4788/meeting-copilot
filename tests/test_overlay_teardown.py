@@ -1,4 +1,5 @@
 """Real inert children and OS pipes; no overlay UI, capture, or providers."""
+from tests.thread_test_support import mock_capture_preflight
 import subprocess
 import sys
 import threading
@@ -58,6 +59,10 @@ def real_display(show=True, child_code=None):
 
 @unittest.skipUnless(sys.platform in ('darwin', 'linux'), 'POSIX pipe/select helper required')
 class OverlayTeardownTests(CheckedThreads):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def finish_denied_cleanup(self, bridge, state):
         # A bounded API return may precede worker completion. Drain the denied
         # attempt at its explicit gate before restoring real signals, so the

@@ -1,4 +1,5 @@
 """Authorized production routes must not publish adapter exception diagnostics."""
+from tests.thread_test_support import mock_capture_preflight
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -12,6 +13,10 @@ MARKER = 'synthetic-sensitive-adapter-diagnostic'
 
 
 class LifecycleDiagnosticTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_authorized_adapter_errors_are_actionable_without_raw_text(self):
         for action in ('start', 'pause', 'clear', 'clear-overlay', 'clear-invalidation'):
             with self.subTest(action=action), ExitStack() as stack:

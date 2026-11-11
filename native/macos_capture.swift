@@ -233,12 +233,65 @@ struct Main {
     static func main() async {
         let args = Array(CommandLine.arguments.dropFirst())
         if args == ["--help"] || args.isEmpty {
-            print("macos_capture --start --source microphone|system|both\n--check-only: static capabilities; no permission checks or capture")
+            print("macos_capture --start --source microphone|system|both\n--check-only: static capabilities; no permission checks or capture\n--preflight --source microphone|system|both: nonprompting permission checks\n--request-permissions --source microphone|system|both: explicit permission setup; no capture")
             return
         }
         if args == ["--check-only"] {
             let usage = Bundle.main.object(forInfoDictionaryKey: "NSMicrophoneUsageDescription") as? String != nil
             print("{\"capture_started\":false,\"microphone_usage_description\":\(usage),\"sources\":[\"microphone\",\"system\",\"both\"],\"rate\":16000}")
+            return
+        }
+        // This command is reachable only through explicit permission setup.
+        // It exits before Capture is constructed and never starts audio streams.
+        if args.count == 3, args[0] == "--request-permissions", args[1] == "--source",
+           ["microphone", "system", "both"].contains(args[2]) {
+            let source = args[2]
+            if source == "microphone" || source == "both" {
+                let usage = Bundle.main.object(forInfoDictionaryKey: "NSMicrophoneUsageDescription") as? String
+                if !(usage ?? "").isEmpty,
+                   AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
+                    _ = await AVCaptureDevice.requestAccess(for: .audio)
+                }
+            }
+            if source == "system" || source == "both" {
+                if !CGPreflightScreenCaptureAccess() { _ = CGRequestScreenCaptureAccess() }
+            }
+            let result: [String: Any] = ["version": 1, "source": source,
+                                        "capture_started": false, "permission_request_completed": true]
+            if let data = try? JSONSerialization.data(withJSONObject: result),
+               let line = String(data: data, encoding: .utf8) { print(line) }
+            return
+        }
+        // Nonprompting readiness only: never instantiate Capture, request access,
+        // enumerate shareable content, or start an AVAudioEngine/SCStream here.
+        if args.count == 3, args[0] == "--preflight", args[1] == "--source",
+           ["microphone", "system", "both"].contains(args[2]) {
+            let source = args[2]
+            var result: [String: Any] = ["version": 1, "source": source, "capture_started": false]
+            if source == "microphone" || source == "both" {
+                let usage = Bundle.main.object(forInfoDictionaryKey: "NSMicrophoneUsageDescription") as? String
+                result["microphone_usage_description"] = !(usage ?? "").isEmpty
+                // Device discovery only, no AVCaptureDeviceInput or session.
+                result["microphone_available"] = AVCaptureDevice.default(for: .audio) != nil
+                switch AVCaptureDevice.authorizationStatus(for: .audio) {
+                case .authorized: result["microphone"] = "authorized"
+                case .denied: result["microphone"] = "denied"
+                case .restricted: result["microphone"] = "restricted"
+                case .notDetermined: result["microphone"] = "not_determined"
+                @unknown default: result["microphone"] = "unknown"
+                }
+            }
+            if source == "system" || source == "both" {
+                result["system"] = CGPreflightScreenCaptureAccess() ? "authorized" : "not_authorized"
+                // ScreenCaptureKit's display filter requires an active display.
+                // CoreGraphics metadata does not request screen permission.
+                var displayCount: UInt32 = 0
+                if CGGetActiveDisplayList(0, nil, &displayCount) == .success {
+                    result["display_available"] = displayCount > 0
+                } // Absent on error: callers must treat this as unknown.
+            }
+            if let data = try? JSONSerialization.data(withJSONObject: result),
+               let line = String(data: data, encoding: .utf8) { print(line) }
             return
         }
         guard args.count == 3, args[0] == "--start", args[1] == "--source",

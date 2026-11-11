@@ -11,7 +11,7 @@ ERRORS = {
     'microphone_usage': 'Native helper lacks NSMicrophoneUsageDescription. Rebuild with an embedded usage-description Info.plist before starting microphone capture.',
     'microphone_permission': 'Microphone permission denied. Allow Microphone access in System Settings > Privacy & Security, then restart capture.',
     'system_permission': 'System audio permission denied or unavailable. Allow Screen & System Audio Recording in System Settings > Privacy & Security, then restart the app.',
-    'model': 'Local model could not be loaded. Check the audio runtime and model cache/network availability; starting may download model weights.',
+    'model': 'Prepared local model could not be loaded. Prepare the selected model separately, then recheck required settings. Live capture never downloads missing weights.',
     'runtime': 'Audio runtime unavailable. Prepare the isolated Python 3.12 environment.',
     'helper': 'Native macOS audio helper unavailable. Compile macos_capture first.',
     'capture': 'Native audio capture failed. Check the selected source and macOS permissions.',
@@ -242,7 +242,7 @@ class MacOSAudioCapture:
             self._callback_error = 'Audio callback failed.'
 
     def start(self, on_segment, on_status=None):
-        """Explicit opt-in: worker may download allowlisted model weights.
+        """Explicit opt-in: live local capture requires prepared model weights.
 
         Callbacks execute on the reader thread; they should return promptly.
         """
@@ -264,7 +264,10 @@ class MacOSAudioCapture:
             self._state, self._error, self._callback_error = 'starting', None, None
             self._last_loss = {}
             self._process = None
-            self._thread = threading.Thread(target=self._run, args=(worker_env(self.provider), credential_frame, artifacts),
+            environment = worker_env(self.provider)
+            if self.provider == 'local':
+                environment.update(HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1')
+            self._thread = threading.Thread(target=self._run, args=(environment, credential_frame, artifacts),
                                             daemon=True, name='macos-audio-worker')
             self._thread.start()
 

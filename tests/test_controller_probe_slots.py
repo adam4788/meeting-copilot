@@ -1,4 +1,5 @@
 """Controller probe lifetime regressions with inert children and fakes."""
+from tests.thread_test_support import mock_capture_preflight
 import os
 import subprocess
 import sys
@@ -43,6 +44,10 @@ class FakeDisplay:
 
 
 class ControllerProbeSlotTests(CheckedThreads):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     @unittest.skipUnless(os.name == 'posix', 'healthy real-child evidence requires POSIX wait primitives')
     def test_sampled_alive_before_publication_requires_uncontradicted_evidence(self):
         # No reader runs for this inert child: model delayed EOF notification,

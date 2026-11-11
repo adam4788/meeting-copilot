@@ -1,3 +1,4 @@
+from tests.thread_test_support import mock_capture_preflight
 import unittest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -5,6 +6,10 @@ from tests.thread_test_support import CheckedThreads
 
 
 class ServerTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_starts_paused_and_keeps_transcript_only_in_memory(self):
         import server
         app = FastAPI()
@@ -658,6 +663,10 @@ class OverlayScopeOrderingTests(unittest.TestCase):
 
 
 class SessionSwitchTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_switch_cancels_live_slot_and_unblocks_new_requests(self):
         import server
         import threading
@@ -1030,6 +1039,10 @@ class CompletedRunningLabelTests(unittest.TestCase):
 
 
 class PauseTailTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_tail_segment_flushed_during_stop_survives_pause(self):
         import server
         tail = {'speaker': 'you', 'text': 'final words', 'timestamp': 1.0}
@@ -1051,6 +1064,10 @@ class PauseTailTests(unittest.TestCase):
 
 
 class RetiringWindowTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_same_session_resume_keeps_bounded_tail_window(self):
         import server
         callbacks = []
@@ -1069,6 +1086,10 @@ class RetiringWindowTests(unittest.TestCase):
 
 
 class ErrorRequestHygieneTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def _failing_state(self):
         import server
         class BoomEngine:
@@ -1154,6 +1175,10 @@ class ErrorRequestHygieneTests(unittest.TestCase):
 
 
 class ClearTailTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_clear_invalidates_retiring_tail_window(self):
         import server
         late = {}
@@ -1211,6 +1236,10 @@ class ProviderFailureTests(unittest.TestCase):
 
 
 class StaleTerminalTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_older_terminal_never_overwrites_newer_capture(self):
         import server
         callbacks = []
@@ -1257,6 +1286,10 @@ class StaleTerminalTests(unittest.TestCase):
 
 
 class MeetingBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def _state(self):
         import server
         callbacks = []
@@ -1310,6 +1343,10 @@ class PauseErrorPreservationTests(unittest.TestCase):
 
 
 class ClearBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_clear_while_listening_rejects_pre_clear_audio(self):
         import server
         callbacks = []
@@ -1354,6 +1391,10 @@ class ClearBoundaryTests(unittest.TestCase):
 
 
 class ClearRouteTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_clear_route_restarts_live_capture_without_resurrection(self):
         import server
         from fastapi import FastAPI
@@ -1384,6 +1425,10 @@ class ClearRouteTests(unittest.TestCase):
 
 
 class StatusShapeTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_meetily_status_shaped_error_terminal_is_recognized(self):
         import server
         callbacks = []
@@ -1405,6 +1450,10 @@ class StatusShapeTests(unittest.TestCase):
 
 
 class LastSessionTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_status_exposes_last_session_descriptor(self):
         import server
         from fastapi import FastAPI
@@ -1430,6 +1479,10 @@ class LastSessionTests(unittest.TestCase):
 
 
 class ClearStopTimeTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_synchronous_stop_time_tail_rejected_after_clear(self):
         import server
         from fastapi import FastAPI
@@ -1460,6 +1513,10 @@ class ClearStopTimeTests(unittest.TestCase):
 
 
 class ClearPauseRaceTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_concurrent_pause_always_wins_over_clear_restart(self):
         import threading
         import server
@@ -1491,6 +1548,10 @@ class ClearPauseRaceTests(unittest.TestCase):
 
 
 class RestartAfterClearTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def _state(self):
         import server
         stopped = []
@@ -1545,6 +1606,10 @@ class RestartAfterClearTests(unittest.TestCase):
 
 
 class ClearRestartProviderTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_clear_restart_preserves_meta_diarization_and_cleared_text(self):
         import server
         constructions, callbacks = [], []
@@ -1591,6 +1656,10 @@ class ClearRestartProviderTests(unittest.TestCase):
 
 
 class PauseCancellationOrderTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_requests_cancelled_before_backend_stop_runs(self):
         import server
         order = []
@@ -1615,6 +1684,10 @@ class PauseCancellationOrderTests(unittest.TestCase):
 
 
 class WatchdogCancellationOrderTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_expiry_cancels_requests_before_backend_stop_runs(self):
         import server
         import threading as _threading
@@ -1749,6 +1822,10 @@ class ClearBoundaryFailureRestartTests(unittest.TestCase):
 
 
 class ClearBoundaryStartGateTests(CheckedThreads):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def _client(self):
         import server
         from fastapi import FastAPI
@@ -1874,6 +1951,10 @@ class ClearBoundaryStartGateTests(CheckedThreads):
 
 
 class ClearStartAtomicityTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_plain_start_blocks_until_clear_publishes_failure(self):
         import server
         import threading as _threading
@@ -1909,6 +1990,10 @@ class ClearStartAtomicityTests(unittest.TestCase):
 
 
 class ClearStartBridgeWindowTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_clear_during_start_installs_boundary_before_restart(self):
         import json as _json
         import server

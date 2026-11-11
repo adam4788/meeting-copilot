@@ -117,7 +117,7 @@ class LifecycleControlRequest(BaseModel):
 
 
 class CaptureRequest(LifecycleControlRequest):
-    consent: bool = False
+    consent: StrictBool = False
     backend: Literal['meetily', 'native', 'macos'] = 'meetily'
     recording_id: str | None = Field(default=None, max_length=500)
     transcription_model: Literal['tiny.en', 'base.en', 'small.en'] = 'base.en'
@@ -125,6 +125,17 @@ class CaptureRequest(LifecycleControlRequest):
     transcription_provider: Literal['local', 'meta'] = 'local'
     asr_mode: Literal['ENDPOINTING', 'DIARIZATION', 'PUSH_TO_TALK'] = 'ENDPOINTING'
     new_meeting: bool = False
+
+
+class PermissionRequest(LifecycleControlRequest):
+    consent: StrictBool = False
+    audio_source: Literal['microphone', 'system', 'both']
+
+
+class ModelDiscoveryRequest(BaseModel):
+    model_config = {'extra': 'forbid'}
+    provider: Literal['openai', 'openrouter']
+    consent: StrictBool = False
 
 
 def _meta_key_present():
@@ -255,6 +266,34 @@ class MeetingState:
                 self.audio_options = options
             return self.audio
 
+    def capture_preflight(self, consent=False, backend='meetily', recording_id=None,
+                          transcription_model='base.en', audio_source='microphone',
+                          transcription_provider='local', asr_mode='ENDPOINTING'):
+        """Read-only, no lease renewal, recording, permissions prompt or network."""
+        import importlib
+        try:
+            module = importlib.import_module(f'{__package__}.capture_preflight' if __package__ else 'capture_preflight')
+            report = module.check(backend, recording_id, transcription_model, audio_source,
+                                  transcription_provider, asr_mode,
+                                  adapter=self.get_bridge() if backend == 'meetily' else None)
+            if not isinstance(report, dict) or report.get('version') != 1 or not isinstance(report.get('checks'), list) or not report['checks'] or any(not isinstance(c, dict) or c.get('status') not in ('ready', 'blocked', 'unknown') for c in report['checks']):
+                raise ValueError()
+        except Exception:
+            report = {'version': 1, 'ready': False, 'checked_at': time.time(), 'valid_for_seconds': 15,
+                      'checks': [{'id': 'probe', 'label': 'Capture checks', 'status': 'unknown',
+                                  'detail': 'Readiness could not be checked. Check backend setup and retry.'}]}
+        checks = list(report['checks'])
+        checks.insert(0, {'id': 'consent', 'label': 'Participant permission',
+                         'status': 'ready' if consent is True else 'blocked',
+                         'detail': 'Permission confirmed for these settings.' if consent is True else
+                                   'Confirm participant permission in the pane before Start.'})
+        with self.lock:
+            idle = not self.listening and self.pending_stop is None and not self.overlay_cleanup_error and self.pending_overlay is None
+            checks.append({'id': 'capture_idle', 'label': 'Capture stopped',
+                           'status': 'ready' if idle else 'blocked',
+                           'detail': 'Capture is idle.' if idle else 'Pause capture and resolve any unconfirmed audio or overlay stop before Start.'})
+        return {**report, 'checks': checks, 'ready': report.get('ready') is True and all(c.get('status') == 'ready' for c in checks)}
+
     def start(self, consent, backend='meetily', recording_id=None, transcription_model='base.en', audio_source='microphone',
               new_meeting=False, transcription_provider='local', asr_mode='ENDPOINTING', *, pane=None, action=None):
         # Serialize the actual backend operation, not merely the UI state transition.
@@ -282,6 +321,12 @@ class MeetingState:
             raise HTTPException(400, 'Confirm participant consent and audio capture before starting.')
         if backend == 'meetily' and not recording_id:
             raise HTTPException(400, 'Start a recording in Meetily, then explicitly select it here.')
+        # Re-run on the backend for every Start, under the lifecycle lock.
+        # Client reports, old cached checks and direct HTTP calls grant no bypass.
+        report = self.capture_preflight(consent, backend, recording_id, transcription_model,
+                                        audio_source, transcription_provider, asr_mode)
+        if report.get('ready') is not True:
+            raise HTTPException(409, 'Capture preflight is not ready. Recheck the required settings in the pane before starting.')
         with self._overlay_admission_guard(ticket), self.lock:
             # Check under the same lock Clear uses to record the failure, and
             # before any state mutation: a concurrent plain start must block
@@ -681,6 +726,11 @@ class MeetingState:
                 selection.validate_selection(answer_provider, answer_model)
             except ValueError:
                 raise _AnswerRejected(400, 'Choose a supported provider and exact model ID.') from None
+        if answer_provider == 'hermes':
+            import importlib
+            host_route = importlib.import_module(f'{__package__}.host_default' if __package__ else 'host_default')
+            if host_route.catalog_entry().get('configured') is not True:
+                raise _AnswerRejected(503, 'Hermes default is unavailable in this host mode. Enable the plugin in Agent settings and reopen the pane, or choose an explicit supported provider.')
         request_home = None
         if not self.engine_factory:
             import importlib
@@ -1789,7 +1839,7 @@ class MeetingState:
                     'generation': self.generation, 'status_seq': self.status_seq,
                     'capture_generation': self.capture_generation, 'pane_seen': self.pane_seen,
                     'overlay_shown': None if uncertain_overlay else overlay is not None,
-                    'capabilities': {'all_projects': True, 'automatic_web_fallback': True, 'independent_models': True, 'history_opt_out': True,
+                    'capabilities': {'all_projects': True, 'automatic_web_fallback': True, 'independent_models': True, 'history_opt_out': True, 'capture_preflight': 1, 'model_discovery': True,
                                      'meta_asr': _meta_key_present(),
                                      'macos_transcription': bool(macos_ready),
                                      'windows_transcription': windows['ready'],
@@ -1859,6 +1909,21 @@ def make_router(state):
     def heartbeat(body: LeaseRequest | None = None):
         return state.heartbeat(body)
 
+    @router.post('/preflight')
+    def preflight(body: CaptureRequest):
+        return state.capture_preflight(body.consent, body.backend, body.recording_id,
+            body.transcription_model, body.audio_source, body.transcription_provider, body.asr_mode)
+
+    @router.post('/permissions/request')
+    def permissions(body: PermissionRequest):
+        if not body.consent:
+            raise HTTPException(400, 'Confirm the macOS permission request first.')
+        with state.control_boundary(body):
+            if state.listening or state.pending_stop is not None:
+                raise HTTPException(409, 'Pause capture and confirm it stopped before permission setup.')
+            module = importlib.import_module(f'{__package__}.capture_preflight' if __package__ else 'capture_preflight')
+            return module.request_permissions(body.audio_source)
+
     @router.post('/start')
     def start(body: CaptureRequest):
         with state.control_boundary(body):
@@ -1880,6 +1945,17 @@ def make_router(state):
         import importlib
         module = importlib.import_module(f'{__package__}.model_selection' if __package__ else 'model_selection')
         return module.available_models()
+
+    @router.post('/models/discover')
+    def discover_models(body: ModelDiscoveryRequest):
+        if not body.consent:
+            raise HTTPException(400, 'Confirm the provider model-list request before continuing.')
+        module = importlib.import_module(f'{__package__}.byok' if __package__ else 'byok')
+        try:
+            return module.discover_models(body.provider)
+        except (ValueError, RuntimeError) as exc:
+            # These messages are fixed local strings, never provider payloads.
+            raise HTTPException(503, str(exc)) from None
 
     @router.get('/devices')
     def devices(backend: Literal['native', 'macos'] = 'native'):

@@ -87,11 +87,21 @@ def decode_frame(line):
     return ('you' if item['source'] == 'microphone' else 'remote'), samples, float(stamp), native_drops
 
 
-def load_model(name, factory=None):
+def load_model(name, factory=None, *, offline=False):
     validate(name, 'microphone', 'en')
     if factory is None:
         from faster_whisper import WhisperModel
         factory = WhisperModel
+    if offline:
+        # A cache can disappear between preflight and Start. Do not turn a
+        # successful check into an implicit download or tokenizer fallback.
+        from huggingface_hub import snapshot_download
+        cached = Path(snapshot_download('Systran/faster-whisper-' + name, local_files_only=True))
+        for filename in ('model.bin', 'config.json', 'tokenizer.json', 'vocabulary.json'):
+            with (cached / filename).open('rb') as stream:
+                if not stream.read(1):
+                    raise ValueError('Prepared model is unavailable')
+        return factory(str(cached), device='cpu', compute_type='int8', cpu_threads=4, local_files_only=True)
     return factory(name, device='cpu', compute_type='int8', cpu_threads=4)
 
 
@@ -654,7 +664,7 @@ def _read_meta_worker_key(stream):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='Explicit local CPU int8 transcription; starting may download model weights.')
+    parser = argparse.ArgumentParser(description='Live capture requires prepared cached weights; explicit file runs may download weights.')
     parser.add_argument('--model', choices=MODELS, default='base.en')
     parser.add_argument('--source', choices=SOURCES, default='microphone')
     parser.add_argument('--language', choices=['en'], default='en')
@@ -699,7 +709,7 @@ def main(argv=None):
             return 1
         return 0
     try:
-        model = load_model(args.model)
+        model = load_model(args.model, offline=not bool(args.file))
     except Exception:
         emit({'type': 'error', 'code': 'model', 'message': error_message('model')})
         return 1

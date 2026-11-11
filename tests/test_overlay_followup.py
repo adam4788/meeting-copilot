@@ -1,4 +1,5 @@
 """Reviewer reproductions: deterministic local-only lifecycle regressions."""
+from tests.thread_test_support import mock_capture_preflight
 import threading
 from unittest.mock import Mock, patch
 from fastapi import FastAPI
@@ -11,6 +12,10 @@ from tests.test_overlay_blockers import click
 
 
 class FollowupTests(CheckedThreads):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_provider_slot_failure_is_sanitized_and_persists(self):
         class Transport:
             def assist(self, question, scope, row_id, expected_generation=None):

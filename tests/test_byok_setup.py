@@ -34,10 +34,10 @@ class SetupTests(unittest.TestCase):
             ready=model_selection.available_models()
         with patch.object(byok,'secret',return_value=''):
             missing=model_selection.available_models()
-        self.assertTrue(all(p['configured'] for p in ready['providers']))
+        self.assertTrue(all(p['configured'] for p in ready['providers'] if p['id'] != 'hermes'))
         self.assertTrue(all(not p['configured'] for p in missing['providers']))
         self.assertNotIn('synthetic-key',json.dumps(ready))
-        self.assertEqual({p['id'] for p in ready['providers']},{'openai','openrouter'})
+        self.assertEqual({p['id'] for p in ready['providers']},{'hermes','openai','openrouter'})
     def test_no_selection_never_invokes_configured_host_model(self):
         from knowledge import KnowledgeEngine
         with tempfile.TemporaryDirectory() as root:

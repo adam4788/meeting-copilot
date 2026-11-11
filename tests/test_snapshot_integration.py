@@ -1,4 +1,5 @@
 """Synthetic provider-wire and backend-lifecycle proof; no devices or network."""
+from tests.thread_test_support import mock_capture_preflight
 import json
 from pathlib import Path
 import tempfile
@@ -13,6 +14,7 @@ from server import MeetingState, make_router, _AnswerRejected
 
 class SnapshotIntegrationTests(unittest.TestCase):
     def setUp(self):
+        mock_capture_preflight(self)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.wire = []

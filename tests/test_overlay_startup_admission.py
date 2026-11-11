@@ -1,4 +1,5 @@
 """Startup/admission races using inert children and real OS pipes only."""
+from tests.thread_test_support import mock_capture_preflight
 import subprocess
 import sys
 import threading
@@ -13,6 +14,10 @@ from tests.thread_test_support import CheckedThreads
 
 
 class StartupAdmissionTests(CheckedThreads):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def require_supported_helper_platform(self):
         # These tests exercise real POSIX helper launch, not injected launch.
         # Keep the controller-only tests running in the Windows CI matrix.

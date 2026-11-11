@@ -1,4 +1,5 @@
 """Real snapshot adapter boundaries; no devices, provider, or user data."""
+from tests.thread_test_support import mock_capture_preflight
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ import server
 
 class SnapshotBoundaryTests(unittest.TestCase):
     def setUp(self):
+        mock_capture_preflight(self)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)

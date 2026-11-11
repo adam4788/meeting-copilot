@@ -6,6 +6,7 @@ Start with [the overview](../README.md), then choose the guide for your task.
 | --- | --- |
 | Install and ask a first question | [Getting started](getting-started.md) |
 | Try fictional documents without capture | [Synthetic demo](demo.md) |
+| Resolve capture checks and model options | [Preflight](preflight.md) |
 | Configure answer keys/models | [BYOK](byok.md), [optional Meta](meta-api-key.md) |
 | Review consent and data movement | [Security](../SECURITY.md), [architecture](architecture.md) |
 | Understand document support and retrieval bounds | [Knowledge engine](knowledge.md) |

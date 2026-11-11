@@ -1,4 +1,5 @@
 """Real inert children: unreaped exit, native wait contention and fallbacks."""
+from tests.thread_test_support import mock_capture_preflight
 import os
 import subprocess
 import sys
@@ -41,6 +42,10 @@ def observe_exit(child):
 
 
 class ChildObservationTests(CheckedThreads):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_unsupported_native_observation_cannot_authorize_capture(self):
         from types import SimpleNamespace
         from fastapi import HTTPException

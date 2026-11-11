@@ -1,10 +1,15 @@
 """Independent capture/API contracts; no devices or network."""
+from tests.thread_test_support import mock_capture_preflight
 import unittest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 
 class IndependentServerTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_assist_forwards_model_selection_without_global_state(self):
         import server
         import threading

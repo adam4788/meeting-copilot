@@ -89,9 +89,9 @@ class MetaModelTests(unittest.TestCase):
                 complete = selection.selected_completion('meta', 'muse-spark-1.3')
         self.assertTrue(callable(complete))
 
-    def test_catalog_advertises_only_bounded_byok_routes(self):
+    def test_catalog_advertises_explicit_host_mode_and_bounded_byok_routes(self):
         import model_selection
-        self.assertEqual({p['id'] for p in model_selection.available_models()['providers']}, {'openai','openrouter'})
+        self.assertEqual({p['id'] for p in model_selection.available_models()['providers']}, {'hermes','openai','openrouter'})
 
     def test_no_automatic_meta_or_configured_model_submission(self):
         from knowledge import KnowledgeEngine

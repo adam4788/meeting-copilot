@@ -1,4 +1,5 @@
 """Real-router lease tests: no hardware, providers or wall-clock sleeps."""
+from tests.thread_test_support import mock_capture_preflight
 import threading
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -10,6 +11,7 @@ from tests.thread_test_support import CheckedThreads
 
 class LeaseFencingTests(CheckedThreads):
     def setUp(self):
+        mock_capture_preflight(self)
         super().setUp()
         self.now = 1000.0
         self.audio = Mock()

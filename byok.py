@@ -3,6 +3,7 @@ import json
 import re
 import urllib.request
 import urllib.error
+import threading
 from pathlib import Path
 
 PROVIDERS = {
@@ -106,3 +107,109 @@ def completion(provider, model, *, standalone=False):
         except Exception:
             raise RuntimeError('Provider returned no complete answer or connection failed. Check model compatibility; retry explicitly.') from None
     return complete
+
+
+_MODEL_ENDPOINTS = {
+    'openai': 'https://api.openai.com/v1/models',
+    'openrouter': 'https://openrouter.ai/api/v1/models',
+}
+_MODEL_BYTES = 2 * 1024 * 1024
+_MODEL_COUNT = 2000
+_MODEL_TIMEOUT = 10
+# One bounded outstanding listing per process. A timed-out daemon may finish its
+# already admitted request, but cannot accumulate abandoned credential workers.
+_DISCOVERY_LOCK = threading.Lock()
+
+
+def _fetch_model_listing(request):
+    if not _DISCOVERY_LOCK.acquire(blocking=False):
+        raise RuntimeError('A model listing is still in progress. Wait for it to finish before retrying explicitly.')
+    done, outcome = threading.Event(), {}
+    def read():
+        try:
+            with urllib.request.build_opener(_NoRedirect()).open(request, timeout=_MODEL_TIMEOUT) as response:
+                outcome['raw'] = response.read(_MODEL_BYTES + 1)
+        except urllib.error.HTTPError as exc:
+            outcome['status'] = exc.code
+            exc.close()
+        except Exception:
+            outcome['failed'] = True
+        finally:
+            _DISCOVERY_LOCK.release()
+            done.set()
+    worker = threading.Thread(target=read, name='meeting-model-list', daemon=True)
+    try:
+        worker.start()
+    except Exception:
+        _DISCOVERY_LOCK.release()
+        raise RuntimeError('Model listing could not start. Retry explicitly.') from None
+    if not done.wait(_MODEL_TIMEOUT):
+        raise RuntimeError('Model listing timed out. Its already submitted request may still finish; wait before retrying explicitly.')
+    if 'status' in outcome:
+        raise RuntimeError(f"Model listing failed (HTTP {outcome['status']}). Check the provider key and connection, then retry explicitly.")
+    if outcome.get('failed') or 'raw' not in outcome:
+        raise RuntimeError('Model listing unavailable. Check the connection and retry explicitly.')
+    return outcome['raw']
+
+
+def discover_models(provider):
+    """Explicit, request-scoped listing only. Never called by readiness checks.
+
+    Hermes' generic model picker can probe other providers, merge curated
+    fallbacks and persist caches. Do not reuse it as proof of BYOK access.
+    This GET sends only this provider's scoped key, never meeting content.
+    """
+    if provider not in PROVIDERS:
+        raise ValueError('Choose OpenAI or OpenRouter before loading models.')
+    if not _scope_available():
+        raise ValueError('Profile-scoped credentials are unavailable. Reopen the pane in a supported Hermes host.')
+    key = secret(PROVIDERS[provider][1])
+    if not key:
+        raise ValueError('Provider key unavailable. Configure Hermes plugin secrets and reopen the pane.')
+    request = urllib.request.Request(_MODEL_ENDPOINTS[provider], headers={
+        'Authorization': 'Bearer ' + key, 'Accept': 'application/json'})
+    raw = _fetch_model_listing(request)
+    try:
+        if len(raw) > _MODEL_BYTES:
+            raise ValueError()
+        payload = json.loads(raw)
+        rows = payload.get('data') if isinstance(payload, dict) else None
+        if not isinstance(rows, list) or len(rows) > 10000:
+            raise ValueError()
+        ids = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            model = row.get('id')
+            try:
+                validate(provider, model)
+            except ValueError:
+                continue
+            # OpenRouter identifies modalities. Exclude non-text output when
+            # specified, but do not infer account entitlement or compatibility.
+            architecture = row.get('architecture')
+            if provider == 'openrouter' and isinstance(architecture, dict):
+                outputs = architecture.get('output_modalities')
+                if isinstance(outputs, list) and 'text' not in outputs:
+                    continue
+            # OpenAI's list includes audio/image/embedding models. Conservative
+            # chat-family filtering is a UI aid, not compatibility verification.
+            if provider == 'openai' and (not re.match(r'^(gpt-|chatgpt-|o[1-9](?:-|$)|ft:(?:gpt-|o[1-9]))', model)
+                    or re.search(r'(?i)(realtime|audio|transcrib|tts|image|search)', model)):
+                continue
+            if key in model or re.search(r'(?i)(ghp_|github_pat_|eyJ[A-Za-z0-9_-]{10,})', model):
+                continue
+            ids.add(model)
+        if len(ids) > _MODEL_COUNT:
+            raise ValueError()
+        return {'provider': provider, 'models': sorted(ids),
+                'source': 'account-list' if provider == 'openai' else 'provider-catalog',
+                'status': ('Models returned for this OpenAI key; Chat Completions support, credits and access are unverified.'
+                           if provider == 'openai' else
+                           'OpenRouter public catalog, filtered for text output. Your account access, provider preferences, credits and compatibility are unverified.')}
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        exc.close()
+        raise RuntimeError(f'Model listing failed (HTTP {status}). Check the selected provider key and connection, then retry explicitly.') from None
+    except Exception:
+        raise RuntimeError('Model listing unavailable or invalid. Check the connection or enter an exact model ID manually; retry explicitly.') from None

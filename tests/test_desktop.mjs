@@ -6,6 +6,12 @@ import { webcrypto } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 
+// Explicit synthetic readiness. No device, permissions or model download.
+function readyPreflight(signature, overrides = {}) {
+  return { version: 1, ready: true, checks: [{ id: 'fixture', label: 'Synthetic readiness', status: 'ready', detail: 'No devices.' }],
+    receivedAt: Date.now(), signature, ...overrides };
+}
+
 async function realBackend(t) {
   const child = spawn(process.env.PYTHON || 'python', ['-B', '-u', '-m', 'tests.lifecycle_test_backend'], { cwd: new URL('../', import.meta.url), stdio: ['pipe', 'pipe', 'pipe'] });
   let id = 0, stderr = '';
@@ -642,15 +648,17 @@ function pane(scope, supported = true, fallback = true, web = '', settings = {},
     useQueryClient: () => ({ invalidateQueries: qcBehavior.failInvalidate ? async () => { throw new Error('invalidate failed'); } : async () => {},
       getQueryCache: () => ({ subscribe: listener => { cacheListeners.add(listener); return () => cacheListeners.delete(listener); } }),
       getQueryState: key => qcBehavior.keyedCache ? keyedCache.get(JSON.stringify(key)) : key[1] === 'status'
-        ? ({ error: qcBehavior.statusError, isPending: qcBehavior.statusPending, fetchStatus: qcBehavior.statusFetchStatus || 'idle', data: { listening: false, stopping: false, overlay_shown: false, overlay_stop_confirmed: true, busy: false, requests: {}, capabilities: supported ? { all_projects: true, automatic_web_fallback: true, independent_models: true, history_opt_out: true, macos_transcription: true, overlay: true } : undefined, ...activeStatus() } })
+        ? ({ error: qcBehavior.statusError, isPending: qcBehavior.statusPending, fetchStatus: qcBehavior.statusFetchStatus || 'idle', data: { listening: false, stopping: false, overlay_shown: false, overlay_stop_confirmed: true, busy: false, requests: {}, capabilities: supported ? { all_projects: true, automatic_web_fallback: true, independent_models: true, history_opt_out: true, capture_preflight: 1, model_discovery: true, macos_transcription: true, overlay: true } : undefined, ...activeStatus() } })
+        : key[1] === 'preflight' ? { data: readyPreflight(key.at(-1), qcBehavior.preflight), error: qcBehavior.preflightError, fetchStatus: qcBehavior.preflightFetchStatus || 'idle', status: 'success' }
         : key[1] === 'projects' ? { data: [{ name: 'alpha', path: '/projects/alpha' }], status: 'success' }
         : key[1] === 'models' ? { data: { providers: qcBehavior.providers ?? [{ id: 'openai', label: 'OpenAI API', models: [], custom_model: true, configured: true, status: 'Key available; connection and model unverified' }] }, status: 'success' }
         : undefined }),
     useQuery: options => {
       queryOptions.push(options);
       if (options.queryKey[1] === 'status' && options.enabled !== false) statusQuery = options;
-      const result = { ...(qcBehavior.keyedCache ? { status: 'success', fetchStatus: 'idle' } : {}), error: options.queryKey[1] === 'status' ? qcBehavior.statusError : null, data: options.queryKey[1] === 'status'
-        ? { ...(qcBehavior.keyedCache ? { listening: false, stopping: false } : {}), overlay_shown: false, overlay_stop_confirmed: true, busy: false, requests: {}, capabilities: supported ? { all_projects: true, automatic_web_fallback: true, independent_models: true, history_opt_out: true, macos_transcription: true, overlay: true, overlay_stream: true, overlay_cancel: true } : undefined, ...activeStatus() }
+      const result = { ...(qcBehavior.keyedCache ? { status: 'success', fetchStatus: 'idle' } : {}), error: options.queryKey[1] === 'status' ? qcBehavior.statusError : options.queryKey[1] === 'preflight' ? qcBehavior.preflightError : null, data: options.queryKey[1] === 'status'
+        ? { listening: false, stopping: false, overlay_shown: false, overlay_stop_confirmed: true, busy: false, requests: {}, capabilities: supported ? { all_projects: true, automatic_web_fallback: true, independent_models: true, history_opt_out: true, capture_preflight: 1, model_discovery: true, macos_transcription: true, overlay: true, overlay_stream: true, overlay_cancel: true } : undefined, ...activeStatus() }
+        : options.queryKey[1] === 'preflight' ? readyPreflight(options.queryKey.at(-1), qcBehavior.preflight)
         : options.queryKey[1] === 'projects' ? (qcBehavior.projectsForRoute?.(route) || [{ name: 'alpha', path: '/projects/alpha' }])
         : options.queryKey[1] === 'models' ? { providers: qcBehavior.providers ?? [{ id: 'openai', label: 'OpenAI API', models: [], custom_model: true, configured: true, status: 'Key available; connection and model unverified' }] } : [] };
       if (!qcBehavior.keyedCache) return result;
@@ -1049,7 +1057,7 @@ test('native settings move answer preferences and propagate changes to an open p
   assert.ok(nodes(settings).some(n => n.props['aria-label'] === 'Exclude past sessions'));
   assert.ok(nodes(settings).some(n => n.props['aria-labelledby'] === 'mc-provider-label'));
   assert.ok(fallbackControl(settings));
-  assert.doesNotMatch(JSON.stringify(ui.tree), /Bring your own API key/);
+  assert.doesNotMatch(JSON.stringify(ui.tree), /Optional API key overrides/);
   assert.equal(nodes(ui.tree).some(n => n.props['aria-labelledby'] === 'mc-scope-label'), false);
   assert.ok(nodes(ui.tree).some(n => n.props['aria-label'] === 'Capture session'));
   assert.ok(button(ui.tree, 'Show overlay'));
@@ -1125,8 +1133,8 @@ const settingsPage = ui => ui.contributions.find(c => c.area === 'settings.plugi
 const settingNode = (tree, label) => nodes(tree).find(n => n.props['aria-label'] === label || n.props['aria-labelledby'] === label);
 
 for (const modern of [true, false]) for (const [platform, caps, expected] of [
-  ['macOS', { macos_transcription: true, windows_transcription: false, meta_asr: true }, 'macos'],
-  ['Windows', { macos_transcription: false, windows_transcription: true, meta_asr: true }, 'native'],
+  ['macOS', { capture_preflight: 1, model_discovery: true, macos_transcription: true, windows_transcription: false, meta_asr: true }, 'macos'],
+  ['Windows', { capture_preflight: 1, model_discovery: true, macos_transcription: false, windows_transcription: true, meta_asr: true }, 'native'],
 ]) test(`fresh ${platform} defaults send both inputs locally (modern=${modern})`, async () => {
   const storage = settingsStore();
   const status = { listening: false, stopping: false, capabilities: caps };
@@ -1164,7 +1172,7 @@ for (const modern of [true, false]) test(`delayed platform readiness never freez
   const setup = modern ? settingsPage(ui).render() : tree;
   settingNode(setup, 'mc-scope-label').props.onChange({ target: { value: '/projects/alpha' } });
   assert.equal(storage.map.get('preferences-v1')?.backend, undefined);
-  status.capabilities = { windows_transcription: true, macos_transcription: false, meta_asr: true };
+  status.capabilities = { windows_transcription: true, capture_preflight: 1, model_discovery: true, macos_transcription: false, meta_asr: true };
   tree = ui.rerender();
   assert.match(JSON.stringify(disclosedNodes(tree)), /Windows.*Microphone \+ system audio.*Local transcription/);
   assert.equal(storage.map.get('preferences-v1')?.backend, undefined);
@@ -1178,12 +1186,12 @@ for (const modern of [true, false]) test(`delayed platform readiness never freez
 
 for (const modern of [true, false]) test(`inferred-source changes revoke consent and a pending claim (modern=${modern})`, async () => {
   const claim = gate(), storage = settingsStore();
-  const status = { listening: false, stopping: false, capabilities: { macos_transcription: true, windows_transcription: false } };
+  const status = { listening: false, stopping: false, capabilities: { capture_preflight: 1, model_discovery: true, macos_transcription: true, windows_transcription: false } };
   const ui = pane(undefined, true, false, '', {}, { '/overlay/claim': () => claim.promise }, status,
     { setInterval: () => 0, clearInterval: () => {} }, { settingsHost: modern, effects: true, noSeedOverrides: true, storage });
   permissionControl(ui.tree).props.onChange({ target: { checked: true } });
   const pending = button(ui.rerender(), 'Start listening').props.onClick();
-  status.capabilities = { macos_transcription: false, windows_transcription: true };
+  status.capabilities = { capture_preflight: 1, model_discovery: true, macos_transcription: false, windows_transcription: true };
   claim.resolve({ pane: 'inferred-source-test' });
   await pending;
   assert.equal(ui.requests.filter(r => r.path === '/start').length, 0);
@@ -1198,8 +1206,8 @@ for (const modern of [true, false]) test(`inferred-source changes revoke consent
 
 for (const modern of [true, false]) for (const pending of [false, true]) test(`inferred source away and back never restores old consent (modern=${modern}, pending=${pending})`, async () => {
   const claim = gate(), storage = settingsStore();
-  const mac = { macos_transcription: true, windows_transcription: false };
-  const windows = { macos_transcription: false, windows_transcription: true };
+  const mac = { capture_preflight: 1, model_discovery: true, macos_transcription: true, windows_transcription: false };
+  const windows = { capture_preflight: 1, model_discovery: true, macos_transcription: false, windows_transcription: true };
   const status = { listening: false, stopping: false, capabilities: mac };
   const ui = pane(undefined, true, false, '', {}, { '/overlay/claim': () => claim.promise }, status,
     { setInterval: () => 0, clearInterval: () => {} }, { settingsHost: modern, effects: true, noSeedOverrides: true, storage });
@@ -1224,14 +1232,14 @@ for (const modern of [true, false]) for (const pending of [false, true]) test(`i
 
 for (const modern of [true, false]) for (const pending of [false, true]) test(`batched inferred-source changes revoke consent before rendering (modern=${modern}, pending=${pending})`, async () => {
   const claim = gate(), storage = settingsStore();
-  const mac = { macos_transcription: true, windows_transcription: false };
+  const mac = { capture_preflight: 1, model_discovery: true, macos_transcription: true, windows_transcription: false };
   const status = { listening: false, stopping: false, capabilities: mac };
   const delayed = pane(undefined, true, false, '', {}, { '/overlay/claim': () => claim.promise }, status,
     { setInterval: () => 0, clearInterval: () => {} }, { settingsHost: modern, effects: true, noSeedOverrides: true, storage });
   permissionControl(delayed.tree).props.onChange({ target: { checked: true } });
   const start = button(delayed.rerender(), 'Start listening');
   const inflight = pending ? start.props.onClick() : null;
-  status.capabilities = { macos_transcription: false, windows_transcription: true };
+  status.capabilities = { capture_preflight: 1, model_discovery: true, macos_transcription: false, windows_transcription: true };
   delayed.notifyCache();
   status.capabilities = mac;
   delayed.notifyCache(); // Deliberately no render between authoritative updates.
@@ -1245,8 +1253,8 @@ for (const modern of [true, false]) for (const pending of [false, true]) test(`b
 
 test('unavailable native readiness identifies platform without pretending capture is ready', () => {
   for (const [caps, platform] of [
-    [{ macos_transcription: false, windows_transcription: false, macos_detail: 'On macOS: run prepare_macos.py, allow Microphone / Screen Recording, then restart capture.', windows_detail: 'Windows capture requires Windows.' }, 'macOS'],
-    [{ macos_transcription: false, windows_transcription: false, macos_detail: 'macOS transcription requires macOS.', windows_detail: 'Windows capture needs optional audio dependencies in the gateway interpreter: SoundCard. See the Windows setup guide. Capture remains unavailable.' }, 'Windows'],
+    [{ capture_preflight: 1, model_discovery: true, macos_transcription: false, windows_transcription: false, macos_detail: 'On macOS: run prepare_macos.py, allow Microphone / Screen Recording, then restart capture.', windows_detail: 'Windows capture requires Windows.' }, 'macOS'],
+    [{ capture_preflight: 1, model_discovery: true, macos_transcription: false, windows_transcription: false, macos_detail: 'macOS transcription requires macOS.', windows_detail: 'Windows capture needs optional audio dependencies in the gateway interpreter: SoundCard. See the Windows setup guide. Capture remains unavailable.' }, 'Windows'],
   ]) {
     const ui = pane(undefined, true, false, '', {}, {}, { listening: false, stopping: false, capabilities: caps }, {}, { settingsHost: true, noSeedOverrides: true });
     const text = JSON.stringify(disclosedNodes(ui.tree));
@@ -1257,7 +1265,7 @@ test('unavailable native readiness identifies platform without pretending captur
 });
 
 test('unknown and contradictory platform capability evidence stays unselected', () => {
-  for (const caps of [{ macos_transcription: false, windows_transcription: false, macos_detail: 'macOS transcription requires macOS.', windows_detail: 'Windows capture requires Windows.' }, { macos_transcription: true, windows_transcription: true }]) {
+  for (const caps of [{ capture_preflight: 1, model_discovery: true, macos_transcription: false, windows_transcription: false, macos_detail: 'macOS transcription requires macOS.', windows_detail: 'Windows capture requires Windows.' }, { capture_preflight: 1, model_discovery: true, macos_transcription: true, windows_transcription: true }]) {
     const storage = settingsStore();
     const ui = pane(undefined, true, false, '', {}, {}, { listening: false, stopping: false, capabilities: caps }, {}, { settingsHost: true, noSeedOverrides: true, storage });
     assert.match(JSON.stringify(disclosedNodes(ui.tree)), /capture source.*(not identified|choose)/i);
@@ -1283,7 +1291,7 @@ for (const modern of [true, false]) test(`explicit saved capture choices survive
   for (const backend of ['meetily', 'native', 'macos']) {
     const storage = settingsStore();
     storage.set('preferences-v1', { backend, audioSource: 'microphone', transcriptionProvider: 'local' });
-    const ui = pane(undefined, true, false, '', {}, {}, { listening: false, stopping: false, capabilities: { macos_transcription: true, windows_transcription: false, independent_models: true, history_opt_out: true } }, {}, { settingsHost: modern, noSeedOverrides: true, storage });
+    const ui = pane(undefined, true, false, '', {}, {}, { listening: false, stopping: false, capabilities: { capture_preflight: 1, model_discovery: true, macos_transcription: true, windows_transcription: false, independent_models: true, history_opt_out: true } }, {}, { settingsHost: modern, noSeedOverrides: true, storage });
     const page = modern ? settingsPage(ui).render() : ui.tree;
     assert.equal(settingNode(page, 'mc-backend-label').props.value, backend);
     settingNode(page, 'mc-scope-label').props.onChange({ target: { value: '/projects/alpha' } });
@@ -1294,8 +1302,8 @@ for (const modern of [true, false]) test(`explicit saved capture choices survive
 
 test('pane has one overlay toggle across collapsed sections and keeps key disclosures visible', async () => {
   for (const status of [
-    { listening: false, stopping: false, capabilities: { macos_transcription: true, overlay: true, independent_models: true, history_opt_out: true } },
-    { listening: false, stopping: false, overlay_cleanup_error: 'Overlay shutdown is not confirmed. Verify the window is gone.', capabilities: { macos_transcription: true, overlay: false, independent_models: true, history_opt_out: true } },
+    { listening: false, stopping: false, capabilities: { capture_preflight: 1, model_discovery: true, macos_transcription: true, overlay: true, independent_models: true, history_opt_out: true } },
+    { listening: false, stopping: false, overlay_cleanup_error: 'Overlay shutdown is not confirmed. Verify the window is gone.', capabilities: { capture_preflight: 1, model_discovery: true, macos_transcription: true, overlay: false, independent_models: true, history_opt_out: true } },
   ]) {
     const ui = pane('/projects/alpha', true, false, '', {}, {}, status, {}, { settingsHost: true });
     const tree = ui.rerender();
@@ -1314,7 +1322,7 @@ test('pane has one overlay toggle across collapsed sections and keeps key disclo
 });
 
 test('empty capture action row renders no numeric zero artifacts', () => {
-  const ui = pane(undefined, true, false, '', {}, {}, { listening: false, stopping: false, segments: [], recent: [], capabilities: { macos_transcription: true } }, {}, { settingsHost: true, noSeedOverrides: true });
+  const ui = pane(undefined, true, false, '', {}, {}, { listening: false, stopping: false, segments: [], recent: [], capabilities: { capture_preflight: 1, model_discovery: true, macos_transcription: true } }, {}, { settingsHost: true, noSeedOverrides: true });
   const capture = nodes(ui.tree).find(n => n.props['aria-label'] === 'Capture session');
   assert.equal(nodes(capture).flatMap(n => n.children || []).filter(child => child === 0).length, 0);
 });
@@ -1340,7 +1348,7 @@ test('modern settings own capture configuration; the pane links there and keeps 
 test('modern pane identifies the chosen source and live privacy boundary before consent', () => {
   const storage = settingsStore();
   storage.set('preferences-v1', { backend: 'macos', audioSource: 'both', transcriptionProvider: 'meta', transcriptionChoiceVersion: 1, asrMode: 'DIARIZATION' });
-  const status = { listening: false, stopping: false, capabilities: { macos_transcription: true, meta_asr: true, independent_models: true, history_opt_out: true, all_projects: true, overlay: true } };
+  const status = { listening: false, stopping: false, capabilities: { capture_preflight: 1, model_discovery: true, macos_transcription: true, meta_asr: true, independent_models: true, history_opt_out: true, all_projects: true, overlay: true } };
   const ui = pane(undefined, true, false, '', {}, {}, status, {}, { settingsHost: true, noSeedOverrides: true, storage });
   const card = nodes(ui.tree).find(n => n.props['aria-label'] === 'Capture session');
   const text = JSON.stringify(disclosedNodes(card));
@@ -1354,7 +1362,7 @@ test('modern pane identifies the chosen source and live privacy boundary before 
 test('modern pane discloses an already-running cloud capture even when next defaults are local', () => {
   const storage = settingsStore();
   storage.set('preferences-v1', { backend: 'macos', audioSource: 'microphone', transcriptionProvider: 'local', transcriptionModel: 'base.en' });
-  const status = { listening: true, stopping: false, backend: 'macos', last_session: { backend: 'macos', transcription_provider: 'meta', asr_mode: 'DIARIZATION' }, capabilities: { macos_transcription: true, meta_asr: true, independent_models: true, history_opt_out: true, all_projects: true, overlay: true } };
+  const status = { listening: true, stopping: false, backend: 'macos', last_session: { backend: 'macos', transcription_provider: 'meta', asr_mode: 'DIARIZATION' }, capabilities: { capture_preflight: 1, model_discovery: true, macos_transcription: true, meta_asr: true, independent_models: true, history_opt_out: true, all_projects: true, overlay: true } };
   const ui = pane(undefined, true, false, '', {}, {}, status, {}, { settingsHost: true, noSeedOverrides: true, storage });
   const text = JSON.stringify(disclosedNodes(ui.tree));
   assert.match(text, /meeting audio is sent to Meta/i);
@@ -1403,7 +1411,7 @@ test('invalid persisted capture choices fail back to known safe defaults', () =>
 
 test('late pane effects cannot overwrite newer capture settings or silently start cloud audio', async () => {
   const storage = settingsStore();
-  const status = { listening: false, stopping: false, capabilities: { macos_transcription: true, meta_asr: true, independent_models: true, history_opt_out: true, all_projects: true, automatic_web_fallback: true, overlay: true } };
+  const status = { listening: false, stopping: false, capabilities: { capture_preflight: 1, model_discovery: true, macos_transcription: true, meta_asr: true, independent_models: true, history_opt_out: true, all_projects: true, automatic_web_fallback: true, overlay: true } };
   const ui = pane('/projects/alpha', true, false, '', { 3: true }, {}, status,
     { setInterval: () => 0, clearInterval: () => {} }, { settingsHost: true, effects: true, delayPaneEffects: true, storage });
   const staleStart = button(ui.tree, 'Start listening');
@@ -1442,7 +1450,7 @@ test('late pane effects cannot overwrite newer capture settings or silently star
 test('switching capture settings away and back still requires fresh permission', async () => {
   const storage = settingsStore();
   storage.set('preferences-v1', { backend: 'macos', transcriptionProvider: 'local', audioSource: 'microphone', transcriptionModel: 'base.en', asrMode: 'ENDPOINTING' });
-  const status = { listening: false, stopping: false, capabilities: { macos_transcription: true, meta_asr: true, independent_models: true, history_opt_out: true, all_projects: true, overlay: true } };
+  const status = { listening: false, stopping: false, capabilities: { capture_preflight: 1, model_discovery: true, macos_transcription: true, meta_asr: true, independent_models: true, history_opt_out: true, all_projects: true, overlay: true } };
   const ui = pane(undefined, true, false, '', {}, {}, status, { setInterval: () => 0, clearInterval: () => {} }, { settingsHost: true, effects: true, noSeedOverrides: true, storage });
   let tree = ui.tree;
   let label = nodes(tree).find(n => n.type === 'label' && JSON.stringify(n.children).includes('I have permission to capture/read this meeting'));
@@ -1468,7 +1476,7 @@ function permissionControl(tree) {
 }
 
 const idleCaptureStatus = () => ({ listening: false, stopping: false, capabilities: {
-  macos_transcription: true, meta_asr: true, windows_transcription: true, independent_models: true,
+  capture_preflight: 1, model_discovery: true, macos_transcription: true, meta_asr: true, windows_transcription: true, independent_models: true,
   history_opt_out: true, all_projects: true, overlay: true,
 } });
 
@@ -1693,7 +1701,7 @@ test('an older release cannot authorize deferred defaults after a new pane takeo
 test('capture settings reject stale handlers while start is in flight and until an idle status', async () => {
   let finish;
   const storage = settingsStore();
-  const state = { listening: false, stopping: false, capabilities: { macos_transcription: true, meta_asr: true, independent_models: true, history_opt_out: true, all_projects: true, overlay: true } };
+  const state = { listening: false, stopping: false, capabilities: { capture_preflight: 1, model_discovery: true, macos_transcription: true, meta_asr: true, independent_models: true, history_opt_out: true, all_projects: true, overlay: true } };
   const ui = pane('/projects/alpha', true, false, '', { 3: true }, { '/start': () => new Promise(resolve => { finish = resolve; }), '/status': () => state }, state,
     { setInterval: () => 0, clearInterval: () => {} }, { settingsHost: true, effects: true, storage });
   let page = settingsPage(ui).render();
@@ -1726,7 +1734,7 @@ test('capture settings reject stale handlers while start is in flight and until 
 });
 
 test('stale Start and settings callbacks fail closed when capture status becomes unavailable or stopping', async () => {
-  const status = { listening: false, stopping: false, capabilities: { macos_transcription: true, meta_asr: true, independent_models: true, history_opt_out: true, all_projects: true, overlay: true } };
+  const status = { listening: false, stopping: false, capabilities: { capture_preflight: 1, model_discovery: true, macos_transcription: true, meta_asr: true, independent_models: true, history_opt_out: true, all_projects: true, overlay: true } };
   const opts = { settingsHost: true, effects: true, storage: settingsStore() };
   const ui = pane('/projects/alpha', true, false, '', {}, {}, status,
     { setInterval: () => 0, clearInterval: () => {} }, opts);
@@ -1760,7 +1768,7 @@ test('stale Start and settings callbacks fail closed when capture status becomes
 
 test('capture settings surface source and Meta readiness, and stale selections cannot bypass it', () => {
   const storage = settingsStore();
-  const status = { listening: false, stopping: false, capabilities: { macos_transcription: true, meta_asr: true, windows_transcription: true, independent_models: true, history_opt_out: true, all_projects: true, overlay: true } };
+  const status = { listening: false, stopping: false, capabilities: { capture_preflight: 1, model_discovery: true, macos_transcription: true, meta_asr: true, windows_transcription: true, independent_models: true, history_opt_out: true, all_projects: true, overlay: true } };
   const ui = pane('/projects/alpha', true, false, '', {}, {}, status,
     { setInterval: () => 0, clearInterval: () => {} }, { settingsHost: true, effects: true, storage });
   let page = settingsPage(ui).render();
@@ -1791,7 +1799,7 @@ test('capture settings surface source and Meta readiness, and stale selections c
 
 test('host disposal fences retained capture settings and navigation callbacks', async () => {
   const storage = settingsStore();
-  const status = { listening: false, stopping: false, capabilities: { macos_transcription: true, meta_asr: true, independent_models: true, history_opt_out: true, all_projects: true, overlay: true } };
+  const status = { listening: false, stopping: false, capabilities: { capture_preflight: 1, model_discovery: true, macos_transcription: true, meta_asr: true, independent_models: true, history_opt_out: true, all_projects: true, overlay: true } };
   const ui = pane('/projects/alpha', true, false, '', {}, {}, status,
     { setInterval: () => 0, clearInterval: () => {} }, { settingsHost: true, effects: true, storage });
   const staleSource = settingNode(settingsPage(ui).render(), 'mc-backend-label');
@@ -1810,7 +1818,7 @@ test('settings-first capture reaches real backend lifecycle with synthetic audio
   const backend = await realBackend(t);
   const storage = settingsStore();
   // This fixture deliberately substitutes fake readiness; the backend audio factory is synthetic.
-  const status = { listening: false, stopping: false, capabilities: { macos_transcription: true, meta_asr: false, independent_models: true, history_opt_out: true, all_projects: true, automatic_web_fallback: true, overlay: true } };
+  const status = { listening: false, stopping: false, capabilities: { capture_preflight: 1, model_discovery: true, macos_transcription: true, meta_asr: false, independent_models: true, history_opt_out: true, all_projects: true, automatic_web_fallback: true, overlay: true } };
   const ui = backend.mount({}, undefined, { settingsHost: true, skipInitialPane: true, noSeedOverrides: true, storage }, status);
   let page = settingsPage(ui).render();
   settingNode(page, 'mc-backend-label').props.onChange({ target: { value: 'macos' } });
@@ -2017,7 +2025,7 @@ for (const throws of [false, true]) test(`older or partial host keeps inline set
   assert.ok(fallbackControl(ui.tree));
   assert.ok(settingNode(ui.tree, 'Specific public web query'));
   assert.ok(button(ui.tree, 'Check sources + web'));
-  assert.match(JSON.stringify(ui.tree), /Bring your own API key/);
+  assert.match(JSON.stringify(ui.tree), /Optional API key overrides/);
 });
 
 test('late pane persistence cannot roll back a newer Settings edit', () => {
@@ -2038,7 +2046,7 @@ for (const [excludeHistory, webFallback] of [[false, true], [true, false]]) test
   const ui = pane(undefined, true, false, '', {}, { '/assist': { request_id: 'new-answer' } }, {},
     { localStorage: { getItem: k => old.get(k) || null }, setInterval: () => 0, clearInterval: () => {} },
     { settingsHost: true, effects: true, delayPaneEffects: true, noSeedOverrides: true, storage,
-      providers: [{ id: 'openai', label: 'OpenAI' }, { id: 'openrouter', label: 'OpenRouter' }] });
+      providers: [{ id: 'openai', label: 'OpenAI', configured: true }, { id: 'openrouter', label: 'OpenRouter', configured: true }] });
   const page = settingsPage(ui);
   const immediateSuggest = button(ui.tree, 'Suggest answer');
   let tree = page.render();
@@ -2165,7 +2173,7 @@ test('Windows capture exposes source and model, and never sends a hidden cloud t
   const store = new Map([['meeting-copilot.scope.v2', JSON.stringify({ backend: 'native', transcriptionProvider: 'meta', transcriptionChoiceVersion: 1 })]]);
   const ui = pane('/projects/alpha', true, false, '', { 3: true, 4: 'native' }, {}, {
     capabilities: { all_projects: true, independent_models: true, history_opt_out: true,
-      windows_transcription: true, windows_detail: 'Experimental; hardware unverified.' },
+      capture_preflight: 1, model_discovery: true, windows_transcription: true, windows_detail: 'Experimental; hardware unverified.' },
   }, { localStorage: { getItem: key => store.get(key), setItem: (key, value) => store.set(key, value) } });
   nodes(ui.tree).find(n => n.props?.['aria-label'] === 'Audio source').props.onChange({ target: { value: 'system' } });
   nodes(ui.tree).find(n => n.props?.['aria-label'] === 'Local transcription model').props.onChange({ target: { value: 'tiny.en' } });
@@ -2188,7 +2196,7 @@ test('Windows resume ignores the hidden macOS provider and ASR settings', async 
   const ui = pane('/projects/alpha', true, false, '', { 3: true, 4: 'native' }, {}, {
     segments: [{ text: 'Synthetic retained question' }],
     last_session: { backend: 'native', audio_source: 'microphone', transcription_model: 'base.en', transcription_provider: 'local', asr_mode: 'ENDPOINTING' },
-    capabilities: { windows_transcription: true },
+    capabilities: { capture_preflight: 1, model_discovery: true, windows_transcription: true },
   }, { localStorage: { getItem: key => store.get(key), setItem() {} }, window: { confirm() { assert.fail('same native settings must resume without clearing'); } } });
   await button(ui.tree, 'Resume listening').props.onClick();
   const request = ui.requests.find(r => r.path === '/start');
@@ -2287,13 +2295,13 @@ test('read-only overlay notice remains visible with settings closed', () => {
 
 test('legacy automatic Meta preference migrates to local without proof', async () => {
   const store = new Map([['meeting-copilot.scope.v2', JSON.stringify({ backend: 'macos', transcriptionProvider: 'meta' })]]);
-  const ui = pane('', true, false, '', {}, {}, { capabilities: { macos_transcription: true, meta_asr: true } }, { localStorage: { getItem: k => store.get(k), setItem: (k,v) => store.set(k,v) } });
+  const ui = pane('', true, false, '', {}, {}, { capabilities: { capture_preflight: 1, model_discovery: true, macos_transcription: true, meta_asr: true } }, { localStorage: { getItem: k => store.get(k), setItem: (k,v) => store.set(k,v) } });
   assert.equal(nodes(ui.tree).find(n => n.props['aria-label'] === 'Transcription provider').props.value, 'local');
 });
 
 test('saved explicit unavailable Meta disables capture with actionable guidance', async () => {
   const store = new Map([['meeting-copilot.scope.v2', JSON.stringify({ backend: 'macos', transcriptionProvider: 'meta', transcriptionChoiceVersion: 1 })]]);
-  const ui = pane('', true, false, '', { 3: true }, {}, { capabilities: { macos_transcription: true, meta_asr: false } }, { localStorage: { getItem: k => store.get(k), setItem: (k,v) => store.set(k,v) } });
+  const ui = pane('', true, false, '', { 3: true }, {}, { capabilities: { capture_preflight: 1, model_discovery: true, macos_transcription: true, meta_asr: false } }, { localStorage: { getItem: k => store.get(k), setItem: (k,v) => store.set(k,v) } });
   assert.equal(button(ui.tree, 'Start listening').props.disabled, true);
   assert.match(JSON.stringify(ui.tree), /Meta.*unavailable.*local.*key/i);
   const metaOption = nodes(ui.tree).find(n => n.type === 'option' && n.props.value === 'meta');
@@ -2322,7 +2330,7 @@ test('BYOK setup points to Hermes and never renders credential entry or makes cr
   ui.unmount();ui.unregister();
   assert.ok(!ui.requests.some(r=>r.path.startsWith('/credentials')));
 });
-test('fresh panes require explicit BYOK selection and default to history excluded', async () => {
+test('fresh panes cannot submit an unavailable Hermes default and keep history excluded', async () => {
   const ui=pane('alpha',true,false,'',{}, {}, {}, {}, {freshDefaults:true});
   const toggle=nodes(ui.tree).find(n=>n.props['aria-label']==='Exclude past sessions');
   assert.equal(toggle.props.checked,true);
@@ -2534,7 +2542,7 @@ test('attributed capture restart preserves cloud availability and overlay safety
     const ui = pane('', true, false, '', { 3: true }, {}, {
       error_source: 'capture', capture_error: 'Microphone failed',
       ...(overlayUncertain ? { overlay_cleanup_error: 'Overlay shutdown is not confirmed' } : {}),
-      capabilities: { macos_transcription: true, meta_asr: false },
+      capabilities: { capture_preflight: 1, model_discovery: true, macos_transcription: true, meta_asr: false },
     }, { localStorage: { getItem: k => store.get(k), setItem: (k, v) => store.set(k, v) } });
     const restart = button(alertFor(ui.tree, 'Microphone failed'), 'Restart capture');
     assert.ok(restart);
@@ -2885,7 +2893,7 @@ test('independent transcription sends explicit local model/source and consent', 
 });
 
 test('meta cloud transcription is opt-in, warns, and sends provider/mode', async () => {
-  const caps = { capabilities: { all_projects: true, automatic_web_fallback: true, independent_models: true, history_opt_out: true, macos_transcription: true, meta_asr: true, overlay: true, overlay_stream: true, overlay_cancel: true } };
+  const caps = { capabilities: { all_projects: true, automatic_web_fallback: true, independent_models: true, history_opt_out: true, capture_preflight: 1, model_discovery: true, macos_transcription: true, meta_asr: true, overlay: true, overlay_stream: true, overlay_cancel: true } };
   const { tree, requests } = pane('', true, false, '',
     { 3: true, 4: 'macos', 25: 'meta', 26: 'DIARIZATION' }, {}, caps);
   const provider = nodes(tree).find(n => n.type === 'select' && n.props['aria-label'] === 'Transcription provider');
@@ -2990,7 +2998,7 @@ function disclosedNodes(node) {
 
 for (const timing of ['cached', 'delayed']) test(`local capture default is independent of capability timing (${timing})`, async () => {
   const store = new Map();
-  const status = { capabilities: { macos_transcription: true, meta_asr: timing === 'cached' } };
+  const status = { capabilities: { capture_preflight: 1, model_discovery: true, macos_transcription: true, meta_asr: timing === 'cached' } };
   const ui = pane('', true, false, '', { 3: true, 4: 'macos' }, {}, status, {
     localStorage: { getItem: key => store.get(key) || null, setItem: (key, value) => store.set(key, value) },
     setInterval: () => 0, clearInterval: () => {},
@@ -3007,7 +3015,7 @@ for (const timing of ['cached', 'delayed']) test(`local capture default is indep
 
 test('explicit persisted cloud preference survives unrelated preference edits and discloses at Start', async () => {
   const store = new Map([['meeting-copilot.scope.v2', JSON.stringify({ transcriptionProvider: 'meta', transcriptionChoiceVersion: 1 })]]);
-  const ui = pane('', true, false, '', { 3: true, 4: 'macos' }, {}, { capabilities: { macos_transcription: true, meta_asr: true } }, {
+  const ui = pane('', true, false, '', { 3: true, 4: 'macos' }, {}, { capabilities: { capture_preflight: 1, model_discovery: true, macos_transcription: true, meta_asr: true } }, {
     localStorage: { getItem: key => store.get(key) || null, setItem: (key, value) => store.set(key, value) },
     setInterval: () => 0, clearInterval: () => {},
   }, { effects: true });
@@ -4097,4 +4105,166 @@ test('visual answer card retains full evidence and empty state never replaces an
   assert.equal(nodes(ui.tree).find(n => n.props['data-answer-result']).props.className, 'mc-answer');
   assert.ok(nodes(ui.tree).find(n => n.props.className === 'mc-evidence-card'));
   assert.match(JSON.stringify(ui.tree), /Synthetic evidence/);
+});
+
+for (const [name, config] of [
+  ['blocked', { preflight: { ready: false, checks: [{ id: 'permission', status: 'blocked', label: 'Microphone permission', detail: 'Allow access.' }] } }],
+  ['expired', { preflight: { receivedAt: Date.now() - 20000 } }],
+  ['wrong settings', { preflight: { signature: 'stale-settings' } }],
+  ['empty checks', { preflight: { checks: [] } }],
+  ['failed', { preflightError: new Error('offline') }],
+  ['refresh in flight', { preflightFetchStatus: 'fetching' }],
+]) test(`preflight ${name} disables and fences Start`, async () => {
+  const ui = pane('', true, false, '', { 3: true, 4: 'macos' }, {}, {}, {}, config);
+  const start = button(ui.tree, 'Start listening');
+  assert.equal(start.props.disabled, true);
+  await start.props.onClick();
+  assert.equal(ui.requests.filter(r => r.path === '/start').length, 0);
+});
+
+test('local capture readiness does not require an answer provider or key', async () => {
+  const ui = pane('', true, false, '', { 3: true, 4: 'macos', 12: '', 13: '' }, {}, {}, {}, { providers: [] });
+  assert.equal(button(ui.tree, 'Start listening').props.disabled, false);
+  await button(ui.tree, 'Start listening').props.onClick();
+  assert.equal(ui.requests.filter(r => r.path === '/start').length, 1);
+  assert.equal(ui.requests.filter(r => r.path === '/models/discover').length, 0);
+});
+
+for (const pending of [false, true]) test(`removed preflight capability fences retained Start (pending=${pending})`, async () => {
+  const claim = gate(), status = idleCaptureStatus();
+  const ui = pane('', true, false, '', { 3: true, 4: 'macos' }, { '/overlay/claim': () => claim.promise }, status);
+  const start = button(ui.tree, 'Start listening');
+  let work;
+  if (pending) { work = start.props.onClick(); await settle(); }
+  delete status.capabilities.capture_preflight;
+  if (!pending) work = start.props.onClick();
+  claim.resolve({ accepted: true, pane: 'test-pane' });
+  await work;
+  assert.equal(ui.requests.filter(r => r.path === '/start').length, 0);
+});
+
+test('capture checks only send selected settings and consent, never answers or recording requests', async () => {
+  const ui = pane('', true, false, '', { 3: true, 4: 'macos', 11: 'system' }, { '/preflight': { version: 1, ready: false, checks: [] } });
+  const query = ui.queryOptions.find(q => q.queryKey[1] === 'preflight');
+  await query.queryFn();
+  const request = ui.requests.find(r => r.path === '/preflight');
+  assert.equal(request.body.audio_source, 'system');
+  assert.equal(request.body.consent, true);
+  assert.equal(request.body.transcription_provider, 'local');
+  assert.equal(request.body.question, undefined);
+  assert.equal(request.body.answer_model, undefined);
+  assert.equal(ui.requests.filter(r => ['/start', '/permissions/request', '/models/discover'].includes(r.path)).length, 0);
+});
+
+function modelOptionsPane(response, globals = {}, extra = {}) {
+  return pane('/projects/alpha', true, false, '', {}, { '/models/discover': response }, {},
+    { window: { confirm: () => true }, ...globals },
+    { settingsHost: true, providers: [{ id: 'openai', label: 'OpenAI', configured: true }, { id: 'openrouter', label: 'OpenRouter', configured: true }], ...extra });
+}
+
+test('provider model options load only explicitly and preserve manual selection', async () => {
+  const confirmations = [];
+  const ui = modelOptionsPane({ provider: 'openai', models: ['gpt-first', 'gpt-second'], status: 'Account list; compatibility unverified.' },
+    { window: { confirm: text => { confirmations.push(text); return true; } } });
+  const page = settingsPage(ui);
+  const initial = page.render();
+  assert.equal(ui.requests.filter(r => r.path === '/models/discover').length, 0);
+  await button(initial, 'Load model options…').props.onClick();
+  const request = ui.requests.find(r => r.path === '/models/discover');
+  assert.deepEqual(JSON.parse(JSON.stringify(request.body)), { provider: 'openai', consent: true });
+  assert.match(confirmations[0], /saved API key/);
+  assert.match(confirmations[0], /No meeting, question or project content/);
+  let tree = page.render();
+  assert.equal(settingNode(tree, 'Answer model').props.value, 'gpt-test', 'loading never picks a model');
+  settingNode(tree, 'Listed model options').props.onChange({ target: { value: 'gpt-second' } });
+  tree = page.render();
+  assert.equal(settingNode(tree, 'Answer model').props.value, 'gpt-second');
+  settingNode(tree, 'Answer model').props.onChange({ target: { value: 'gpt-custom' } });
+  assert.equal(settingNode(page.render(), 'Answer model').props.value, 'gpt-custom');
+});
+
+for (const change of ['manual model', 'provider away and back']) test(`stale model discovery after ${change} retires loading and permits retry`, async () => {
+  const pending = gate();
+  const ui = modelOptionsPane(() => pending.promise);
+  const page = settingsPage(ui);
+  const load = button(page.render(), 'Load model options…').props.onClick;
+  const work = load();
+  await load();
+  assert.equal(ui.requests.filter(r => r.path === '/models/discover').length, 1, 'repeated clicks do not duplicate requests');
+  if (change === 'manual model') settingNode(page.render(), 'Answer model').props.onChange({ target: { value: 'gpt-manual' } });
+  else {
+    settingNode(page.render(), 'mc-provider-label').props.onChange({ target: { value: 'openrouter' } });
+    settingNode(page.render(), 'mc-provider-label').props.onChange({ target: { value: 'openai' } });
+  }
+  pending.resolve({ provider: 'openai', models: ['gpt-stale'], status: 'Unverified' });
+  await work;
+  const tree = page.render();
+  assert.equal(button(tree, 'Load model options…').props.disabled, false);
+  assert.equal(settingNode(tree, 'Listed model options'), undefined);
+  assert.equal(settingNode(tree, 'Answer model').props.value, change === 'manual model' ? 'gpt-manual' : '');
+});
+
+test('cancelled model discovery and missing key do not send a provider request', async () => {
+  for (const allowed of [false, true]) {
+    const ui = modelOptionsPane({}, { window: { confirm: () => allowed } },
+      allowed ? { providers: [{ id: 'openai', configured: false }] } : {});
+    await button(settingsPage(ui).render(), 'Load model options…').props.onClick();
+    assert.equal(ui.requests.filter(r => r.path === '/models/discover').length, 0);
+  }
+});
+
+test('OS permissions require a separate confirmed action and never start capture', async () => {
+  const ui = pane('', true, false, '', { 3: false, 4: 'macos' }, {
+    '/permissions/request': { version: 1, status: 'unknown', capture_started: false },
+  }, {}, { window: { confirm: () => true } });
+  await button(ui.tree, 'Request macOS permissions…').props.onClick();
+  assert.equal(ui.requests.filter(r => r.path === '/start').length, 0);
+  assert.equal(ui.requests.filter(r => r.path === '/permissions/request').length, 1);
+  assert.match(JSON.stringify(ui.rerender()), /Permission setup is not confirmed/);
+});
+
+test('new preferences follow Hermes default without a separate answer key', async () => {
+  const ui = pane('/projects/alpha', true, false, '', {}, {}, {}, {}, {
+    noSeedOverrides: true, settingsHost: true,
+    storage: settingsStore(),
+    providers: [{ id: 'hermes', label: 'Follow Hermes default', configured: true, status: 'Host-scoped route available' }],
+  });
+  let tree = settingsPage(ui).render();
+  assert.equal(settingNode(tree, 'mc-provider-label').props.value, 'hermes');
+  assert.equal(settingNode(tree, 'Answer model'), undefined);
+  assert.match(JSON.stringify(tree), /current Hermes default model/);
+  assert.equal(button(tree, 'Load model options…'), undefined);
+  settingNode(tree, 'mc-scope-label').props.onChange({ target: { value: '/projects/alpha' } });
+  await button(ui.rerender(), 'Suggest answer').props.onClick();
+  const body = ui.requests.find(r => r.path === '/assist')?.body;
+  assert.equal(body?.answer_provider, 'hermes');
+  assert.equal(body?.answer_model, 'default');
+  assert.equal(ui.requests.filter(r => r.path === '/models/discover').length, 0);
+});
+
+test('saved explicit answer override is preserved and can deliberately follow Hermes again', () => {
+  const storage = settingsStore();
+  storage.set('preferences-v1', { answerProvider: 'openrouter', answerModel: 'vendor/saved', project: '/projects/alpha' });
+  const ui = pane('', true, false, '', {}, {}, {}, {}, { noSeedOverrides: true, settingsHost: true, storage,
+    providers: [{ id: 'hermes', configured: true }, { id: 'openrouter', configured: true }] });
+  const page = settingsPage(ui);
+  let tree = page.render();
+  assert.equal(settingNode(tree, 'mc-provider-label').props.value, 'openrouter');
+  assert.equal(settingNode(tree, 'Answer model').props.value, 'vendor/saved');
+  settingNode(tree, 'mc-provider-label').props.onChange({ target: { value: 'hermes' } });
+  tree = page.render();
+  assert.equal(settingNode(tree, 'mc-provider-label').props.value, 'hermes');
+  assert.equal(settingNode(tree, 'Answer model'), undefined);
+  assert.equal(storage.map.get('preferences-v1').answerModel, 'default');
+  assert.equal(ui.requests.filter(r => r.path === '/assist').length, 0);
+});
+
+test('unavailable Hermes default is visible and never falls back to configured BYOK', async () => {
+  const ui = pane('', true, false, '', {}, {}, {}, {}, { noSeedOverrides: true, settingsHost: true,
+    providers: [{ id: 'hermes', configured: false, status: 'Hermes default is unavailable in this host mode.' }, { id: 'openai', configured: true }] });
+  const page = settingsPage(ui).render();
+  assert.match(JSON.stringify(page), /Hermes default is unavailable/);
+  await button(ui.tree, 'Suggest answer').props.onClick();
+  assert.equal(ui.requests.filter(r => r.path === '/assist').length, 0);
+  assert.equal(settingNode(page, 'mc-provider-label').props.value, 'hermes');
 });

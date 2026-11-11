@@ -1,4 +1,5 @@
 """Gated inert real children; never activate audio, UI, or provider services."""
+from tests.thread_test_support import mock_capture_preflight
 import codecs
 import json
 import locale
@@ -21,6 +22,10 @@ from tests.thread_test_support import CheckedThreads
 
 @unittest.skipUnless(sys.platform in ('darwin', 'linux'), 'POSIX pipe/select helper required')
 class ChannelRaceTests(CheckedThreads):
+    def setUp(self):
+        super().setUp()
+        mock_capture_preflight(self)
+
     def test_reader_failure_publication_serializes_with_admission(self):
         with closing_display() as (bridge, children, close_stdout):
             self.assertTrue(bridge.show_overlay()['shown'])

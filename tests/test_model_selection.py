@@ -22,8 +22,8 @@ class ModelSelectionTests(unittest.TestCase):
     def test_catalog_lists_fixed_routes_without_oauth_or_secret_values(self):
         with patch('byok.secret',return_value='synthetic-secret'), patch.dict(sys.modules, {'hermes_cli.models':None,'agent.auxiliary_client':None}):
             result=self.module().available_models()
-        self.assertEqual({p['id'] for p in result['providers']},{'openai','openrouter'})
-        self.assertTrue(all(p['custom_model'] and p['configured'] for p in result['providers']))
+        self.assertEqual({p['id'] for p in result['providers']},{'hermes','openai','openrouter'})
+        self.assertTrue(all(p['custom_model'] and p['configured'] for p in result['providers'] if p['id'] != 'hermes'))
         self.assertNotIn('synthetic-secret',json.dumps(result))
 
     def test_validation_accepts_exact_user_id_without_catalog_or_aliases(self):
@@ -37,7 +37,7 @@ class ModelSelectionTests(unittest.TestCase):
         with patch('byok.secret',return_value=''), patch('byok._scope_available',return_value=True):
             result=self.module().available_models()
         self.assertTrue(all(not p['configured'] for p in result['providers']))
-        self.assertTrue(all('Hermes Settings' in p['status'] for p in result['providers']))
+        self.assertTrue(all('Hermes Settings' in p['status'] for p in result['providers'] if p['id'] != 'hermes'))
 
     def test_missing_credentials_fail_before_transport(self):
         with patch('byok.secret',return_value=''),patch('urllib.request.build_opener',side_effect=AssertionError('no transport')):
@@ -550,7 +550,7 @@ class CatalogSingleFlightTests(unittest.TestCase):
             token=flag.set(value);contexts.append(contextvars.copy_context());flag.reset(token)
         with patch('byok.secret',side_effect=lambda name:flag.get()),ThreadPoolExecutor(max_workers=2) as pool:
             rows=[f.result(timeout=2) for f in [pool.submit(c.run,catalog) for c in contexts]]
-        self.assertTrue(all(p['configured'] for p in rows[0]['providers']))
+        self.assertTrue(all(p['configured'] for p in rows[0]['providers'] if p['id'] != 'hermes'))
         self.assertTrue(all(not p['configured'] for p in rows[1]['providers']))
 
 
