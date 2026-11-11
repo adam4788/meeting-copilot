@@ -5,6 +5,7 @@ are conservative local accounting, NOT a provider bill or guaranteed dollar cap.
 Uncertain attempts are never refunded. There is intentionally no reset route.
 """
 import importlib
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -85,7 +86,12 @@ def _open(*, create=False):
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
             raise ValueError()
-        fcntl.flock(fd, (fcntl.LOCK_EX if create else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+        if create:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Read-only checks are advisory snapshots, never admission. Do not let
+        # a reader lock the just-created empty ledger ahead of its initializer.
+        # A concurrent/partial read fails closed; reserve rechecks under both
+        # exclusive locks before any worker or provider call.
         return fd, fresh
     except BaseException:
         os.close(fd)
@@ -113,7 +119,46 @@ def budget_status(source='microphone'):
             os.close(fd)
 
 
+@contextmanager
+def _admission_lock():
+    """Lock before ledger creation, so competing first calls cannot poison it.
+
+    A stable sidecar is necessary: locking only the newly created empty ledger
+    allows another opener to take its lock before the creator initializes it.
+    The sidecar contains no data. Read-only preflight never creates either file.
+    """
+    import fcntl
+    path = _path()
+    try:
+        path.parent.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    directory = path.parent.lstat()
+    if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.getuid():
+        raise ValueError()
+    fd = os.open(path.with_suffix(path.suffix + '.lock'), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            raise ValueError()
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(fd)
+
+
 def reserve(source='microphone'):
+    """No scope/invalid source may create even the empty admission lock."""
+    try:
+        _require_scope()
+        _streams(source)
+        with _admission_lock():
+            return _reserve_locked(source)
+    except Exception:
+        raise RuntimeError('Google preview allowance is unavailable or exhausted. No provider call was admitted.') from None
+
+
+def _reserve_locked(source='microphone'):
     """Durably reserve every planned stream before any socket/worker attempt."""
     fd = None
     try:

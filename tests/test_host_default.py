@@ -27,8 +27,8 @@ class HostDefaultTests(unittest.TestCase):
         self.patches = [patch.dict(sys.modules, {
             'agent': types.ModuleType('agent'),
             'agent.plugin_llm': types.SimpleNamespace(PluginLlm=Facade),
-            'hermes_constants': types.SimpleNamespace(get_hermes_home=lambda: Path('/profile'))}),
-            patch.object(host_default, '_scope_home', return_value=Path('/profile'))]
+            'hermes_constants': types.SimpleNamespace(get_hermes_home=lambda: Path('/profile').resolve())}),
+            patch.object(host_default, '_scope_home', return_value=Path('/profile').resolve())]
         for p in self.patches:
             p.start()
     def tearDown(self):
@@ -54,7 +54,7 @@ class HostDefaultTests(unittest.TestCase):
     def test_home_mismatch_and_unload_revoke_prepared_call(self):
         host_default.register(self.ctx)
         fn = host_default.completion()
-        with patch.object(host_default, '_scope_home', return_value=Path('/other')):
+        with patch.object(host_default, '_scope_home', return_value=Path('/other').resolve()):
             self.assertFalse(host_default.catalog_entry()['configured'])
             with self.assertRaises(RuntimeError): fn([])
         self.cleanup[-1]()
@@ -107,7 +107,7 @@ class HostDefaultTests(unittest.TestCase):
                 dashboard.mkdir(exist_ok=True)
                 for name in ('runtime_loader.py', 'host_default.py'):
                     (root / name).write_text((source / name).read_text())
-                (root / 'byok.py').write_text("from pathlib import Path\ndef _host_scope(): return object(), Path('/profile')\n")
+                (root / 'byok.py').write_text("from pathlib import Path\ndef _host_scope(): return object(), Path('/profile').resolve()\n")
                 (root / 'server.py').write_text("from . import host_default\nrouter = host_default\n")
                 (plugin / '__init__.py').write_text((source / '__init__.py').read_text())
                 if legacy:

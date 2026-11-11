@@ -78,6 +78,76 @@ class BudgetTests(unittest.TestCase):
         self.assertLessEqual(accepted, 4)
         self.assertEqual(json.loads(self.path.read_text())['reserved_streams'], accepted)
 
+    def test_first_creator_owns_admission_before_empty_ledger_is_visible(self):
+        import threading
+        created, release = threading.Event(), threading.Event()
+        original_open = google_preview.os.open
+        results = []
+        def gated_open(path, flags, *args):
+            fd = original_open(path, flags, *args)
+            if Path(path) == self.path and flags & google_preview.os.O_EXCL:
+                created.set()
+                if not release.wait(2): raise AssertionError('test release timed out')
+            return fd
+        def creator():
+            try: results.append(google_preview.reserve())
+            except Exception as exc: results.append(type(exc).__name__)
+        with patch.object(google_preview.os, 'open', side_effect=gated_open):
+            thread = threading.Thread(target=creator)
+            thread.start()
+            try:
+                self.assertTrue(created.wait(1))
+                with self.assertRaises(RuntimeError): google_preview.reserve()
+            finally:
+                release.set(); thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(results[0]['reserved_usd'], 1)
+        self.assertEqual(json.loads(self.path.read_text())['reserved_streams'], 1)
+        self.assertEqual(google_preview.reserve()['reserved_usd'], 2)
+
+    def test_admission_lock_symlink_is_rejected_without_ledger_or_target_write(self):
+        self.path.parent.mkdir()
+        target = self.path.parent / 'target'; target.write_text('unchanged')
+        self.path.with_suffix('.json.lock').symlink_to(target)
+        with self.assertRaises(RuntimeError): google_preview.reserve()
+        self.assertEqual(target.read_text(), 'unchanged')
+        self.assertFalse(self.path.exists())
+
+    def test_preflight_reader_cannot_block_first_ledger_initialization(self):
+        import threading
+        created, release_creator, reading, release_reader = (threading.Event() for _ in range(4))
+        original_open, original_read = google_preview.os.open, google_preview.os.read
+        admitted, observed = [], []
+        def gated_open(path, flags, *args):
+            fd = original_open(path, flags, *args)
+            if Path(path) == self.path and flags & google_preview.os.O_EXCL:
+                created.set()
+                if not release_creator.wait(2): raise AssertionError('creator timed out')
+            return fd
+        def gated_read(fd, size):
+            if threading.current_thread().name == 'synthetic-preflight':
+                reading.set()
+                if not release_reader.wait(2): raise AssertionError('reader timed out')
+            return original_read(fd, size)
+        def create():
+            try: admitted.append(google_preview.reserve())
+            except Exception as exc: admitted.append(type(exc).__name__)
+        with patch.object(google_preview.os, 'open', side_effect=gated_open), patch.object(google_preview.os, 'read', side_effect=gated_read):
+            creator = threading.Thread(target=create)
+            reader = threading.Thread(name='synthetic-preflight', target=lambda: observed.append(google_preview.budget_status()))
+            creator.start()
+            try:
+                self.assertTrue(created.wait(1)); reader.start(); self.assertTrue(reading.wait(1))
+                release_creator.set(); creator.join(1)
+                self.assertFalse(creator.is_alive())
+                self.assertEqual(admitted[0]['reserved_usd'], 1)
+            finally:
+                release_creator.set(); release_reader.set()
+                creator.join(2)
+                if reader.ident is not None: reader.join(2)
+        self.assertEqual(json.loads(self.path.read_text())['reserved_streams'], 1)
+        self.assertTrue(observed[0]['available'])
+
 
 class FixtureTests(unittest.TestCase):
     def setUp(self):
