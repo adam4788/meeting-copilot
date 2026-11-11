@@ -42,7 +42,7 @@ function audioAttentionText(value) {
 const workspaceStyles = `
 .mc-workspace { container-type: inline-size; --mc-accent: var(--ui-accent); --mc-warn: var(--ui-orange, var(--ui-accent)); }
 .mc-workspace p { margin: 0; }
-.mc-rail { position: sticky; top: -12px; z-index: 3; display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin: -12px -12px 0; padding: 12px; background: var(--ui-bg-card); border-bottom: 1px solid var(--ui-stroke-secondary); }
+.mc-rail { position: sticky; top: -12px; z-index: 3; display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin: -12px -12px 0; padding: 12px; background: var(--ui-bg-elevated, var(--background, Canvas)); border-bottom: 1px solid var(--ui-stroke-secondary); }
 .mc-rail-actions, .mc-chips, .mc-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .mc-chip { display: inline-flex; align-items: center; gap: 5px; min-width: 0; max-width: 100%; padding: 4px 7px; border-radius: 6px; background: color-mix(in srgb, var(--ui-text-secondary) 7%, transparent); color: var(--ui-text-secondary); font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
 .mc-chip[data-tone="ready"] { color: var(--ui-green, var(--ui-accent)); }

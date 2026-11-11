@@ -4366,6 +4366,9 @@ test('compact visual controls retain native disclosure, accessible names, focus 
   assert.ok(button(ui.tree, 'Recheck').props['aria-label']);
   const stylesheet = nodes(ui.tree).find(n => n.type === 'style').children.join('');
   assert.match(stylesheet, /\.mc-rail\s*\{[^}]*position:\s*sticky/);
+  const railCss = stylesheet.match(/\.mc-rail\s*\{([^}]+)\}/)?.[1];
+  assert.match(railCss, /background:\s*var\(--ui-bg-elevated, var\(--background, Canvas\)\)/);
+  assert.doesNotMatch(railCss, /--ui-bg-card|transparent|backdrop-filter/, 'sticky capture controls need an opaque host surface, not a translucent card');
   assert.match(stylesheet, /focus-visible/);
   assert.match(stylesheet, /prefers-reduced-motion:\s*reduce/);
   assert.match(stylesheet, /max-width:\s*300px/);
