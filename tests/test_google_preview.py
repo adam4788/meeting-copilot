@@ -4,6 +4,7 @@ import io
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 import wave
@@ -26,6 +27,7 @@ def wav():
     return base64.b64encode(out.getvalue()).decode()
 
 
+@unittest.skipIf(sys.platform == 'win32', 'Google Mac preview ledger requires POSIX file locking')
 class BudgetTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)

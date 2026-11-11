@@ -18,13 +18,15 @@ it. Nothing is spoken, posted, or submitted for you.
 
 **Early developer preview.** The published source includes OpenAI/OpenRouter
 bring-your-own-key setup. Live responses from those accounts remain unverified.
-Native audio is experimental; macOS fictional-audio checks found dropped frames.
+Native audio remains experimental. Recent local Mac checks recovered microphone
+transcription and removed observed drops in short tests. System-audio capture is
+still setup-dependent; a synthetic replay is not proof of a complete live meeting.
 Windows Desktop pane and runtime verification is still in progress.
 
 | Platform | Source CI checkpoint (c5aa3cf) | Desktop and native audio status |
 | --- | --- | --- |
 | Windows | Python 3.11/3.12 suite and JavaScript checks passed in CI | Desktop pane/runtime under verification; SoundCard/WASAPI capture remains experimental |
-| macOS | Python 3.12 suite, JavaScript checks, and overlay helper build/self-test passed in CI | Microphone/system-audio checks used fictional content; native frame loss remains unresolved |
+| macOS | Python 3.12 suite, JavaScript checks, and overlay helper build/self-test passed in CI | Historical checkpoint; see the newer bounded Mac/synthetic evidence below |
 | Linux | Python 3.11/3.12 suite and JavaScript checks passed in CI | Native audio and Desktop use are not established by these checks |
 
 The CI results above describe source revision
@@ -34,6 +36,13 @@ See [CI](https://github.com/adam4788/meeting-copilot/actions),
 [verification notes](docs/verification.md), and the
 [native loss investigation](docs/native-backpressure.md).
 CI and plugin validation do not prove a complete meeting works on your computer.
+
+A newer local preview at `0747967` transcribed a 38.4-second generated fictional
+meeting with local Whisper and the explicit Google preview. Google matched all
+119 normalized reference words; local `tiny.en` had one insertion (0.84% WER).
+This is one controlled example, not a general accuracy benchmark, speaker
+diarization result or live system-audio claim. See [verification](docs/verification.md#bounded-mac-and-generated-audio-checkpoint-0747967).
+The runtime/catalog release must be pinned and validated separately.
 
 ## What it does
 
