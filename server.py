@@ -16,6 +16,12 @@ except ImportError:  # top-level use (tests, scripts)
     from transcript_snapshot import reference_warnings
 
 
+try:
+    from .macos_audio import clean_audio_diagnostics
+except ImportError:
+    from macos_audio import clean_audio_diagnostics
+
+
 def _is_engine_abort(exc):
     """True when the engine raised its cooperative-cancellation signal."""
     try:
@@ -476,15 +482,26 @@ class MeetingState:
     def audio_status(self, info):
         with self.lock:
             incoming = info if isinstance(info, dict) else {'message': str(info)}
+            if incoming.get('type') == 'diagnostics':
+                # Diagnostic reports cannot assert running, undo stopping,
+                # clear an error or otherwise change the capture lifecycle.
+                diagnostics = clean_audio_diagnostics(incoming.get('audio_diagnostics'))
+                if diagnostics:
+                    previous = self.capture_info if isinstance(self.capture_info, dict) else {}
+                    self.capture_info = dict(previous, audio_diagnostics=diagnostics)
+                return
             if isinstance(incoming, dict) and 'state' not in incoming and isinstance(incoming.get('status'), str):
                 incoming = dict(incoming, state=incoming['status'])
+            incoming = dict(incoming)
+            if 'audio_diagnostics' in incoming:
+                incoming['audio_diagnostics'] = clean_audio_diagnostics(incoming['audio_diagnostics'])
             previous = self.capture_info if isinstance(self.capture_info, dict) else {}
             # Audio-loss evidence latches: a later plain status must not clear
             # an earlier drop warning until pause, clear, or a new capture.
             # Drop counts are monotonic within a capture: a lower later report
             # (e.g. a worker-only update after a combined one) never rewinds.
             for key in ('warning', 'dropped_chunks', 'native_dropped_chunks', 'worker_dropped_chunks',
-                        'sub_second_dropped_chunks', 'reader_incomplete', 'partial_tail'):
+                        'sub_second_dropped_chunks', 'reader_incomplete', 'partial_tail', 'audio_diagnostics'):
                 if incoming.get(key) is None and previous.get(key) is not None:
                     incoming = dict(incoming)
                     incoming[key] = previous[key]
@@ -682,7 +699,7 @@ class MeetingState:
                 latched = {'state': 'stopped', 'backend': self.backend, 'message': 'Paused / detached',
                            'error': previous.get('error') if error_before else None}
                 for key in ('warning', 'dropped_chunks', 'native_dropped_chunks', 'worker_dropped_chunks', 'native_writer_timing_ms',
-                            'sub_second_dropped_chunks', 'reader_incomplete', 'partial_tail'):
+                            'sub_second_dropped_chunks', 'reader_incomplete', 'partial_tail', 'audio_diagnostics'):
                     if previous.get(key) is not None:
                         latched[key] = previous[key]
                 self.capture_info = latched

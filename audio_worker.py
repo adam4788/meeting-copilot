@@ -111,6 +111,63 @@ def transcribe(model, samples, speaker, stamp, language):
     return {'type': 'segment', 'speaker': speaker, 'text': text, 'timestamp': stamp}
 
 
+class AudioDiagnostics:
+    """Bounded cumulative levels and counters, never PCM or transcript text."""
+    def __init__(self, source):
+        self.lock = threading.Lock()
+        names = ('microphone', 'system') if source == 'both' else (source,)
+        self.rows = {name: dict(received_samples=0, peak=0.0, rms=0.0,
+                               submitted=0, completed=0, empty=0) for name in names}
+        self.last_report = time.monotonic()
+
+    def receive(self, speaker, samples):
+        import numpy as np
+        name = 'microphone' if speaker == 'you' else 'system'
+        # Clamp only diagnostics, not the actual audio sent to transcription.
+        values = np.clip(np.asarray(samples, dtype=np.float64), -1, 1)
+        if not values.size or not np.isfinite(values).all():
+            return
+        with self.lock:
+            row = self.rows.get(name)
+            if row is None:
+                return
+            previous = row['received_samples']
+            count = min(int(values.size), 10**12 - previous)
+            if count <= 0:
+                return
+            total = previous + count
+            row['rms'] = min(1.0, math.sqrt((row['rms'] ** 2 * previous + float(np.mean(values ** 2)) * count) / total))
+            row['peak'] = max(row['peak'], float(np.max(np.abs(values))))
+            row['received_samples'] = total
+
+    def inference(self, speaker, result=None):
+        name = 'microphone' if speaker == 'you' else 'system'
+        with self.lock:
+            row = self.rows[name]
+            keys = ('submitted',) if result is None else ('completed', 'empty') if not result.get('text') else ('completed',)
+            for key in keys:
+                row[key] = min(10**12, row[key] + 1)
+
+    def snapshot(self):
+        with self.lock:
+            return {name: dict(row) for name, row in self.rows.items()}
+
+    def report(self):
+        now = time.monotonic()
+        with self.lock:
+            if now - self.last_report < 2:
+                return
+            self.last_report = now
+            rows = {name: dict(row) for name, row in self.rows.items()}
+            # Keep snapshot and emission ordered across reader/main threads.
+            emit({'type': 'diagnostics', 'audio_diagnostics': rows})
+
+    def emit_final(self, event):
+        with self.lock:
+            event = dict(event, audio_diagnostics={name: dict(row) for name, row in self.rows.items()})
+            emit(event)
+
+
 def run_capture(model, source, language, helper=None, stop=None):
     """Bounded reader queue. Helper inherits worker process group for gateway cleanup."""
     import numpy as np
@@ -142,6 +199,7 @@ def run_capture(model, source, language, helper=None, stop=None):
     dropped = {'count': 0}
     native_lost = {'count': 0}
     native_timing = {}
+    diagnostics = AudioDiagnostics(source)
     tail_items = []
     sub_second_lost = {'count': 0}
     # faster-whisper inference is not guaranteed thread-safe: the reader's
@@ -231,6 +289,8 @@ def run_capture(model, source, language, helper=None, stop=None):
                         pass
                 if (source == 'microphone' and speaker != 'you') or (source == 'system' and speaker != 'remote'):
                     raise ValueError('unexpected source')
+                diagnostics.receive(speaker, samples)
+                diagnostics.report()
                 if not counts[speaker]:
                     stamps[speaker] = stamp
                 buffers[speaker].append(samples)
@@ -272,11 +332,14 @@ def run_capture(model, source, language, helper=None, stop=None):
             try:
                 speaker, samples, stamp = pending.get(timeout=.1)
             except queue.Empty:
+                diagnostics.report()
                 if done.is_set():
                     break
                 continue
             with infer_lock:
+                diagnostics.inference(speaker)
                 result = transcribe(model, samples, speaker, stamp, language)
+                diagnostics.inference(speaker, result)
             # A finished transcription is valid speech: emit it even during
             # teardown (delivery is best-effort) instead of silently dropping
             # a chunk that was already removed from the queue.
@@ -315,7 +378,9 @@ def run_capture(model, source, language, helper=None, stop=None):
                 try:
                     if getattr(samples, 'size', len(samples)) >= 16000:
                         with infer_lock:
+                            diagnostics.inference(speaker)
                             flushed = transcribe(model, samples, speaker, stamp, language)
+                            diagnostics.inference(speaker, flushed)
                         if flushed['text']:
                             flushed['partial_tail'] = True
                             try:
@@ -332,24 +397,24 @@ def run_capture(model, source, language, helper=None, stop=None):
                     dropped['count'] += 1
                     continue
             total_lost = dropped['count'] + native_lost['count']
-            if total_lost or sub_second_lost['count'] or reader_incomplete or native_timing:
-                try:
-                    warning = (f"Stopped with worker {dropped['count']} dropped chunk(s), "
-                               f"native {native_lost['count']} dropped frame(s), "
-                               f"{sub_second_lost['count']} sub-second tail(s); some words may be missing.")
-                    if reader_incomplete:
-                        warning += ' Reader had not finished; tail accounting may be incomplete.'
-                    summary = {'type': 'status', 'state': 'stopped', 'dropped_chunks': total_lost,
-                          'native_dropped_chunks': native_lost['count'],
-                          'worker_dropped_chunks': dropped['count'],
-                          'sub_second_dropped_chunks': sub_second_lost['count'],
-                          'reader_incomplete': bool(reader_incomplete),
-                          **({'native_writer_timing_ms': dict(native_timing)} if native_timing else {})}
-                    if total_lost or sub_second_lost['count'] or reader_incomplete:
-                        summary['warning'] = warning
-                    emit(summary)
-                except Exception:
-                    pass
+            # Always publish final diagnostics, including zero received samples.
+            try:
+                warning = (f"Stopped with worker {dropped['count']} dropped chunk(s), "
+                           f"native {native_lost['count']} dropped frame(s), "
+                           f"{sub_second_lost['count']} sub-second tail(s); some words may be missing.")
+                if reader_incomplete:
+                    warning += ' Reader had not finished; tail accounting may be incomplete.'
+                summary = {'type': 'status', 'state': 'stopped', 'dropped_chunks': total_lost,
+                      'native_dropped_chunks': native_lost['count'],
+                      'worker_dropped_chunks': dropped['count'],
+                      'sub_second_dropped_chunks': sub_second_lost['count'],
+                      'reader_incomplete': bool(reader_incomplete),
+                      **({'native_writer_timing_ms': dict(native_timing)} if native_timing else {})}
+                if total_lost or sub_second_lost['count'] or reader_incomplete:
+                    summary['warning'] = warning
+                diagnostics.emit_final(summary)
+            except Exception:
+                pass
         except Exception:
             pass
         if not stop.is_set() or failure:

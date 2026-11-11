@@ -8,6 +8,23 @@ const muted = { color: 'var(--ui-text-secondary)', fontSize: 12, lineHeight: 1.5
 const card = { border: '1px solid var(--ui-stroke-secondary)', borderRadius: 10, padding: 14, minWidth: 0, boxSizing: 'border-box', background: 'var(--ui-bg-card)' };
 const selectStyle = { padding: 8, borderRadius: 6, width: '100%', maxWidth: '100%', minWidth: 0, boxSizing: 'border-box', color: 'var(--ui-text-primary)', background: 'var(--ui-bg-card)', border: '1px solid var(--ui-stroke-secondary)' };
 
+// Content-free cumulative diagnostics. Unknown/missing fields never mean silence.
+function audioDiagnosticText(value) {
+  if (!value || typeof value !== 'object') return '';
+  return ['microphone', 'system'].flatMap(source => {
+    const row = value[source];
+    if (!row || !Number.isSafeInteger(row.received_samples) || row.received_samples < 0 || row.received_samples > 1e12) return [];
+    const label = source === 'microphone' ? 'Microphone' : 'System audio';
+    let text = row.received_samples === 0 ? 'no samples received' : 'input received';
+    if (row.received_samples > 0 && row.peak === 0 && row.rms === 0) text = 'zero-level input received';
+    const count = key => Number.isSafeInteger(row[key]) && row[key] >= 0 && row[key] <= 1e12;
+    if (count('completed') && count('empty') && row.completed > 0 && row.empty <= row.completed) {
+      text += `; ${row.completed} chunk(s) transcribed, ${row.empty} with no words`;
+    } else if (count('submitted') && row.submitted > 0) text += '; transcription pending';
+    return [`${label}: ${text}`];
+  }).join(' · ');
+}
+
 // Scoped to the pane so host settings and other plugins keep their own design.
 const workspaceStyles = `
 .mc-workspace { container-type: inline-size; --mc-accent: var(--ui-accent); }
@@ -1358,6 +1375,7 @@ export default {
             h('p', { 'data-overlay-controls-help': true, style: { ...muted, margin: 0 } }, 'Overlay is read-only; ask questions here. ⌃⌥⌘O temporarily enables interaction; see Help.')),
           !data.capabilities?.overlay && h('p', { role: 'status', style: { ...muted, margin: 0 } }, backend === 'native' ? 'The floating overlay is macOS-only. Use this Meeting Copilot pane on Windows.' : 'Overlay helper unavailable. Check the macOS helper build and restart the gateway when other sessions are idle.'),
           data.capture && h('div', { style: muted }, data.capture.message || data.capture.state || ''),
+          audioDiagnosticText(data.capture?.audio_diagnostics) && h('div', { role: 'status', style: muted }, audioDiagnosticText(data.capture.audio_diagnostics)),
           data.capture && (data.capture.warning || lossText(data.capture)) && h('div', { role: 'status', style: muted },
             ['Transcript may be incomplete',
              lossText(data.capture),

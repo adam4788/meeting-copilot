@@ -86,20 +86,59 @@ private func fail(_ code: String) -> Never {
     exit(1)
 }
 
-private var terminating = false
+// Coalesce tiny hardware callbacks into 250 ms PCM messages. With two sources,
+// the old ~10 ms messages could saturate four writer slots during brief stalls.
+// Storage stays <= 4000 Float32 samples per source; no unbounded audio queue.
+private final class PCMFramer {
+    private var pending = Data()
+    private var timestamp: Double = 0
+    private var source = ""
+    private let frameBytes = 4000 * 4
+
+    func append(_ channel: UnsafePointer<Float>, count: Int, source: String, timestamp: Double) {
+        var offset = 0
+        while offset < count {
+            if pending.isEmpty {
+                self.timestamp = timestamp + Double(offset) / 16000
+                self.source = source
+            }
+            let samples = min((frameBytes - pending.count) / 4, count - offset)
+            pending.append(Data(bytes: channel.advanced(by: offset), count: samples * 4))
+            offset += samples
+            if pending.count == frameBytes { flush() }
+        }
+    }
+
+    func flush() {
+        guard !pending.isEmpty else { return }
+        emit(["type": "pcm", "source": source, "rate": 16000,
+              "samples": pending.count / 4, "timestamp": timestamp,
+              "pcm": pending.base64EncodedString()])
+        pending.removeAll(keepingCapacity: true)
+    }
+}
 
 private final class Converter {
+    // Serialize conversion and tail retirement. finish() seals this source
+    // before flushing, so an in-flight callback cannot emit after the terminal.
+    private let lock = NSLock()
+    private var stopped = false
+    private let framer = PCMFramer()
+
+    func finish() {
+        lock.lock()
+        defer { lock.unlock() }
+        stopped = true
+        framer.flush()
+    }
     private var converter: AVAudioConverter?
     private var inputFormat: AVAudioFormat?
     private let outputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
 
     func consume(_ buffer: AVAudioPCMBuffer, source: String) {
-        // After the SIGTERM barrier no new audio may enter the writer
-        // queue: count it as dropped so the terminal line stays honest.
-        if terminating {
-            dropCounter.sync { droppedFrames += 1 }
-            return
-        }
+        lock.lock()
+        defer { lock.unlock() }
+        guard !stopped else { return }
         guard buffer.frameLength > 0, buffer.frameLength <= 192000,
               buffer.format.sampleRate > 0 else { return }
         if inputFormat != buffer.format {
@@ -118,16 +157,10 @@ private final class Converter {
             return buffer
         }
         guard result != .error, error == nil, let channel = output.floatChannelData?[0] else { fail("capture") }
-        var offset = 0
         let total = Int(output.frameLength)
         let start = Date().timeIntervalSince1970 - Double(total) / 16000
-        while offset < total {
-            let count = min(8000, total - offset)
-            let data = Data(bytes: channel.advanced(by: offset), count: count * 4)
-            emit(["type": "pcm", "source": source, "rate": 16000, "samples": count,
-                  "timestamp": start + Double(offset) / 16000, "pcm": data.base64EncodedString()])
-            offset += count
-        }
+        framer.append(UnsafePointer(channel), count: total, source: source, timestamp: start)
+
     }
 }
 
@@ -209,6 +242,11 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
             stream = nil
             Task { try? await active.stopCapture() }
         }
+    }
+
+    func flushAudio() {
+        micConverter.finish()
+        systemConverter.finish()
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) { fail("capture") }
@@ -311,16 +349,15 @@ struct Main {
             termCount += 1
             if termCount > 1 { exit(3) }
             // Stop capture inputs first so no callback can enqueue frames
-            // after the writer barrier below; anything already in flight
-            // lands during the short settle, then the barrier is final.
+            // after source retirement below; anything already in flight
+            // lands during the short settle, then finish() seals each source.
             capture.stop()
             Thread.sleep(forTimeInterval: 0.3)
-            terminating = true
+            capture.flushAudio()
             writer.sync {}
             // Snapshot after the barrier: every pre-barrier frame was
-            // emitted above and every post-barrier callback was counted,
-            // so the terminal line accounts for all audio observed to this
-            // point. The only uncounted window is the direct write below.
+            // emitted above (including residual PCM) or counted as dropped.
+            // Retired converters cannot add post-terminal audio.
             var payload: [String: Any] = ["type": "status", "state": "stopped"]
             payload["native_writer_timing_ms"] = writer.sync { writerTiming() }
             let pending = dropCounter.sync { () -> Int in let n = droppedFrames; droppedFrames = 0; return n }

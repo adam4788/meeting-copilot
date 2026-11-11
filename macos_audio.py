@@ -141,6 +141,31 @@ def clean_writer_timing(value):
             and 0 <= value[k] <= 60000 and math.isfinite(value[k])}
 
 
+def clean_audio_diagnostics(value, source=None):
+    """Strict content-free numeric schema; missing data is not silence."""
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for name in ('microphone', 'system'):
+        if source in ('microphone', 'system') and name != source:
+            continue
+        row = value.get(name)
+        if not isinstance(row, dict):
+            continue
+        clean = {}
+        for key in ('received_samples', 'submitted', 'completed', 'empty'):
+            number = row.get(key)
+            if type(number) is int and 0 <= number <= 10**12:
+                clean[key] = number
+        for key in ('peak', 'rms'):
+            number = row.get(key)
+            if type(number) in (int, float) and math.isfinite(number) and 0 <= number <= 1:
+                clean[key] = float(number)
+        if clean:
+            result[name] = clean
+    return result
+
+
 def worker_env(provider='local'):
     """Pass only named OS/locale and public-model cache settings to workers.
 
@@ -271,6 +296,15 @@ class MacOSAudioCapture:
                                             daemon=True, name='macos-audio-worker')
             self._thread.start()
 
+    def _diagnostics_update(self, event):
+        diagnostics = clean_audio_diagnostics(event.get('audio_diagnostics'), self.source)
+        if not diagnostics:
+            return
+        with self._lock:
+            self._last_loss = {**getattr(self, '_last_loss', {}), 'audio_diagnostics': diagnostics}
+        # No lifecycle snapshot: stop may change state before callback delivery.
+        self._callback(self._on_status, {'type': 'diagnostics', 'audio_diagnostics': diagnostics})
+
     def _run(self, environment, credential_frame=None, artifacts=None):
         process = None
         try:
@@ -308,18 +342,24 @@ class MacOSAudioCapture:
                 if kind == 'error':
                     self._notify('error', event.get('code'))
                     break
+                if kind == 'diagnostics':
+                    self._diagnostics_update(event)
+                    continue
                 if kind == 'status' and event.get('state') in ('loading', 'starting', 'running', 'stopped'):
                     extra = {k: event.get(k) for k in ('warning', 'dropped_chunks', 'native_dropped_chunks',
                                                        'worker_dropped_chunks', 'sub_second_dropped_chunks',
                                                        'reader_incomplete', 'partial_tail')
                              if event.get(k) is not None}
+                    diagnostics = clean_audio_diagnostics(event.get('audio_diagnostics'), self.source)
+                    if diagnostics:
+                        extra['audio_diagnostics'] = diagnostics
                     timing = clean_writer_timing(event.get('native_writer_timing_ms'))
                     if timing:
                         extra['native_writer_timing_ms'] = timing
                     self._notify(event['state'], None)
                     if extra:
                         with self._lock:
-                            self._last_loss = dict(extra)
+                            self._last_loss = {**getattr(self, '_last_loss', {}), **extra}
                         try:
                             merged = self.status()
                             merged.update(extra)
