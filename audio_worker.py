@@ -95,12 +95,11 @@ def load_model(name, factory=None, *, offline=False):
     if offline:
         # A cache can disappear between preflight and Start. Do not turn a
         # successful check into an implicit download or tokenizer fallback.
-        from huggingface_hub import snapshot_download
-        cached = Path(snapshot_download('Systran/faster-whisper-' + name, local_files_only=True))
-        for filename in ('model.bin', 'config.json', 'tokenizer.json', 'vocabulary.json'):
-            with (cached / filename).open('rb') as stream:
-                if not stream.read(1):
-                    raise ValueError('Prepared model is unavailable')
+        try:
+            from .capture_preflight import cached_model_path
+        except ImportError:
+            from capture_preflight import cached_model_path
+        cached = cached_model_path(name)
         return factory(str(cached), device='cpu', compute_type='int8', cpu_threads=4, local_files_only=True)
     return factory(name, device='cpu', compute_type='int8', cpu_threads=4)
 

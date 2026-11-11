@@ -172,20 +172,25 @@ class LiveModelCacheTests(unittest.TestCase):
         import types
         from pathlib import Path
         import audio_worker
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            for filename in ('model.bin', 'config.json', 'vocabulary.json'):
-                (root / filename).write_text('synthetic')
-            hub = types.SimpleNamespace(snapshot_download=Mock(return_value=str(root)))
-            factory = Mock()
-            with patch.dict('sys.modules', {'huggingface_hub': hub}):
-                with self.assertRaises(FileNotFoundError):
+        for vocabulary in ('vocabulary.txt', 'vocabulary.json'):
+            with self.subTest(vocabulary=vocabulary), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                for filename in ('model.bin', 'config.json', vocabulary):
+                    (root / filename).write_text('synthetic')
+                hub = types.SimpleNamespace(snapshot_download=Mock(return_value=str(root)))
+                factory = Mock()
+                with patch.dict('sys.modules', {'huggingface_hub': hub}):
+                    with self.assertRaises(FileNotFoundError):
+                        audio_worker.load_model('base.en', factory, offline=True)
+                    factory.assert_not_called()
+                    (root / 'tokenizer.json').write_text('synthetic')
                     audio_worker.load_model('base.en', factory, offline=True)
-                factory.assert_not_called()
-                (root / 'tokenizer.json').write_text('synthetic')
-                audio_worker.load_model('base.en', factory, offline=True)
-            hub.snapshot_download.assert_called_with('Systran/faster-whisper-base.en', local_files_only=True)
-            factory.assert_called_once_with(str(root), device='cpu', compute_type='int8', cpu_threads=4, local_files_only=True)
+                    factory.assert_called_once_with(str(root), device='cpu', compute_type='int8', cpu_threads=4, local_files_only=True)
+                    (root / vocabulary).unlink()
+                    with self.assertRaises(ValueError):
+                        audio_worker.load_model('base.en', factory, offline=True)
+                    self.assertEqual(factory.call_count, 1)
+                hub.snapshot_download.assert_called_with('Systran/faster-whisper-base.en', local_files_only=True, allow_patterns=capture_preflight.MODEL_FILES)
 
     def test_discovery_wall_clock_timeout_never_spawns_another_worker(self):
         import threading

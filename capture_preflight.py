@@ -17,6 +17,9 @@ import time
 MODELS = ('tiny.en', 'base.en', 'small.en')
 SOURCES = ('microphone', 'system', 'both')
 MODES = ('ENDPOINTING', 'DIARIZATION', 'PUSH_TO_TALK')
+# Match faster_whisper.utils.download_model: model-only snapshots intentionally
+# omit repository metadata, which newer Hub versions otherwise call incomplete.
+MODEL_FILES = ['config.json', 'preprocessor_config.json', 'model.bin', 'tokenizer.json', 'vocabulary.*']
 
 
 def _module(name):
@@ -39,6 +42,29 @@ def _json_command(command, env, timeout=20):
     return value
 
 
+def cached_model_path(model):
+    """Validate the local model layout without fetching or tokenizer fallback."""
+    if model not in MODELS:
+        raise ValueError('Unsupported transcription model')
+    hub = importlib.import_module('huggingface_hub')
+    cached = Path(hub.snapshot_download('Systran/faster-whisper-' + model,
+                                       local_files_only=True, allow_patterns=MODEL_FILES))
+    for filename in ('model.bin', 'config.json', 'tokenizer.json'):
+        with (cached / filename).open('rb') as stream:
+            if not stream.read(1):
+                raise ValueError('Prepared model is unavailable')
+    # CTranslate2 converts vocabularies to text or JSON. English Whisper
+    # releases commonly ship vocabulary.txt; neither format implies download.
+    for filename in ('vocabulary.txt', 'vocabulary.json'):
+        try:
+            with (cached / filename).open('rb') as stream:
+                if stream.read(1):
+                    return cached
+        except FileNotFoundError:
+            continue
+    raise ValueError('Prepared model vocabulary is unavailable')
+
+
 def _runtime_probe(model, provider, windows=False):
     """Executed in the actual audio interpreter, with offline HF settings."""
     result = {'version': 1, 'dependencies': False, 'model': False}
@@ -55,15 +81,7 @@ def _runtime_probe(model, provider, windows=False):
         result['dependencies'] = True
         # local_files_only prohibits Hub fetching, including missing weights.
         # Offline environment also protects optional tokenizer resolution.
-        hub = importlib.import_module('huggingface_hub')
-        cached = Path(hub.snapshot_download('Systran/faster-whisper-' + model,
-                                           local_files_only=True))
-        # Whisper otherwise falls back to Tokenizer.from_pretrained, which may
-        # perform a request even when the model's local_files_only flag is set.
-        for filename in ('model.bin', 'config.json', 'tokenizer.json', 'vocabulary.json'):
-            with (cached / filename).open('rb') as stream:
-                if not stream.read(1):
-                    return result
+        cached = cached_model_path(model)
         whisper.WhisperModel(str(cached), device='cpu', compute_type='int8', cpu_threads=1,
                              local_files_only=True)
         result['model'] = True
@@ -82,7 +100,8 @@ def _prepare_model_worker(model):
     try:
         whisper = importlib.import_module('faster_whisper')
         whisper.WhisperModel(model, device='cpu', compute_type='int8', cpu_threads=1)
-        return {'version': 1, 'prepared': True}
+        # Preparation and readiness must agree on the usable offline layout.
+        return {'version': 1, 'prepared': _runtime_probe(model, 'local').get('model') is True}
     except Exception:
         return {'version': 1, 'prepared': False}
 

@@ -102,7 +102,31 @@ class PreflightTests(unittest.TestCase):
                 result = preflight._runtime_probe('base.en', 'local')
             self.assertFalse(result['model'])
             whisper.WhisperModel.assert_not_called()
-            hub.snapshot_download.assert_called_once_with('Systran/faster-whisper-base.en', local_files_only=True)
+            hub.snapshot_download.assert_called_once_with('Systran/faster-whisper-base.en', local_files_only=True, allow_patterns=preflight.MODEL_FILES)
+
+    def test_offline_probe_accepts_text_or_json_vocabulary_and_validates_model(self):
+        for vocabulary in ('vocabulary.txt', 'vocabulary.json'):
+            with self.subTest(vocabulary=vocabulary), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                whisper, hub = Mock(), Mock()
+                hub.snapshot_download.return_value = tmp
+                for name in ('model.bin', 'config.json', 'tokenizer.json', vocabulary):
+                    (root / name).write_text('synthetic')
+                with patch.object(preflight.importlib, 'import_module', side_effect=lambda name: hub if name == 'huggingface_hub' else whisper):
+                    self.assertTrue(preflight._runtime_probe('base.en', 'local')['model'])
+                    whisper.WhisperModel.assert_called_once_with(tmp, device='cpu', compute_type='int8', cpu_threads=1, local_files_only=True)
+                    whisper.WhisperModel.side_effect = ValueError('corrupt synthetic model')
+                    self.assertFalse(preflight._runtime_probe('base.en', 'local')['model'])
+                    whisper.WhisperModel.reset_mock()
+                    for name in ('model.bin', 'config.json', 'tokenizer.json', vocabulary):
+                        (root / name).write_text('')
+                        self.assertFalse(preflight._runtime_probe('base.en', 'local')['model'])
+                        whisper.WhisperModel.assert_not_called()
+                        (root / name).unlink()
+                        self.assertFalse(preflight._runtime_probe('base.en', 'local')['model'])
+                        whisper.WhisperModel.assert_not_called()
+                        (root / name).write_text('synthetic')
+                hub.snapshot_download.assert_called_with('Systran/faster-whisper-base.en', local_files_only=True, allow_patterns=preflight.MODEL_FILES)
 
     def test_model_preparation_uses_prepared_interpreter_and_sanitized_env(self):
         mac, native = Mock(), Mock()
@@ -134,12 +158,16 @@ class PreflightTests(unittest.TestCase):
     def test_model_preparation_worker_only_constructs_model(self):
         whisper = Mock()
         with patch.object(preflight.importlib, 'import_module', return_value=whisper) as imports, \
+             patch.object(preflight, '_runtime_probe', return_value={'model': True}) as offline, \
              patch.dict(preflight.os.environ, {}, clear=True):
             self.assertTrue(preflight._prepare_model_worker('tiny.en')['prepared'])
             self.assertEqual(preflight.os.environ['HF_HUB_DISABLE_IMPLICIT_TOKEN'], '1')
             imports.assert_called_once_with('faster_whisper')
             whisper.WhisperModel.assert_called_once_with('tiny.en', device='cpu', compute_type='int8', cpu_threads=1)
             whisper.WhisperModel.return_value.transcribe.assert_not_called()
+            offline.assert_called_once_with('tiny.en', 'local')
+            offline.return_value = {'model': False}
+            self.assertFalse(preflight._prepare_model_worker('tiny.en')['prepared'])
 
     def test_missing_model_has_exact_recovery_command(self):
         result = self.mac_check(runtime={'version': 1, 'dependencies': True, 'model': False})
