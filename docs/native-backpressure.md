@@ -106,3 +106,27 @@ The local worker also reports bounded numeric input and transcription counters.
 They distinguish no received samples, zero-level input, and model chunks that
 completed without words. Signal amplitude does not establish speech, microphone
 quality or successful transcription. These diagnostics contain no audio or text.
+
+## Explicit mono normalization for discrete layouts
+
+A subsequent controlled run had zero transport drops but received only zero-valued
+samples. Device-free tests reproduced a matching native failure: a valid
+`DiscreteInOrder` channel layout containing nonzero PCM produced all-zero mono
+from `AVAudioConverter`, despite successful conversion. Standard mono/stereo
+fixtures had not exercised these hardware-style layouts. Enabling the converter's
+`downmix` property did not correct the reproduced failure.
+
+The converter now explicitly normalizes supported PCM into standard Float32 mono
+at the original sample rate before resampling. It averages all channels, without
+relying on channel labels or silently choosing only channel zero. Planar and
+interleaved Float32, Float64, signed Int16 and signed Int32 are covered. Missing,
+short, unsupported-layout/byte-format or nonfinite buffers fail visibly rather
+than being treated as silence. Discrete two-, three- and four-channel tests
+exercise every active input channel and verify the expected scaled nonzero output
+through the real serialization path. Opposed-phase channels can still cancel
+under arithmetic averaging; this is not a universal audio-quality guarantee.
+
+This fixes the demonstrated offline conversion bug. The live stream's layout was
+not inspected during recording, and microphone speech recognition still requires
+a separately authorized verification after rebuilding the helper. No recording
+or audio-setting change was made for this fix.

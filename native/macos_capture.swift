@@ -118,6 +118,87 @@ private final class PCMFramer {
     }
 }
 
+// Copy only complete, matching PCM buffers. A partial/missing source list must
+// fail rather than silently filling the remaining channels with zeros.
+private func copyPCMInput(_ source: UnsafePointer<AudioBufferList>, into target: AVAudioPCMBuffer) -> Bool {
+    let sources = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: source))
+    let targets = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: target.audioBufferList))
+    guard sources.count == targets.count, !sources.isEmpty else { return false }
+    for index in 0..<sources.count {
+        guard sources[index].mNumberChannels == targets[index].mNumberChannels,
+              sources[index].mDataByteSize >= targets[index].mDataByteSize,
+              sources[index].mData != nil, targets[index].mData != nil else { return false }
+    }
+    for index in 0..<sources.count {
+        targets[index].mData!.copyMemory(from: sources[index].mData!, byteCount: Int(targets[index].mDataByteSize))
+    }
+    return true
+}
+
+// Do not ask AVAudioConverter to interpret hardware channel labels. A valid
+// discrete-in-order multichannel layout can silently convert to all-zero mono.
+// Normalize PCM explicitly, then use AVAudioConverter only for resampling.
+private func normalizedMono(_ input: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+    withExtendedLifetime(input) {
+        normalizedMono(format: input.format, frames: input.frameLength, buffers: input.audioBufferList)
+    }
+}
+
+private func normalizedMono(format inputFormat: AVAudioFormat, frames frameLength: AVAudioFrameCount,
+                            buffers bufferList: UnsafePointer<AudioBufferList>) -> AVAudioPCMBuffer? {
+    let frames = Int(frameLength)
+    let channels = Int(inputFormat.channelCount)
+    guard frames > 0, frames <= 192000, channels > 0, channels <= 32,
+          inputFormat.sampleRate.isFinite, inputFormat.sampleRate > 0,
+          let format = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                    sampleRate: inputFormat.sampleRate, channels: 1, interleaved: false),
+          let output = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameLength),
+          let target = output.floatChannelData?[0] else { return nil }
+    let bytes: Int
+    switch inputFormat.commonFormat {
+    case .pcmFormatFloat32, .pcmFormatInt32: bytes = 4
+    case .pcmFormatFloat64: bytes = 8
+    case .pcmFormatInt16: bytes = 2
+    default: return nil
+    }
+    let interleaved = inputFormat.isInterleaved
+    let description = inputFormat.streamDescription.pointee
+    guard description.mFormatID == kAudioFormatLinearPCM,
+          description.mFormatFlags & kAudioFormatFlagIsBigEndian == 0,
+          description.mFormatFlags & kAudioFormatFlagIsPacked != 0,
+          description.mBitsPerChannel == UInt32(bytes * 8),
+          description.mBytesPerFrame == UInt32(bytes * (interleaved ? channels : 1)),
+          description.mFramesPerPacket == 1 else { return nil }
+    let buffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: bufferList))
+    guard buffers.count == (interleaved ? 1 : channels) else { return nil }
+    let stride = interleaved ? channels : 1
+    let weight = Float(1) / Float(channels)
+    output.frameLength = frameLength
+    for frame in 0..<frames { target[frame] = 0 }
+    for channel in 0..<channels {
+        let buffer = buffers[interleaved ? 0 : channel]
+        guard Int(buffer.mNumberChannels) == (interleaved ? channels : 1),
+              Int(buffer.mDataByteSize) >= frames * stride * bytes,
+              let data = buffer.mData else { return nil }
+        let offset = interleaved ? channel : 0
+        for frame in 0..<frames {
+            let index = frame * stride + offset
+            let sample: Float
+            switch inputFormat.commonFormat {
+            case .pcmFormatFloat32: sample = data.assumingMemoryBound(to: Float.self)[index]
+            case .pcmFormatFloat64: sample = Float(data.assumingMemoryBound(to: Double.self)[index])
+            case .pcmFormatInt16: sample = Float(data.assumingMemoryBound(to: Int16.self)[index]) / 32768
+            case .pcmFormatInt32: sample = Float(Double(data.assumingMemoryBound(to: Int32.self)[index]) / 2147483648)
+            default: return nil
+            }
+            guard sample.isFinite else { return nil }
+            target[frame] += sample * weight
+        }
+    }
+    for frame in 0..<frames where !target[frame].isFinite { return nil }
+    return output
+}
+
 private final class Converter {
     // Serialize conversion and tail retirement. finish() seals this source
     // before flushing, so an in-flight callback cannot emit after the terminal.
@@ -141,9 +222,10 @@ private final class Converter {
         guard !stopped else { return }
         guard buffer.frameLength > 0, buffer.frameLength <= 192000,
               buffer.format.sampleRate > 0 else { return }
-        if inputFormat != buffer.format {
-            inputFormat = buffer.format
-            converter = AVAudioConverter(from: buffer.format, to: outputFormat)
+        guard let mono = normalizedMono(buffer) else { fail("capture") }
+        if inputFormat != mono.format {
+            inputFormat = mono.format
+            converter = AVAudioConverter(from: mono.format, to: outputFormat)
         }
         guard let converter = converter else { fail("capture") }
         let capacity = AVAudioFrameCount(ceil(Double(buffer.frameLength) * 16000 / buffer.format.sampleRate) + 128)
@@ -154,7 +236,7 @@ private final class Converter {
             if supplied { status.pointee = .noDataNow; return nil }
             supplied = true
             status.pointee = .haveData
-            return buffer
+            return mono
         }
         guard result != .error, error == nil, let channel = output.floatChannelData?[0] else { fail("capture") }
         let total = Int(output.frameLength)
@@ -188,14 +270,7 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
             guard audioBufferList.pointee.mNumberBuffers > 0,
                   let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return noErr }
             buffer.frameLength = frameCount
-            let sources = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: audioBufferList))
-            let targets = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
-            for index in 0..<min(sources.count, targets.count) {
-                let bytes = min(Int(sources[index].mDataByteSize), Int(targets[index].mDataByteSize))
-                if let from = sources[index].mData, let to = targets[index].mData, bytes > 0 {
-                    to.copyMemory(from: from, byteCount: bytes)
-                }
-            }
+            guard copyPCMInput(audioBufferList, into: buffer) else { fail("capture") }
             self.micConverter.consume(buffer, source: "microphone")
             return noErr
         }

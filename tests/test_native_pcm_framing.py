@@ -14,6 +14,62 @@ DRIVER = r'''
 @main struct FramingTest {
     static func main() {
         let mode = CommandLine.arguments[1]
+        if mode == "invalid" {
+            let format = AVAudioFormat(commonFormat:.pcmFormatFloat32, sampleRate:48000, channels:2, interleaved:false)!
+            let buffer = AVAudioPCMBuffer(pcmFormat:format, frameCapacity:16)!
+            buffer.frameLength = 16
+            for channel in 0..<2 { for frame in 0..<16 { buffer.floatChannelData![channel][frame] = 0.25 } }
+            let raw = buffer.mutableAudioBufferList
+            let list = UnsafeMutableAudioBufferListPointer(raw)
+            let original = list[0]
+            let kind = CommandLine.arguments[2]
+            if kind == "short" { list[0].mDataByteSize = 1 }
+            if kind == "missing" { list[0].mData = nil }
+            if kind == "channels" { list[0].mNumberChannels = 2 }
+            if kind == "nan" { buffer.floatChannelData![0][0] = .nan }
+            if kind == "infinity" { buffer.floatChannelData![0][0] = .infinity }
+            let rejected = normalizedMono(format:format, frames:16, buffers:UnsafePointer(raw)) == nil
+            let target = AVAudioPCMBuffer(pcmFormat:format, frameCapacity:16)!
+            target.frameLength = 16
+            let copyRejected = !copyPCMInput(UnsafePointer(raw), into:target)
+            list[0] = original
+            print("{\"rejected\":\(rejected),\"copy_rejected\":\(copyRejected)}")
+            return
+        }
+        if mode == "layout" {
+            let channels = Int(CommandLine.arguments[2])!
+            let active = Int(CommandLine.arguments[3])!
+            let kind: AVAudioCommonFormat = ["f32": .pcmFormatFloat32, "f64": .pcmFormatFloat64,
+                                            "i16": .pcmFormatInt16, "i32": .pcmFormatInt32][CommandLine.arguments[4]]!
+            let interleaved = CommandLine.arguments[5] == "1"
+            let layout = AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | UInt32(channels))!
+            let format = AVAudioFormat(commonFormat:kind, sampleRate:48000, interleaved:interleaved, channelLayout:layout)
+            let converter = Converter()
+            for _ in 0..<24 {
+                let buffer = AVAudioPCMBuffer(pcmFormat:format, frameCapacity:512)!
+                buffer.frameLength = 512
+                let list = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+                for channel in 0..<channels {
+                    let data = list[interleaved ? 0 : channel].mData!
+                    for frame in 0..<512 {
+                        let index = interleaved ? frame * channels + channel : frame
+                        let value:Float = active == -1 || channel == active ? 0.375 : 0
+                        switch kind {
+                        case .pcmFormatFloat32: data.assumingMemoryBound(to:Float.self)[index] = value
+                        case .pcmFormatFloat64: data.assumingMemoryBound(to:Double.self)[index] = Double(value)
+                        case .pcmFormatInt16: data.assumingMemoryBound(to:Int16.self)[index] = Int16(value * 32768)
+                        case .pcmFormatInt32: data.assumingMemoryBound(to:Int32.self)[index] = Int32(Double(value) * 2147483648)
+                        default: fatalError("unsupported fixture")
+                        }
+                    }
+                }
+                converter.consume(buffer, source:"microphone")
+                writer.sync {}
+            }
+            converter.finish()
+            writer.sync {}
+            return
+        }
         if mode == "retire" {
             let converter = Converter()
             let format = AVAudioFormat(commonFormat:.pcmFormatFloat32, sampleRate:16000, channels:1, interleaved:false)!
@@ -77,8 +133,8 @@ class NativePCMFramingTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def run_mode(self, mode):
-        result = subprocess.run([self.binary, mode], capture_output=True, timeout=15, check=True)
+    def run_mode(self, mode, *args):
+        result = subprocess.run([self.binary, mode, *map(str, args)], capture_output=True, timeout=15, check=True)
         return [json.loads(line) for line in result.stdout.splitlines()], json.loads(result.stderr or '{}')
 
     def assert_samples_preserved(self, rows, count):
@@ -112,6 +168,31 @@ class NativePCMFramingTests(unittest.TestCase):
         self.assertEqual(len(rows), 4)
         self.assertEqual(stats['samples_per_source'], 25650)
         self.assertEqual(len(rows) + stats['pending_drops'] + sum(r.get('native_dropped_chunks', 0) for r in rows), 14)
+
+    def test_normalization_rejects_missing_short_mismatched_and_nonfinite_samples(self):
+        for kind in ('short', 'missing', 'channels', 'nan', 'infinity'):
+            with self.subTest(kind=kind):
+                rows, _ = self.run_mode('invalid', kind)
+                self.assertEqual(rows, [{'rejected': True, 'copy_rejected': kind in ('short', 'missing', 'channels')}])
+
+    def test_discrete_layout_mixes_every_channel_for_each_pcm_representation(self):
+        # Standard mono/stereo labels missed a native silent-success failure:
+        # valid discrete layouts converted to zero despite a nonzero channel.
+        for channels in (1, 2, 3, 4):
+            for active in [-1, *range(channels)]:
+                for kind in ('f32', 'f64', 'i16', 'i32'):
+                    for interleaved in (0, 1):
+                        with self.subTest(channels=channels, active=active, kind=kind, interleaved=interleaved):
+                            rows, _ = self.run_mode('layout', channels, active, kind, interleaved)
+                            values = []
+                            for row in rows:
+                                self.assertEqual(row['source'], 'microphone')
+                                values.extend(struct.unpack('<' + 'f' * row['samples'], base64.b64decode(row['pcm'])))
+                            self.assertGreater(len(values), 4000)
+                            self.assertLessEqual(len(values), 4096)
+                            expected = .375 if active == -1 else .375 / channels
+                            self.assertAlmostEqual(sum(values[-1000:]) / 1000, expected, delta=1e-4)
+                            self.assertGreater(max(abs(value) for value in values), expected * .9)
 
     def test_actual_worker_transcribes_both_synthetic_source_tails(self):
         import audio_worker
