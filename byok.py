@@ -10,7 +10,7 @@ PROVIDERS = {
     'openai': ('OpenAI API', 'OPENAI_API_KEY', 'https://api.openai.com/v1/chat/completions'),
     'openrouter': ('OpenRouter', 'OPENROUTER_API_KEY', 'https://openrouter.ai/api/v1/chat/completions'),
 }
-_SECRET_NAMES = frozenset({'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'MODEL_API_KEY'})
+_SECRET_NAMES = frozenset({'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'MODEL_API_KEY', 'MEETING_COPILOT_GEMINI_API_KEY'})
 _ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._/:@+\-]{0,199}\Z')
 
 def validate(provider, model):

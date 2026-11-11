@@ -2,7 +2,7 @@
 
 ## Data flow
 
-- Microphone and loopback audio are processed locally after explicit consent when using native capture with local transcription. Optional explicit Meta transcription sends audio off-device; local model preparation may download weights.
+- Microphone and loopback audio are processed locally after explicit consent when using native capture with local transcription. Optional explicit Meta or Google transcription sends audio off-device; local model preparation may download weights.
 - The optional, unofficial Meetily adapter reads only an explicitly attached active recording's live JSON snapshots. Meetily independently saves audio/transcripts according to its own settings; this project does not erase or change those files.
 - This project does not write additional raw audio or transcripts to disk. Transcripts and
   answer results remain in bounded process memory until cleared or the process exits.
@@ -116,3 +116,16 @@ meeting context. Dragging and position presets only rearrange the window.
 For security-sensitive findings, use GitHub's private vulnerability reporting if
 available rather than posting secrets or exploit details in a public issue.
 Maintainer: [Adam Nugroho](https://github.com/adam4788).
+
+## Google preview boundary
+
+The [Google transcription preview](docs/google-transcription.md) uses a separate
+plugin-scoped secret, fixed official WebSocket origin/header auth and no retries.
+Explicit selection and fresh consent are required; source labels are not people.
+Free-tier audio may improve Google products. A durable shared local $4 reservation
+ledger admits at most four 60-second stream attempts, counting both sources and
+uncertain failures. This is not a guaranteed provider bill cap. The explicit
+synthetic WAV endpoint accepts bounded bytes only, never file paths; it shares
+Pause/lease/teardown cancellation and cannot start devices or append to meetings.
+Scoped-key changes retire an active synthetic test. No API key enters a URL,
+worker environment, log, fixture, preview ledger or result.

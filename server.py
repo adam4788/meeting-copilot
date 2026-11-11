@@ -17,9 +17,9 @@ except ImportError:  # top-level use (tests, scripts)
 
 
 try:
-    from .macos_audio import clean_audio_diagnostics
+    from .macos_audio import clean_audio_diagnostics, clean_google_usage
 except ImportError:
-    from macos_audio import clean_audio_diagnostics
+    from macos_audio import clean_audio_diagnostics, clean_google_usage
 
 
 def _is_engine_abort(exc):
@@ -128,9 +128,14 @@ class CaptureRequest(LifecycleControlRequest):
     recording_id: str | None = Field(default=None, max_length=500)
     transcription_model: Literal['tiny.en', 'base.en', 'small.en'] = 'base.en'
     audio_source: Literal['microphone', 'system', 'both'] = 'microphone'
-    transcription_provider: Literal['local', 'meta'] = 'local'
+    transcription_provider: Literal['local', 'meta', 'google'] = 'local'
     asr_mode: Literal['ENDPOINTING', 'DIARIZATION', 'PUSH_TO_TALK'] = 'ENDPOINTING'
     new_meeting: bool = False
+
+
+class GoogleFixtureRequest(LifecycleControlRequest):
+    consent: StrictBool = False
+    audio_base64: str = Field(min_length=1, max_length=2600000)
 
 
 class PermissionRequest(LifecycleControlRequest):
@@ -142,6 +147,15 @@ class ModelDiscoveryRequest(BaseModel):
     model_config = {'extra': 'forbid'}
     provider: Literal['openai', 'openrouter']
     consent: StrictBool = False
+
+
+def _google_key_present():
+    try:
+        import importlib
+        module = importlib.import_module(f'{__package__}.google_preview' if __package__ else 'google_preview')
+        return bool(module.scoped_key())
+    except Exception:
+        return False
 
 
 def _meta_key_present():
@@ -190,6 +204,7 @@ class MeetingState:
         self.capture_error = None
         # Logical retirement is not proof of physical shutdown. Keep the exact
         # adapter until stop succeeds; starts cannot replace it meanwhile.
+        self.fixture_test = None
         self.pending_stop = None
         self.stop_sequence = 0
         self.stop_attempts = 0
@@ -294,7 +309,7 @@ class MeetingState:
                          'detail': 'Permission confirmed for these settings.' if consent is True else
                                    'Confirm participant permission in the pane before Start.'})
         with self.lock:
-            idle = not self.listening and self.pending_stop is None and not self.overlay_cleanup_error and self.pending_overlay is None
+            idle = not self.listening and self.pending_stop is None and self.fixture_test is None and not self.overlay_cleanup_error and self.pending_overlay is None
             checks.append({'id': 'capture_idle', 'label': 'Capture stopped',
                            'status': 'ready' if idle else 'blocked',
                            'detail': 'Capture is idle.' if idle else 'Pause capture and resolve any unconfirmed audio or overlay stop before Start.'})
@@ -318,6 +333,8 @@ class MeetingState:
     def _start(self, consent, backend='meetily', recording_id=None, transcription_model='base.en', audio_source='microphone',
                new_meeting=False, transcription_provider='local', asr_mode='ENDPOINTING', *, renew_lease=True):
         from fastapi import HTTPException
+        if self.fixture_test is not None:
+            raise HTTPException(409, 'Pause the Google audio test before starting capture.')
         if self.pending_stop is not None:
             raise HTTPException(409, self.stop_error or 'Capture stop is not confirmed. Retry Pause before starting.')
         ticket = self._reconcile_overlay_admission()
@@ -493,6 +510,8 @@ class MeetingState:
             if isinstance(incoming, dict) and 'state' not in incoming and isinstance(incoming.get('status'), str):
                 incoming = dict(incoming, state=incoming['status'])
             incoming = dict(incoming)
+            if 'google_usage' in incoming:
+                incoming['google_usage'] = clean_google_usage(incoming['google_usage'])
             if 'audio_diagnostics' in incoming:
                 incoming['audio_diagnostics'] = clean_audio_diagnostics(incoming['audio_diagnostics'])
             previous = self.capture_info if isinstance(self.capture_info, dict) else {}
@@ -501,7 +520,7 @@ class MeetingState:
             # Drop counts are monotonic within a capture: a lower later report
             # (e.g. a worker-only update after a combined one) never rewinds.
             for key in ('warning', 'dropped_chunks', 'native_dropped_chunks', 'worker_dropped_chunks',
-                        'sub_second_dropped_chunks', 'reader_incomplete', 'partial_tail', 'audio_diagnostics'):
+                        'sub_second_dropped_chunks', 'reader_incomplete', 'partial_tail', 'audio_diagnostics', 'google_usage'):
                 if incoming.get(key) is None and previous.get(key) is not None:
                     incoming = dict(incoming)
                     incoming[key] = previous[key]
@@ -558,7 +577,7 @@ class MeetingState:
     def _expire_capture(self):
         """Called with lifecycle_lock; no stop/join while holding overlay_lock."""
         with self.overlay_lock:
-            expired = self.listening and time.monotonic() - self.pane_seen > 30
+            expired = (self.listening or self.fixture_test is not None) and time.monotonic() - self.pane_seen > 30
         if expired:
             self.pause(retain_tail=False)
             self.overlay_hide()
@@ -567,7 +586,7 @@ class MeetingState:
     def watchdog(self, capture_generation=None):
         if capture_generation is None:
             capture_generation = self.capture_generation
-        while self.listening and capture_generation == self.capture_generation:
+        while (self.listening or self.fixture_test is not None) and capture_generation == self.capture_generation:
             time.sleep(2)
             with self.lifecycle_lock:
                 if capture_generation != self.capture_generation:
@@ -655,11 +674,13 @@ class MeetingState:
                 # The retiring generation gets a bounded tail window: the
                 # adapter's graceful shutdown flushes trailing speech after
                 # pause, and those segments belong to this meeting. Five
-                # seconds covers the adapter's default teardown budget.
+                # seconds covers ordinary teardown; Google's explicitly bounded
+                # final drain needs its full 9.5-second adapter stop budget.
                 # Clear passes retain_tail=False: a forget-everything boundary
                 # must not accept stop-time audio into the cleared transcript.
                 if retain_tail:
-                    self.retiring_generations[self.capture_generation] = time.monotonic() + 5.0
+                    google = getattr(self, 'last_start_args', None) and len(self.last_start_args) > 4 and self.last_start_args[4] == 'google'
+                    self.retiring_generations[self.capture_generation] = time.monotonic() + (9.5 if google else 5.0)
                 # Prune expired windows so the map stays tiny.
                 now = time.monotonic()
                 for gen in [g for g, deadline in self.retiring_generations.items() if deadline < now]:
@@ -673,7 +694,8 @@ class MeetingState:
                     if entry.get('status') in ('queued', 'streaming', 'running'):
                         entry['cancelled'] = True
                         entry['status'] = 'cancelled'
-                audio = self.audio if self.backend in ('native', 'macos') else self.bridge
+                audio = self.fixture_test or (self.audio if self.backend in ('native', 'macos') else self.bridge)
+                self.fixture_test = None
                 self.busy = False
                 self.stop_sequence += 1
                 self.stop_attempts = 0
@@ -699,7 +721,7 @@ class MeetingState:
                 latched = {'state': 'stopped', 'backend': self.backend, 'message': 'Paused / detached',
                            'error': previous.get('error') if error_before else None}
                 for key in ('warning', 'dropped_chunks', 'native_dropped_chunks', 'worker_dropped_chunks', 'native_writer_timing_ms',
-                            'sub_second_dropped_chunks', 'reader_incomplete', 'partial_tail', 'audio_diagnostics'):
+                            'sub_second_dropped_chunks', 'reader_incomplete', 'partial_tail', 'audio_diagnostics', 'google_usage'):
                     if previous.get(key) is not None:
                         latched[key] = previous[key]
                 self.capture_info = latched
@@ -1262,7 +1284,7 @@ class MeetingState:
             # A claim authorizes a pane, never continuation of someone else's
             # capture. Stop before minting authority; hold lifecycle, not overlay,
             # across adapter teardown (callbacks may need the state lock).
-            if self.listening:
+            if self.listening or self.fixture_test is not None:
                 self.pause(retain_tail=False)
             with self.overlay_lock:
                 self.overlay_revision += 1
@@ -1689,6 +1711,8 @@ class MeetingState:
         """
         transition = {'overlay_credentials': 'not_shown'}
         with self.lifecycle_lock:
+            if self.fixture_test is not None:
+                self.pause(retain_tail=False)
             retired = False
             try:
                 with self.overlay_lock:
@@ -1835,8 +1859,9 @@ class MeetingState:
             import importlib
             audio_module = importlib.import_module(f'{__package__}.audio' if __package__ else 'audio')
             windows = audio_module.windows_readiness()
-            return {'listening': self.listening, 'stopping': self.pending_stop is not None,
-                    'stop_confirmed': not self.listening and self.pending_stop is None,
+            return {'listening': self.listening, 'stopping': self.pending_stop is not None or self.fixture_test is not None,
+                    'google_fixture_active': self.fixture_test is not None or getattr(self.pending_stop, 'is_google_fixture', False) is True,
+                    'stop_confirmed': not self.listening and self.pending_stop is None and self.fixture_test is None,
                     'stop_attempts': self.stop_attempts,
                     'overlay_cleanup_error': cleanup_error,
                     'overlay_stop_confirmed': not uncertain_overlay and overlay is None and cleanup_error is None,
@@ -1858,6 +1883,7 @@ class MeetingState:
                     'overlay_shown': None if uncertain_overlay else overlay is not None,
                     'capabilities': {'all_projects': True, 'automatic_web_fallback': True, 'independent_models': True, 'history_opt_out': True, 'capture_preflight': 1, 'model_discovery': True,
                                      'meta_asr': _meta_key_present(),
+                                     'google_asr': _google_key_present(),
                                      'macos_transcription': bool(macos_ready),
                                      'windows_transcription': windows['ready'],
                                      'windows_detail': windows['detail'],
@@ -1931,12 +1957,44 @@ def make_router(state):
         return state.capture_preflight(body.consent, body.backend, body.recording_id,
             body.transcription_model, body.audio_source, body.transcription_provider, body.asr_mode)
 
+    @router.post('/transcription/google/test')
+    def google_fixture_test(body: GoogleFixtureRequest):
+        if not body.consent:
+            raise HTTPException(400, 'Confirm sending this synthetic WAV to Google first.')
+        module = importlib.import_module(f'{__package__}.google_fixture' if __package__ else 'google_fixture')
+        operation = module.FixtureOperation()
+        with state.control_boundary(body):
+            if state.listening or state.pending_stop is not None or state.fixture_test is not None:
+                raise HTTPException(409, 'Pause audio and confirm it stopped before the synthetic test.')
+            try:
+                operation.start(body.audio_base64)
+            except ValueError:
+                raise HTTPException(400, 'Supply a valid PCM16 mono 16 kHz WAV of at most 60 seconds.') from None
+            except Exception:
+                raise HTTPException(503, 'Google fixture test is unavailable. Check scoped credentials, runtime and preview allowance; review usage before retrying.') from None
+            state.fixture_test = operation
+            state._touch_pane_seen()
+            threading.Thread(target=state.watchdog, args=(state.capture_generation,), daemon=True).start()
+        # Network wait never holds the lifecycle fence. Pause, release, lease
+        # expiry and teardown can terminate this exact operation meanwhile.
+        try:
+            return operation.wait()
+        except Exception:
+            raise HTTPException(503, 'Google fixture test is incomplete. Review usage and stop state before retrying.') from None
+        finally:
+            with state.lifecycle_lock:
+                if state.fixture_test is operation:
+                    state.fixture_test = None
+                    if operation.is_running:
+                        state.pending_stop = operation
+                        state.stop_error = 'Google audio test stop is unconfirmed. Retry Pause.'
+
     @router.post('/permissions/request')
     def permissions(body: PermissionRequest):
         if not body.consent:
             raise HTTPException(400, 'Confirm the macOS permission request first.')
         with state.control_boundary(body):
-            if state.listening or state.pending_stop is not None:
+            if state.listening or state.pending_stop is not None or state.fixture_test is not None:
                 raise HTTPException(409, 'Pause capture and confirm it stopped before permission setup.')
             module = importlib.import_module(f'{__package__}.capture_preflight' if __package__ else 'capture_preflight')
             return module.request_permissions(body.audio_source)
@@ -2045,6 +2103,8 @@ def make_router(state):
     @router.post('/clear')
     def clear(body: LifecycleControlRequest | None = None):
         with state.control_boundary(body):
+            if state.fixture_test is not None:
+                state.pause(retain_tail=False)
             return clear_authorized()
 
     def clear_authorized():

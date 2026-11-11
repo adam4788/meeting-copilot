@@ -241,10 +241,10 @@ export default {
         if (out.answerProvider === 'hermes') out.answerModel = 'default';
         else if (out.answerProvider !== undefined && !out.answerModel) out.answerModel = '';
         for (const [key, choices] of Object.entries({ backend: ['meetily', 'macos', 'native'], audioSource: ['microphone', 'system', 'both'],
-          transcriptionModel: ['tiny.en', 'base.en', 'small.en'], transcriptionProvider: ['local', 'meta'], asrMode: ['ENDPOINTING', 'DIARIZATION', 'PUSH_TO_TALK'] })) {
+          transcriptionModel: ['tiny.en', 'base.en', 'small.en'], transcriptionProvider: ['local', 'meta', 'google'], asrMode: ['ENDPOINTING', 'DIARIZATION', 'PUSH_TO_TALK'] })) {
           if (out[key] !== undefined && !choices.includes(out[key])) delete out[key];
         }
-        if (out.transcriptionProvider === 'meta' && parsed?.transcriptionChoiceVersion !== 1) out.transcriptionProvider = 'local';
+        if (['meta', 'google'].includes(out.transcriptionProvider) && parsed?.transcriptionChoiceVersion !== 1) out.transcriptionProvider = 'local';
         return out;
       } catch (_) { return {}; }
     }
@@ -257,7 +257,7 @@ export default {
       const windows = caps?.windows_transcription === true || (typeof caps?.windows_detail === 'string' && caps.windows_detail.startsWith('Windows capture needs optional audio dependencies in the gateway interpreter:'));
       return mac === windows ? '' : mac ? 'macos' : 'native';
     }
-    const effectiveCapture = (prefs, caps) => ({ ...prefs, backend: prefs.backend || defaultBackend(caps) });
+    const effectiveCapture = (prefs, caps) => ({ ...prefs, backend: prefs.backend || defaultBackend(caps), asrMode: prefs.transcriptionProvider === 'google' ? 'ENDPOINTING' : prefs.asrMode });
     const preferences = atom({ project: '', backend: '', webFallback: false, transcriptionModel: 'base.en', audioSource: 'both', answerProvider: 'hermes', answerModel: 'default', transcriptionProvider: 'local', asrMode: 'ENDPOINTING', ...loaded,
       excludeHistory: loaded.excludeHistory !== undefined ? loaded.excludeHistory : !loaded.webFallback });
     const storageFailed = atom(false);
@@ -354,7 +354,7 @@ export default {
         (!state?.fetchStatus || state.fetchStatus === 'idle') &&
         state?.data?.listening === false && state.data.stopping === false);
     }
-    const captureKey = prefs => JSON.stringify([prefs.backend, prefs.audioSource, prefs.transcriptionModel, prefs.transcriptionProvider, prefs.asrMode]);
+    const captureKey = prefs => JSON.stringify([prefs.backend, prefs.audioSource, prefs.transcriptionModel, prefs.transcriptionProvider, prefs.transcriptionProvider === 'google' ? 'ENDPOINTING' : prefs.asrMode]);
     function answerScope(prefs) {
       const all = prefs.project === '__all_projects__';
       return { project: all ? null : prefs.project || null, all_projects: all, web_fallback: prefs.webFallback,
@@ -476,7 +476,8 @@ export default {
         const caps = latest?.data?.capabilities || {};
         if (hasMountedPane() && ((field === 'backend' && value === 'macos' && !caps.macos_transcription) ||
             (field === 'backend' && value === 'native' && caps.windows_transcription !== true) ||
-            (field === 'transcriptionProvider' && value === 'meta' && !caps.meta_asr))) return;
+            (field === 'transcriptionProvider' && value === 'meta' && !caps.meta_asr) ||
+            (field === 'transcriptionProvider' && value === 'google' && !caps.google_asr))) return;
         savePreferences({ [field]: value, ...(field === 'transcriptionProvider' ? { transcriptionChoiceVersion: 1 } : {}) });
       };
       return h('section', { style: { ...card, display: 'grid', gap: 10 }, 'aria-label': 'Transcript source preferences' },
@@ -497,15 +498,18 @@ export default {
             h('select', { style: selectStyle, value: audioSource, disabled: locked, 'aria-label': 'Audio source', onChange: e => change('audioSource', e.target.value, ['microphone', 'system', 'both']) },
               h('option', { value: 'microphone' }, 'Microphone'), h('option', { value: 'system' }, 'System audio'), h('option', { value: 'both' }, 'Microphone + system audio'))),
           backend === 'macos' && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Transcription provider'),
-            h('select', { style: selectStyle, value: transcriptionProvider, disabled: locked, 'aria-label': 'Transcription provider', onChange: e => change('transcriptionProvider', e.target.value, ['local', 'meta']) },
+            h('select', { style: selectStyle, value: transcriptionProvider, disabled: locked, 'aria-label': 'Transcription provider', onChange: e => change('transcriptionProvider', e.target.value, ['local', 'meta', 'google']) },
               h('option', { value: 'local' }, 'Local — faster-whisper on this Mac'),
-              h('option', { value: 'meta', disabled: mounted && !data.capabilities?.meta_asr, title: mounted && !data.capabilities?.meta_asr ? 'Set the Meta API key in Hermes Settings → Plugins → meeting-copilot-live, then reopen the pane.' : '' }, 'Meta Muse Voice — cloud transcription'))),
+              h('option', { value: 'meta', disabled: mounted && !data.capabilities?.meta_asr, title: mounted && !data.capabilities?.meta_asr ? 'Set the Meta API key in Hermes Settings → Plugins → meeting-copilot-live, then reopen the pane.' : '' }, 'Meta Muse Voice — cloud transcription'),
+              h('option', { value: 'google', disabled: mounted && !data.capabilities?.google_asr }, 'Google Gemini — 60-second cloud preview'))),
           backend === 'macos' && mounted && !status.isPending && !status.error && !data.capabilities?.meta_asr && h('p', { role: 'status', style: muted }, 'Meta transcription is unavailable. Set the Meta API key in managed Agent settings, then reopen the pane to recheck readiness.'),
           (backend === 'native' || transcriptionProvider === 'local') && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Local transcription model'),
             h('select', { style: selectStyle, value: transcriptionModel, disabled: locked, 'aria-label': 'Local transcription model', onChange: e => change('transcriptionModel', e.target.value, ['tiny.en', 'base.en', 'small.en']) },
               h('option', { value: 'tiny.en' }, 'Whisper tiny.en — fastest'), h('option', { value: 'base.en' }, 'Whisper base.en — balanced'), h('option', { value: 'small.en' }, 'Whisper small.en — higher accuracy'))),
           backend === 'native' && h('span', { style: muted }, 'Local transcription uses the default microphone and all audio on the default output, according to Audio source. Prepare Whisper weights before Start. ', data.capabilities?.windows_detail || 'Experimental; hardware is unverified.'),
           backend === 'macos' && transcriptionProvider === 'local' && h('span', { style: muted }, 'Runs on this Mac without Meetily. Prepare the selected model before Start. Microphone or screen and system audio permission is required.'),
+          backend === 'macos' && transcriptionProvider === 'google' && h('span', { style: muted }, 'Source labels only · no speaker diarization'),
+          backend === 'macos' && transcriptionProvider === 'google' && h('p', { role: 'status', style: muted }, 'Google Gemini 3.5 Transcribe Live: explicit 60-second cloud preview. Configure its dedicated key in Hermes plugin secrets. Audio is sent to Google; free-tier data may improve Google products. No automatic retries or session rollover.'),
           backend === 'macos' && transcriptionProvider === 'meta' && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Meta ASR mode'),
             h('select', { style: selectStyle, value: asrMode, disabled: locked, 'aria-label': 'Meta ASR mode', onChange: e => change('asrMode', e.target.value, ['ENDPOINTING', 'DIARIZATION', 'PUSH_TO_TALK']) },
               h('option', { value: 'ENDPOINTING' }, 'Endpointing — one segment per utterance'), h('option', { value: 'DIARIZATION' }, 'Diarization — speaker labels per source'), h('option', { value: 'PUSH_TO_TALK' }, 'Push-to-talk — single-turn finals'))),
@@ -846,10 +850,10 @@ export default {
       const [liveEntry, setLiveEntry] = useState(null);
       const [lastAsked, setLastAsked] = useState(null);
       const [assistFailed, setAssistFailed] = useState(false);
-      const [fallbackTranscriptionProvider, setTranscriptionProvider] = useState(saved.transcriptionProvider === 'meta' ? 'meta' : 'local');
+      const [fallbackTranscriptionProvider, setTranscriptionProvider] = useState(['meta', 'google'].includes(saved.transcriptionProvider) ? saved.transcriptionProvider : 'local');
       const [fallbackAsrMode, setAsrMode] = useState(['ENDPOINTING', 'DIARIZATION', 'PUSH_TO_TALK'].includes(saved.asrMode) ? saved.asrMode : 'ENDPOINTING');
       const transcriptionProvider = settingsAvailable ? prefs.transcriptionProvider : fallbackTranscriptionProvider;
-      const asrMode = settingsAvailable ? prefs.asrMode : fallbackAsrMode;
+      const asrMode = transcriptionProvider === 'google' ? 'ENDPOINTING' : (settingsAvailable ? prefs.asrMode : fallbackAsrMode);
       const [setupOpen, setSetupOpen] = useState(false);
       const [answerUncertain, setAnswerUncertain] = useState(false);
       const [progressPaused, setProgressPaused] = useState(false);
@@ -862,7 +866,7 @@ export default {
         setAnswerUncertain(false); setProgressPaused(false);
         if (safety.answer && safety.answerKnown) { safety.answerToken += 1; signalSafety(); }
       }
-      const cloudUnavailable = backend === 'macos' && transcriptionProvider === 'meta' && !data.capabilities?.meta_asr;
+      const cloudUnavailable = backend === 'macos' && ((transcriptionProvider === 'meta' && !data.capabilities?.meta_asr) || (transcriptionProvider === 'google' && (!data.capabilities?.google_asr || asrMode !== 'ENDPOINTING')));
       const windowsUnavailable = backend === 'native' && data.capabilities?.windows_transcription !== true;
       const overlayNeedsHide = !!data.overlay_cleanup_error || !!overlayActionAt.current.credentialShutdownUnconfirmed;
       function reflectCredentialOverlay(written, target) {
@@ -941,7 +945,7 @@ export default {
             consentPrefs.current && captureKey(current) === captureKey(renderedCapture) && captureInput.current.recording === recording &&
             captureRevision === renderedCaptureRevision && consentPrefs.current.revision === captureRevision && consentPrefs.current.key === captureKey(current) &&
             sourceVersion.current.revision === renderedSourceRevision && consentPrefs.current.sourceRevision === renderedSourceRevision &&
-            !!backend && (backend !== 'meetily' || recording) && (backend !== 'macos' || (caps.macos_transcription && (transcriptionProvider !== 'meta' || caps.meta_asr))) &&
+            !!backend && (backend !== 'meetily' || recording) && (backend !== 'macos' || (caps.macos_transcription && (transcriptionProvider !== 'meta' || caps.meta_asr) && (transcriptionProvider !== 'google' || (caps.google_asr && asrMode === 'ENDPOINTING')))) &&
             (backend !== 'native' || caps.windows_transcription === true));
         };
         if (!canStartCurrent()) {
@@ -1189,7 +1193,7 @@ export default {
       const transcript = data.segments || [];
       const failed = !!(data.error_request || data.error || (data.capture && (data.capture.error || /fail|error|could not/i.test(data.capture.warning || ''))));
       const captureLabel = data.listening ? (['loading', 'starting'].includes(data.capture?.state) ? 'Starting…' : 'Listening') : 'Paused';
-      const statusLabel = status.isPending ? 'Connecting…' : status.error ? 'Unavailable' : data.stopping ? 'Stopping — unconfirmed' : failed ? (data.listening ? `${captureLabel} · needs attention` : 'Needs attention') : captureLabel;
+      const statusLabel = status.isPending ? 'Connecting…' : status.error ? 'Unavailable' : data.google_fixture_active ? 'Google audio test' : data.stopping ? 'Stopping — unconfirmed' : failed ? (data.listening ? `${captureLabel} · needs attention` : 'Needs attention') : captureLabel;
         // Always-visible listening bar: the source card collapses while
         // listening, but Pause/Detach and loss evidence must never hide.
         // Native frames, worker chunks, and sub-second tails are distinct
@@ -1346,15 +1350,18 @@ export default {
       // likewise recheck without borrowing another message's retry request.
       const localRecheck = assistFailed || (typeof error === 'string' && /^(Answer progress|Answer submission|Cancellation was not confirmed)/.test(error));
       const restartCapture = !data.listening && !data.stopping;
-      const cloudAudioSelected = backend === 'macos' && transcriptionProvider === 'meta';
-      const cloudAudioActive = data.listening && data.last_session?.backend === 'macos' && data.last_session?.transcription_provider === 'meta';
-      const cloudAudioUnconfirmed = data.stopping && data.last_session?.backend === 'macos' && data.last_session?.transcription_provider === 'meta';
+      const selectedCloudProvider = backend === 'macos' && ['meta', 'google'].includes(transcriptionProvider) ? transcriptionProvider : null;
+      const activeCloudProvider = data.google_fixture_active ? 'google' : (data.listening || data.stopping) && data.last_session?.backend === 'macos' && ['meta', 'google'].includes(data.last_session?.transcription_provider) ? data.last_session.transcription_provider : null;
+      const cloudName = (activeCloudProvider || selectedCloudProvider) === 'google' ? 'Google' : 'Meta';
+      const cloudAudioSelected = !!selectedCloudProvider;
+      const cloudAudioActive = data.listening && !!activeCloudProvider;
+      const cloudAudioUnconfirmed = data.stopping && !!activeCloudProvider;
       const cloudAudioDisclosed = cloudAudioSelected || cloudAudioActive || cloudAudioUnconfirmed;
       const captureMessage = (data.capture?.error || data.capture?.warning) && typeof data.capture?.message === 'string' ? data.capture.message.slice(0, 500) : '';
       const audioAttention = audioAttentionText(data.capture?.audio_diagnostics);
-      const sourceSummary = !backend ? 'Not identified — choose a capture source'
+      const sourceSummary = data.google_fixture_active ? 'Synthetic WAV → Google · no microphone or system capture' : !backend ? 'Not identified — choose a capture source'
         : backend === 'meetily' ? (recording ? 'Meetily · recording selected' : 'Meetily — choose an active recording below')
-        : `${backend === 'macos' ? 'macOS' : 'Windows'} · ${{ microphone: 'Microphone', system: 'System audio', both: 'Microphone + system audio' }[audioSource] || audioSource} · ${cloudAudioSelected ? `Meta (${asrMode})` : `Local transcription (${transcriptionModel})`}`;
+        : `${backend === 'macos' ? 'macOS' : 'Windows'} · ${{ microphone: 'Microphone', system: 'System audio', both: 'Microphone + system audio' }[audioSource] || audioSource} · ${cloudAudioSelected ? (selectedCloudProvider === 'google' ? 'Google Gemini (60s preview · source labels)' : `Meta (${asrMode})`) : `Local transcription (${transcriptionModel})`}`;
       const captureBlocked = !freshPreflight() || !captureStatusIdle(status) || !backend || overlayNeedsHide || cloudUnavailable || windowsUnavailable || !consentValid || (backend === 'meetily' && !recording)
         || (settingsAvailable && !mayChangeCapture(qc, status, () => usable() && actionLife.mounted && overlayActionAt.current === actionLife))
         || (backend === 'macos' && !data.capabilities?.macos_transcription);
@@ -1369,7 +1376,7 @@ export default {
       const checkRows = Array.isArray(preflight.data?.checks) ? preflight.data.checks : [];
       const passedChecks = checkRows.filter(c => c.status === 'ready');
       const blockedChecks = checkRows.filter(c => c.status !== 'ready');
-      const checksLabel = startReady ? 'Ready to start' : status.error ? 'Unavailable' : data.stopping ? 'Stop unconfirmed'
+      const checksLabel = startReady ? 'Ready to start' : status.error ? 'Unavailable' : data.google_fixture_active ? 'Google audio test' : data.stopping ? 'Stop unconfirmed'
         : status.isPending || preflight.isPending ? 'Checking…' : blockedChecks.length ? 'Needs setup' : freshPreflight() ? 'Start blocked' : 'Recheck required';
       const renderCheck = c => h('li', { key: c.id, 'data-check-status': c.status },
         h(PaneIcon, { name: c.status === 'ready' ? 'check' : 'alert' }),
@@ -1394,7 +1401,8 @@ export default {
           h('div', { className: 'mc-chips', 'aria-label': 'Capture source' },
             h('span', { className: 'mc-chip', title: 'Next capture' }, `${data.listening ? 'Next capture' : 'Capture source'}: ${sourceSummary}`)),
           (status.error || status.isPending || data.stopping) && h('p', { role: 'status', style: muted }, status.error ? 'Capture status unavailable. Check the backend connection.' : status.isPending ? 'Checking capture status…' : 'Stop is not confirmed — audio may still be active.'),
-          cloudAudioDisclosed && h('p', { id: `${paneEntry.a11yId}-cloud-audio`, 'data-cloud-capture-disclosure': true, role: 'status', className: 'mc-notice' }, h(PaneIcon, { name: 'cloud' }), cloudAudioUnconfirmed ? 'Meta cloud transcription may still be active. Audio transmission is not confirmed stopped; retry stop.' : `Cloud transcription ${cloudAudioActive ? 'active' : 'selected'}: meeting audio is sent to Meta while listening. ${data.listening ? 'Pause to change.' : 'Next capture.'}`),
+          cloudAudioDisclosed && h('p', { id: `${paneEntry.a11yId}-cloud-audio`, 'data-cloud-capture-disclosure': true, role: 'status', className: 'mc-notice' }, h(PaneIcon, { name: 'cloud' }), cloudAudioUnconfirmed ? `${cloudName} cloud transcription may still be active. Audio transmission is not confirmed stopped; retry stop.` : `Cloud transcription ${cloudAudioActive ? 'active' : 'selected'}: meeting audio is sent to ${cloudName} while listening. ${data.listening ? 'Pause to change.' : 'Next capture.'}`),
+          (selectedCloudProvider === 'google' || activeCloudProvider === 'google') && h('p', { role: 'status', 'data-google-preview-disclosure': true, className: 'mc-notice' }, 'Google preview: 60 seconds per source, no speaker diarization. Free-tier audio may improve Google products; use a paid project for private meetings. Each source reserves $1 of the shared $4 local preview allowance, not an actual charge or guaranteed bill cap.'),
           h('label', { className: 'mc-consent', style: { display: 'flex', gap: 8, alignItems: 'flex-start', padding: '2px 0' } },
             h('input', { type: 'checkbox', checked: consentValid, disabled: data.listening, onChange: e => {
               if (e.target.checked && (!usable() || !actionLife.mounted || overlayActionAt.current !== actionLife ||
@@ -1429,7 +1437,7 @@ export default {
               backend === 'macos' && h(Button, { variant: 'secondary', disabled: pending || !captureStatusIdle(status) || data.capabilities?.capture_preflight !== 1,
                 onClick: requestPermissions }, 'Request macOS permissions…'))),
           data.listening && data.backend === 'macos' && !data.last_session?.transcription_provider && h('p', { role: 'status', style: muted }, 'The active transcription provider is not confirmed. Check capture status and pause if unsure.'),
-          cloudUnavailable && h('p', { role: 'status', style: muted }, `Meta cloud transcription is unavailable. Choose Local in ${settingsAvailable ? 'Meeting Copilot settings' : 'Transcript source'}, or configure a Meta key and recheck backend readiness before Start.`),
+          cloudUnavailable && h('p', { role: 'status', style: muted }, `${transcriptionProvider === 'google' ? 'Google preview' : 'Meta cloud transcription'} is unavailable. Choose Local in ${settingsAvailable ? 'Meeting Copilot settings' : 'Transcript source'}, or configure the selected provider key and supported mode, then recheck readiness before Start.`),
           backend === 'macos' && !data.capabilities?.macos_transcription && h('p', { role: 'status', style: muted }, data.capabilities?.macos_detail || 'macOS transcription readiness was not reported. Check the backend and macOS setup guide.'),
           windowsUnavailable && h('p', { role: 'status', style: muted }, data.capabilities?.windows_detail || 'Windows capture readiness was not reported. Check the backend and Windows setup guide.'),
           !data.listening && !data.stopping && (pending || !backend || !consentValid || (backend === 'meetily' && !recording)) && h('p', { style: { ...muted, margin: 0 }, role: 'status' },
@@ -1489,11 +1497,13 @@ export default {
               h('option', { value: 'microphone' }, 'Microphone'), h('option', { value: 'system' }, 'System audio'), h('option', { value: 'both' }, 'Microphone + system audio'))),
             backend === 'macos' && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Transcription provider'), h('select', { style: selectStyle, value: transcriptionProvider, disabled: data.listening, onChange: e => changeCaptureInput('transcriptionProvider', e.target.value, setTranscriptionProvider), 'aria-label': 'Transcription provider' },
               h('option', { value: 'local' }, 'Local — faster-whisper on this Mac'),
-              h('option', { value: 'meta', disabled: !data.capabilities?.meta_asr, title: data.capabilities?.meta_asr ? '' : 'Set the Meta API key in Hermes Settings → Plugins → meeting-copilot-live, then reopen this pane.' }, 'Meta Muse Voice — cloud transcription'))),
+              h('option', { value: 'meta', disabled: !data.capabilities?.meta_asr, title: data.capabilities?.meta_asr ? '' : 'Set the Meta API key in Hermes Settings → Plugins → meeting-copilot-live, then reopen this pane.' }, 'Meta Muse Voice — cloud transcription'),
+              h('option', { value: 'google', disabled: !data.capabilities?.google_asr }, 'Google Gemini — 60-second cloud preview'))),
             (backend === 'native' || transcriptionProvider === 'local') && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Local transcription model'), h('select', { style: selectStyle, value: transcriptionModel, disabled: data.listening, onChange: e => changeCaptureInput('transcriptionModel', e.target.value, setTranscriptionModel), 'aria-label': 'Local transcription model' },
               h('option', { value: 'tiny.en' }, 'Whisper tiny.en — fastest'), h('option', { value: 'base.en' }, 'Whisper base.en — balanced'), h('option', { value: 'small.en' }, 'Whisper small.en — higher accuracy'))),
             backend === 'native' && h('span', { style: muted }, 'Local transcription uses the default microphone and all audio on the default output, according to Audio source. Prepare Whisper weights before Start. ', data.capabilities?.windows_detail || 'Experimental; hardware is unverified.'),
             backend === 'macos' && transcriptionProvider === 'local' && h('span', { style: muted }, 'Runs on this Mac without Meetily. Prepare the selected model before Start. Microphone or screen and system audio permission is required.'),
+            backend === 'macos' && transcriptionProvider === 'google' && h('span', { style: muted }, 'Source labels only · no speaker diarization'),
             backend === 'macos' && transcriptionProvider === 'meta' && h('label', { style: { display: 'grid', gap: 6 } }, h('span', null, 'Meta ASR mode'), h('select', { style: selectStyle, value: asrMode, disabled: data.listening, onChange: e => changeCaptureInput('asrMode', e.target.value, setAsrMode), 'aria-label': 'Meta ASR mode' },
               h('option', { value: 'ENDPOINTING' }, 'Endpointing — one segment per utterance'),
               h('option', { value: 'DIARIZATION' }, 'Diarization — speaker labels per source'),

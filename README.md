@@ -40,6 +40,7 @@ CI and plugin validation do not prove a complete meeting works on your computer.
 - Reads supported text files from a selected project and shows the evidence used
   for each answer. Markdown, plain text, and reStructuredText are supported.
 - Uses local Whisper transcription, optional explicit Meta cloud transcription,
+  a bounded [Google Gemini transcription preview](docs/google-transcription.md),
   or an optional, unofficial Meetily JSON attachment, depending on platform setup.
 - Checks required capture settings and permissions before enabling Start, with
   separate explicit permission setup and model preparation. See [preflight](docs/preflight.md).

@@ -25,6 +25,10 @@ SILENCE_SAMPLES = 6400  # 400ms trailing silence; avoid cutting words at four se
 # Keep helper retirement plus session drain within the macOS adapter's default
 # 2.5s graceful-stop window, leaving a margin for scheduling and publication.
 META_SESSION_DRAIN_TIMEOUT = .75
+# Google: helper <=1.05s + grace5s + cancellation/close2.5s + watcher0.1s
+# stays below the adapter 9.5s stop budget. Meta retains its prior timings.
+GOOGLE_SESSION_DRAIN_TIMEOUT = 5.0
+GOOGLE_CLEANUP_TIMEOUT = 2.5
 
 
 def utterance_boundary(buffers, count):
@@ -442,7 +446,7 @@ def run_capture(model, source, language, helper=None, stop=None):
                 break
 
 
-def run_capture_meta(source, mode, api_key, model_id, helper=None, stop=None):
+def run_capture_cloud(source, mode, api_key, model_id, helper=None, stop=None, *, provider='meta'):
     """Stream helper PCM to Meta Muse Voice (opt-in cloud ASR).
 
     One realtime session per active source, so microphone audio keeps
@@ -451,17 +455,21 @@ def run_capture_meta(source, mode, api_key, model_id, helper=None, stop=None):
     """
     import asyncio
     import os
-    import meta_asr
+    import importlib
+    if provider not in ('meta', 'google'):
+        raise ValueError('Unsupported cloud provider')
+    asr = importlib.import_module('meta_asr' if provider == 'meta' else 'google_asr')
     stop = stop or threading.Event()
     helper = helper or Path(__file__).resolve().with_name('macos_capture')
     process = subprocess.Popen([str(helper), '--start', '--source', source],
                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL)
-    emit({'type': 'status', 'state': 'running'})
+    emit({'type': 'status', 'state': 'starting' if provider == 'google' else 'running'})
     loop = asyncio.new_event_loop()
     sources = {'microphone': 'you', 'system': 'remote'}
     active = sources if source == 'both' else {source: sources[source]}
     queues = {name: asyncio.Queue(maxsize=64) for name in active}
+    usage = {}
     ended_queues = set()
     stop_requested = asyncio.Event()
     native_lost = {'count': 0}
@@ -536,6 +544,8 @@ def run_capture_meta(source, mode, api_key, model_id, helper=None, stop=None):
                     if not isinstance(header, dict):
                         continue
                     if header.get('type') in ('status', 'error'):
+                        if provider == 'google' and header.get('type') == 'status' and header.get('state') == 'running':
+                            schedule(emit, {'type': 'status', 'state': 'running'})
                         if not schedule(report_native_loss, header.get('native_dropped_chunks', header.get('dropped_chunks'))):
                             break
                         if header.get('type') == 'error':
@@ -554,7 +564,7 @@ def run_capture_meta(source, mode, api_key, model_id, helper=None, stop=None):
                 name = 'microphone' if speaker == 'you' else 'system'
                 if name not in queues:
                     continue
-                frame = meta_asr.resample_to_24k(samples)
+                frame = asr.resample_to_24k(samples) if provider == 'meta' else asr.pcm16(samples)
                 if not schedule(_offer, queues[name], frame):
                     break
         except Exception:
@@ -589,9 +599,9 @@ def run_capture_meta(source, mode, api_key, model_id, helper=None, stop=None):
                     schedule(stop_requested.set)
                 return
 
-    reader_thread = threading.Thread(target=reader, daemon=True, name='meta-audio-reader')
+    reader_thread = threading.Thread(target=reader, daemon=True, name=provider + '-audio-reader')
     reader_thread.start()
-    threading.Thread(target=watcher, daemon=True, name='meta-audio-watcher').start()
+    threading.Thread(target=watcher, daemon=True, name=provider + '-audio-watcher').start()
 
     reader_incomplete = False
     forced_kill = False
@@ -633,10 +643,14 @@ def run_capture_meta(source, mode, api_key, model_id, helper=None, stop=None):
 
     async def main_async():
         nonlocal session_incomplete, early_session_exit
-        tasks = [asyncio.ensure_future(meta_asr.run_session(
-            queues[name], emit, api_key, model_id, mode, label))
+        def remember_usage(name, report):
+            usage[name] = report
+        tasks = [asyncio.ensure_future(asr.run_session(
+            queues[name], emit, api_key, model_id, mode, label,
+            **({'usage_callback': lambda report, name=name: remember_usage(name, report)} if provider == 'google' else {})))
             for name, label in active.items()]
         stop_task = asyncio.ensure_future(stop_requested.wait())
+        google_cleanup_waited = False
         try:
             # A single failed/finished source or an explicit stop retires
             # capture rather than waiting forever for another source's EOF.
@@ -646,23 +660,43 @@ def run_capture_meta(source, mode, api_key, model_id, helper=None, stop=None):
             await retire_reader()
             pending = {task for task in tasks if not task.done()}
             if pending:
-                _, pending = await asyncio.wait(pending, timeout=META_SESSION_DRAIN_TIMEOUT)
+                _, pending = await asyncio.wait(pending, timeout=GOOGLE_SESSION_DRAIN_TIMEOUT if provider == 'google' else META_SESSION_DRAIN_TIMEOUT)
             if pending:
                 session_incomplete = True
                 for task in pending:
                     task.cancel()
-                await asyncio.sleep(0)
+                if provider == 'google':
+                    # run_session owns bounded websocket close in its finally.
+                    # Keep this event loop alive until that retirement finishes.
+                    google_cleanup_waited = True
+                    _, remaining = await asyncio.wait(pending, timeout=GOOGLE_CLEANUP_TIMEOUT)
+                    if remaining:
+                        raise asr.GoogleAsrError()
+                else:
+                    await asyncio.sleep(0)
             errors = [task.exception() for task in tasks if task.done() and not task.cancelled()]
             # Prefer the provider-specific error, but never turn another
             # session exception into an apparently successful capture.
             for error in errors:
-                if isinstance(error, meta_asr.MetaAsrError):
+                if isinstance(error, asr.GoogleAsrError if provider == 'google' else asr.MetaAsrError):
                     raise error
             for error in errors:
                 if error is not None:
                     raise error
         finally:
             stop_task.cancel()
+            if provider == 'google' and not google_cleanup_waited:
+                pending = {task for task in tasks if not task.done()}
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    _, remaining = await asyncio.wait(pending, timeout=GOOGLE_CLEANUP_TIMEOUT)
+                    if remaining:
+                        session_incomplete = True
+                for task in tasks:
+                    if task.done() and not task.cancelled():
+                        task.exception()
+            await asyncio.sleep(0)
 
     try:
         loop.run_until_complete(main_async())
@@ -693,6 +727,9 @@ def run_capture_meta(source, mode, api_key, model_id, helper=None, stop=None):
                       'native_dropped_chunks': native_lost['count'],
                       'worker_dropped_chunks': worker_lost['count'],
                       'reader_incomplete': reader_incomplete, 'warning': warning})
+            if provider == 'google':
+                emit({'type': 'status', 'state': 'stopped', 'google_usage': usage,
+                      'warning': 'Google preview stopped. Final audio tail is not independently confirmed; review the transcript before relying on completeness.'})
             # The adapter stops reading after an error. Publish the terminal
             # loss summary first so the user can still see missing audio.
             if native_error['code']:
@@ -708,7 +745,43 @@ def run_capture_meta(source, mode, api_key, model_id, helper=None, stop=None):
                     pass
 
 
-def _read_meta_worker_key(stream):
+async def _run_google_fixture(audio, api_key, stop, usage_callback):
+    """Observe SIGTERM without capturing devices; never turn interruption into success."""
+    import asyncio
+    import google_asr
+    if stop.is_set():
+        raise google_asr.GoogleAsrError()
+    task = asyncio.create_task(google_asr.transcribe_wav(audio, emit, api_key,
+                                                       usage_callback=usage_callback))
+
+    async def watch_stop():
+        while not stop.is_set():
+            await asyncio.sleep(.05)
+
+    watcher = asyncio.create_task(watch_stop())
+    try:
+        done, _ = await asyncio.wait([task, watcher], return_when=asyncio.FIRST_COMPLETED)
+        if watcher in done or stop.is_set():
+            raise google_asr.GoogleAsrError()
+        return await task
+    finally:
+        watcher.cancel()
+        if not task.done():
+            task.cancel()
+        # Transport cleanup is bounded independently of audio duration.
+        _, pending = await asyncio.wait([task, watcher], timeout=GOOGLE_CLEANUP_TIMEOUT)
+        for completed in (task, watcher):
+            if completed.done() and not completed.cancelled():
+                completed.exception()
+        if pending:
+            raise google_asr.GoogleAsrError()
+
+
+def run_capture_meta(source, mode, api_key, model_id, helper=None, stop=None):
+    return run_capture_cloud(source, mode, api_key, model_id, helper, stop, provider='meta')
+
+
+def _read_meta_worker_key(stream, provider='meta'):
     """Read only the parent worker pipe, never the process environment."""
     try:
         if stream.isatty():
@@ -717,7 +790,7 @@ def _read_meta_worker_key(stream):
         if not frame.endswith(b'\n') or len(frame) > 4096:
             return ''
         payload = json.loads(frame)
-        if not isinstance(payload, dict) or set(payload) != {'type', 'key'} or payload['type'] != 'scoped_meta_key':
+        if not isinstance(payload, dict) or set(payload) != {'type', 'key'} or provider not in ('meta', 'google') or payload['type'] != 'scoped_' + provider + '_key':
             return ''
         key = payload['key']
         if not isinstance(key, str) or not key.strip() or '\n' in key or '\r' in key:
@@ -733,8 +806,9 @@ def main(argv=None):
     parser.add_argument('--source', choices=SOURCES, default='microphone')
     parser.add_argument('--language', choices=['en'], default='en')
     parser.add_argument('--file', type=Path, help='Read an existing synthetic/offline WAV instead of opening audio devices')
+    parser.add_argument('--google-fixture-stdin', action='store_true', help='Explicit bounded WAV test from private stdin; no audio devices')
     parser.add_argument('--helper', type=Path, help='Prepared native capture helper')
-    parser.add_argument('--provider', choices=['local', 'meta'], default='local',
+    parser.add_argument('--provider', choices=['local', 'meta', 'google'], default='local',
                         help='Transcription provider: local faster-whisper (default) or Meta Muse Voice cloud ASR')
     parser.add_argument('--asr-mode', choices=['ENDPOINTING', 'DIARIZATION', 'PUSH_TO_TALK'], default='ENDPOINTING')
     parser.add_argument('--asr-model', default=None, help='Meta ASR model id (default: ASR_MODEL or muse-voice-transcribe-1.0)')
@@ -743,13 +817,52 @@ def main(argv=None):
     if args.file and (args.file.suffix.lower() != '.wav' or not args.file.is_file()):
         parser.error('--file must be an existing WAV')
     helper = args.helper or Path(__file__).resolve().with_name('macos_capture')
-    if not args.file and not helper.is_file():
+    if args.google_fixture_stdin and (args.provider != 'google' or args.file):
+        parser.error('Google fixture input is a separate Google-only action')
+    if not args.file and not args.google_fixture_stdin and not helper.is_file():
         emit({'type': 'error', 'code': 'helper', 'message': error_message('helper')})
         return 1
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     emit({'type': 'status', 'state': 'loading'})
+    if args.provider == 'google':
+        import asyncio
+        import google_asr
+        api_key = _read_meta_worker_key(sys.stdin.buffer, 'google')
+        if not api_key:
+            emit({'type': 'error', 'code': 'google_auth', 'message': error_message('google_auth')})
+            return 1
+        try:
+            google_asr.validate(args.asr_model or google_asr.DEFAULT_MODEL, args.asr_mode)
+            if args.file:
+                raise google_asr.GoogleAsrError('google_auth')  # No unscoped file/ambient-key shortcut.
+            if args.google_fixture_stdin:
+                frame = sys.stdin.buffer.readline(2666801)
+                if not frame.endswith(b'\n') or len(frame) > 2666800:
+                    raise ValueError()
+                payload = json.loads(frame)
+                if not isinstance(payload, dict) or set(payload) != {'audio_base64'}:
+                    raise ValueError()
+                audio = base64.b64decode(payload['audio_base64'], validate=True)
+                last_usage = {}
+                def usage_callback(report):
+                    last_usage.clear()
+                    last_usage.update(report)
+                try:
+                    asyncio.run(_run_google_fixture(audio, api_key, stop, usage_callback))
+                finally:
+                    if last_usage:
+                        emit({'type': 'google_usage', 'usage': last_usage})
+            elif not stop.is_set():
+                run_capture_cloud(args.source, args.asr_mode, api_key, google_asr.DEFAULT_MODEL, helper=helper, stop=stop, provider='google')
+        except google_asr.GoogleAsrError as exc:
+            emit({'type': 'error', 'code': exc.code, 'message': error_message(exc.code)})
+            return 1
+        except Exception:
+            emit({'type': 'error', 'code': 'google_transcription', 'message': error_message('google_transcription')})
+            return 1
+        return 0
     if args.provider == 'meta':
         import meta_asr
         api_key = _read_meta_worker_key(sys.stdin.buffer)

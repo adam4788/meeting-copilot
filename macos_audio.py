@@ -17,6 +17,10 @@ ERRORS = {
     'capture': 'Native audio capture failed. Check the selected source and macOS permissions.',
     'protocol': 'Invalid or oversized audio worker frame.',
     'worker': 'Audio worker exited unexpectedly.',
+    'google_auth': 'Google transcription requires its own key in Hermes plugin secrets. Account access remains unverified.',
+    'google_runtime': 'Google transcription requires websockets >=15,<16 in the isolated audio runtime.',
+    'google_limit': 'Google preview limit reached. Capture stopped; review transcription and local preview allowance before restarting.',
+    'google_transcription': 'Google transcription failed or its final tail is unconfirmed. Check connection, account access and preview limits; no automatic retry occurs.',
     'asr_auth': 'Meta cloud transcription is unavailable. Set the Meta API key in Hermes plugin settings and reopen the pane.',
     'asr': 'Meta cloud transcription failed. Check the network connection and MODEL_API_KEY, then restart capture.',
 }
@@ -104,7 +108,7 @@ def _valid_speaker(value):
 
 MODELS = ('tiny.en', 'base.en', 'small.en')
 SOURCES = ('microphone', 'system', 'both')
-PROVIDERS = ('local', 'meta')
+PROVIDERS = ('local', 'meta', 'google')
 ASR_MODES = ('ENDPOINTING', 'DIARIZATION', 'PUSH_TO_TALK')
 
 
@@ -116,7 +120,9 @@ def validate(model, source, language, provider='local', asr_mode='ENDPOINTING'):
     if language != 'en':
         raise ValueError('English-only models require language=en')
     if provider not in PROVIDERS:
-        raise ValueError('provider must be local or meta')
+        raise ValueError('provider must be local, meta, or google')
+    if provider == 'google' and asr_mode != 'ENDPOINTING':
+        raise ValueError('Google live transcription supports source labels only; select ENDPOINTING explicitly.')
     if asr_mode not in ASR_MODES:
         raise ValueError('asr_mode must be ENDPOINTING, DIARIZATION, or PUSH_TO_TALK')
 
@@ -166,11 +172,32 @@ def clean_audio_diagnostics(value, source=None):
     return result
 
 
+def clean_google_usage(value):
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for source in ('microphone', 'system'):
+        row = value.get(source)
+        if not isinstance(row, dict):
+            continue
+        clean = {}
+        for key in ('audio_bytes', 'final_segments', 'output_characters', 'input_tokens', 'output_tokens', 'total_tokens'):
+            number = row.get(key)
+            if type(number) is int and 0 <= number <= 2000000:
+                clean[key] = number
+        seconds = row.get('audio_seconds')
+        if type(seconds) in (int, float) and math.isfinite(seconds) and 0 <= seconds <= 60:
+            clean['audio_seconds'] = float(seconds)
+        if clean:
+            result[source] = clean
+    return result
+
+
 def worker_env(provider='local'):
     """Pass only named OS/locale and public-model cache settings to workers.
 
     Never inherit host credentials or Python/dynamic-loader configuration.
-    Meta credentials use the separate, request-scoped stdin handoff. Keep model
+    Cloud credentials use the separate, request-scoped stdin handoff. Keep model
     settings explicit: HF_HUB_* can contain credentials and is not a safe prefix.
     """
     allowed = {
@@ -188,13 +215,15 @@ def worker_env(provider='local'):
     return env
 
 
-def _meta_worker_frame(key):
+def _meta_worker_frame(key, provider='meta'):
     """Bounded one-shot private handoff of a host-scoped key to the worker."""
+    if provider not in ('meta', 'google'):
+        raise RuntimeError('Unsupported cloud provider.')
     if not isinstance(key, str) or not key.strip() or '\n' in key or '\r' in key:
-        raise RuntimeError('Meta transcription needs a profile-scoped Hermes key.')
-    frame = json.dumps({'type': 'scoped_meta_key', 'key': key}, ensure_ascii=True).encode('ascii') + b'\n'
+        raise RuntimeError(f'{provider.title()} transcription needs a profile-scoped Hermes key.')
+    frame = json.dumps({'type': 'scoped_' + provider + '_key', 'key': key}, ensure_ascii=True).encode('ascii') + b'\n'
     if len(frame) > 4096:
-        raise RuntimeError('Meta transcription needs a valid profile-scoped Hermes key.')
+        raise RuntimeError(f'{provider.title()} transcription needs a valid profile-scoped Hermes key.')
     return frame
 
 
@@ -274,6 +303,10 @@ class MacOSAudioCapture:
         if not callable(on_segment) or (on_status is not None and not callable(on_status)):
             raise TypeError('on_segment and on_status must be callable')
         credential_frame = _meta_worker_frame(_model_api_key()) if self.provider == 'meta' else None
+        if self.provider == 'google':
+            import importlib
+            preview = importlib.import_module('.google_preview', __package__) if __package__ else importlib.import_module('google_preview')
+            credential_frame = _meta_worker_frame(preview.scoped_key(), 'google')
         # Resolve the active profile on the requesting thread. The worker thread
         # must not inherit unrelated request/credential context variables.
         root = Path(__file__).resolve().parent
@@ -281,6 +314,8 @@ class MacOSAudioCapture:
         with self._lock:
             if not self.status()['stop_confirmed']:
                 raise RuntimeError('Audio capture is active or its cleanup is unconfirmed')
+            if self.provider == 'google':
+                preview.reserve(self.source)  # Before worker/socket; uncertain attempts remain reserved.
             self._cleanup_confirmed = False
             self._cancel = threading.Event()
             self._stopping = threading.Event()
@@ -348,8 +383,10 @@ class MacOSAudioCapture:
                 if kind == 'status' and event.get('state') in ('loading', 'starting', 'running', 'stopped'):
                     extra = {k: event.get(k) for k in ('warning', 'dropped_chunks', 'native_dropped_chunks',
                                                        'worker_dropped_chunks', 'sub_second_dropped_chunks',
-                                                       'reader_incomplete', 'partial_tail')
+                                                       'reader_incomplete', 'partial_tail', 'google_usage')
                              if event.get(k) is not None}
+                    if 'google_usage' in extra:
+                        extra['google_usage'] = clean_google_usage(extra['google_usage'])
                     diagnostics = clean_audio_diagnostics(event.get('audio_diagnostics'), self.source)
                     if diagnostics:
                         extra['audio_diagnostics'] = diagnostics
@@ -409,12 +446,14 @@ class MacOSAudioCapture:
             with self._lock:
                 self._cleanup_confirmed = True
 
-    def stop(self, timeout=3.0):
+    def stop(self, timeout=None):
         """Bounded graceful shutdown: SIGTERM first so the worker flushes its
         tail and delivers a final summary, then force-terminate leftovers.
 
         Already executing user callbacks cannot be forcibly interrupted.
         """
+        if timeout is None:
+            timeout = 9.5 if self.provider == 'google' else 3.0
         timeout = max(0.0, min(float(timeout), 10.0))
         deadline = time.monotonic() + timeout
         self._stopping.set()

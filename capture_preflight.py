@@ -73,6 +73,9 @@ def _runtime_probe(model, provider, windows=False):
         if windows:
             # Import only; do not enumerate or open devices.
             importlib.import_module('soundcard')
+        if provider == 'google':
+            result['dependencies'] = _module('google_asr').runtime_available() is True
+            return result
         if provider == 'meta':
             importlib.import_module('websockets.asyncio.client')
             result['dependencies'] = True
@@ -190,8 +193,8 @@ def check(backend, recording_id, transcription_model, audio_source,
         return finish()
 
     valid = (backend in ('macos', 'native') and transcription_model in MODELS
-             and audio_source in SOURCES and transcription_provider in ('local', 'meta')
-             and asr_mode in MODES and not (backend == 'native' and transcription_provider != 'local'))
+             and audio_source in SOURCES and transcription_provider in ('local', 'meta', 'google')
+             and asr_mode in MODES and (transcription_provider != 'google' or asr_mode == 'ENDPOINTING') and not (backend == 'native' and transcription_provider != 'local'))
     add('selection', 'Capture settings', valid,
         'Capture settings are supported.' if valid else 'Choose supported capture, audio source and transcription settings.')
     if not valid:
@@ -266,13 +269,21 @@ def check(backend, recording_id, transcription_model, audio_source,
         add('transcription_key', 'Meta transcription credential', present,
             'A scoped Meta key is configured; account and network access are not tested.' if present else
             'Configure a Meta key in Hermes plugin settings, then reopen the pane.')
+    if transcription_provider == 'google':
+        preview = _module('google_preview')
+        present = bool(preview.scoped_key())
+        add('transcription_key', 'Google transcription credential', present,
+            'A scoped Google key is configured; account, billing tier and network access are not tested.' if present else
+            'Configure the Google transcription key in Hermes plugin secrets, then reopen the pane. Never paste it into chat or model fields.')
+        budget = preview.budget_status(audio_source)
+        add('google_preview_allowance', 'Google preview allowance', budget.get('available') is True, budget['detail'])
     return finish()
 
 
 if __name__ == '__main__':
     args = sys.argv[1:]
     if (len(args) in (3, 4) and args[0] == '--runtime-probe' and args[1] in MODELS
-            and args[2] in ('local', 'meta') and (len(args) == 3 or args[3] == '--windows')):
+            and args[2] in ('local', 'meta', 'google') and (len(args) == 3 or args[3] == '--windows')):
         print(json.dumps(_runtime_probe(args[1], args[2], len(args) == 4)))
     elif len(args) == 2 and args[0] == '--prepare-model' and args[1] in MODELS:
         result = prepare_model(args[1])

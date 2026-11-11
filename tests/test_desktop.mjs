@@ -4445,3 +4445,37 @@ test('unconfirmed Meta stop retains the transmission warning even with next defa
   assert.doesNotMatch(compactText(ui.tree), /Ready to start/);
   assert.equal(ui.requests.length, 0);
 });
+
+for (const modern of [true, false]) test(`Google selection preserves Meta diarization and needs fresh consent (modern=${modern})`, async () => {
+  const storage = settingsStore();
+  storage.set('meeting-copilot.preferences', { backend: 'macos', transcriptionProvider: 'meta', transcriptionChoiceVersion: 1, asrMode: 'DIARIZATION', audioSource: 'both' });
+  const status = { listening: false, stopping: false, capabilities: { capture_preflight: 1, macos_transcription: true, meta_asr: true, google_asr: true } };
+  const ui = pane(undefined, true, false, '', {}, {}, status, { setInterval: () => 0, clearInterval: () => {} }, { settingsHost: modern, effects: true, noSeedOverrides: true, storage });
+  const setup = () => modern ? settingsPage(ui).render() : ui.rerender();
+  const choose = value => { settingNode(setup(), 'Transcription provider').props.onChange({ target: { value } }); ui.rerender(); };
+  choose('meta');
+  settingNode(setup(), 'Meta ASR mode').props.onChange({ target: { value: 'DIARIZATION' } });
+  ui.rerender(); choose('google');
+  let tree = ui.rerender();
+  assert.equal(permissionControl(tree).props.checked, false);
+  assert.match(JSON.stringify(tree), /no speaker diarization/);
+  assert.match(JSON.stringify(tree), /not an actual charge or guaranteed bill cap/);
+  choose('meta');
+  assert.equal(settingNode(setup(), 'Meta ASR mode').props.value, 'DIARIZATION');
+  choose('google'); tree = ui.rerender();
+  permissionControl(tree).props.onChange({ target: { checked: true } }); tree = ui.rerender();
+  await button(tree, 'Start listening').props.onClick();
+  const body = ui.requests.find(r => r.path === '/start')?.body;
+  assert.equal(body?.transcription_provider, 'google');
+  assert.equal(body?.asr_mode, 'ENDPOINTING');
+  ui.unmount(); ui.unmountSettings();
+});
+
+test('Google WAV test is visibly cloud-active with Pause and no device claim', () => {
+  const ui = pane('', true, false, '', {}, {}, { listening: false, stopping: true, google_fixture_active: true });
+  const text = JSON.stringify(ui.tree);
+  assert.match(text, /Google audio test/);
+  assert.match(text, /no microphone or system capture/);
+  assert.match(text, /Google cloud transcription may still be active/);
+  assert.ok(button(ui.tree, 'Retry stop'));
+});
