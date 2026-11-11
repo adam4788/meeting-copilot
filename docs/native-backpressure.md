@@ -75,3 +75,58 @@ Further physical tests require a freshly confirmed quiet, private environment.
 Do not suppress drop warnings or treat a synthetic scheduling experiment as
 native-device reliability verification. No new microphone permission was
 accepted during this investigation.
+
+## Bounded PCM aggregation and input diagnostics
+
+A later consented Mac test produced no transcript and 610 native frame drops,
+with no worker drops or reported capture error. Its stopped timing metadata
+showed a maximum 622ms writer queue wait, 106ms JSON encoding time and 54ms write
+time. These values establish transport congestion, not the reason recognition
+produced no words. Device-free conversion checks did not reproduce zeroed audio.
+
+The native converter now combines small hardware callbacks into at most 4,000
+Float32 samples (250ms) per source before JSON encoding. Each source retains at
+most one partial frame, and the writer still has four PCM slots. This reduces
+per-callback serialization and scheduling overhead without an unbounded queue.
+Graceful stop seals each converter under its lock, flushes its residual frame,
+then drains the writer before emitting the terminal status. A rejected full or
+residual frame is counted by the same loss mechanism. Native loss counts now
+refer to these larger protocol frames, so raw counts are not comparable with
+older small-callback counts and do not represent seconds of lost audio.
+
+`tests.test_native_pcm_framing` extracts the actual framing/conversion code and
+uses generated sample arrays only. It verifies both source labels, byte-level
+sample preservation, timestamps, frame bounds, residual flush, post-retirement
+rejection and accounting under sustained congestion. A deterministic blocked
+writer accepts 40 small callbacks as two aggregated frames without loss. This
+proves that specific congestion mitigation, not live speech accuracy or
+loss-free recording. No device or permission API is used by the test.
+
+The local worker also reports bounded numeric input and transcription counters.
+They distinguish no received samples, zero-level input, and model chunks that
+completed without words. Signal amplitude does not establish speech, microphone
+quality or successful transcription. These diagnostics contain no audio or text.
+
+## Explicit mono normalization for discrete layouts
+
+A subsequent controlled run had zero transport drops but received only zero-valued
+samples. Device-free tests reproduced a matching native failure: a valid
+`DiscreteInOrder` channel layout containing nonzero PCM produced all-zero mono
+from `AVAudioConverter`, despite successful conversion. Standard mono/stereo
+fixtures had not exercised these hardware-style layouts. Enabling the converter's
+`downmix` property did not correct the reproduced failure.
+
+The converter now explicitly normalizes supported PCM into standard Float32 mono
+at the original sample rate before resampling. It averages all channels, without
+relying on channel labels or silently choosing only channel zero. Planar and
+interleaved Float32, Float64, signed Int16 and signed Int32 are covered. Missing,
+short, unsupported-layout/byte-format or nonfinite buffers fail visibly rather
+than being treated as silence. Discrete two-, three- and four-channel tests
+exercise every active input channel and verify the expected scaled nonzero output
+through the real serialization path. Opposed-phase channels can still cancel
+under arithmetic averaging; this is not a universal audio-quality guarantee.
+
+This fixes the demonstrated offline conversion bug. The live stream's layout was
+not inspected during recording, and microphone speech recognition still requires
+a separately authorized verification after rebuilding the helper. No recording
+or audio-setting change was made for this fix.

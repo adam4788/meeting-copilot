@@ -37,18 +37,25 @@ verify the Desktop pane, a provider account, or native audio on your machine.
 
 ## Configure answers
 
+New preferences select **Follow Hermes default**. When the genuine host route is
+available, no separate key or model is needed. Existing explicit choices stay
+unchanged. Missing/isolated context fails closed with a setup message, not another
+provider. See [default-route support](preflight.md#follow-the-hermes-default).
+To override that default with your own OpenAI/OpenRouter key:
+
 1. In **Settings → Plugins → Meeting Copilot**, open the agent settings for the
    default profile. Enter an OpenAI or OpenRouter key in its matching secret
    field and save. Never paste keys into chat, questions, or model fields.
 2. Reopen the pane after changing keys. First finish active requests and pause
    capture; admitted requests retain their credential snapshots.
 3. Use **Open settings** in the pane or navigate to **Settings → Plugins →
-   Meeting Copilot**. Choose **Answer provider** and enter the exact **Answer
-   model** ID your account supports. Older Desktop hosts without plugin settings
+   Meeting Copilot**. Choose a configured **Answer provider**, use **Load model options…**
+   explicitly, and choose a listed option or enter an exact **Answer model** ID. Older Desktop hosts without plugin settings
    pages keep **Answer setup** and **Transcript source** in the pane.
 
 Keys, credits, and Chat Completions compatibility depend on the account. There
-is no account model discovery or automatic provider/model fallback. A saved key
+is no automatic provider/model fallback. Explicit listing returns OpenAI key-visible
+IDs or an OpenRouter public catalog, not guaranteed account access. A saved key
 does not prove a successful connection. Live OpenAI/OpenRouter responses remain
 unverified; see [BYOK boundaries](byok.md). The optional
 [Meta API route](meta-api-key.md) is explicit and is never the answer default.
@@ -122,8 +129,9 @@ code. This legacy developer path is separate from managed Git installation.
 ## Listen, ask, and stop
 
 1. If using Meetily, select the active recording in the pane. Confirm **Permission
-   check**, then choose **Start listening** or the Meetily attachment action.
-   Approve any actual OS recording prompt yourself.
+   check** and pass the required capture checks, then choose **Start listening**
+   or the Meetily attachment action. On first-use macOS, use the separate
+   **Request macOS permissions…** action and review OS prompts yourself.
 2. Type a question, or leave it blank to ask about the latest conversation, and
    choose **Suggest answer**. Inspect **Evidence**, warnings, and uncertainty.
 3. Use Pause/Detach when finished. If stopping is still pending, follow the pane's
@@ -170,3 +178,14 @@ off at each helper launch; do not treat that default as proof of capture exclusi
 
 See [privacy](../SECURITY.md), [current status](../README.md#current-status), and
 [compatibility cautions](catalog-compatibility.md) before broader use.
+
+## Check before capture
+
+Start requires current successful [capture preflight checks](preflight.md) and
+participant permission. Checks are local and never record, request OS permission
+or download models. Use the separate **Request macOS permissions…** action for
+first-use permission setup, and the documented explicit model-preparation command
+if Whisper weights are missing. **Recheck required settings** after setup.
+Native Windows Start is currently blocked because complete safe Windows access
+checks are unavailable; use an active Meetily recording. Answer keys and models
+remain optional for local transcription.

@@ -1,6 +1,13 @@
 # Bring your own API key
 
-Meeting Copilot supports explicit OpenAI and OpenRouter Chat Completions routes.
+New panes default to **Follow Hermes default**, using the genuine host-provided
+LLM facade in supported, matching-profile nonisolated runtimes. Existing explicit
+provider choices are preserved. Hermes owns default-route credentials and its
+routing/fallback policy. An unavailable default route fails closed; Copilot does
+not borrow credentials or silently choose a BYOK provider. See
+[default-route requirements](preflight.md#follow-the-hermes-default).
+
+For explicit overrides, Meeting Copilot supports OpenAI and OpenRouter Chat Completions routes.
 Configure the corresponding API key in **Hermes Settings → Plugins → meeting-copilot-live (default profile)**. Use the OpenAI API key or OpenRouter API key field, then **Save settings**. These settings are declared secret fields in `plugin.yaml`; the
 plugin obtains them only through `agent.secret_scope.get_secret` in a bound
 Hermes scope. An unavailable scope fails closed. Reopen the pane after changing
@@ -12,10 +19,14 @@ be unavailable in host-isolation or secondary-profile routes; it does not fall
 back to the child process environment. Live Desktop/provider behavior remains
 unverified. See [compatibility](catalog-compatibility.md).
 
-Choose your provider and enter its exact model ID. Model access, credits and
-Chat Completions compatibility depend on your account. A configured key is not
-a successful connection test. The app does not infer models, discover account
-models, follow redirects, retry automatically, or change providers on failure.
+Choose a configured provider, explicitly **Load model options…**, and choose an
+option or enter its exact model ID manually. OpenAI lists models returned for
+your key; OpenRouter returns a public catalog, not account entitlements. Model
+access, credits and Chat Completions compatibility remain unverified. A configured
+key is not a successful connection test. Model listing sends only that provider
+its scoped key, never meeting content, and never runs automatically. The app does
+not pick models, follow redirects, retry automatically or change providers on
+failure. See [checks and model options](preflight.md).
 Responses are completed-only; empty, truncated or non-text output fails. Each
 answer has a 30-second request timeout and a 2048-token output limit. Some models
 need a different API or parameters and are unsupported. No live OpenAI or
@@ -37,8 +48,9 @@ configure Hermes Settings and ask in the Desktop pane for a live answer.
 
 Meta remains an optional explicit API route for existing integrations. Its
 `MODEL_API_KEY` is also Hermes-managed in plugin mode; it is never selected
-automatically. OAuth subscription routes and generic Hermes configured-model
-fallback are deliberately unavailable in this foundation. This replaces the old
+automatically. Direct OAuth subscription credential access and implicit fallback from BYOK to
+Hermes are deliberately unavailable. The explicit **Follow Hermes default** mode
+uses only host-owned auth and host routing when supported. This replaces the old
 Meta-first default, client credential extraction, startup dotenv import, and
 in-pane credential editor. Legacy tests for those removed contracts are not
 claims about current behavior. `test_byok.py` exercises actual HTTP against a

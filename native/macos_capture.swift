@@ -86,25 +86,146 @@ private func fail(_ code: String) -> Never {
     exit(1)
 }
 
-private var terminating = false
+// Coalesce tiny hardware callbacks into 250 ms PCM messages. With two sources,
+// the old ~10 ms messages could saturate four writer slots during brief stalls.
+// Storage stays <= 4000 Float32 samples per source; no unbounded audio queue.
+private final class PCMFramer {
+    private var pending = Data()
+    private var timestamp: Double = 0
+    private var source = ""
+    private let frameBytes = 4000 * 4
+
+    func append(_ channel: UnsafePointer<Float>, count: Int, source: String, timestamp: Double) {
+        var offset = 0
+        while offset < count {
+            if pending.isEmpty {
+                self.timestamp = timestamp + Double(offset) / 16000
+                self.source = source
+            }
+            let samples = min((frameBytes - pending.count) / 4, count - offset)
+            pending.append(Data(bytes: channel.advanced(by: offset), count: samples * 4))
+            offset += samples
+            if pending.count == frameBytes { flush() }
+        }
+    }
+
+    func flush() {
+        guard !pending.isEmpty else { return }
+        emit(["type": "pcm", "source": source, "rate": 16000,
+              "samples": pending.count / 4, "timestamp": timestamp,
+              "pcm": pending.base64EncodedString()])
+        pending.removeAll(keepingCapacity: true)
+    }
+}
+
+// Copy only complete, matching PCM buffers. A partial/missing source list must
+// fail rather than silently filling the remaining channels with zeros.
+private func copyPCMInput(_ source: UnsafePointer<AudioBufferList>, into target: AVAudioPCMBuffer) -> Bool {
+    let sources = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: source))
+    let targets = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: target.audioBufferList))
+    guard sources.count == targets.count, !sources.isEmpty else { return false }
+    for index in 0..<sources.count {
+        guard sources[index].mNumberChannels == targets[index].mNumberChannels,
+              sources[index].mDataByteSize >= targets[index].mDataByteSize,
+              sources[index].mData != nil, targets[index].mData != nil else { return false }
+    }
+    for index in 0..<sources.count {
+        targets[index].mData!.copyMemory(from: sources[index].mData!, byteCount: Int(targets[index].mDataByteSize))
+    }
+    return true
+}
+
+// Do not ask AVAudioConverter to interpret hardware channel labels. A valid
+// discrete-in-order multichannel layout can silently convert to all-zero mono.
+// Normalize PCM explicitly, then use AVAudioConverter only for resampling.
+private func normalizedMono(_ input: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+    withExtendedLifetime(input) {
+        normalizedMono(format: input.format, frames: input.frameLength, buffers: input.audioBufferList)
+    }
+}
+
+private func normalizedMono(format inputFormat: AVAudioFormat, frames frameLength: AVAudioFrameCount,
+                            buffers bufferList: UnsafePointer<AudioBufferList>) -> AVAudioPCMBuffer? {
+    let frames = Int(frameLength)
+    let channels = Int(inputFormat.channelCount)
+    guard frames > 0, frames <= 192000, channels > 0, channels <= 32,
+          inputFormat.sampleRate.isFinite, inputFormat.sampleRate > 0,
+          let format = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                    sampleRate: inputFormat.sampleRate, channels: 1, interleaved: false),
+          let output = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameLength),
+          let target = output.floatChannelData?[0] else { return nil }
+    let bytes: Int
+    switch inputFormat.commonFormat {
+    case .pcmFormatFloat32, .pcmFormatInt32: bytes = 4
+    case .pcmFormatFloat64: bytes = 8
+    case .pcmFormatInt16: bytes = 2
+    default: return nil
+    }
+    let interleaved = inputFormat.isInterleaved
+    let description = inputFormat.streamDescription.pointee
+    guard description.mFormatID == kAudioFormatLinearPCM,
+          description.mFormatFlags & kAudioFormatFlagIsBigEndian == 0,
+          description.mFormatFlags & kAudioFormatFlagIsPacked != 0,
+          description.mBitsPerChannel == UInt32(bytes * 8),
+          description.mBytesPerFrame == UInt32(bytes * (interleaved ? channels : 1)),
+          description.mFramesPerPacket == 1 else { return nil }
+    let buffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: bufferList))
+    guard buffers.count == (interleaved ? 1 : channels) else { return nil }
+    let stride = interleaved ? channels : 1
+    let weight = Float(1) / Float(channels)
+    output.frameLength = frameLength
+    for frame in 0..<frames { target[frame] = 0 }
+    for channel in 0..<channels {
+        let buffer = buffers[interleaved ? 0 : channel]
+        guard Int(buffer.mNumberChannels) == (interleaved ? channels : 1),
+              Int(buffer.mDataByteSize) >= frames * stride * bytes,
+              let data = buffer.mData else { return nil }
+        let offset = interleaved ? channel : 0
+        for frame in 0..<frames {
+            let index = frame * stride + offset
+            let sample: Float
+            switch inputFormat.commonFormat {
+            case .pcmFormatFloat32: sample = data.assumingMemoryBound(to: Float.self)[index]
+            case .pcmFormatFloat64: sample = Float(data.assumingMemoryBound(to: Double.self)[index])
+            case .pcmFormatInt16: sample = Float(data.assumingMemoryBound(to: Int16.self)[index]) / 32768
+            case .pcmFormatInt32: sample = Float(Double(data.assumingMemoryBound(to: Int32.self)[index]) / 2147483648)
+            default: return nil
+            }
+            guard sample.isFinite else { return nil }
+            target[frame] += sample * weight
+        }
+    }
+    for frame in 0..<frames where !target[frame].isFinite { return nil }
+    return output
+}
 
 private final class Converter {
+    // Serialize conversion and tail retirement. finish() seals this source
+    // before flushing, so an in-flight callback cannot emit after the terminal.
+    private let lock = NSLock()
+    private var stopped = false
+    private let framer = PCMFramer()
+
+    func finish() {
+        lock.lock()
+        defer { lock.unlock() }
+        stopped = true
+        framer.flush()
+    }
     private var converter: AVAudioConverter?
     private var inputFormat: AVAudioFormat?
     private let outputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
 
     func consume(_ buffer: AVAudioPCMBuffer, source: String) {
-        // After the SIGTERM barrier no new audio may enter the writer
-        // queue: count it as dropped so the terminal line stays honest.
-        if terminating {
-            dropCounter.sync { droppedFrames += 1 }
-            return
-        }
+        lock.lock()
+        defer { lock.unlock() }
+        guard !stopped else { return }
         guard buffer.frameLength > 0, buffer.frameLength <= 192000,
               buffer.format.sampleRate > 0 else { return }
-        if inputFormat != buffer.format {
-            inputFormat = buffer.format
-            converter = AVAudioConverter(from: buffer.format, to: outputFormat)
+        guard let mono = normalizedMono(buffer) else { fail("capture") }
+        if inputFormat != mono.format {
+            inputFormat = mono.format
+            converter = AVAudioConverter(from: mono.format, to: outputFormat)
         }
         guard let converter = converter else { fail("capture") }
         let capacity = AVAudioFrameCount(ceil(Double(buffer.frameLength) * 16000 / buffer.format.sampleRate) + 128)
@@ -115,19 +236,13 @@ private final class Converter {
             if supplied { status.pointee = .noDataNow; return nil }
             supplied = true
             status.pointee = .haveData
-            return buffer
+            return mono
         }
         guard result != .error, error == nil, let channel = output.floatChannelData?[0] else { fail("capture") }
-        var offset = 0
         let total = Int(output.frameLength)
         let start = Date().timeIntervalSince1970 - Double(total) / 16000
-        while offset < total {
-            let count = min(8000, total - offset)
-            let data = Data(bytes: channel.advanced(by: offset), count: count * 4)
-            emit(["type": "pcm", "source": source, "rate": 16000, "samples": count,
-                  "timestamp": start + Double(offset) / 16000, "pcm": data.base64EncodedString()])
-            offset += count
-        }
+        framer.append(UnsafePointer(channel), count: total, source: source, timestamp: start)
+
     }
 }
 
@@ -155,14 +270,7 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
             guard audioBufferList.pointee.mNumberBuffers > 0,
                   let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return noErr }
             buffer.frameLength = frameCount
-            let sources = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: audioBufferList))
-            let targets = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
-            for index in 0..<min(sources.count, targets.count) {
-                let bytes = min(Int(sources[index].mDataByteSize), Int(targets[index].mDataByteSize))
-                if let from = sources[index].mData, let to = targets[index].mData, bytes > 0 {
-                    to.copyMemory(from: from, byteCount: bytes)
-                }
-            }
+            guard copyPCMInput(audioBufferList, into: buffer) else { fail("capture") }
             self.micConverter.consume(buffer, source: "microphone")
             return noErr
         }
@@ -211,6 +319,11 @@ private final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    func flushAudio() {
+        micConverter.finish()
+        systemConverter.finish()
+    }
+
     func stream(_ stream: SCStream, didStopWithError error: Error) { fail("capture") }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -233,12 +346,65 @@ struct Main {
     static func main() async {
         let args = Array(CommandLine.arguments.dropFirst())
         if args == ["--help"] || args.isEmpty {
-            print("macos_capture --start --source microphone|system|both\n--check-only: static capabilities; no permission checks or capture")
+            print("macos_capture --start --source microphone|system|both\n--check-only: static capabilities; no permission checks or capture\n--preflight --source microphone|system|both: nonprompting permission checks\n--request-permissions --source microphone|system|both: explicit permission setup; no capture")
             return
         }
         if args == ["--check-only"] {
             let usage = Bundle.main.object(forInfoDictionaryKey: "NSMicrophoneUsageDescription") as? String != nil
             print("{\"capture_started\":false,\"microphone_usage_description\":\(usage),\"sources\":[\"microphone\",\"system\",\"both\"],\"rate\":16000}")
+            return
+        }
+        // This command is reachable only through explicit permission setup.
+        // It exits before Capture is constructed and never starts audio streams.
+        if args.count == 3, args[0] == "--request-permissions", args[1] == "--source",
+           ["microphone", "system", "both"].contains(args[2]) {
+            let source = args[2]
+            if source == "microphone" || source == "both" {
+                let usage = Bundle.main.object(forInfoDictionaryKey: "NSMicrophoneUsageDescription") as? String
+                if !(usage ?? "").isEmpty,
+                   AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
+                    _ = await AVCaptureDevice.requestAccess(for: .audio)
+                }
+            }
+            if source == "system" || source == "both" {
+                if !CGPreflightScreenCaptureAccess() { _ = CGRequestScreenCaptureAccess() }
+            }
+            let result: [String: Any] = ["version": 1, "source": source,
+                                        "capture_started": false, "permission_request_completed": true]
+            if let data = try? JSONSerialization.data(withJSONObject: result),
+               let line = String(data: data, encoding: .utf8) { print(line) }
+            return
+        }
+        // Nonprompting readiness only: never instantiate Capture, request access,
+        // enumerate shareable content, or start an AVAudioEngine/SCStream here.
+        if args.count == 3, args[0] == "--preflight", args[1] == "--source",
+           ["microphone", "system", "both"].contains(args[2]) {
+            let source = args[2]
+            var result: [String: Any] = ["version": 1, "source": source, "capture_started": false]
+            if source == "microphone" || source == "both" {
+                let usage = Bundle.main.object(forInfoDictionaryKey: "NSMicrophoneUsageDescription") as? String
+                result["microphone_usage_description"] = !(usage ?? "").isEmpty
+                // Device discovery only, no AVCaptureDeviceInput or session.
+                result["microphone_available"] = AVCaptureDevice.default(for: .audio) != nil
+                switch AVCaptureDevice.authorizationStatus(for: .audio) {
+                case .authorized: result["microphone"] = "authorized"
+                case .denied: result["microphone"] = "denied"
+                case .restricted: result["microphone"] = "restricted"
+                case .notDetermined: result["microphone"] = "not_determined"
+                @unknown default: result["microphone"] = "unknown"
+                }
+            }
+            if source == "system" || source == "both" {
+                result["system"] = CGPreflightScreenCaptureAccess() ? "authorized" : "not_authorized"
+                // ScreenCaptureKit's display filter requires an active display.
+                // CoreGraphics metadata does not request screen permission.
+                var displayCount: UInt32 = 0
+                if CGGetActiveDisplayList(0, nil, &displayCount) == .success {
+                    result["display_available"] = displayCount > 0
+                } // Absent on error: callers must treat this as unknown.
+            }
+            if let data = try? JSONSerialization.data(withJSONObject: result),
+               let line = String(data: data, encoding: .utf8) { print(line) }
             return
         }
         guard args.count == 3, args[0] == "--start", args[1] == "--source",
@@ -258,16 +424,15 @@ struct Main {
             termCount += 1
             if termCount > 1 { exit(3) }
             // Stop capture inputs first so no callback can enqueue frames
-            // after the writer barrier below; anything already in flight
-            // lands during the short settle, then the barrier is final.
+            // after source retirement below; anything already in flight
+            // lands during the short settle, then finish() seals each source.
             capture.stop()
             Thread.sleep(forTimeInterval: 0.3)
-            terminating = true
+            capture.flushAudio()
             writer.sync {}
             // Snapshot after the barrier: every pre-barrier frame was
-            // emitted above and every post-barrier callback was counted,
-            // so the terminal line accounts for all audio observed to this
-            // point. The only uncounted window is the direct write below.
+            // emitted above (including residual PCM) or counted as dropped.
+            // Retired converters cannot add post-terminal audio.
             var payload: [String: Any] = ["type": "status", "state": "stopped"]
             payload["native_writer_timing_ms"] = writer.sync { writerTiming() }
             let pending = dropCounter.sync { () -> Int in let n = droppedFrames; droppedFrames = 0; return n }

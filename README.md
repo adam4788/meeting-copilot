@@ -1,4 +1,4 @@
-> Runtime-only source release. Development tests and mutation probes are retained in source commit `11fd105f83d6798e2a3ebdcab5b580b96f2feae7`. Their omission is an explicit packaging boundary, not a scanner suppression.
+> Runtime-only source release. Development tests and mutation probes are retained in source commit `94690ad277dcc47be54d1d529353f0a39ce39175`. Their omission is an explicit packaging boundary, not a scanner suppression.
 
 # Meeting Copilot
 
@@ -20,13 +20,15 @@ it. Nothing is spoken, posted, or submitted for you.
 
 **Early developer preview.** The published source includes OpenAI/OpenRouter
 bring-your-own-key setup. Live responses from those accounts remain unverified.
-Native audio is experimental; macOS fictional-audio checks found dropped frames.
+Native audio remains experimental. Recent local Mac checks recovered microphone
+transcription and removed observed drops in short tests. System-audio capture is
+still setup-dependent; a synthetic replay is not proof of a complete live meeting.
 Windows Desktop pane and runtime verification is still in progress.
 
 | Platform | Source CI checkpoint (c5aa3cf) | Desktop and native audio status |
 | --- | --- | --- |
 | Windows | Python 3.11/3.12 suite and JavaScript checks passed in CI | Desktop pane/runtime under verification; SoundCard/WASAPI capture remains experimental |
-| macOS | Python 3.12 suite, JavaScript checks, and overlay helper build/self-test passed in CI | Microphone/system-audio checks used fictional content; native frame loss remains unresolved |
+| macOS | Python 3.12 suite, JavaScript checks, and overlay helper build/self-test passed in CI | Historical checkpoint; see the newer bounded Mac/synthetic evidence below |
 | Linux | Python 3.11/3.12 suite and JavaScript checks passed in CI | Native audio and Desktop use are not established by these checks |
 
 The CI results above describe source revision
@@ -37,13 +39,27 @@ See [CI](https://github.com/adam4788/meeting-copilot/actions),
 [native loss investigation](docs/native-backpressure.md).
 CI and plugin validation do not prove a complete meeting works on your computer.
 
+A newer local preview at `0747967` transcribed a 38.4-second generated fictional
+meeting with local Whisper and the explicit Google preview. Google matched all
+119 normalized reference words; local `tiny.en` had one insertion (0.84% WER).
+This is one controlled example, not a general accuracy benchmark, speaker
+diarization result or live system-audio claim. See [verification](docs/verification.md#bounded-mac-and-generated-audio-checkpoint-0747967).
+The runtime/catalog release must be pinned and validated separately.
+
 ## What it does
 
 - Reads supported text files from a selected project and shows the evidence used
   for each answer. Markdown, plain text, and reStructuredText are supported.
 - Uses local Whisper transcription, optional explicit Meta cloud transcription,
+  a bounded [Google Gemini transcription preview](docs/google-transcription.md),
   or an optional, unofficial Meetily JSON attachment, depending on platform setup.
-- Sends an answer request to the provider and exact model you select in
+- Checks required capture settings and permissions before enabling Start, with
+  separate explicit permission setup and model preparation. See [preflight](docs/preflight.md).
+- Offers explicitly loaded answer model options for configured OpenAI/OpenRouter
+  keys, with manual entry and clear account-access limits.
+- Defaults new answer settings to **Follow Hermes default** on supported hosts,
+  with host-owned credentials and routing. Saved explicit overrides remain.
+- Sends an answer request through that default or the provider and exact model you select in
   **Settings → Plugins → Meeting Copilot**. OpenAI and OpenRouter are the main
   Desktop answer routes.
 - Offers explicit recent-transcript actions: **Catch me up**, **Extract actions**,
@@ -107,6 +123,12 @@ is not provider or audio readiness. Windows capture remains experimental.
 
 ## Ask your first question
 
+New panes use **Follow Hermes default** when this runtime has a genuine,
+profile-scoped host route. No separate plugin answer key is needed for that mode.
+Existing provider choices stay unchanged. If the default route is unavailable
+or you want an override, use the OpenAI/OpenRouter setup below. See
+[default-route limits](docs/preflight.md#follow-the-hermes-default).
+
 1. In **Settings → Plugins → Meeting Copilot**, open the plugin's agent settings
    for the default profile and save an OpenAI or OpenRouter key in its secret
    field. Reopen the pane; never put keys in chat or model fields.
@@ -125,7 +147,9 @@ is not provider or audio readiness. Windows capture remains experimental.
    Open **Evidence** and compare the answer with its sources.
 5. To add meeting context, prepare the platform's transcript source, select any
    active Meetily recording in the pane, confirm participant permission, and
-   explicitly start capture. Pause when finished and check that stopping is
+   pass the required preflight checks, and explicitly start capture. Use
+   **Request macOS permissions…** for first-use OS access and the model-preparation
+   command shown by a missing-model check. Pause when finished and check that stopping is
    confirmed. After changing capture settings, confirm permission again.
 
 Start with [the synthetic walkthrough](docs/demo.md). It also includes an offline CLI
@@ -173,10 +197,14 @@ recorder exclusion. See [asset provenance](docs/assets/README.md).*
 
 ## Known limits
 
+- Native Windows Start is blocked until safe device/privacy readiness can be
+  verified. Use an active Meetily recording; dependencies alone are not enough.
+
 - Native capture can lose audio under load. Long meetings, broad device
   compatibility, and multi-speaker accuracy are not established.
 - OpenAI/OpenRouter access, credits, exact model IDs, and API compatibility
-  depend on the account. There is no automatic provider/model fallback.
+  depend on the account. BYOK overrides have no automatic provider/model fallback;
+  Follow Hermes default uses Hermes’ own routing/fallback policy.
 - Sources are evidence supplied to a model, not proof of every generated claim.
   Missing or adversarial evidence can still produce an incorrect answer.
 - PDF, DOCX, and XLSX extraction is not implemented. Project scans and session
