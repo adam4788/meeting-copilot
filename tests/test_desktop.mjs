@@ -2258,7 +2258,7 @@ test('settings use a short heading and disclose answer data at the action', () =
   assert.doesNotMatch(JSON.stringify(summary.children), /scope, models, overlay, web/);
   assert.deepEqual(nodes(tree).find(n => n.props.id === 'mc-backend-label').children, ['Capture source']);
   const visible = JSON.stringify(disclosedNodes(tree));
-  assert.match(visible, /question.*part of.*transcript.*selected source snippets.*may be sent.*answer model/i);
+  assert.match(visible, /question.*recent transcript.*selected sources.*sent to this model.*when you ask/i);
   assert.match(visible, /permission.*capture\/read.*meeting/i);
 });
 
@@ -3438,7 +3438,7 @@ test('clear question empties the composer', async () => {
 
 test('clearing a question returns focus to the composer without sending', () => {
   const { tree, rerender, requests } = pane('', true, false, '', { 1: 'Draft question' });
-  const label = nodes(tree).find(n => n.type === 'label' && nodes(n).some(c => c.type === 'textarea'));
+  const label = nodes(tree).find(n => n.type === 'section' && n.props['aria-label'] === 'Answer composer');
   assert.ok(label.props.ref, 'composer wrapper exposes its DOM ref');
   let focused = 0;
   label.props.ref.current = { querySelector: selector => selector === 'textarea' ? { focus: () => { focused++; } } : null };
@@ -3450,8 +3450,7 @@ test('clearing a question returns focus to the composer without sending', () => 
 
 test('setup tiles are separated by real gaps, not touching edges', async () => {
   const { tree } = pane('', true, false, '', {}, {}, {});
-  const setup = nodes(tree).find(n => n.type === 'details'
-    && JSON.stringify(n.children).includes('Answer setup'));
+  const setup = nodes(tree).find(n => n.type === 'details' && n.props['data-answer-setup']);
   assert.ok(setup, 'answer setup renders');
   const stack = (setup.children || []).find(c => c && typeof c === 'object' && c.type === 'div'
     && c.props.style && c.props.style.display === 'flex');
@@ -3459,25 +3458,23 @@ test('setup tiles are separated by real gaps, not touching edges', async () => {
   assert.ok(stack.props.style.gap >= 12, `expected gap >= 12, got ${stack.props.style.gap}`);
 });
 
-test('transcript segments render as bounded tiles with accent edges', async () => {
+test('transcript segments use compact accent rows without losing speaker attribution', () => {
   const { tree } = pane('', true, true, '', {}, {}, { segments: [
     { speaker: 'Alice', text: 'hello there', timestamp: 1 },
     { speaker: 'Bob', text: 'general kenobi', timestamp: 2 },
   ] });
-  const tiles = nodes(tree).filter(n => n.type === 'p'
-    && n.props.style && String(n.props.style.borderLeft || '').includes('3px solid'));
-  assert.equal(tiles.length, 2);
-  for (const tile of tiles) {
-    assert.ok(String(tile.props.style.border || '').includes('var(--ui-stroke-secondary)'));
-    assert.ok(String(tile.props.style.background || '').includes('color-mix'));
-    assert.ok(tile.props.style.borderRadius >= 8);
+  const rows = nodes(tree).filter(n => n.props.className === 'mc-transcript-row');
+  assert.equal(rows.length, 2);
+  for (const [index, row] of rows.entries()) {
+    assert.ok(nodes(row).some(n => n.type === 'i' && n.props['aria-hidden'] && n.props.style.background.startsWith('var(')));
+    assert.ok(nodes(row).some(n => n.type === 'strong' && n.children.includes(index ? 'Bob' : 'Alice')));
+    assert.match(JSON.stringify(row), index ? /general kenobi/ : /hello there/);
   }
 });
 
 test('setup rhythm: cards use grids and the web toggle is a tile', async () => {
   const { tree } = pane('', true, false, '', {}, {}, {});
-  const setup = nodes(tree).find(n => n.type === 'details'
-    && JSON.stringify(n.children).includes('Answer setup'));
+  const setup = nodes(tree).find(n => n.type === 'details' && n.props['data-answer-setup']);
   const stack = (setup.children || []).find(c => c && typeof c === 'object' && c.type === 'div'
     && c.props.style && c.props.style.display === 'flex');
   assert.ok(stack && stack.props.style.gap >= 14, `expected setup gap >= 14, got ${stack && stack.props.style.gap}`);
@@ -3498,26 +3495,23 @@ test('setup rhythm: cards use grids and the web toggle is a tile', async () => {
   assert.ok(toggle.props.style.padding.includes('12px'));
 });
 
-test('each speaker keeps one distinct color across tiles, with a legend', async () => {
+test('each speaker keeps a distinct theme color and direct name on every compact row', () => {
   const { tree } = pane('', true, true, '', {}, {}, { segments: [
     { speaker: 'Alice', text: 'first', timestamp: 1 },
     { speaker: 'Bob', text: 'second', timestamp: 2 },
     { speaker: 'Alice', text: 'third', timestamp: 3 },
   ] });
-  const tiles = nodes(tree).filter(n => n.type === 'p'
-    && n.props.style && String(n.props.style.borderLeft || '').includes('3px solid'));
-  assert.equal(tiles.length, 3);
-  const colors = tiles.map(t => t.props.style.borderLeft);
+  const rows = nodes(tree).filter(n => n.props.className === 'mc-transcript-row');
+  assert.equal(rows.length, 3);
+  const colors = rows.map(row => nodes(row).find(n => n.type === 'i').props.style.background);
   assert.equal(colors[0], colors[2], 'same speaker, same color');
   assert.notEqual(colors[0], colors[1], 'different speakers, different colors');
   assert.ok(colors.every(color => color.includes('var(--ui-')), 'speaker colors follow the active theme');
-  const speakerNames = tiles.map(t => t.children[0]);
-  assert.ok(speakerNames.every((s, i) => s && s.props.style
-    && s.props.style.color === colors[i].replace('3px solid ', '')),
-    'speaker name uses the tile color');
-  const legend = nodes(tree).filter(n => n.type === 'span'
-    && (n.children || []).some(c => typeof c === 'string' && (c === 'Alice' || c === 'Bob')));
-  assert.equal(legend.length, 2, 'legend chips name each speaker');
+  for (const [index, row] of rows.entries()) {
+    const name = nodes(row).find(n => n.type === 'strong');
+    assert.equal(name.props.style.color, colors[index]);
+    assert.ok(name.children.includes(index === 1 ? 'Bob' : 'Alice'), 'direct names do not rely on color or a separate legend');
+  }
 });
 
 test('desktop plugin uses theme colors and matches package versions', () => {
@@ -3560,8 +3554,7 @@ test('composer shortcut sends once without inserting a newline or interrupting c
 
 test('answer setup is a bordered panel with a padded inner stack', async () => {
   const { tree } = pane('', true, false, '', {}, {}, {});
-  const setup = nodes(tree).find(n => n.type === 'details'
-    && JSON.stringify(n.children).includes('Answer setup'));
+  const setup = nodes(tree).find(n => n.type === 'details' && n.props['data-answer-setup']);
   assert.ok(setup, 'answer setup renders');
   assert.ok(String(setup.props.style.border || '').includes('var(--ui-stroke-secondary)'),
     'setup expandable has a visible panel boundary');
@@ -4268,4 +4261,187 @@ test('unavailable Hermes default is visible and never falls back to configured B
   await button(ui.tree, 'Suggest answer').props.onClick();
   assert.equal(ui.requests.filter(r => r.path === '/assist').length, 0);
   assert.equal(settingNode(page, 'mc-provider-label').props.value, 'hermes');
+});
+
+// Native details expose their summary while closed. This checks disclosure
+// structure only, not browser geometry, contrast or SDK control rendering.
+function compactVisible(node) {
+  if (node == null || typeof node === 'boolean') return [];
+  if (typeof node !== 'object') return [node];
+  if (Array.isArray(node)) return node.flatMap(compactVisible);
+  if (['style', 'svg'].includes(node.type) || node.props?.hidden || node.props?.['aria-hidden'] === true) return [];
+  const children = node.type === 'details' && !node.props.open
+    ? node.children.filter(child => child?.type === 'summary') : node.children;
+  return [node, ...children.flatMap(compactVisible)];
+}
+const compactText = tree => compactVisible(tree).filter(value => typeof value !== 'object').join(' ');
+
+test('compact ready pane collapses passed detail without hiding consent or performing work', () => {
+  const checks = Array.from({ length: 11 }, (_, i) => ({ id: `check-${i}`, status: 'ready', label: `Fixture ${i}`,
+    detail: 'Synthetic detailed successful verification kept available on demand.' }));
+  const ui = pane('', true, false, '', { 3: true, 4: 'macos' }, {}, {}, {}, { preflight: { checks } });
+  const passed = nodes(ui.tree).find(n => n.props['data-passed-checks']);
+  assert.ok(passed && !passed.props.open);
+  const text = compactText(ui.tree);
+  assert.match(text, /11 checks passed/);
+  assert.doesNotMatch(text, /Synthetic detailed successful verification/);
+  assert.match(text, /I have permission to capture\/read this meeting/);
+  assert.match(text, /Ready to start/);
+  assert.equal(button(ui.tree, 'Start listening').props.disabled, false);
+  assert.ok(text.split(/\s+/).length < 230, 'Routine ready UI avoids expanded setup paragraphs');
+  assert.equal(ui.requests.length, 0, 'rendering or native disclosure does not start capture or contact a provider');
+  assert.equal(passed.props.onToggle, undefined, 'native disclosure needs no backend or side effects');
+});
+
+test('compact blocked and unknown checks retain remedies and explicit permission setup', () => {
+  const checks = [
+    { id: 'microphone_permission', status: 'blocked', label: 'Microphone permission', detail: 'Allow Microphone in System Settings, then recheck.' },
+    { id: 'runtime', status: 'unknown', label: 'Audio runtime', detail: 'The local runtime could not be verified. Repair the installed runtime.' },
+    { id: 'ready', status: 'ready', label: 'Consent', detail: 'Synthetic consent passed.' },
+  ];
+  const ui = pane('', true, false, '', { 3: true, 4: 'macos' }, {}, {}, {}, { preflight: { ready: false, checks } });
+  const text = compactText(ui.tree);
+  assert.match(text, /Needs setup: Microphone permission/);
+  assert.match(text, /Allow Microphone in System Settings, then recheck/);
+  assert.match(text, /Not verified: Audio runtime/);
+  assert.match(text, /Repair the installed runtime/);
+  assert.ok(compactVisible(ui.tree).some(n => n?.type === 'button' && n.children.includes('Request macOS permissions…')));
+  assert.equal(button(ui.tree, 'Start listening').props.disabled, true);
+  assert.equal(ui.requests.length, 0, 'blocked render never prompts for permission');
+});
+
+for (const [name, status, behavior, consent] of [
+  ['stop unconfirmed', { stopping: true, stop_confirmed: false }, {}, true],
+  ['status offline', {}, { statusError: new Error('synthetic offline') }, true],
+  ['preflight offline', {}, { preflightError: new Error('synthetic offline') }, true],
+  ['expired checks', {}, { preflight: { receivedAt: Date.now() - 30000 } }, true],
+  ['missing contract', { capabilities: { macos_transcription: true } }, {}, true],
+  ['no consent', {}, {}, false],
+  ['overlay cleanup', { overlay_cleanup_error: 'Synthetic shutdown unconfirmed' }, {}, true],
+]) test(`compact readiness never contradicts ${name}`, () => {
+  const ui = pane('', true, false, '', { 3: consent, 4: 'macos' }, {}, status, {}, behavior);
+  assert.doesNotMatch(compactText(ui.tree), /Ready to start/);
+  assert.ok(!button(ui.tree, 'Start listening') || button(ui.tree, 'Start listening').props.disabled);
+  const checkStatus = nodes(ui.tree).find(n => n.props['aria-label'] === 'Required capture checks');
+  assert.ok(!nodes(checkStatus).some(n => n.props['data-tone'] === 'ready'));
+  assert.equal(ui.requests.length, 0);
+});
+
+for (const [state, expected] of [['running', 'Listening'], ['loading', 'Starting…'], ['starting', 'Starting…']]) {
+  test(`compact active rail preserves ${state} state and Pause alongside answer errors`, async () => {
+    const ui = pane('', true, false, '', { 3: true, 4: 'macos' }, {}, {
+      listening: true, backend: 'macos', error: 'Synthetic answer failure', capture: { state },
+    });
+    const rail = nodes(ui.tree).find(n => n.props['data-capture-rail']);
+    assert.match(compactText(rail), new RegExp(`${expected} · needs attention`));
+    assert.equal(nodes(rail).some(n => n.type === 'details'), false, 'capture rail cannot collapse');
+    assert.equal(nodes(ui.tree).filter(n => n.type === 'button' && n.children.includes('Pause listening')).length, 1);
+    assert.equal(button(rail, 'Pause listening').props.disabled, undefined);
+    await button(rail, 'Pause listening').props.onClick();
+    assert.equal(ui.requests.filter(r => r.path === '/pause').length, 1);
+    assert.equal(ui.requests.filter(r => r.path === '/start' || r.path === '/assist').length, 0);
+  });
+}
+
+test('compact stop retry and audio loss remain disclosed with all setup details closed', () => {
+  const ui = pane('', true, false, '', { 3: true, 4: 'macos' }, {}, {
+    stopping: true, stop_confirmed: false, capture: { native_dropped_chunks: 3, worker_dropped_chunks: 2 },
+  });
+  const rail = nodes(ui.tree).find(n => n.props['data-capture-rail']);
+  assert.ok(button(rail, 'Retry stop'));
+  const text = compactText(ui.tree);
+  assert.match(text, /Stopping — unconfirmed/);
+  assert.match(text, /audio may still be active/);
+  assert.match(text, /3 native frame\(s\)/);
+  assert.match(text, /2 worker chunk\(s\)/);
+});
+
+test('compact visual controls retain native disclosure, accessible names, focus and reduced motion', () => {
+  const ui = pane('', true, false, '', { 3: true, 4: 'macos' });
+  for (const details of nodes(ui.tree).filter(n => n.type === 'details')) {
+    assert.equal(details.children[0].type, 'summary');
+    assert.ok(compactText(details.children[0]).trim(), 'every native disclosure has a textual name');
+  }
+  for (const svg of nodes(ui.tree).filter(n => n.type === 'svg')) assert.equal(svg.props['aria-hidden'], true);
+  assert.ok(button(ui.tree, 'Recheck').props['aria-label']);
+  const stylesheet = nodes(ui.tree).find(n => n.type === 'style').children.join('');
+  assert.match(stylesheet, /\.mc-rail\s*\{[^}]*position:\s*sticky/);
+  assert.match(stylesheet, /focus-visible/);
+  assert.match(stylesheet, /prefers-reduced-motion:\s*reduce/);
+  assert.match(stylesheet, /max-width:\s*300px/);
+  assert.equal(ui.requests.length, 0);
+});
+
+test('Meetily Detach keeps its recording boundary beside the always-visible action', () => {
+  const ui = pane('', true, false, '', { 3: true, 4: 'meetily', 5: 'synthetic-recording' }, {}, { listening: true, backend: 'meetily' });
+  const rail = nodes(ui.tree).find(n => n.props['data-capture-rail']);
+  assert.ok(button(rail, 'Detach'));
+  assert.match(compactText(rail), /Detach does not stop Meetily recording/);
+  assert.equal(ui.requests.length, 0);
+});
+
+for (const settingsHost of [false, true]) test(`required Meetily recording selector is disclosed without expanding setup (settings host ${settingsHost})`, () => {
+  const storage = settingsStore();
+  storage.set('preferences-v1', { backend: 'meetily' });
+  const ui = pane('', true, false, '', { 4: 'meetily' }, {}, {}, {}, { settingsHost, storage });
+  const selector = compactVisible(ui.tree).find(n => n?.type === 'select' && n.props['aria-labelledby'] === 'mc-rec-label');
+  assert.ok(selector, 'mandatory selector is outside every closed disclosure');
+  assert.equal(!!selector.props.disabled, false);
+  assert.match(compactText(ui.tree), /Active Meetily recording/);
+  assert.equal(button(ui.tree, 'Attach to Meetily').props.disabled, true);
+  assert.equal(ui.requests.length, 0);
+});
+
+test('compact capture errors preserve the readable snapshot failure instead of only its code', () => {
+  const ui = pane('', true, false, '', { 4: 'meetily' }, {}, { listening: true, backend: 'meetily',
+    capture_error: 'snapshot_unavailable', capture: { error: 'snapshot_unavailable', message: 'Waiting for a valid JSON snapshot' } });
+  assert.match(compactText(ui.tree), /Waiting for a valid JSON snapshot/);
+  const message = compactVisible(ui.tree).find(n => n?.props?.['data-capture-message']);
+  assert.equal(message.props.role, 'status');
+  const routine = pane('', true, false, '', { 4: 'meetily' }, {}, { capture: { message: 'Listening to selected recording' } });
+  assert.doesNotMatch(compactText(routine.tree), /Listening to selected recording/);
+});
+
+test('nonzero audio with only empty completed chunks gets a compact actionable note, not a silence claim', () => {
+  const diagnostics = { microphone: { received_samples: 96000, completed: 2, empty: 2, peak: .2, rms: .01 },
+    system: { received_samples: 96000, completed: 2, empty: 1, peak: .2, rms: .01 } };
+  const ui = pane('', true, false, '', { 4: 'macos' }, {}, { listening: true, capture: { audio_diagnostics: diagnostics } });
+  const note = compactVisible(ui.tree).find(n => n?.props?.['data-audio-attention']);
+  assert.match(compactText(note), /Microphone: audio received, no words detected/);
+  assert.match(compactText(note), /input, speech language and transcription model/);
+  assert.doesNotMatch(compactText(note), /System|silence|failed|broken/);
+  assert.equal(ui.requests.length, 0);
+  for (const row of [
+    { received_samples: 0, completed: 2, empty: 2, peak: .1 },
+    { received_samples: 10, completed: 2, empty: 2 },
+    { received_samples: 10, completed: 2, empty: 2, peak: 0, rms: 0 },
+    { received_samples: 10, completed: 0, empty: 0, peak: .1 },
+    { received_samples: 10, completed: 2, empty: 2, peak: Infinity },
+  ]) {
+    const other = pane('', true, false, '', {}, {}, { capture: { audio_diagnostics: { microphone: row } } });
+    assert.ok(!nodes(other.tree).some(n => n.props['data-audio-attention']), 'absent/invalid evidence cannot establish nonzero empty recognition');
+  }
+});
+
+test('composer shortcut is visible and machine-readable as well as retaining its key handler', () => {
+  const ui = pane('', true, false);
+  assert.match(compactText(ui.tree), /⌘\/Ctrl\+Enter to ask/);
+  const textarea = nodes(ui.tree).find(n => n.type === 'textarea');
+  assert.equal(textarea.props['aria-keyshortcuts'], 'Meta+Enter Control+Enter');
+  const hint = compactVisible(ui.tree).find(n => n?.props?.id === textarea.props['aria-describedby']);
+  assert.match(compactText(hint), /⌘\/Ctrl\+Enter/);
+  assert.equal(typeof textarea.props.onKeyDown, 'function');
+});
+
+test('unconfirmed Meta stop retains the transmission warning even with next defaults local', () => {
+  const storage = settingsStore();
+  storage.set('preferences-v1', { backend: 'macos', transcriptionProvider: 'local' });
+  const ui = pane('', true, false, '', {}, {}, { listening: false, stopping: true, stop_confirmed: false, backend: 'macos',
+    last_session: { backend: 'macos', transcription_provider: 'meta' } }, {}, { settingsHost: true, storage });
+  const notice = compactVisible(ui.tree).find(n => n?.props?.['data-cloud-capture-disclosure']);
+  assert.match(compactText(notice), /Meta cloud transcription may still be active/);
+  assert.match(compactText(notice), /Audio transmission is not confirmed stopped; retry stop/);
+  assert.ok(button(ui.tree, 'Retry stop'));
+  assert.doesNotMatch(compactText(ui.tree), /Ready to start/);
+  assert.equal(ui.requests.length, 0);
 });

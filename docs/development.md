@@ -83,3 +83,24 @@ independently. A catalog pin must identify the published tree that was validated
 For manual checks obtain permission before recording and use fictional content.
 Short synthetic runs cannot establish long-call reliability. See [BYOK](byok.md),
 [contributing](../CONTRIBUTING.md), and the [demo](demo.md).
+
+## Compact pane source previews
+
+```sh
+node scripts/render_pane_preview.mjs /tmp/meeting-copilot-pane-preview
+```
+
+This dependency-free helper renders the production pane through the regression
+harness, using fictional meeting text and inert HTML stand-ins for SDK controls.
+It writes 16 ready, cloud-active, blocked and answer previews at 320/440 px in
+light/dark, plus structural-check results. It accesses no backend, recording,
+provider, account or saved preferences; the HTML has no event handlers.
+
+The pane keeps capture state and Pause in a sticky rail. Consent, active cloud
+transmission, errors and failed/unknown checks stay disclosed; successful checks,
+setup and routine guidance use native keyboard-accessible disclosures. Ready
+means the same thing as the enabled Start control, not merely cached checks.
+
+These source previews do not establish actual Hermes geometry, overflow,
+contrast or screen-reader behavior. Inspect an authorized installed pane for
+those checks; use fictional data and obtain separate permission for recording.

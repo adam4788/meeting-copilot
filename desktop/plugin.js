@@ -25,28 +25,67 @@ function audioDiagnosticText(value) {
   }).join(' · ');
 }
 
+// Content-free, source-specific attention cue. Empty recognition does not
+// establish silence or a broken model, and absent levels remain unknown.
+function audioAttentionText(value) {
+  if (!value || typeof value !== 'object') return '';
+  return ['microphone', 'system'].flatMap(source => {
+    const row = value[source];
+    if (!row || !Number.isSafeInteger(row.received_samples) || row.received_samples <= 0 || row.received_samples > 1e12
+      || !Number.isSafeInteger(row.completed) || row.completed <= 0 || row.completed > 1e12 || row.empty !== row.completed
+      || ![row.peak, row.rms].some(level => Number.isFinite(level) && level > 0 && level <= 1)) return [];
+    return [`${source === 'microphone' ? 'Microphone' : 'System audio'}: audio received, no words detected. Check the input, speech language and transcription model.`];
+  }).join(' ');
+}
+
 // Scoped to the pane so host settings and other plugins keep their own design.
 const workspaceStyles = `
-.mc-workspace { container-type: inline-size; --mc-accent: var(--ui-accent); }
+.mc-workspace { container-type: inline-size; --mc-accent: var(--ui-accent); --mc-warn: var(--ui-orange, var(--ui-accent)); }
+.mc-workspace p { margin: 0; }
+.mc-rail { position: sticky; top: -12px; z-index: 3; display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin: -12px -12px 0; padding: 12px; background: var(--ui-bg-card); border-bottom: 1px solid var(--ui-stroke-secondary); }
+.mc-rail-actions, .mc-chips, .mc-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.mc-chip { display: inline-flex; align-items: center; gap: 5px; min-width: 0; max-width: 100%; padding: 4px 7px; border-radius: 6px; background: color-mix(in srgb, var(--ui-text-secondary) 7%, transparent); color: var(--ui-text-secondary); font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
+.mc-chip[data-tone="ready"] { color: var(--ui-green, var(--ui-accent)); }
+.mc-chip[data-tone="warning"] { color: var(--mc-warn); }
+.mc-notice { display: flex; align-items: flex-start; gap: 7px; padding: 8px 10px; border-radius: 8px; background: color-mix(in srgb, var(--mc-accent) 7%, transparent); font-size: 12px; line-height: 1.5; }
+.mc-notice svg { flex: 0 0 15px; margin-top: 2px; }
+.mc-checks { border-top: 1px solid var(--ui-stroke-secondary); padding-top: 9px; display: grid; gap: 8px; }
+.mc-checks-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; flex-wrap: wrap; }
+.mc-check-list { list-style: none; padding: 0; margin: 0; display: grid; gap: 7px; }
+.mc-check-list li { display: grid; grid-template-columns: 16px 1fr; gap: 6px; font-size: 12px; line-height: 1.5; }
+.mc-check-list [data-check-status="blocked"], .mc-check-list [data-check-status="unknown"] { color: var(--mc-warn); }
+.mc-check-list strong { display: block; color: var(--ui-text-primary); font-weight: 550; }
+.mc-check-details { color: var(--ui-text-secondary); font-size: 11px; }
+.mc-check-details[open] > summary { margin-bottom: 8px; }
+.mc-secondary { border-top: 1px solid var(--ui-stroke-secondary); padding-top: 9px; }
+.mc-answer-context { display: grid; gap: 6px; font-size: 11px; color: var(--ui-text-secondary); }
+.mc-answer-actions > button:first-child { flex: 1; }
+.mc-source-details { padding: 10px 12px; border: 1px solid var(--ui-stroke-secondary); border-radius: 10px; }
+.mc-source-details > summary { font-size: 12px; font-weight: 550; }
+.mc-transcript-row { display: grid; grid-template-columns: 3px 1fr; gap: 9px; padding: 6px 0; }
+.mc-transcript-row > i { border-radius: 2px; }
+.mc-transcript-row strong { display: block; font-size: 10px; font-weight: 600; margin-bottom: 3px; }
+.mc-transcript-row p { margin: 0; font-size: 13px; line-height: 1.6; }
+.mc-sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
 .mc-workspace :is(button, input, textarea, select, summary, a):focus-visible { outline: 2px solid var(--mc-accent); outline-offset: 3px; }
 .mc-workspace button { white-space: normal; max-width: 100%; }
 .mc-workspace :is(input, textarea, select) { max-width: 100%; }
 .mc-workspace summary { min-height: 24px; }
 .mc-workspace summary::marker { color: var(--ui-text-secondary); }
 .mc-header { display: flex; align-items: center; gap: 12px; }
-.mc-mark { display: grid; place-items: center; width: 42px; height: 42px; flex: 0 0 42px; border: 1px solid var(--ui-stroke-secondary); border-radius: 13px; background: color-mix(in srgb, var(--mc-accent) 12%, transparent); color: var(--mc-accent); }
+.mc-mark { display: grid; place-items: center; width: 30px; height: 30px; flex: 0 0 30px; border: 1px solid var(--ui-stroke-secondary); border-radius: 9px; background: color-mix(in srgb, var(--mc-accent) 12%, transparent); color: var(--mc-accent); }
 .mc-eyebrow { color: var(--ui-text-secondary); font-size: 10px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
-.mc-title { margin: 3px 0 0; font-size: 21px; font-weight: 650; letter-spacing: -.6px; line-height: 1.2; }
+.mc-title { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -.6px; line-height: 1.2; }
 .mc-status { display: flex; align-items: center; gap: 7px; padding: 6px 9px; border: 1px solid var(--ui-stroke-secondary); border-radius: 999px; font-size: 11px; }
 .mc-status-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
 .mc-status[data-state="listening"] { color: var(--mc-accent); background: color-mix(in srgb, var(--mc-accent) 9%, transparent); }
-.mc-capture { border-radius: 16px !important; border-top: 3px solid var(--mc-accent) !important; }
-.mc-consent { font-size: 12px; line-height: 1.6; }
+.mc-capture { border-radius: 12px !important; }
+.mc-consent { font-size: 11px; line-height: 1.5; color: var(--ui-text-secondary); }
 .mc-consent input { flex-shrink: 0; margin-top: 3px; accent-color: var(--mc-accent); }
-.mc-composer { padding: 16px; border: 1px solid var(--ui-stroke-secondary); border-radius: 16px; background: var(--ui-bg-card); }
-.mc-composer > strong { font-size: 15px; letter-spacing: -.2px; }
-.mc-composer textarea { min-height: 96px; line-height: 1.6; }
-.mc-quick-actions { padding: 12px 14px; border: 1px solid var(--ui-stroke-secondary); border-radius: 12px; background: var(--ui-bg-card); }
+.mc-composer { padding: 12px; border: 1px solid var(--ui-stroke-secondary); border-radius: 16px; background: var(--ui-bg-card); }
+.mc-composer strong { font-size: 15px; letter-spacing: -.2px; }
+.mc-composer textarea { min-height: 68px; line-height: 1.6; }
+.mc-quick-actions { padding: 2px 0; }
 .mc-quick-actions[open] > summary { margin-bottom: 12px; }
 .mc-quick-actions button { flex: 1 1 100px; min-height: 40px; text-align: left; }
 .mc-answer { border-radius: 16px !important; border-top: 3px solid var(--mc-accent) !important; background: color-mix(in srgb, var(--mc-accent) 5%, var(--ui-bg-card)) !important; }
@@ -56,17 +95,28 @@ const workspaceStyles = `
 .mc-evidence-card { border-radius: 12px !important; padding: 12px !important; }
 .mc-evidence-card > strong { display: block; color: var(--ui-text-primary); margin-bottom: 5px; }
 .mc-evidence { border-top: 1px solid var(--ui-stroke-secondary); padding-top: 12px; }
-.mc-transcript, .mc-history { padding: 14px; border: 1px solid var(--ui-stroke-secondary); border-radius: 14px; background: var(--ui-bg-card); }
+.mc-transcript, .mc-history { padding: 12px; border: 1px solid var(--ui-stroke-secondary); border-radius: 14px; background: var(--ui-bg-card); }
 .mc-transcript > summary, .mc-history > summary { font-weight: 600; }
 .mc-error { border-left: 3px solid var(--mc-accent) !important; }
-.mc-empty { display: grid; gap: 8px; border: 1px dashed var(--ui-stroke-secondary); border-radius: 16px; padding: 18px; }
+.mc-empty { display: flex; align-items: center; gap: 9px; color: var(--ui-text-secondary); padding: 8px 12px; font-size: 12px; }
 .mc-empty p { margin: 0; }
-@container (max-width: 300px) { .mc-title { font-size: 18px; } .mc-header { gap: 8px; } .mc-quick-actions button { flex-basis: 100%; } .mc-answer-heading { display: grid; } }
+@container (max-width: 300px) { .mc-title { font-size: 15px; } .mc-header { gap: 8px; } .mc-quick-actions button { flex-basis: 100%; } .mc-answer-heading { display: grid; } }
 @media (prefers-reduced-motion: reduce) { .mc-workspace *, .mc-workspace *::before, .mc-workspace *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }
 `;
 function WorkspaceMark() {
   return h('svg', { width: 24, height: 24, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', 'aria-hidden': true },
     h('path', { d: 'M4 10v4M8 6v12M12 3v18M16 7v10M20 10v4' }));
+}
+
+function PaneIcon({ name, size = 15 }) {
+  const paths = {
+    cloud: 'M7 18H6a4 4 0 1 1 1-7.9A5.5 5.5 0 0 1 18 9a4.5 4.5 0 0 1 0 9h-1M12 21V12m-3 3 3-3 3 3',
+    check: 'm5 12 4 4L19 6',
+    alert: 'M12 3 2 20h20L12 3Zm0 6v5m0 3v.1',
+    source: 'M4 4h6l2 3h8v13H4V4Z',
+    sparkle: 'm12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5L12 3Z',
+  };
+  return h('svg', { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.6, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true, focusable: false }, h('path', { d: paths[name] || paths.source }));
 }
 
 // Portable evidence is assembled only from the displayed answer, never current
@@ -1138,7 +1188,8 @@ export default {
       }, [liveEntry, data.generation, data.recent, !!status.error]);
       const transcript = data.segments || [];
       const failed = !!(data.error_request || data.error || (data.capture && (data.capture.error || /fail|error|could not/i.test(data.capture.warning || ''))));
-      const statusLabel = status.isPending ? 'Connecting…' : status.error ? 'Unavailable' : data.stopping ? 'Stopping — unconfirmed' : failed ? 'Needs attention' : data.listening ? 'Listening' : 'Paused';
+      const captureLabel = data.listening ? (['loading', 'starting'].includes(data.capture?.state) ? 'Starting…' : 'Listening') : 'Paused';
+      const statusLabel = status.isPending ? 'Connecting…' : status.error ? 'Unavailable' : data.stopping ? 'Stopping — unconfirmed' : failed ? (data.listening ? `${captureLabel} · needs attention` : 'Needs attention') : captureLabel;
         // Always-visible listening bar: the source card collapses while
         // listening, but Pause/Detach and loss evidence must never hide.
         // Native frames, worker chunks, and sub-second tails are distinct
@@ -1297,13 +1348,17 @@ export default {
       const restartCapture = !data.listening && !data.stopping;
       const cloudAudioSelected = backend === 'macos' && transcriptionProvider === 'meta';
       const cloudAudioActive = data.listening && data.last_session?.backend === 'macos' && data.last_session?.transcription_provider === 'meta';
-      const cloudAudioDisclosed = cloudAudioSelected || cloudAudioActive;
+      const cloudAudioUnconfirmed = data.stopping && data.last_session?.backend === 'macos' && data.last_session?.transcription_provider === 'meta';
+      const cloudAudioDisclosed = cloudAudioSelected || cloudAudioActive || cloudAudioUnconfirmed;
+      const captureMessage = (data.capture?.error || data.capture?.warning) && typeof data.capture?.message === 'string' ? data.capture.message.slice(0, 500) : '';
+      const audioAttention = audioAttentionText(data.capture?.audio_diagnostics);
       const sourceSummary = !backend ? 'Not identified — choose a capture source'
         : backend === 'meetily' ? (recording ? 'Meetily · recording selected' : 'Meetily — choose an active recording below')
         : `${backend === 'macos' ? 'macOS' : 'Windows'} · ${{ microphone: 'Microphone', system: 'System audio', both: 'Microphone + system audio' }[audioSource] || audioSource} · ${cloudAudioSelected ? `Meta (${asrMode})` : `Local transcription (${transcriptionModel})`}`;
       const captureBlocked = !freshPreflight() || !captureStatusIdle(status) || !backend || overlayNeedsHide || cloudUnavailable || windowsUnavailable || !consentValid || (backend === 'meetily' && !recording)
         || (settingsAvailable && !mayChangeCapture(qc, status, () => usable() && actionLife.mounted && overlayActionAt.current === actionLife))
         || (backend === 'macos' && !data.capabilities?.macos_transcription);
+      const startReady = !pending && !captureBlocked;
       const hasRecentTranscript = Array.isArray(data.segments) && data.segments.slice(-40)
         .some(segment => typeof segment?.text === 'string' && segment.text.trim());
       const contextActions = [
@@ -1311,25 +1366,36 @@ export default {
         ['Extract actions', 'Extract action items only from the recent available meeting transcript. For each item show Action, Owner, Deadline. Include an owner or deadline only if explicitly stated; otherwise write unspecified. Distinguish proposed actions from agreed commitments. If none are stated, say so.'],
         ['Suggest a question', 'Suggest one useful clarifying question grounded in the recent available meeting transcript, followed by one short reason to ask it. Do not invent facts, decisions, or commitments. If context is insufficient, say so.'],
       ];
-      return h('div', { className: 'mc-workspace', style: { padding: 18, display: 'flex', flexDirection: 'column', gap: 14, height: '100%', minWidth: 0, width: '100%', boxSizing: 'border-box', overflowY: 'auto', overflowX: 'hidden', overflowWrap: 'anywhere', color: 'var(--ui-text-primary)' } },
+      const checkRows = Array.isArray(preflight.data?.checks) ? preflight.data.checks : [];
+      const passedChecks = checkRows.filter(c => c.status === 'ready');
+      const blockedChecks = checkRows.filter(c => c.status !== 'ready');
+      const checksLabel = startReady ? 'Ready to start' : status.error ? 'Unavailable' : data.stopping ? 'Stop unconfirmed'
+        : status.isPending || preflight.isPending ? 'Checking…' : blockedChecks.length ? 'Needs setup' : freshPreflight() ? 'Start blocked' : 'Recheck required';
+      const renderCheck = c => h('li', { key: c.id, 'data-check-status': c.status },
+        h(PaneIcon, { name: c.status === 'ready' ? 'check' : 'alert' }),
+        h('div', null, h('strong', null, `${c.status === 'ready' ? 'Ready' : c.status === 'blocked' ? 'Needs setup' : 'Not verified'}: ${c.label}`), c.detail));
+      const stopControl = data.stopping
+        ? h(Button, { variant: 'secondary', disabled: pending, onClick: () => act('/pause', {}) }, 'Retry stop')
+        : data.listening ? h(Button, { variant: 'secondary', onClick: () => act('/pause', {}) }, data.backend === 'meetily' ? 'Detach' : 'Pause listening') : null;
+      return h('div', { className: 'mc-workspace', style: { padding: 12, display: 'flex', flexDirection: 'column', gap: 10, height: '100%', minWidth: 0, width: '100%', boxSizing: 'border-box', overflowY: 'auto', overflowX: 'hidden', overflowWrap: 'anywhere', color: 'var(--ui-text-primary)' } },
         h('style', null, workspaceStyles),
-        h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' } },
+        h('div', { className: 'mc-rail', 'data-capture-rail': true },
           h('header', { className: 'mc-header' }, h('div', { className: 'mc-mark' }, h(WorkspaceMark)),
-            h('div', null, h('div', { className: 'mc-eyebrow' }, 'Meeting workspace'), h('h1', { className: 'mc-title' }, 'Meeting Copilot'))),
-          h('span', { className: 'mc-status', 'data-state': statusLabel === 'Listening' ? 'listening' : 'idle' },
-            h('span', { className: 'mc-status-dot', 'aria-hidden': true }), h(Badge, { title: status.error ? 'Backend unavailable. Check the backend connection, installation, and plugin enablement.' : status.isPending ? 'Contacting backend…' : undefined }, statusLabel))),
-        settingsAvailable && h('div', { style: { ...muted, display: 'flex', gap: 8, alignItems: 'center' } },
-          typeof host.navigate === 'function' && h('button', { type: 'button', onClick: () => { if (usable()) host.navigate(`/settings?tab=plugins&plugin=${ID}`); }, style: { color: 'var(--ui-accent)', background: 'transparent', border: 0, cursor: 'pointer' } }, 'Open settings')),
+            h('h1', { className: 'mc-title' }, 'Meeting Copilot')),
+          h('div', { className: 'mc-rail-actions' },
+            h('span', { className: 'mc-status', role: 'status', 'data-state': data.listening && !data.stopping && !status.error && !status.isPending ? 'listening' : 'idle' },
+              h('span', { className: 'mc-status-dot', 'aria-hidden': true }), h(Badge, null, statusLabel)),
+            stopControl,
+            (data.listening || data.stopping) && data.backend === 'meetily' && h('span', { 'data-detach-disclosure': true, style: { ...muted, fontSize: 11 } }, 'Detach does not stop Meetily recording.'),
+            settingsAvailable && typeof host.navigate === 'function' && h('button', { type: 'button', onClick: () => { if (usable()) host.navigate(`/settings?tab=plugins&plugin=${ID}`); }, style: { fontSize: 11, color: 'var(--ui-text-secondary)', background: 'transparent', border: 0, cursor: 'pointer' } }, 'Open settings'))),
         // Capture session first: the permission check and the primary
         // start/pause actions live at the top, before any setup detail.
         h('section', { className: 'mc-capture', style: { ...card, display: 'grid', gap: 10 }, 'aria-label': 'Capture session' },
-          h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
-            h('strong', null, 'Capture session'),
-            h('span', { style: muted, role: 'status' }, settingsAvailable && status.error ? 'Capture status unavailable — check the backend connection.' : settingsAvailable && status.isPending ? 'Checking capture status…' : data.stopping ? 'Stop is not confirmed — audio may still be active.' : data.listening
-              ? `Listening via ${data.backend || backend}${lossText(data.capture)}${data.capture?.warning ? ' · transcript may be incomplete' : ''}`
-              : ((data.segments || []).length || result || (data.recent || []).length) ? 'Paused — resume this meeting or start a fresh one.' : 'Not capturing yet.')),
-          h('p', { style: { ...muted, margin: 0 } }, `Capture source: ${sourceSummary} (next capture).`),
-          h('label', { className: 'mc-consent', style: { display: 'flex', gap: 8, alignItems: 'flex-start', border: '1px solid var(--ui-stroke-secondary)', borderRadius: 10, padding: '10px 12px', background: 'var(--ui-bg-card)' } },
+          h('div', { className: 'mc-chips', 'aria-label': 'Capture source' },
+            h('span', { className: 'mc-chip', title: 'Next capture' }, `${data.listening ? 'Next capture' : 'Capture source'}: ${sourceSummary}`)),
+          (status.error || status.isPending || data.stopping) && h('p', { role: 'status', style: muted }, status.error ? 'Capture status unavailable. Check the backend connection.' : status.isPending ? 'Checking capture status…' : 'Stop is not confirmed — audio may still be active.'),
+          cloudAudioDisclosed && h('p', { id: `${paneEntry.a11yId}-cloud-audio`, 'data-cloud-capture-disclosure': true, role: 'status', className: 'mc-notice' }, h(PaneIcon, { name: 'cloud' }), cloudAudioUnconfirmed ? 'Meta cloud transcription may still be active. Audio transmission is not confirmed stopped; retry stop.' : `Cloud transcription ${cloudAudioActive ? 'active' : 'selected'}: meeting audio is sent to Meta while listening. ${data.listening ? 'Pause to change.' : 'Next capture.'}`),
+          h('label', { className: 'mc-consent', style: { display: 'flex', gap: 8, alignItems: 'flex-start', padding: '2px 0' } },
             h('input', { type: 'checkbox', checked: consentValid, disabled: data.listening, onChange: e => {
               if (e.target.checked && (!usable() || !actionLife.mounted || overlayActionAt.current !== actionLife ||
                   captureInput.current.recording !== recording || captureRevision !== renderedCaptureRevision || sourceVersion.current.revision !== renderedSourceRevision ||
@@ -1339,43 +1405,45 @@ export default {
               setConsent(e.target.checked);
               setConsentRevision(value => value + 1);
             }, 'aria-describedby': cloudAudioDisclosed ? `${paneEntry.a11yId}-cloud-audio` : undefined }),
-            h('span', null, h('strong', null, 'Permission check. '), 'I have permission to capture/read this meeting and use its context with my configured model.')),
-          !data.listening && h('section', { style: { display: 'grid', gap: 6 }, 'aria-label': 'Required capture checks' },
-            h('strong', null, 'Required capture checks'),
-            h('p', { style: { ...muted, margin: 0 } }, 'Checks never record, request OS permission, download models or contact answer providers. Start rechecks the backend before recording. Answer setup is separate.'),
-            data.capabilities?.capture_preflight !== 1 ? h('p', { role: 'alert', style: muted }, 'This backend does not support capture preflight. Update the plugin and reopen the pane before Start.')
-              : preflight.error ? h('p', { role: 'alert', style: muted }, 'Required checks are unavailable. Restore the backend connection and recheck before Start.')
+            h('span', null, 'I have permission to capture/read this meeting and use its context with my configured model.')),
+          h('div', { className: 'mc-actions' },
+            !data.listening && !data.stopping && h(Button, { disabled: pending || captureBlocked, onClick: () => startCapture() }, ((data.segments || []).length || result || (data.recent || []).length) ? (backend === 'meetily' ? 'Resume' : 'Resume listening') : (backend === 'meetily' ? 'Attach to Meetily' : 'Start listening')),
+            !data.listening && !data.stopping && !!((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending || captureBlocked, title: 'Starts a fresh meeting; the earlier transcript, answers, and retry data are cleared', onClick: () => startCapture(true) }, 'New meeting'),
+            !!(data.overlay_cleanup_error || (data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending, title: 'Clears past Q&A, transcript segments, and cached snippets for this meeting', onClick: async () => { if (typeof window !== 'undefined' && window.confirm && !window.confirm('Clear this meeting? Past questions, answers, and transcript segments are removed from the pane.')) return; if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } } }, 'Clear meeting')),
+          !data.listening && h('section', { className: 'mc-checks', 'aria-label': 'Required capture checks' },
+            h('div', { className: 'mc-checks-head' },
+              h('span', { className: 'mc-chip', 'data-tone': startReady ? 'ready' : 'warning', role: 'status' },
+                h(PaneIcon, { name: startReady ? 'check' : 'alert' }), checksLabel),
+              h(Button, { variant: 'secondary', 'aria-label': 'Recheck required settings', disabled: pending || !backend || status.error || data.capabilities?.capture_preflight !== 1,
+                onClick: () => { if (usable()) return qc.invalidateQueries({ queryKey: cacheKey('preflight') }); } }, 'Recheck')),
+            data.capabilities?.capture_preflight !== 1 ? h('p', { role: 'alert', style: muted }, 'Capture checks need an updated backend. Update the plugin and reopen this pane.')
+              : preflight.error ? h('p', { role: 'alert', style: muted }, 'Required checks unavailable. Restore the connection, then recheck.')
               : preflight.isPending || !preflight.data ? h('p', { role: 'status', style: muted }, 'Checking required settings…')
-              : h('ul', { style: { ...muted, margin: 0, paddingLeft: 20 } }, ...(Array.isArray(preflight.data.checks) ? preflight.data.checks : []).map(c =>
-                  h('li', { key: c.id }, `${c.status === 'ready' ? 'Ready' : c.status === 'blocked' ? 'Needs setup' : 'Not verified'}: ${c.label}. ${c.detail}`))),
-            preflight.data && !freshPreflight() && h('p', { role: 'status', style: muted }, 'Start stays disabled until all required checks pass for the current settings. Checks expire after 15 seconds; recheck if needed.'),
-            h(Button, { variant: 'secondary', disabled: pending || !backend || status.error || data.capabilities?.capture_preflight !== 1,
-              onClick: () => { if (usable()) return qc.invalidateQueries({ queryKey: cacheKey('preflight') }); } }, 'Recheck required settings'),
-            backend === 'macos' && h(Button, { variant: 'secondary', disabled: pending || !captureStatusIdle(status) || data.capabilities?.capture_preflight !== 1,
-              onClick: requestPermissions }, 'Request macOS permissions…')),
-          cloudAudioDisclosed && h('p', { id: `${paneEntry.a11yId}-cloud-audio`, 'data-cloud-capture-disclosure': true, role: 'status', style: { ...muted, margin: 0 } }, `Cloud transcription ${cloudAudioActive ? 'active' : 'selected'}: meeting audio is sent to Meta while listening. ${data.listening ? 'Pause to change' : 'Change'} the provider in ${settingsAvailable ? 'Meeting Copilot settings' : 'Transcript source below'}.`),
+              : h('ul', { className: 'mc-check-list', 'data-blocked-checks': true }, ...blockedChecks.map(renderCheck)),
+            passedChecks.length > 0 && h('details', { className: 'mc-check-details', 'data-passed-checks': true },
+              h('summary', { style: { cursor: 'pointer' } }, `${passedChecks.length} checks passed`),
+              h('ul', { className: 'mc-check-list' }, ...passedChecks.map(renderCheck))),
+            preflight.data && !freshPreflight() && !blockedChecks.length && h('p', { role: 'status', style: muted }, 'Recheck before Start. Checks expire after 15 seconds.'),
+            h('details', { className: 'mc-check-details', open: blockedChecks.some(c => ['microphone_permission', 'system_permission'].includes(c.id)) }, h('summary', { style: { cursor: 'pointer' } }, 'Check details & permissions'),
+              h('p', { style: muted }, 'Checks never record, request OS permission, download models or contact providers. Start checks again. Answer setup is separate.'),
+              backend === 'macos' && h(Button, { variant: 'secondary', disabled: pending || !captureStatusIdle(status) || data.capabilities?.capture_preflight !== 1,
+                onClick: requestPermissions }, 'Request macOS permissions…'))),
           data.listening && data.backend === 'macos' && !data.last_session?.transcription_provider && h('p', { role: 'status', style: muted }, 'The active transcription provider is not confirmed. Check capture status and pause if unsure.'),
           cloudUnavailable && h('p', { role: 'status', style: muted }, `Meta cloud transcription is unavailable. Choose Local in ${settingsAvailable ? 'Meeting Copilot settings' : 'Transcript source'}, or configure a Meta key and recheck backend readiness before Start.`),
           backend === 'macos' && !data.capabilities?.macos_transcription && h('p', { role: 'status', style: muted }, data.capabilities?.macos_detail || 'macOS transcription readiness was not reported. Check the backend and macOS setup guide.'),
           windowsUnavailable && h('p', { role: 'status', style: muted }, data.capabilities?.windows_detail || 'Windows capture readiness was not reported. Check the backend and Windows setup guide.'),
           !data.listening && !data.stopping && (pending || !backend || !consentValid || (backend === 'meetily' && !recording)) && h('p', { style: { ...muted, margin: 0 }, role: 'status' },
             pending ? 'Starting…' : !backend ? `Choose a capture source in ${settingsAvailable ? 'Meeting Copilot settings' : 'Transcript source below'}.` : !consentValid ? (consent ? 'Capture settings changed. Confirm permission again before starting.' : 'Confirm permission to enable Start.') : 'Select an active Meetily recording below to enable Attach.'),
-          h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
-            data.stopping
-              ? h(Button, { variant: 'secondary', disabled: pending, onClick: () => act('/pause', {}) }, 'Retry stop')
-              : data.listening
-              ? h(Button, { variant: 'secondary', onClick: () => act('/pause', {}) }, data.backend === 'meetily' ? 'Detach' : 'Pause listening')
-              : h(Button, { disabled: pending || captureBlocked, onClick: () => startCapture() }, ((data.segments || []).length || result || (data.recent || []).length) ? (backend === 'meetily' ? 'Resume' : 'Resume listening') : (backend === 'meetily' ? 'Attach to Meetily' : 'Start listening')),
-            !data.listening && !data.stopping && !!((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending || captureBlocked, title: 'Starts a fresh meeting; the earlier transcript, answers, and retry data are cleared', onClick: () => startCapture(true) }, 'New meeting'),
-            !!(data.overlay_cleanup_error || (data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending, title: 'Clears past Q&A, transcript segments, and cached snippets for this meeting', onClick: async () => { if (typeof window !== 'undefined' && window.confirm && !window.confirm('Clear this meeting? Past questions, answers, and transcript segments are removed from the pane.')) return; if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } } }, 'Clear meeting')),
-          h('div', { role: overlayNeedsHide ? 'alert' : undefined, style: { display: 'grid', gap: 6 } },
+          h('div', { className: 'mc-secondary', role: overlayNeedsHide ? 'alert' : undefined, style: { display: 'grid', gap: 5 } },
             h(Button, { variant: 'secondary', disabled: pending || (!data.capabilities?.overlay && !overlayNeedsHide), title: 'Show or hide the read-only meeting overlay (macOS)', onClick: toggleOverlay }, overlayNeedsHide ? 'Retry hide overlay' : overlayOn ? 'Hide overlay' : 'Show overlay'),
             (data.overlay_cleanup_error || overlayMsg) && h('p', { role: overlayNeedsHide ? undefined : 'status', style: { ...muted, margin: 0 } }, data.overlay_cleanup_error || overlayMsg),
-            h('p', { style: { ...muted, margin: 0 } }, 'Screen-share privacy: the overlay may appear in screenshots, recordings or screen sharing. Exclusion is best-effort, not a guarantee. Hide it when it must not appear.'),
-            h('p', { 'data-overlay-controls-help': true, style: { ...muted, margin: 0 } }, 'Overlay is read-only; ask questions here. ⌃⌥⌘O temporarily enables interaction; see Help.')),
+            h('p', { style: { ...muted, margin: 0 } }, 'Screen-share privacy: overlay may appear in screenshots, recordings or screen sharing. Exclusion is best-effort, not a guarantee.'),
+            h('p', { 'data-overlay-controls-help': true, style: { ...muted, margin: 0 } }, 'Overlay is read-only; ask questions here. Interact: ⌃⌥⌘O.')),
           !data.capabilities?.overlay && h('p', { role: 'status', style: { ...muted, margin: 0 } }, backend === 'native' ? 'The floating overlay is macOS-only. Use this Meeting Copilot pane on Windows.' : 'Overlay helper unavailable. Check the macOS helper build and restart the gateway when other sessions are idle.'),
-          data.capture && h('div', { style: muted }, data.capture.message || data.capture.state || ''),
-          audioDiagnosticText(data.capture?.audio_diagnostics) && h('div', { role: 'status', style: muted }, audioDiagnosticText(data.capture.audio_diagnostics)),
+          captureMessage && h('p', { role: 'status', 'data-capture-message': true, style: muted }, captureMessage),
+          audioAttention && h('p', { role: 'status', 'data-audio-attention': true, style: muted }, audioAttention),
+          audioDiagnosticText(data.capture?.audio_diagnostics) && h('details', { className: 'mc-check-details', open: /zero-level|no samples/.test(audioDiagnosticText(data.capture.audio_diagnostics)) && !!data.listening },
+            h('summary', { style: { cursor: 'pointer' } }, 'Audio signal'), h('div', { role: 'status', style: muted }, audioDiagnosticText(data.capture.audio_diagnostics))),
           data.capture && (data.capture.warning || lossText(data.capture)) && h('div', { role: 'status', style: muted },
             ['Transcript may be incomplete',
              lossText(data.capture),
@@ -1406,8 +1474,8 @@ export default {
           'Retry', recheckStatus),
         persistWarning && h('p', { role: 'status', style: muted }, persistWarning),
 
-        !settingsAvailable && h(data.listening ? 'details' : 'section', data.listening ? null : { style: card },
-          ...(data.listening ? [h('summary', { style: { cursor: 'pointer', ...muted } }, `Transcript source: ${data.backend || backend} — listening (pause to change settings)`)] : []),
+        !settingsAvailable && h('details', { className: 'mc-source-details', open: !backend },
+          h('summary', { style: { cursor: 'pointer', ...muted } }, data.listening ? `Transcript source: ${data.backend || backend} — listening (pause to change settings)` : 'Transcript source settings'),
           h('span', { id: 'mc-source-label', style: { fontWeight: 700 } }, 'Transcript source'),
           h('div', { style: { display: 'grid', gap: 6, paddingTop: 8, paddingBottom: 10 } },
             h('label', { style: { display: 'grid', gap: 6 } }, h('span', { id: 'mc-backend-label' }, 'Capture source'),
@@ -1439,8 +1507,10 @@ export default {
                 ...(Array.isArray(recordings.data) ? recordings.data : []).filter(r => r.status === 'recording').map(r => h('option', { value: r.id, key: r.id }, r.title || r.id)))),
             recordings.error && h('span', { role: 'alert', style: muted }, `Meetily lookup unavailable: ${recordings.error.message}. Start or check Meetily, then retry.`),
             h('span', { style: muted }, 'Meetily saves its own recordings and transcripts. Pausing here detaches the copilot; it does not stop the Meetily recording.'))),
-        h('label', { className: 'mc-composer', ref: composerRef, style: { display: 'grid', gap: 6 } }, h('strong', { id: 'mc-q-label' }, 'What should I say?'),
-          h(Textarea, { value: question, maxLength: 4000, onChange: e => setQuestion(e.target.value.slice(0, 4000)), placeholder: 'Leave blank to answer the latest question, or type a question… (⌘/Ctrl+Enter to send)', rows: 3, 'aria-labelledby': 'mc-q-label', onKeyDown: e => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !e.repeat && !e.nativeEvent?.isComposing && !busy && !unsupported) { e.preventDefault(); assistNow(); } } })),
+        h('section', { className: 'mc-composer', ref: composerRef, style: { display: 'grid', gap: 9 }, 'aria-label': 'Answer composer' },
+        h('label', { style: { display: 'grid', gap: 6 } }, h('span', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' } }, h('strong', { id: 'mc-q-label' }, 'What should I say?'),
+          h('span', { id: `${paneEntry.a11yId}-answer-shortcut`, style: { ...muted, fontSize: 11 } }, '⌘/Ctrl+Enter to ask')),
+          h(Textarea, { value: question, maxLength: 4000, onChange: e => setQuestion(e.target.value.slice(0, 4000)), placeholder: 'Ask a question, or leave blank for the latest…', title: 'Send with ⌘/Ctrl+Enter', rows: 2, 'aria-labelledby': 'mc-q-label', 'aria-keyshortcuts': 'Meta+Enter Control+Enter', 'aria-describedby': `${paneEntry.a11yId}-answer-shortcut`, onKeyDown: e => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !e.repeat && !e.nativeEvent?.isComposing && !busy && !unsupported) { e.preventDefault(); assistNow(); } } })),
         h('details', { className: 'mc-quick-actions', 'aria-label': 'Recent meeting quick actions' },
           h('summary', { style: { cursor: 'pointer', ...muted } }, 'Quick actions'),
           h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
@@ -1449,17 +1519,19 @@ export default {
               title: 'Sends an explicit request to your selected answer model using recent available context',
               onClick: () => { if (!hasRecentTranscript) return; return assistNow({}, prompt); } }, label))),
           h('p', { style: { ...muted, margin: 0 }, 'data-recent-context-disclosure': true },
-            'Each action sends a request to your selected model using recent available transcript and your selected source settings, not the whole meeting. Review the result; missing owners or deadlines remain unspecified.'),
+            'Sends recent transcript and selected sources to your model, not the whole meeting. Review the result.'),
           !hasRecentTranscript && h('p', { style: { ...muted, margin: 0 }, role: 'status' },
-            'Quick actions become available after transcript text arrives. You can still type a project question above.')),
+            'Available when transcript text arrives.')),
 
         ...(unsupported ? [h('p', { role: 'alert', style: muted }, `Suggest is unavailable: ${unsupportedReasons.join(' ')} See ${settingsAvailable ? 'Meeting Copilot settings' : 'Answer setup below'}.`)] : []),
-        h('p', { role: 'status', style: { ...muted, margin: 0 }, 'data-history-excluded': excludeHistory },
-          excludeHistory ? (unsupported ? 'Past-session exclusion requested — resolve the warning before submitting.' : 'Past sessions and web search are excluded. Only the selected project is searched.')
+        h('div', { className: 'mc-chip', role: 'status', 'data-history-excluded': excludeHistory },
+          excludeHistory ? (unsupported ? 'Past-session exclusion requested — resolve the warning.' : 'Selected project only · past sessions + web excluded')
             : `Search scope: ${project === '__all_projects__' ? 'all projects + sessions (may include unrelated projects)' : project ? `${project.split(/[\\/]/).pop()} + past sessions` : 'past sessions only'}${webFallback ? ' · automatic web on' : ' · automatic web off'}.`),
-        h('p', { style: { ...muted, margin: 0 } }, `Your question, part of the transcript and selected source snippets may be sent to the answer model${answerProvider && answerModel ? `: ${answerProvider} / ${answerModel}` : ' you choose'}.`),
-        webFallback && h('p', { 'data-web-fallback-disclosure': true, role: 'status', style: { ...muted, margin: 0 } }, 'Automatic web fallback is on: if local evidence is insufficient, a public query may be drafted. Filtering is not a privacy guarantee; turn it off for sensitive calls.'),
-        h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
+        h('div', { className: 'mc-answer-context', 'data-answer-sharing': true },
+          h('span', { className: 'mc-chip' }, h(PaneIcon, { name: 'sparkle' }), answerProvider && answerModel ? `${answerProvider} / ${answerModel}` : 'Choose an answer model'),
+          h('span', null, 'Your question, recent transcript and selected sources are sent to this model when you ask.')),
+        webFallback && h('p', { 'data-web-fallback-disclosure': true, role: 'status', style: { ...muted, margin: 0 } }, 'Automatic web fallback is on: may send a public query. Filtering is not a privacy guarantee; turn off for sensitive calls.'),
+        h('div', { className: 'mc-actions mc-answer-actions' },
           h(Button, { disabled: answerBlocked || unsupported, onClick: () => assistNow() }, busy ? 'Checking your sources…' : 'Suggest answer'),
           (answerUncertain || progressPaused || (assistFailed && trackedRequest)) && h(Button, { variant: 'secondary', disabled: pending, onClick: async () => {
             if (!usable() || answerSubmitting.current || safety.answerToken !== answerSafetyToken) return;
@@ -1481,7 +1553,7 @@ export default {
               catch (e) { setError('Answer progress unavailable after cancellation. Recheck status before asking again.'); }
             } }, 'Cancel answer'),
           result?.answer && h(Button, { variant: 'secondary', onClick: async () => { if (!usable()) return; try { await writeClipboard(result.answer); if (usable()) { setCopied(true); setTimeout(() => { if (usable()) setCopied(false); }, 2000); } } catch (e) { if (usable()) setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, copied ? 'Copied ✓' : 'Copy'),
-          question && h(Button, { variant: 'secondary', disabled: busy, onClick: () => { setQuestion(''); composerRef.current?.querySelector('textarea')?.focus(); } }, 'Clear question')),
+          question && h(Button, { variant: 'secondary', disabled: busy, onClick: () => { setQuestion(''); composerRef.current?.querySelector('textarea')?.focus(); } }, 'Clear question'))),
         currentLive && ['error', 'cancelled'].includes(currentLive.status) && !data.error && h('section', { style: card, 'aria-live': 'polite', 'data-terminal-answer': true },
           h('p', null, currentLive.status === 'error' ? answerFailure() : 'Answer cancelled.'),
           currentLive.request && h(Button, { variant: 'secondary', disabled: answerBlocked, onClick: () => replayRequest(currentLive.request) }, 'Retry this answer')),
@@ -1509,31 +1581,20 @@ export default {
             h('p', { style: muted }, 'Excerpts are limited to 2,050 characters per source.'),
             ...(result.sources || []).map(evidenceItem))),
         !result && !liveEntry && !busy && h('section', { className: 'mc-empty', 'aria-label': 'Answer workspace' },
-          h('div', { className: 'mc-eyebrow' }, 'Your answer space'),
-          h('strong', null, 'Make room for the conversation.'),
-          h('p', { style: muted }, 'Ask a project question, or connect a meeting and ask about its recent context. Your answer and supporting excerpts will appear here.')),
+          h(PaneIcon, { name: 'sparkle' }), 'Answers & evidence appear here.'),
         h('details', { className: 'mc-transcript', open: showTranscript, onToggle: e => setShowTranscript(e.currentTarget.open) },
           h('summary', { style: { cursor: 'pointer', ...muted } }, `Live transcript · ${transcript.length} segments`),
-          ...(() => {
-            const assigned = {};
-            for (const seg of transcript) {
-              const name = String(seg.speaker || 'Speaker');
-              if (!(name in assigned)) assigned[name] = speakerPalette[Object.keys(assigned).length % speakerPalette.length];
-            }
-            return Object.keys(assigned).length > 1 ? [h('div', { key: 'speakers', style: { display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 } },
-              ...Object.entries(assigned).map(([name, color]) => h('span', { key: name, style: { border: '1px solid var(--ui-stroke-secondary)', borderRadius: 999, padding: '2px 9px', fontSize: 12 } },
-                h('span', { style: { color } }, '\u25cf '), name)))] : [];
-          })(),
-          h('div', { style: { maxHeight: 280, overflowY: 'auto', marginTop: 8, padding: 10, display: 'flex', flexDirection: 'column', gap: 8, border: '1px solid var(--ui-stroke-secondary)', borderRadius: 10, background: 'var(--ui-bg-card)' } },
+          h('div', { style: { maxHeight: 280, overflowY: 'auto', marginTop: 8, display: 'flex', flexDirection: 'column', gap: 4 } },
             ...(transcript.length ? transcript.slice(-30).map((s, i) => {
               const order = [];
               for (const seg of transcript) { const n = String(seg.speaker || 'Speaker'); if (!order.includes(n)) order.push(n); }
               const color = speakerPalette[Math.max(0, order.indexOf(String(s.speaker || 'Speaker'))) % speakerPalette.length];
-              return h('p', { key: `${i}-${s.timestamp}`, style: { margin: 0, padding: '8px 10px', borderRadius: 8, border: '1px solid var(--ui-stroke-secondary)', borderLeft: `3px solid ${color}`, background: `color-mix(in srgb, ${color} 7%, transparent)`, lineHeight: 1.5 } },
-              h('strong', { style: { color } }, `${s.speaker}: `), s.text,
-              s.partial_tail && h('span', { title: 'Transcribed from trailing audio captured during shutdown' }, ' \u00b7 trailing audio'));
+              return h('div', { className: 'mc-transcript-row', key: `${i}-${s.timestamp}` },
+                h('i', { style: { background: color }, 'aria-hidden': true }),
+                h('div', null, h('strong', { style: { color } }, s.speaker || 'Speaker'), h('p', null, s.text,
+                  s.partial_tail && h('span', { title: 'Transcribed from trailing audio captured during shutdown' }, ' · trailing audio'))));
             })
-              : [h('p', { key: 'empty', style: { ...muted, margin: 0 } }, 'No transcript segments yet — attach or start listening, then speak.')]))),
+              : [h('p', { key: 'empty', style: { ...muted, margin: 0 } }, 'No transcript yet.')]))),
         (Array.isArray(data.recent) && data.recent.length > 0) && h('details', { className: 'mc-history' }, h('summary', { style: { cursor: 'pointer', ...muted } }, `Recent answers · ${data.recent.length}`),
           h('p', { style: muted }, 'Kept for this session only — a restart, new meeting, or new answer session clears older entries. Retained excerpts and sent context may contain confidential information.'),
           ...[...data.recent].reverse().map((entry, i) => h('div', { key: entry.request_id || i, style: { ...card, marginTop: 8 } },
@@ -1553,8 +1614,8 @@ export default {
             h('div', { style: { paddingTop: 8, display: 'flex', gap: 8, flexWrap: 'wrap' } },
               entry.answer && h(Button, { variant: 'secondary', onClick: async () => { if (!usable()) return; try { await writeClipboard(entry.answer); } catch (e) { if (usable()) setError('Clipboard unavailable. Select and copy the answer manually.'); } } }, 'Copy this answer'),
               entry.request && h(Button, { variant: 'secondary', disabled: answerBlocked, onClick: () => replayRequest(entry.request) }, /partial|interrupt|unavailable|failed|error/i.test((entry.warnings || []).join(' ') + ' ' + (entry.status || '')) ? 'Retry for the complete response' : 'Ask again'))))),
-        h('details', { open: setupOpen, onToggle: e => setSetupOpen(e.currentTarget.open), style: { border: '1px solid var(--ui-stroke-secondary)', borderRadius: 12, padding: '2px 14px 14px', background: 'var(--ui-bg-card)' } },
-        h('summary', { style: { cursor: 'pointer', fontWeight: 700, color: 'var(--ui-text-primary)', padding: '12px 0', fontSize: 14 } }, `${setupOpen ? '\u25be' : '\u25b8'} ${settingsAvailable ? 'More actions' : 'Answer setup'}`),
+        h('details', { 'data-answer-setup': true, open: setupOpen, onToggle: e => setSetupOpen(e.currentTarget.open), style: { border: '1px solid var(--ui-stroke-secondary)', borderRadius: 12, padding: '2px 14px 14px', background: 'var(--ui-bg-card)' } },
+        h('summary', { style: { cursor: 'pointer', fontWeight: 700, color: 'var(--ui-text-primary)', padding: '12px 0', fontSize: 14 } }, settingsAvailable ? 'More actions' : 'Answer setup'),
         h('div', { style: { display: 'flex', flexDirection: 'column', gap: 14, paddingTop: 4 } },
 
         !settingsAvailable && h(AnswerPreferences, { prefs, status, projects, models: modelCatalog, qc, live: () => usable() && overlayActionAt.current.mounted }),
