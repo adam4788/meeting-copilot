@@ -129,3 +129,15 @@ synthetic WAV endpoint accepts bounded bytes only, never file paths; it shares
 Pause/lease/teardown cancellation and cannot start devices or append to meetings.
 Scoped-key changes retire an active synthetic test. No API key enters a URL,
 worker environment, log, fixture, preview ledger or result.
+
+## Review notes
+
+The pane's Review notes workspace holds up to 12 explicitly pinned answers in
+memory (12,000 characters per editable note and 20,000 characters of displayed
+source evidence per note). It does not store notes in preferences or write them
+to disk, make model calls, or send them to other apps. Editing a note resets its
+review checkbox. Copy reviewed notes requires every note to be marked reviewed
+and a separate clipboard confirmation. That copy includes edited note text, not
+source excerpts or hidden transcript snapshots. Review is the user's assessment,
+not independent verification by the application. Meeting-generation changes and
+pane closure/reload discard notes; exported copies are not erased by Clear.
