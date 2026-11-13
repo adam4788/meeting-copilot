@@ -99,9 +99,9 @@ class ExportTests(unittest.TestCase):
             source, dest = root / 'source', root / 'release'
             tracked = self.fixture(source)
             export_runtime(source, dest, 'a' * 40, tracked)
-            screenshot = 'docs/assets/overlay-controls.png'
-            self.assertTrue((dest / screenshot).is_file())
-            self.assertEqual((dest / screenshot).read_bytes(), (source / screenshot).read_bytes())
+            for screenshot in ('docs/assets/overlay-controls.png', 'docs/assets/workflow.svg'):
+                self.assertTrue((dest / screenshot).is_file())
+                self.assertEqual((dest / screenshot).read_bytes(), (source / screenshot).read_bytes())
             self.assertFalse((dest / 'docs/assets/unrelated.png').exists())
 
     def test_missing_source_or_existing_destination_never_overwrites(self):

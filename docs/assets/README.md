@@ -42,3 +42,10 @@ unless deliberately allowlisted. See [development](../development.md#runtime-sou
 Follow the [brand guide](../brand-guide.md). Inspiration:
 [Nous Research](https://nousresearch.com/). No Nous seal, logo, illustration,
 or font file is bundled, and the project does not claim endorsement.
+
+## Workflow diagram
+
+[workflow.svg](workflow.svg) is an editable, hand-authored vector diagram using
+the project palette. It illustrates four deliberate user actions, not product UI
+or a performance claim. Its text is also represented in the main README. No
+external resources, scripts, fonts, or user data are embedded.

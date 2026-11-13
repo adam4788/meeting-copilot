@@ -16,7 +16,8 @@ ENTRY_FILES = ('__init__.py', 'plugin.yaml', 'desktop/plugin.js',
                'prepare_macos.py', 'install.py', 'README.md', 'SECURITY.md',
                'CONTRIBUTING.md', '.gitignore', 'LICENSE', 'requirements-audio.txt',
                'docs/assets/meeting-copilot-hero.png',
-               'docs/assets/overlay-controls.png')
+               'docs/assets/overlay-controls.png',
+               'docs/assets/workflow.svg')
 
 
 def export_runtime(source, destination, revision, tracked):

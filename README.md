@@ -11,40 +11,54 @@ it. Nothing is spoken, posted, or submitted for you.
 
 *Generated conceptual artwork; not a product screenshot.*
 
-[Get started](docs/getting-started.md) · [Try the offline demo](docs/demo.md) ·
-[Privacy](SECURITY.md) · [Documentation](docs/README.md)
+<p align="center">
+  <a href="docs/getting-started.md"><strong>Get started →</strong></a> ·
+  <a href="docs/demo.md">Try the offline demo</a> ·
+  <a href="docs/README.md">Read the docs</a> ·
+  <a href="SECURITY.md">Privacy &amp; control</a>
+</p>
 
-## Current status
+> **Early developer preview.** Capture is experimental; short tests and CI do not
+> establish reliable long meetings or provider access on your machine.
+> [See platform status and verification](#current-status).
 
-**Early developer preview.** The published source includes OpenAI/OpenRouter
-bring-your-own-key setup. Live responses from those accounts remain unverified.
-Native audio remains experimental. Recent local Mac checks recovered microphone
-transcription and removed observed drops in short tests. System-audio capture is
-still setup-dependent; a synthetic replay is not proof of a complete live meeting.
-Windows Desktop pane and runtime verification is still in progress.
+## From conversation to a source-backed suggestion
 
-| Platform | Source CI checkpoint (c5aa3cf) | Desktop and native audio status |
-| --- | --- | --- |
-| Windows | Python 3.11/3.12 suite and JavaScript checks passed in CI | Desktop pane/runtime under verification; SoundCard/WASAPI capture remains experimental |
-| macOS | Python 3.12 suite, JavaScript checks, and overlay helper build/self-test passed in CI | Historical checkpoint; see the newer bounded Mac/synthetic evidence below |
-| Linux | Python 3.11/3.12 suite and JavaScript checks passed in CI | Native audio and Desktop use are not established by these checks |
+![Four-step workflow: choose project files, capture with participant permission, explicitly request a suggestion, and review the answer with its evidence.](docs/assets/workflow.svg)
 
-The CI results above describe source revision
-[`c5aa3cf`](https://github.com/adam4788/meeting-copilot/commit/c5aa3cf85bd94ce7134925d0ebc0c1c5a17c9f12)
-([successful run](https://github.com/adam4788/meeting-copilot/actions/runs/42535380563)).
-See [CI](https://github.com/adam4788/meeting-copilot/actions),
-[verification notes](docs/verification.md), and the
-[native loss investigation](docs/native-backpressure.md).
-CI and plugin validation do not prove a complete meeting works on your computer.
+| **Ground it** | **Ask deliberately** | **Keep control** |
+| :--- | :--- | :--- |
+| Select a project. Retrieve supported text files and inspect numbered sources. | Suggest an answer, catch up, extract actions, or suggest a question when you choose. | Review first. Nothing is automatically spoken, posted, or submitted. |
 
-A newer local preview at `0747967` transcribed a 38.4-second generated fictional
-meeting with local Whisper and the explicit Google preview. Google matched all
-119 normalized reference words; local `tiny.en` had one insertion (0.84% WER).
-This is one controlled example, not a general accuracy benchmark, speaker
-diarization result or live system-audio claim. See [verification](docs/verification.md#bounded-mac-and-generated-audio-checkpoint-0747967).
-The runtime/catalog release must be pinned and validated separately.
+### See the native overlay
+
+<p align="center">
+  <img src="docs/assets/overlay-controls.png" width="440" alt="Native macOS overlay showing placement controls, a recording-visibility warning, and fictional transcript lines.">
+</p>
+
+*Native macOS 27 view rendered with synthetic content at source `32680e03`.
+Not a live meeting or proof of recorder exclusion. [Asset provenance](docs/assets/README.md).*
+
+The overlay is a read-only companion. Ask questions and review evidence in the
+Desktop pane. Recording visibility is best effort: hide the overlay when it must
+not appear in a recording.
+
+### Try it before connecting anything
+
+The offline demo uses fictional project files and a fake provider. No API key,
+audio device, or Hermes installation is required. From a source checkout:
+
+```sh
+python demo_standalone.py
+```
+
+[Follow the walkthrough](docs/demo.md) · [Install in Hermes Desktop](#install-in-hermes-desktop)
 
 ## What it does
+
+<details>
+<summary><strong>Explore capabilities and model options</strong></summary>
+
 
 - Reads supported text files from a selected project and shows the evidence used
   for each answer. Markdown, plain text, and reStructuredText are supported.
@@ -70,6 +84,10 @@ The runtime/catalog release must be pinned and validated separately.
   exclusion; the overlay may still appear in captures. Hide it when it must not
   appear. Ask questions in the Desktop pane.
 
+</details>
+
+### How the pieces fit together
+
 ```mermaid
 flowchart TD
     accTitle: Meeting Copilot answer workflow
@@ -90,7 +108,9 @@ Local transcription does not make hosted answers local.
 
 ## Install in Hermes Desktop
 
-Requires **Hermes 0.22.7 or newer**. Catalog admission is still pending.
+Requires **Hermes 0.22.7 or newer**. The macOS developer-preview catalog entry
+[was merged](https://github.com/NousResearch/hermes-agent/pull/152088). Catalog
+admission does not establish live capture or provider readiness.
 Use a full 40-character commit from the reviewed
 [runtime-release branch](https://github.com/adam4788/meeting-copilot/tree/catalog/runtime-0.1.0),
 not a floating branch or the development tree. Copy its full SHA before running:
@@ -103,8 +123,9 @@ hermes plugins enable meeting-copilot-live
 hermes plugins doctor meeting-copilot-live --ci
 ```
 
-After maintainers admit the catalog entry, `hermes plugins install
-meeting-copilot-live --no-enable` uses its reviewed pin. This repository does not
+The catalog command `hermes plugins install
+meeting-copilot-live --no-enable` uses the catalog’s reviewed pin, which may differ
+from the latest source on `main`. This repository does not
 self-update the catalog or bypass installation consent.
 
 Open the command palette and run **Open Meeting Copilot**. Agent enablement and
@@ -155,6 +176,14 @@ demo that needs no API key, audio device, or Hermes installation.
 
 ## Privacy and control
 
+**Read-only project access. Explicit capture. Model calls only when requested.**
+Local transcription does not make hosted answers local. Cloud transcription and
+hosted answers send selected data off-device; review the boundaries before use.
+
+<details>
+<summary><strong>Read the full data-flow and consent boundaries</strong></summary>
+
+
 Answer requests send the question, bounded meeting context, and retrieved
 excerpts to the selected HTTPS provider. Provider billing and retention rules
 apply. Optional Meta transcription also sends meeting audio off-device; local
@@ -185,13 +214,37 @@ sending, speaking, posting, capture or cloud-transcription opt-in.
 Read [security and privacy](SECURITY.md) and the
 [architecture and data flow](docs/architecture.md) for the complete boundaries.
 
-## Native overlay preview
+</details>
 
-![Native Meeting Copilot overlay with a move grip, six placement buttons and recording visibility controls above fictional transcript lines.](docs/assets/overlay-controls.png)
+## Current status
 
-*Production native view rendered on macOS 27 with synthetic content, from source
-`32680e03db334a07dcb904cf63acbff2b8eb25cf`. It is not a live meeting or proof of
-recorder exclusion. See [asset provenance](docs/assets/README.md).*
+**Early developer preview.** The published source includes OpenAI/OpenRouter
+bring-your-own-key setup. Live responses from those accounts remain unverified.
+Native audio remains experimental. Recent local Mac checks recovered microphone
+transcription and removed observed drops in short tests. System-audio capture is
+still setup-dependent; a synthetic replay is not proof of a complete live meeting.
+Windows Desktop pane and runtime verification is still in progress.
+
+| Platform | Source CI checkpoint (c5aa3cf) | Desktop and native audio status |
+| --- | --- | --- |
+| Windows | Python 3.11/3.12 suite and JavaScript checks passed in CI | Desktop pane/runtime under verification; SoundCard/WASAPI capture remains experimental |
+| macOS | Python 3.12 suite, JavaScript checks, and overlay helper build/self-test passed in CI | Historical checkpoint; see the newer bounded Mac/synthetic evidence below |
+| Linux | Python 3.11/3.12 suite and JavaScript checks passed in CI | Native audio and Desktop use are not established by these checks |
+
+The CI results above describe source revision
+[`c5aa3cf`](https://github.com/adam4788/meeting-copilot/commit/c5aa3cf85bd94ce7134925d0ebc0c1c5a17c9f12)
+([successful run](https://github.com/adam4788/meeting-copilot/actions/runs/42535380563)).
+See [CI](https://github.com/adam4788/meeting-copilot/actions),
+[verification notes](docs/verification.md), and the
+[native loss investigation](docs/native-backpressure.md).
+CI and plugin validation do not prove a complete meeting works on your computer.
+
+A newer local preview at `0747967` transcribed a 38.4-second generated fictional
+meeting with local Whisper and the explicit Google preview. Google matched all
+119 normalized reference words; local `tiny.en` had one insertion (0.84% WER).
+This is one controlled example, not a general accuracy benchmark, speaker
+diarization result or live system-audio claim. See [verification](docs/verification.md#bounded-mac-and-generated-audio-checkpoint-0747967).
+The runtime/catalog release must be pinned and validated separately.
 
 ## Known limits
 
