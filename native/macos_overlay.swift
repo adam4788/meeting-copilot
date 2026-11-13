@@ -19,10 +19,11 @@ struct QuestionRow: Decodable, Identifiable {
     let completedOnly: Bool?
     let warnings: [String]?
     let sources: [String]?
+    var status: String? = nil
     init(id: String, question: String, answer: String? = nil, busy: Bool? = nil, streaming: Bool? = nil, completedOnly: Bool? = nil, warnings: [String]? = nil, sources: [String]? = nil) {
         self.id = id; self.question = question; self.answer = answer; self.busy = busy; self.streaming = streaming; self.completedOnly = completedOnly; self.warnings = warnings; self.sources = sources
     }
-    enum CodingKeys: String, CodingKey { case id, question, answer, busy, streaming, completedOnly = "completed_only", warnings, sources }
+    enum CodingKeys: String, CodingKey { case id, question, answer, busy, streaming, completedOnly = "completed_only", warnings, sources, status }
 }
 struct Snapshot: Decodable {
     var transcript: [TranscriptLine] = []
@@ -33,12 +34,13 @@ struct Snapshot: Decodable {
     var truncated: Bool? = nil
     var snapshotID: String? = nil
     var answerActions: Bool? = nil
+    var focusAnswer: QuestionRow? = nil
     init(transcript: [TranscriptLine] = [], questions: [QuestionRow] = [], message: String? = nil, shareWarning: String? = nil, listening: Bool? = nil, truncated: Bool? = nil, snapshotID: String? = nil, answerActions: Bool? = nil) {
         self.snapshotID = snapshotID
         self.answerActions = answerActions
         self.transcript = transcript; self.questions = questions; self.message = message; self.shareWarning = shareWarning; self.listening = listening; self.truncated = truncated
     }
-    enum CodingKeys: String, CodingKey { case transcript, questions, message, shareWarning = "share_warning", listening, truncated, snapshotID = "snapshot_id", answerActions = "answer_actions" }
+    enum CodingKeys: String, CodingKey { case transcript, questions, message, shareWarning = "share_warning", listening, truncated, snapshotID = "snapshot_id", answerActions = "answer_actions", focusAnswer = "focus_answer" }
     init(from decoder: Decoder) throws {
         let box = try decoder.container(keyedBy: CodingKeys.self)
         transcript = (try? box.decode([TranscriptLine].self, forKey: .transcript)) ?? []
@@ -49,6 +51,7 @@ struct Snapshot: Decodable {
         truncated = try? box.decode(Bool.self, forKey: .truncated)
         snapshotID = try? box.decode(String.self, forKey: .snapshotID)
         answerActions = try? box.decode(Bool.self, forKey: .answerActions)
+        focusAnswer = try? box.decode(QuestionRow.self, forKey: .focusAnswer)
     }
 }
 
@@ -62,8 +65,10 @@ struct OverlayState {
     private(set) var truncated: Bool = false
     private(set) var snapshotID: String? = nil
     private(set) var answerActions: Bool = false
+    private(set) var focusAnswer: QuestionRow? = nil
     mutating func update(_ snapshot: Snapshot) {
         snapshotID = snapshot.snapshotID
+        focusAnswer = snapshot.focusAnswer
         answerActions = snapshot.answerActions ?? false
         transcript = Array(snapshot.transcript.suffix(6))
         questions = Array(snapshot.questions.suffix(20))
@@ -253,6 +258,7 @@ struct OverlayView: View {
             Divider()
             // Keep privacy controls pinned. Questions lead the scrollable content
             // so transcript history never hides them in the click-through view.
+            ScrollViewReader { scroll in
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
                     if let message = model.state.message {
@@ -261,68 +267,53 @@ struct OverlayView: View {
                     if model.state.truncated {
                         Text("Long answers shortened; open the pane for full text.").font(.caption)
                     }
-                    if model.state.questions.isEmpty {
+                    if model.state.questions.isEmpty && model.state.focusAnswer == nil {
                         Text(model.state.listening ? "Listening - detected questions appear here. Ask in the Meeting Copilot pane." : "Paused - resume capture in the Meeting Copilot pane to detect questions.")
                             .font(.caption).foregroundColor(.secondary)
                             .accessibilityLabel(model.state.listening ? "Listening, no questions detected yet" : "Paused, resume capture in the pane")
                     }
-                    LazyVStack(alignment: .leading, spacing: 8) {
-                        ForEach(model.state.questions) { row in
-                            VStack(alignment: .leading, spacing: 4) {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(row.question).font(.subheadline).bold()
-                                    if row.busy == true {
-                                        Text(row.streaming == true ? "Streaming answer…" : "Preparing answer…").font(.caption)
-                                    }
-                                    if let answer = row.answer {
-                                        Text(answer).font(.caption).textSelection(.enabled)
-                                    }
-                                    if let warnings = row.warnings {
-                                        ForEach(warnings, id: \.self) { warning in
-                                            Text("⚠ \(warning)").font(.caption).foregroundColor(.orange)
-                                                .accessibilityLabel("Warning: \(warning)")
-                                        }
-                                    }
-                                    if let sources = row.sources, !sources.isEmpty {
-                                        Text("Sources: \(sources.joined(separator: " · "))").font(.caption).foregroundColor(.secondary)
-                                            .accessibilityLabel("Sources: \(sources.joined(separator: ", "))")
-                                    }
-                                }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
-                                .background(Color.primary.opacity(0.05))
-                                .cornerRadius(8)
-                                if row.answer != nil {
-                                    Button(action: {
-                                        NSPasteboard.general.clearContents()
-                                        NSPasteboard.general.setString(row.answer ?? "", forType: .string)
-                                    }) {
-                                        Text("Copy answer").font(.caption)
-                                    }.buttonStyle(.link)
-                                    .disabled(!model.interactive)
-                                    .accessibilityLabel("Copy answer for \(row.question)")
+                    if let response = model.state.focusAnswer {
+                        responseCard(response)
+                    } else if let latest = model.state.questions.last {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Latest question").font(.caption).foregroundColor(.secondary)
+                            Text(latest.question).font(.system(size: 15, weight: .semibold))
+                            Text("Ask in the pane to see your response here.").font(.caption)
+                        }.frame(maxWidth: .infinity, alignment: .leading).padding(12)
+                            .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+                    }
+                    if !model.state.questions.isEmpty || !model.state.transcript.isEmpty {
+                        DisclosureGroup("Recent context") {
+                            VStack(alignment: .leading, spacing: 8) {
+                                ForEach(model.state.questions.reversed()) { row in
+                                    Text(row.question).font(.caption).padding(.vertical, 3)
                                 }
-                            }
-                        }
-                    }
-                    if !model.state.transcript.isEmpty {
-                        Divider()
-                        Text("Recent transcript").font(.caption.bold()).foregroundColor(.secondary)
-                    }
-                    ForEach(model.state.transcript) { line in
-                        HStack(alignment: .top, spacing: 6) {
-                            RoundedRectangle(cornerRadius: 2)
-                                .fill(speakerColors[line.speaker] ?? .accentColor)
-                                .frame(width: 3)
-                            Text("\(line.speaker): \(line.text)").font(.caption).lineLimit(2)
-                        }
-                        .padding(6)
-                        .background((speakerColors[line.speaker] ?? .accentColor).opacity(0.08))
-                        .cornerRadius(6)
+                                if !model.state.transcript.isEmpty {
+                                    Divider()
+                                    Text("Recent transcript").font(.caption.bold()).foregroundColor(.secondary)
+                                }
+                                ForEach(model.state.transcript) { line in
+                                    HStack(alignment: .top, spacing: 6) {
+                                        RoundedRectangle(cornerRadius: 2)
+                                            .fill(speakerColors[line.speaker] ?? .accentColor).frame(width: 3)
+                                        Text("\(line.speaker): \(line.text)").font(.caption).lineLimit(2)
+                                    }.padding(6)
+                                        .background((speakerColors[line.speaker] ?? .accentColor).opacity(0.08))
+                                        .cornerRadius(6)
+                                }
+                            }.padding(.top, 6)
+                        }.font(.caption).disabled(!model.interactive)
                     }
                     if let warning = model.state.shareWarning {
                         Text(warning).font(.caption).foregroundColor(.secondary)
                             .accessibilityLabel("Privacy notice: \(warning)")
                     }
                 }.frame(maxWidth: .infinity, alignment: .leading)
+                    .id("response-top")
+            }
+            .onChange(of: model.state.focusAnswer?.id) { _ in
+                scroll.scrollTo("response-top", anchor: .top)
+            }
             }
         }
         .padding(14).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -330,6 +321,51 @@ struct OverlayView: View {
         .background(Color.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 14))
         .preferredColorScheme(.dark)
     }
+    // One stable card; partial tokens update in place without moving focus or
+    // auto-scrolling. No generated shortening or extra provider request.
+    private func responseCard(_ row: QuestionRow) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Latest requested answer").font(.caption.bold())
+                Spacer()
+                Text(responseStatus(row)).font(.caption)
+            }.foregroundColor(.secondary)
+            Text(row.question).font(.subheadline).bold()
+            if row.status == "cancelled" || row.status == "error" || row.status == "interrupted" {
+                Text("Incomplete response. Review or retry in the pane.")
+                    .font(.caption).foregroundColor(.orange)
+            }
+            if let answer = row.answer, !answer.isEmpty {
+                Text(answer).font(.system(size: 15)).lineSpacing(4)
+                    .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+            } else {
+                Text(row.busy == true ? "Waiting for the first words…" : "No answer text. Check the pane.")
+                    .font(.subheadline).foregroundColor(.secondary)
+            }
+            if let warnings = row.warnings {
+                ForEach(warnings, id: \.self) { warning in
+                    Text("⚠ \(warning)").font(.caption).foregroundColor(.orange)
+                        .accessibilityLabel("Warning: \(warning)")
+                }
+            }
+            if let sources = row.sources, !sources.isEmpty {
+                Text("Sources: \(sources.joined(separator: " · "))").font(.caption).foregroundColor(.secondary)
+            }
+            Text("AI suggestion · verify in the pane").font(.caption2).foregroundColor(.secondary)
+        }.frame(maxWidth: .infinity, alignment: .leading).padding(12)
+            .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+    }
+    private func responseStatus(_ row: QuestionRow) -> String {
+        switch row.status {
+        case "queued": return "Queued"
+        case "running", "streaming": return row.streaming == true ? "Streaming answer…" : "Preparing answer…"
+        case "cancelled": return "Cancelled"
+        case "error", "interrupted": return "Interrupted"
+        case "done": return "Ready to review"
+        default: return "Check pane"
+        }
+    }
+
 }
 
 // Route only the dedicated grip at window level, so the first drag works even
@@ -589,6 +625,12 @@ func selfTest() -> Bool {
     state.update(decodedSnapshot)
     guard state.transcript.first?.text == "hello", !state.answerActions,
           state.shareWarning == "Overlay may be visible.", state.snapshotID == "meeting:2" else { return false }
+    let focusWire = #"{"snapshot_id":"meeting:3","focus_answer":{"id":"request-1","question":"When?","answer":"Friday","status":"streaming","busy":true}}"#
+    guard let focused = try? JSONDecoder().decode(Snapshot.self, from: Data(focusWire.utf8)) else { return false }
+    state.update(focused)
+    guard state.focusAnswer?.id == "request-1", state.focusAnswer?.status == "streaming" else { return false }
+    state.update(decodedSnapshot)
+    guard state.focusAnswer == nil else { return false }
     let completedWire = #"{"questions":[{"id":"c","question":"Why?","answer":"Done.","busy":false,"completed_only":true}]}"#
     guard let completedSnapshot = try? JSONDecoder().decode(Snapshot.self, from: Data(completedWire.utf8)),
           completedSnapshot.questions.first?.completedOnly == true,

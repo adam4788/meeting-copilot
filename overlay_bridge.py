@@ -245,6 +245,33 @@ def build_snapshot(status, answers=None, message=None):
     return snapshot
 
 
+def focus_answer(status):
+    """Allowlist bounded pane response text for the read-only display."""
+    entry = status.get('overlay_answer')
+    if not isinstance(entry, dict) or entry.get('generation') != status.get('generation'):
+        return None
+    phase = entry.get('status')
+    if phase not in ('queued', 'running', 'streaming', 'done', 'error', 'cancelled'):
+        return None
+    request_id = entry.get('request_id')
+    if not isinstance(request_id, str) or not request_id:
+        return None
+    answer = entry.get('answer') if isinstance(entry.get('answer'), str) else ''
+    question = entry.get('question') if isinstance(entry.get('question'), str) else ''
+    warnings = [w[:200] for w in (entry.get('warnings') or []) if isinstance(w, str)]
+    if phase == 'done' and any(w.startswith('Stream interrupted; showing a partial answer.') for w in warnings):
+        phase = 'interrupted'
+    if len(answer) > 12000:
+        warnings.insert(0, 'Answer shortened for overlay; open the pane for full text.')
+    return {'id': request_id[:200], 'question': question[:300], 'answer': answer[:12000],
+            'status': phase, 'busy': phase in ('queued', 'running', 'streaming'),
+            'streaming': entry.get('streaming') is True,
+            'completed_only': entry.get('completed_only') is not False,
+            'warnings': _prioritize_warnings(warnings),
+            'sources': [title[:80] for title in (entry.get('source_titles') or [])
+                        if isinstance(title, str)][:3]}
+
+
 def default_message(status):
     """Honest one-line overlay state; never promises capture or streaming."""
     status = status if isinstance(status, dict) else {}
@@ -357,6 +384,8 @@ class OverlayBridge:
         self._sticky_error = None
         self.questions = {}
         self.answers = {}
+        self.focus_answer = None
+        self._focus_revision_floor = -1
         self.order = []
         self.message = None
         self.request_by_row = {}
@@ -410,6 +439,16 @@ class OverlayBridge:
         self._show_probe_threads = set()
 
     # -- backend truth in ------------------------------------------------
+    def _retire_focus_locked(self):
+        self.focus_answer = None
+        if isinstance(self.transport, BackendTransport):
+            # Monotonic admission counter, read without acquiring the backend
+            # lock while holding bridge.lock. Every pre-retirement admission,
+            # including unobserved/in-flight work, stays retired on later polls.
+            revision = getattr(self.transport._state, 'answer_revision', None)
+            self._focus_revision_floor = max(self._focus_revision_floor,
+                                            revision if type(revision) is int else sys.maxsize)
+
     def retire_authorization(self):
         """Even identical settings may carry a different pane principal."""
         with self.lock:
@@ -419,6 +458,7 @@ class OverlayBridge:
             self.request_by_row.clear()
             self.reserved_generation.clear()
             self.answers.clear()
+            self._retire_focus_locked()
 
     def set_scope(self, scope):
         """Pane pushes current project/session scope; clears stale meeting data.
@@ -443,6 +483,7 @@ class OverlayBridge:
                         {'listening': self._listening})
                 self.questions = {}
                 self.answers = {}
+                self._retire_focus_locked()
                 self.order = []
                 self.paused_generation += 1
                 for request_id in list(self.row_by_request):
@@ -463,6 +504,7 @@ class OverlayBridge:
                     return False
                 if poller_seq is not None and poller_seq != self._poller_seq:
                     return False
+                self.focus_answer = None
                 self.message = getattr(self, '_sticky_error', None) or default_message(status)
                 self._listening = False
                 self._paused = False
@@ -581,6 +623,10 @@ class OverlayBridge:
             for row_id in self.questions:
                 self.answers.setdefault(row_id, {'answer': None, 'busy': False,
                                                  'streaming': False, 'completed_only': True})
+            entry = status.get('overlay_answer')
+            revision = entry.get('answer_revision') if isinstance(entry, dict) else None
+            self.focus_answer = (focus_answer(status) if isinstance(self.transport, BackendTransport)
+                                 and type(revision) is int and revision > self._focus_revision_floor else None)
             self.message = getattr(self, '_sticky_error', None) or default_message(status)
             if not raw and not status.get('busy'):
                 for row_id in [key for key in self.answers if not self.answers[key].get('busy')]:
@@ -1197,6 +1243,10 @@ class OverlayBridge:
             snapshot = dict(snapshot)
             snapshot['transcript'] = []
             snapshot['truncated'] = True
+            if isinstance(snapshot.get('focus_answer'), dict):
+                snapshot['focus_answer'] = dict(snapshot['focus_answer'])
+                snapshot['focus_answer']['answer'] = snapshot['focus_answer'].get('answer', '')[:2000]
+                snapshot['focus_answer']['warnings'] = ['Answer shortened for overlay; open the pane for full text.'] + snapshot['focus_answer'].get('warnings', [])[:2]
             try:
                 questions = snapshot.get('questions')
                 if isinstance(questions, list):
@@ -1334,6 +1384,7 @@ class OverlayBridge:
                                       answers, message)
             if isinstance(self.transport, BackendTransport):
                 snapshot['answer_actions'] = False
+                snapshot['focus_answer'] = self.focus_answer
             snapshot['snapshot_id'] = self.snapshot_id
             # Preserve pinned row order so streaming rows do not jump around.
             order_index = {row_id: index for index, row_id in enumerate(self.order)}
@@ -1628,6 +1679,7 @@ class OverlayBridge:
         self.request_by_row.clear()
         self.reserved_generation.clear()
         self.answers.clear()
+        self.focus_answer = None
         self.questions.clear()
         self.order.clear()
         self.segments.clear()

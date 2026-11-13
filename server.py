@@ -188,6 +188,7 @@ class MeetingState:
         self._active_engines = {}
         self.busy = False
         self.result = None
+        self.answer_revision = 0
         self.requests = {}
         self.transcript_snapshots = {}
         self.request_seq = 0
@@ -847,7 +848,8 @@ class MeetingState:
             if self.live_workers >= 8:
                 raise _AnswerRejected(503, 'Too many answer workers in flight; wait for one to finish and retry.')
             self.live_workers += 1
-            entry = {'request_id': request_id, 'row_id': row_id, 'question': question[:4000],
+            self.answer_revision += 1
+            entry = {'answer_revision': self.answer_revision, 'request_id': request_id, 'row_id': row_id, 'question': question[:4000],
                      'status': 'queued', 'answer': '', 'sources': [], 'warnings': [],
                      'web_search': {'used': False}, 'model_route': '', 'streaming': False,
                      'completed_only': True, 'error': None, 'cancelled': False, 'generation': self.generation,
@@ -1791,6 +1793,22 @@ class MeetingState:
             pass
         return None
 
+    def _overlay_answer_locked(self):
+        """Display-only projection of the latest admitted request, never its inputs.
+
+        Called under the state lock. Cancel/error keep partial text visibly
+        labelled; a new queued request replaces the previous answer immediately.
+        """
+        entry = next((e for e in reversed(list(self.requests.values()))
+                      if e.get('generation') == self.generation), None)
+        if not entry:
+            return None
+        return {key: entry.get(key) for key in
+                ('request_id', 'question', 'answer', 'status', 'generation', 'answer_revision',
+                 'streaming', 'completed_only', 'warnings')} | {
+                    'source_titles': [s.get('title', '') for s in (entry.get('sources') or [])
+                                      if isinstance(s, dict)][:3]}
+
     def status(self, touch=True):
         if touch:
             # Preserve pre-pane API compatibility only. After the first claim,
@@ -1872,6 +1890,7 @@ class MeetingState:
                                      'answer' if self.error else 'capture' if self.capture_error else None),
                     'stop_error': self.stop_error, 'answer_error': self.error, 'capture_error': self.capture_error,
                     'error_request': self.error_request if self.error else None,
+                    'overlay_answer': self._overlay_answer_locked(),
                     'busy': self.busy, 'result': self.result, 'requests': {e['request_id']: dict(e) for e in live},
                     'recent': terminal, 'meetily_clear_error': self.meetily_clear_error,
                     'capture': ({**self.capture_info, 'state': 'stopping', 'error': self.stop_error,
