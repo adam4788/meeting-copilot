@@ -4482,3 +4482,64 @@ test('Google WAV test is visibly cloud-active with Pause and no device claim', (
   assert.match(text, /Google cloud transcription may still be active/);
   assert.ok(button(ui.tree, 'Retry stop'));
 });
+
+const reviewFixture = () => ({ generation: 3, result: { request_id: 'review-1', answer: 'Decision: use the sample plan. Owner: unspecified.', sources: [{ title: 'Sample', text: 'Sample evidence', source: 'fixture.md' }], transcript_snapshot: { provider_json: 'PRIVATE_HIDDEN_SNAPSHOT' } } });
+test('review notes are explicit, editable, bounded and copied only after review and confirmation', async () => {
+  const copies = [], state = reviewFixture();
+  const ui = pane('', true, false, '', {}, {}, state, { window: { confirm: () => true } }, { os: { writeClipboard: async text => { copies.push(text); return true; } } });
+  assert.equal(ui.requests.length, 0);
+  await button(ui.tree, 'Keep as note').props.onClick();
+  let tree = ui.rerender();
+  assert.equal(button(tree, 'Keep as note').props.disabled, true, 'duplicate pins disabled');
+  assert.equal(button(tree, 'Copy reviewed notes').props.disabled, true);
+  const area = nodes(tree).find(n => n.props['aria-label'] === 'Review note 1');
+  area.props.onChange({ target: { value: 'Action: confirm the plan. Owner and deadline unspecified.' } });
+  tree = ui.rerender();
+  const section = nodes(tree).find(n => n.props['aria-label'] === 'Meeting review notes');
+  nodes(section).find(n => n.type === 'input' && n.props.type === 'checkbox').props.onChange({ target: { checked: true } });
+  tree = ui.rerender();
+  assert.equal(button(tree, 'Copy reviewed notes').props.disabled, false);
+  await button(tree, 'Copy reviewed notes').props.onClick();
+  assert.equal(copies.length, 1);
+  assert.match(copies[0], /Action: confirm the plan/);
+  assert.doesNotMatch(copies[0], /Sample evidence|PRIVATE_HIDDEN_SNAPSHOT/);
+  nodes(tree).find(n => n.props['aria-label'] === 'Review note 1').props.onChange({ target: { value: 'Changed' } });
+  assert.equal(button(ui.rerender(), 'Copy reviewed notes').props.disabled, true, 'edits require fresh review');
+  assert.equal(ui.requests.length, 0, 'no provider or backend writes');
+});
+test('notes disappear on meeting generation change and stale pin handlers fail closed', async () => {
+  const state = reviewFixture(), ui = pane('', true, false, '', {}, {}, state);
+  const oldPin = button(ui.tree, 'Keep as note');
+  await oldPin.props.onClick();
+  assert.ok(nodes(ui.rerender()).some(n => n.props['aria-label'] === 'Review note 1'));
+  state.generation = 4; state.result = null;
+  ui.rerender();
+  await oldPin.props.onClick();
+  assert.ok(!nodes(ui.rerender()).some(n => n.props['aria-label'] === 'Review note 1'));
+});
+test('review notes copy fails closed without confirmation and respects clipboard denial', async () => {
+  for (const confirm of [undefined, () => false, () => true]) {
+    let copied = 0;
+    const ui = pane('', true, false, '', {}, {}, reviewFixture(), { window: { confirm } }, { os: { writeClipboard: async () => { copied++; return false; } } });
+    await button(ui.tree, 'Keep as note').props.onClick();
+    const section = nodes(ui.rerender()).find(n => n.props['aria-label'] === 'Meeting review notes');
+    nodes(section).find(n => n.type === 'input' && n.props.type === 'checkbox').props.onChange({ target: { checked: true } });
+    await button(ui.rerender(), 'Copy reviewed notes').props.onClick();
+    assert.equal(copied, confirm?.() ? 1 : 0);
+    if (copied) assert.match(JSON.stringify(ui.rerender()), /Clipboard unavailable/);
+  }
+});
+test('review notes cap count and text, disclose truncation, and allow removal', async () => {
+  const state = reviewFixture(), ui = pane('', true, false, '', {}, {}, state);
+  for (let i = 0; i < 13; i++) {
+    state.result = { request_id: `note-${i}`, answer: 'x'.repeat(13000) };
+    await button(ui.rerender(), 'Keep as note').props.onClick();
+  }
+  let tree = ui.rerender();
+  const notes = nodes(tree).filter(n => /^Review note \d+$/.test(n.props['aria-label'] || ''));
+  assert.equal(notes.length, 12);
+  assert.equal(notes[0].props.value.length, 12000);
+  assert.match(JSON.stringify(tree), /shortened to 12,000/);
+  await button(tree, 'Remove note 1').props.onClick();
+  assert.equal(nodes(ui.rerender()).filter(n => /^Review note \d+$/.test(n.props['aria-label'] || '')).length, 11);
+});

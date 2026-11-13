@@ -300,3 +300,6 @@ times remain uninterpreted, and references are not proof that a model claim is
 correct. A separate **Copy sent transcript context** action requires confirmation;
 ordinary evidence export excludes it. See [transcript context](docs/transcript-context.md)
 for retry, retention, timing and verification limits.
+## Reviewed meeting notes
+
+Turn useful answers into an editable, review-first handoff with [Review notes](docs/review-notes.md). Notes stay in pane memory until you explicitly copy them; no automatic sharing or extra model call.

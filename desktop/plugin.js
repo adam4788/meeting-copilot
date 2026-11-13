@@ -1303,6 +1303,31 @@ export default {
         } catch (_) { if (usable() && life.mounted) setError('Permission setup was not confirmed. Check macOS Privacy & Security, then recheck required settings. No capture was requested.'); }
         finally { safety.permissionAction = false; signalSafety(); if (life.mounted) setPending(false); }
       }
+      // Review notes stay in this mounted pane only, never in preferences or disk.
+      // Fence both render and retained handlers at the backend meeting boundary.
+      const [reviewNotes, setReviewNotes] = useState({ generation: null, items: [] });
+      const notesGeneration = data.generation;
+      const notesCurrent = () => usable() && !status.error && Number.isSafeInteger(notesGeneration)
+        && (qc.getQueryState?.(cacheKey('status')) || status)?.data?.generation === notesGeneration;
+      const noteItems = reviewNotes.generation === notesGeneration ? reviewNotes.items : [];
+      useEffect(() => {
+        setReviewNotes(old => old.generation === notesGeneration ? old : { generation: notesGeneration, items: [] });
+      }, [notesGeneration]);
+      const updateNotes = change => {
+        if (!notesCurrent()) return;
+        setReviewNotes(old => ({ generation: notesGeneration,
+          items: change(old.generation === notesGeneration ? old.items : []) }));
+      };
+      const pinAnswer = () => {
+        if (!notesCurrent() || typeof result?.answer !== 'string' || !result.answer) return;
+        const key = result.request_id || result.answer;
+        updateNotes(items => items.length >= 12 || items.some(n => n.key === key) ? items : [...items, {
+          key, text: result.answer.slice(0, 12000), reviewed: false,
+          // Snapshot only visible evidence, not hidden transcript context.
+          evidence: evidenceReport({ ...result, answer: '(See original answer in the pane history.)' }).slice(0, 20000),
+          shortened: result.answer.length > 12000,
+        }]);
+      };
       paneEntry.retire = message => { paneEntry.retired = message; setRetirement(message); };
       if (paneEntry.retired) return h('section', { role: 'alert', style: card },
         h('strong', null, 'Meeting Copilot pane retired — actions disabled'),
@@ -1574,6 +1599,7 @@ export default {
           h('div', { style: { whiteSpace: 'pre-wrap', lineHeight: 1.65, paddingTop: 8 } }, liveEntry.answer || 'Contacting your sources…'),
           ...((liveEntry.warnings || []).map((w, i) => h('p', { key: `lw-${i}`, style: muted }, w)))),
         result && h('section', { className: 'mc-answer', style: card, 'aria-live': 'polite', ref: answerRef, 'data-answer-result': true },
+          h(Button, { variant: 'secondary', disabled: !notesCurrent() || !result.answer || noteItems.length >= 12 || noteItems.some(n => n.key === (result.request_id || result.answer)), onClick: pinAnswer }, 'Keep as note'),
           h(Button, { variant: 'secondary', disabled: !result.answer, onClick: async () => {
             if (!usable()) return;
             if (typeof window === 'undefined' || typeof window.confirm !== 'function' || !window.confirm('Copy this answer and its source excerpts (up to 2,050 characters per source)? The clipboard may include confidential project text or links. Review before sharing. No new model request is sent.')) return;
@@ -1592,6 +1618,29 @@ export default {
             ...(result.sources || []).map(evidenceItem))),
         !result && !liveEntry && !busy && h('section', { className: 'mc-empty', 'aria-label': 'Answer workspace' },
           h(PaneIcon, { name: 'sparkle' }), 'Answers & evidence appear here.'),
+        h('details', { style: card, 'aria-label': 'Meeting review notes', open: noteItems.length > 0 },
+          h('summary', { style: { cursor: 'pointer' } }, `Meeting notes · ${noteItems.length}/12`),
+          h('p', { style: muted }, 'Keep an answer → edit it → check Reviewed → copy. Notes are not saved; copy before closing or starting a new meeting.'),
+          h('details', null, h('summary', null, 'Privacy and review tips'), h('p', { style: muted }, 'Confirm owners and deadlines against evidence; leave unknowns unspecified. Notes stay only in this pane. Clear, New meeting, closing or reloading removes them. Copies you export remain outside Copilot.')),
+          !noteItems.length && h('p', { style: muted }, 'After an answer, choose Keep as note. Pinning and editing make no model request.'),
+          ...noteItems.map((note, i) => h('div', { key: note.key, style: { marginTop: 12 } },
+            h('label', null, `Note ${i + 1}`, h('textarea', { 'aria-label': `Review note ${i + 1}`, value: note.text, maxLength: 12000, rows: 5,
+              style: { width: '100%', boxSizing: 'border-box' },
+              onChange: e => updateNotes(items => items.map(n => n.key === note.key ? { ...n, text: e.target.value.slice(0, 12000), reviewed: false } : n)) })),
+            note.shortened && h('p', { style: muted }, 'Pinned answer shortened to 12,000 characters. Check the original before reviewing.'),
+            h('label', null, h('input', { type: 'checkbox', checked: note.reviewed,
+              onChange: e => updateNotes(items => items.map(n => n.key === note.key ? { ...n, reviewed: e.target.checked } : n)) }), ' Reviewed against evidence'),
+            h(Button, { variant: 'secondary', onClick: () => updateNotes(items => items.filter(n => n.key !== note.key)) }, `Remove note ${i + 1}`),
+            h('details', null, h('summary', null, 'Source evidence at pin time (up to 20,000 characters)'), h('pre', { style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' } }, note.evidence)))),
+          h(Button, { variant: 'secondary', disabled: !notesCurrent() || !noteItems.length || noteItems.some(n => !n.reviewed || !n.text.trim()), onClick: async () => {
+            if (!notesCurrent() || !noteItems.length || noteItems.some(n => !n.reviewed || !n.text.trim())) return;
+            if (typeof window === 'undefined' || typeof window.confirm !== 'function' || !window.confirm('Copy these reviewed notes? They may contain confidential meeting information. Clipboard history and sync may retain them. Source excerpts and transcript are not included. Nothing is sent automatically.')) return;
+            if (!notesCurrent()) return;
+            const output = ['MEETING COPILOT — REVIEWED NOTES', 'User-reviewed notes from selected AI suggestions; not a complete transcript or independent verification.',
+              ...noteItems.map((n, i) => `\n${i + 1}. ${n.text}`)].join('\n');
+            try { await writeClipboard(output); if (usable()) notify('info', 'Reviewed notes copied. Choose where to save or share them.'); }
+            catch (_) { if (usable()) setError('Clipboard unavailable. Select and copy the notes manually.'); }
+          } }, 'Copy reviewed notes')),
         h('details', { className: 'mc-transcript', open: showTranscript, onToggle: e => setShowTranscript(e.currentTarget.open) },
           h('summary', { style: { cursor: 'pointer', ...muted } }, `Live transcript · ${transcript.length} segments`),
           h('div', { style: { maxHeight: 280, overflowY: 'auto', marginTop: 8, display: 'flex', flexDirection: 'column', gap: 4 } },
