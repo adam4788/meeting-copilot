@@ -140,3 +140,41 @@ card color, to keep status and Pause legible while scrolling.
 
 Publication of this source does not itself update the runtime branch or catalog.
 Use only an independently validated public runtime pin for catalog installation.
+
+## Focused response overlay (unpublished development)
+
+The macOS read-only overlay mirrors one latest explicitly admitted pane answer.
+It distinguishes queued, preparing, streaming, cancelled, interrupted and ready
+for review, without making another model request. A new request replaces the old
+card; streaming text updates in place. Recent questions/transcript are collapsed.
+There is no overlay Ask or clipboard action; evidence review and copying remain
+in the pane. Recording visibility remains best effort, with the controls pinned.
+
+Only bounded answer/question text, warning strings and source titles are sent to
+the helper, not request inputs, transcript snapshots, source excerpts, credentials
+or raw errors. Meeting generations and monotonic admission revisions prevent
+cleared or pre-scope/pre-authorization answers from reappearing. Show the overlay before asking. An answer must be
+requested again after an overlay scope/authorization retirement; no automatic
+retry is performed. The screenshot above remains the older historical layout.
+
+Synthetic tests cover latest-request replacement, partial streaming cancellation
+and interruption, clear/new-meeting boundaries, stale polls, retirement and late
+completion, field allowlisting, and multibyte snapshot bounds. Native compilation
+and visual acceptance must be recorded separately from Linux/source assertions.
+
+Local Linux verification on the final source: 1,045 Python tests completed
+successfully (28 platform/optional-host skips) in an isolated requirements-dev
+Python 3.12 environment; 331 Desktop tests passed, four catalog-export checks
+passed, JavaScript syntax and `git diff --check` passed. Independent review
+found no remaining blocker after retirement, partial-state and scroll fixes.
+These are synthetic checks, not live provider or audio validation.
+
+The exact Swift source was transferred to an isolated directory on the connected
+Mac and compiled with Apple Swift 6.4.2 for arm64 macOS 27.2. `--self-test`
+passed; `--protocol-version` returned `meeting-overlay/2`. The hidden-panel
+presentation diagnostic passed main-thread, default click-through and default
+recording-off checks, then stopped with `no_screen`. Native visual acceptance,
+placement/drag interaction and full presentation diagnostics remain unverified.
+The compiler emitted only a nonblocking `onChange(of:perform:)` deprecation
+warning. No capture, provider call, installation or existing-worktree change
+was performed by that verification.

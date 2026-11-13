@@ -39,8 +39,10 @@ it. Nothing is spoken, posted, or submitted for you.
 *Native macOS 27 view rendered with synthetic content at source `32680e03`.
 Not a live meeting or proof of recorder exclusion. [Asset provenance](docs/assets/README.md).*
 
-The overlay is a read-only companion. Ask questions and review evidence in the
-Desktop pane. Recording visibility is best effort: hide the overlay when it must
+The overlay is a read-only companion: one latest requested answer, with recent
+context tucked away. Ask questions and review evidence in the Desktop pane.
+Show the overlay, then ask in the pane. No extra model request is made by the
+overlay. Recording visibility is best effort: hide the overlay when it must
 not appear in a recording.
 
 ### Try it before connecting anything

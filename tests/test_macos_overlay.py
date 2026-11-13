@@ -101,9 +101,17 @@ class OverlayProtocolTests(unittest.TestCase):
         self.assertIn('Toggle("Show in recordings"', pinned)
         self.assertIn('Exclusion is best effort', pinned)
         self.assertNotIn('Toggle("Show in recordings"', content)
-        self.assertLess(content.index('ForEach(model.state.questions)'),
+        self.assertLess(content.index('ForEach(model.state.questions.reversed())'),
                         content.index('ForEach(model.state.transcript)'),
                         'detected questions must not be pushed below the transcript')
+
+    def test_focus_response_precedes_collapsed_context(self):
+        source = SOURCE.read_text(encoding='utf-8')
+        self.assertLess(source.index('responseCard(response)'), source.index('DisclosureGroup("Recent context")'))
+        for label in ('Latest requested answer', 'Incomplete response', 'Ready to review', 'Cancelled',
+                      'AI suggestion · verify in the pane'):
+            self.assertIn(label, source)
+        self.assertNotIn('NSPasteboard.general', source)
 
     def test_overlay_never_initiates_answer_from_a_row(self):
         source = SOURCE.read_text(encoding='utf-8')
