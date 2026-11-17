@@ -7,6 +7,8 @@ import argparse
 import contextlib
 import json
 import math
+import io
+import os
 from pathlib import Path
 import sys
 import threading
@@ -27,17 +29,77 @@ def emit(value):
         _OUTPUT.flush()
 
 
+def control_reader(stream):
+    """Return a nonblocking, bounded raw-pipe reader (None means no data).
+
+    Never hold a buffered stdin lock while waiting: on Windows that can stall
+    native imports and cause a fatal lock error at interpreter shutdown. This
+    pipe has exactly one reader. No commands other than stop are interpreted.
+    """
+    if isinstance(stream, io.BytesIO):  # finite synthetic fixtures only
+        return lambda size: stream.read(size)
+    fd = stream.fileno()
+    if sys.platform == 'win32':
+        import ctypes
+        from ctypes import wintypes
+        import msvcrt
+        handle = wintypes.HANDLE(msvcrt.get_osfhandle(fd))
+        peek = ctypes.WinDLL('kernel32', use_last_error=True).PeekNamedPipe
+        peek.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+                         ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+                         ctypes.POINTER(wintypes.DWORD)]
+        peek.restype = wintypes.BOOL
+
+        def read(size):
+            available = wintypes.DWORD()
+            if not peek(handle, None, 0, None, ctypes.byref(available), None):
+                raise OSError(ctypes.get_last_error(), 'control pipe unavailable')
+            if not available.value:
+                return None
+            return os.read(fd, min(size, available.value))
+        return read
+    # For synthetic subprocess tests on POSIX. Windows pipes do not support
+    # select(), hence the native readiness probe above.
+    import select
+    return lambda size: os.read(fd, size) if select.select([fd], [], [], 0)[0] else None
+
+
 def read_control(stream, stop):
-    """A closed/malformed control pipe also stops capture, fail closed."""
+    """Closed, oversized or malformed control data stops capture, fail closed."""
     try:
-        line = stream.readline(65)
-        # No paths, keys, providers, expressions or capture-start commands.
-        if len(line) > 64 or not line.endswith(b'\n') or json.loads(line) != {'action': 'stop'}:
-            return
+        read = control_reader(stream)
+        line = bytearray()
+        while not stop.is_set():
+            chunk = read(65 - len(line))
+            if chunk is None:
+                stop.wait(.02)
+                continue
+            if not chunk:
+                return
+            line.extend(chunk)
+            if len(line) > 64 or b'\n' in line:
+                # No paths, keys, providers, expressions or start commands.
+                # Invalid input has exactly the same safe stop outcome.
+                return
     except Exception:
         pass
     finally:
         stop.set()
+
+
+@contextlib.contextmanager
+def control_scope(control, stop):
+    reader = None
+    if control is not None:
+        reader = threading.Thread(target=read_control, args=(control, stop),
+                                  name='windows-audio-control')
+        reader.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        if reader is not None:
+            reader.join(timeout=1)
 
 
 @contextlib.contextmanager
@@ -88,8 +150,12 @@ def run(source, model_name, directory=None, *, control=None, stop=None, probe=No
     if source not in SOURCES or model_name not in MODELS:
         raise ValueError('unsupported capture option')
     stop = stop or threading.Event()
-    if control is not None:
-        threading.Thread(target=read_control, args=(control, stop), daemon=True, name='windows-audio-control').start()
+    with control_scope(control, stop):
+        return run_capture(source, model_name, directory, stop=stop, probe=probe,
+                           model_loader=model_loader, capture_factory=capture_factory)
+
+
+def run_capture(source, model_name, directory, *, stop, probe, model_loader, capture_factory):
     if stop.is_set():
         return 0
     emit({'type': 'status', 'state': 'loading'})

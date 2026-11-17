@@ -90,6 +90,61 @@ class WindowsIsolationTests(unittest.TestCase):
             worker.read_control(io.BytesIO(value), stop)
             self.assertTrue(stop.is_set())
 
+    def test_control_partial_line_and_idle_shutdown(self):
+        read_fd, write_fd = os.pipe()
+        stop = threading.Event()
+        with os.fdopen(read_fd, 'rb', buffering=0) as stream:
+            try:
+                with worker.control_scope(stream, stop):
+                    os.write(write_fd, b'{"action":')
+                    self.assertFalse(stop.wait(.1))
+                    os.write(write_fd, b'"stop"}\n')
+                    self.assertTrue(stop.wait(1))
+            finally:
+                os.close(write_fd)
+        self.assertFalse(any(t.name == 'windows-audio-control' for t in threading.enumerate()))
+
+    def test_control_eof_malformed_and_oversized(self):
+        for data in (b'', b'bad\n', b'x' * 65, b'{"action":"start"}\n'):
+            read_fd, write_fd = os.pipe()
+            stop = threading.Event()
+            with os.fdopen(read_fd, 'rb', buffering=0) as stream:
+                try:
+                    with worker.control_scope(stream, stop):
+                        if data:
+                            os.write(write_fd, data)
+                        else:
+                            os.close(write_fd)
+                            write_fd = None
+                        self.assertTrue(stop.wait(1))
+                finally:
+                    if write_fd is not None:
+                        os.close(write_fd)
+
+    def test_idle_control_allows_native_import_and_clean_process_exit(self):
+        # Keep stdin OPEN and empty throughout startup/exit. The old buffered
+        # reader stalled NumPy loading on Windows and could abort at shutdown.
+        script = """
+import sys, threading
+import windows_audio_worker as worker
+with worker.control_scope(sys.stdin.buffer, threading.Event()):
+    import numpy
+print('native-import-and-clean-exit', flush=True)
+"""
+        child = subprocess.Popen([sys.executable, '-c', script], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            child.wait(timeout=15)
+            self.assertEqual(child.returncode, 0, child.stderr.read().decode())
+            self.assertEqual(child.stdout.read().strip(), b'native-import-and-clean-exit')
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+            child.stdin.close()
+            child.stdout.close()
+            child.stderr.close()
+
     def test_invalid_probe_never_loads_model_or_starts_audio(self):
         events = []
         with patch.object(worker, 'emit', events.append):
