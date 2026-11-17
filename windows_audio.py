@@ -4,6 +4,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 try:
     from .macos_audio import MacOSAudioCapture
@@ -66,8 +67,23 @@ class WindowsAudioCapture(MacOSAudioCapture):
             raise ValueError('Windows capture supports prepared local transcription only.')
         super().__init__(model_size, source, language, provider, asr_mode)
         self._control_sent = False
+        self._startup_trace = []
+        self._startup_origin = time.monotonic()
+
+    def status(self):
+        result = super().status()
+        with self._lock:
+            result['startup_trace'] = [dict(item) for item in getattr(self, '_startup_trace', [])]
+        return result
 
     def _notify(self, state, code=None):
+        # Bounded lifecycle metadata only: no paths, endpoint IDs, PCM or text.
+        if state in ('loading', 'starting', 'running', 'stopped', 'error'):
+            with self._lock:
+                if not self._startup_trace or self._startup_trace[-1]['state'] != state:
+                    self._startup_trace.append({'state': state, 'elapsed_ms':
+                        max(0, round((time.monotonic() - self._startup_origin) * 1000))})
+                    self._startup_trace = self._startup_trace[-16:]
         if code == 'runtime':
             code = 'windows_runtime'
         elif code == 'capture':
@@ -83,7 +99,10 @@ class WindowsAudioCapture(MacOSAudioCapture):
         return None
 
     def _worker_environment(self):
-        return worker_environment()
+        environment = worker_environment()
+        self._startup_origin = time.monotonic()
+        self._startup_trace = [{'state': 'starting', 'elapsed_ms': 0}]
+        return environment
 
     def _worker_command(self, root, artifacts):
         self._control_sent = False

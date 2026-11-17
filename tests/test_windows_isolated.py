@@ -68,6 +68,22 @@ class WindowsIsolationTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             capture._worker_stdin(b'secret')
 
+    def test_startup_trace_is_bounded_metadata_and_copy_safe(self):
+        capture = windows_audio.WindowsAudioCapture()
+        capture._on_status = lambda value: None
+        for _ in range(20):
+            capture._notify('loading')
+            capture._notify('starting')
+        trace = capture.status()['startup_trace']
+        self.assertEqual(len(trace), 16)
+        self.assertTrue(all(set(row) == {'state', 'elapsed_ms'} for row in trace))
+        self.assertTrue(all(row['elapsed_ms'] >= 0 for row in trace))
+        trace[0]['state'] = 'changed'
+        self.assertNotEqual(capture.status()['startup_trace'][0]['state'], 'changed')
+        with patch.object(windows_audio, 'worker_environment', return_value={}):
+            capture._worker_environment()
+        self.assertEqual(capture.status()['startup_trace'], [{'state': 'starting', 'elapsed_ms': 0}])
+
     def test_control_only_stops_and_eof_is_fail_closed(self):
         for value in (b'{"action":"stop"}\n', b'', b'{"action":"start"}\n', b'x' * 100):
             stop = threading.Event()
@@ -81,6 +97,33 @@ class WindowsIsolationTests(unittest.TestCase):
                                 model_loader=lambda name: self.fail('must not load'))
         self.assertEqual(result, 1)
         self.assertEqual(events[-1], {'type': 'error', 'code': 'capture'})
+
+    def test_stop_while_model_loads_never_opens_audio(self):
+        # Reproduces a bounded test ending during cold model startup.
+        stop, loading, release = threading.Event(), threading.Event(), threading.Event()
+        events, result = [], []
+        def model_loader(name):
+            loading.set()
+            self.assertTrue(release.wait(2))
+            return object()
+        probe = lambda source: {'version': 1, 'ready': True, 'capture_started': False,
+                                'source': source, 'endpoints': {'microphone': {'id': 'exact-mic', 'ready': True}}}
+        def run():
+            result.append(worker.run('microphone', 'base.en', stop=stop, probe=probe,
+                                     model_loader=model_loader,
+                                     capture_factory=lambda **kw: self.fail('audio must remain closed')))
+        with patch.object(worker, 'emit', events.append):
+            thread = threading.Thread(target=run)
+            thread.start()
+            try:
+                self.assertTrue(loading.wait(1))
+                stop.set()
+            finally:
+                release.set()
+                thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, [0])
+        self.assertEqual(events, [{'type': 'status', 'state': 'loading'}])
 
     def test_bound_endpoints_and_final_loss_survive_worker(self):
         events, calls = [], []
@@ -105,6 +148,8 @@ class WindowsIsolationTests(unittest.TestCase):
             result = worker.run('microphone', 'base.en', stop=stop, probe=probe,
                                 model_loader=lambda name: object(), capture_factory=Capture)
         self.assertEqual(result, 0)
+        self.assertEqual(events[:2], [{'type': 'status', 'state': 'loading'},
+                                      {'type': 'status', 'state': 'starting'}])
         self.assertEqual(calls[0]['input_id'], 'exact-mic')
         self.assertIsNone(calls[0]['output_id'])
         self.assertEqual(events[-1]['worker_dropped_chunks'], 2)

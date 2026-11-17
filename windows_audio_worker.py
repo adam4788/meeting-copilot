@@ -161,6 +161,9 @@ def run(source, model_name, directory=None, *, control=None, stop=None, probe=No
         capture.set_recording_directory(directory)
         if stop.is_set():
             return 0
+        # Device startup is distinct from offline model loading. Do not claim
+        # running until each selected source has delivered valid frames.
+        emit({'type': 'status', 'state': 'starting'})
         capture.start(segment, status)
         while not stop.wait(.05):
             if capture.status().get('state') == 'error':
