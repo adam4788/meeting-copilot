@@ -61,10 +61,10 @@ check itself uses offline-only model loading and never downloads missing files.
 
 ### Windows
 
-Native Windows capture is now fail-closed: this version cannot safely verify all
-required Windows device and privacy access without capture. Installing libraries
+Native Windows capture is fail-closed: the selected WASAPI endpoints must initialize
+without starting streams in an isolated probe, and the local model must load offline. Installing libraries
 alone does not enable Start. Use an accessible active Meetily recording until a
-supported Windows readiness probe is available. This is a deliberate limitation,
+supported runtime and endpoint initialization are available. This is a deliberate limitation,
 not a successful native Windows verification.
 
 ## Follow the Hermes default
@@ -136,3 +136,9 @@ explicit testing.
 Hermes route attribution is host-reported metadata, not independent proof of the
 provider that served a fallback. The host may report its current configured main
 route. No private host routing internals are inspected.
+
+Windows initialization uses the audited SoundCard 0.4.6 shared-mode path. Microsoft
+separates [IAudioClient.Initialize](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudioclient-initialize)
+from [IAudioClient.Start](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudioclient-start).
+Only explicit capture calls Start. An initialization result is a short-lived
+observation, not a guarantee against device disconnects or later access denial.

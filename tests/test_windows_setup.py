@@ -44,7 +44,8 @@ class WindowsSetupTests(unittest.TestCase):
         self.assertIsNone(state.audio)
 
     def test_native_backend_passes_selected_model_and_source(self):
-        with patch.object(audio, 'AudioCapture') as factory:
+        import windows_audio
+        with patch.object(windows_audio, 'WindowsAudioCapture') as factory:
             server.MeetingState().get_audio('native', 'tiny.en', 'system')
         factory.assert_called_once_with(model_size='tiny.en', source='system')
 

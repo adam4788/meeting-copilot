@@ -151,7 +151,7 @@ class PreflightTests(unittest.TestCase):
     def test_invalid_model_preparation_does_not_run(self):
         with patch.object(preflight, '_json_command') as run:
             self.assertFalse(preflight.prepare_model('../untrusted')['prepared'])
-            with patch.object(preflight.sys, 'platform', 'win32'):
+            with patch.object(preflight.sys, 'platform', 'linux'):
                 self.assertFalse(preflight.prepare_model('base.en')['prepared'])
             run.assert_not_called()
 
@@ -220,3 +220,33 @@ class PreflightTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class WindowsInitializationGateTests(unittest.TestCase):
+    def test_initialized_endpoints_and_cached_model_are_both_required(self):
+        win = Mock()
+        win.worker_environment.return_value = {'HF_HUB_OFFLINE': '1'}
+        win.worker_python.return_value = '/prepared/python'
+        devices = {'version': 1, 'source': 'both', 'capture_started': False, 'ready': True,
+                   'endpoints': {'microphone': {'id': 'synthetic-mic', 'ready': True},
+                                 'system': {'id': 'synthetic-output', 'ready': True}}}
+        for missing_model in (False, True):
+            runtime = {'version': 1, 'dependencies': True, 'model': not missing_model}
+            with patch.object(preflight.sys, 'platform', 'win32'), \
+                 patch.object(preflight, '_module', return_value=win), \
+                 patch.object(preflight, '_json_command', side_effect=[devices, runtime]) as run:
+                result = preflight.check('native', None, 'base.en', 'both', 'local', 'ENDPOINTING')
+            self.assertEqual(result['ready'], not missing_model)
+            self.assertTrue(run.call_args_list[0].args[0][-3:] == ['windows_preflight.py', '--source', 'both']
+                            or run.call_args_list[0].args[0][-3].endswith('/windows_preflight.py'))
+
+    def test_missing_source_or_started_capture_report_is_rejected(self):
+        win = Mock()
+        win.worker_environment.return_value = {}
+        win.worker_python.return_value = '/prepared/python'
+        for started, endpoints in ((True, {'system': {'id': 'synthetic', 'ready': True}}),
+                                   (False, {}), (False, {'microphone': {'id': 'synthetic', 'ready': True}})):
+            probe = {'version': 1, 'source': 'system', 'capture_started': started,
+                     'ready': True, 'endpoints': endpoints}
+            with patch.object(preflight.sys, 'platform', 'win32'), patch.object(preflight, '_module', return_value=win), \
+                 patch.object(preflight, '_json_command', side_effect=[probe, {'dependencies': True, 'model': True}]):
+                self.assertFalse(preflight.check('native', None, 'base.en', 'system', 'local', 'ENDPOINTING')['ready'])

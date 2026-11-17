@@ -89,7 +89,7 @@ typed question.
 The Windows changes expose dependency readiness without importing audio libraries,
 opening devices, downloading models or testing recording permissions. Missing
 optional packages disable Windows Start in the pane, while answers remain usable.
-Metadata presence alone does not prove the native libraries or hardware work.
+Metadata presence alone does not prove the native libraries or hardware work. The separate preflight initializes the selected WASAPI endpoints in an isolated process without starting streams, then checks the prepared model offline.
 
 This revision declares NumPy, SoundCard and faster-whisper as Windows-only
 plugin dependencies. Hermes prepares them through its managed dependency resolver
@@ -99,8 +99,7 @@ capture. A running gateway
 keeps its original dependency environment until an idle restart. Finish active
 work before restarting and recheck readiness afterward. Do not patch the active
 managed environment with an arbitrary pip command. Dependency preparation can
-require a download; Whisper model weights are still fetched only at explicit
-warmup/Start. Review the actual dependency and scanner prompts.
+require a download; Whisper model weights require separate explicit preparation; Start never fetches them. Review the actual dependency and scanner prompts.
 
 When dependencies and recording permissions have been separately verified, choose
 **Settings → Plugins → Meeting Copilot → Transcript source → Capture source →
@@ -109,7 +108,7 @@ hosts). The Windows controls provide **Audio source** (Microphone, System audio,
 or both) and **Local transcription model** (tiny.en, base.en, small.en). Only the selected source is
 opened. The pane uses default Windows devices; system loopback includes all audio
 on the default output, which may differ from the device used by a meeting app.
-Whisper runs locally on the CPU; the first explicit Start may download weights.
+Whisper runs locally on the CPU using already-cached weights. From the supported runtime, explicitly run `python -B capture_preflight.py --prepare-model base.en` to prepare public weights before Start; preparation may download weights but never records audio.
 The selected answer provider remains separate from transcription.
 
 In the pane, confirm participant consent and a private test environment before
@@ -143,3 +142,60 @@ Keep installation/UI loading, synthetic capture/backend tests, live provider
 responses, and physical audio verification as separate results. Passing unit
 tests or doctor does not verify a loaded Desktop pane, live API account, audio
 permissions, native loopback, or sustained meeting reliability.
+
+## Source-only, non-recording diagnostics
+
+From a development checkout, with the **same interpreter used by the gateway**:
+
+```powershell
+& $GatewayPython -B scripts/windows_audio_diagnostics.py
+& $GatewayPython -B scripts/windows_audio_diagnostics.py --devices
+```
+
+Set `$GatewayPython` to the verified gateway interpreter, not a guessed system
+Python. The first command checks package metadata only. The optional second
+command imports SoundCard and lists endpoint names locally, but never opens a
+stream, downloads a model, changes permissions, or marks capture ready. Review
+names before sharing output. This helper is source-only, not a runtime dependency.
+
+Endpoint discovery is not a permission or recording test. Before unblocking
+native Windows capture, a developer must implement device/privacy preflight and
+run an explicitly consented short test outside real meetings: close unrelated
+audio applications, select the intended microphone/output, speak a synthetic
+phrase and play a known test clip, then stop. Verify both separate source WAVs,
+transcript alignment, manifest completeness, and that capture actually stops.
+Also test denied access, device removal, repeated Start/Stop, and a failed source
+without silently switching to another device. Do not relax the Start guard to
+perform this test. Do not modify Windows privacy settings automatically.
+
+Use the capture backend's supported shared-mode format handling. A separate
+PortAudio format probe can reject 16 kHz for a WASAPI device; that alone does not
+prove SoundCard (a different backend) will fail or succeed. Verify the actual
+backend rather than treating dependency presence or another library's format
+probe as end-to-end evidence.
+
+
+### Guarded isolated Windows capture
+
+The current source requires audited **SoundCard 0.4.6**, a supported Python gateway
+interpreter, initialized selected endpoints, and cached local model weights. The
+probe constructs a shared-mode WASAPI stream but never calls Start or reads PCM.
+Initialization can reject access, format or device errors; it is not a guarantee
+that the device remains available. Start repeats the probe and binds exact
+endpoint IDs. The selected default output can include other apps' audio.
+
+Live native capture runs in a separate fixed Python worker with a minimal OS/cache
+environment, implicit Hugging Face tokens disabled, and offline model loading.
+No gateway provider credentials are inherited. Running is not announced until
+all selected sources deliver frames. A private stop pipe initiates bounded
+shutdown; a stuck worker is terminated and incomplete output is flagged.
+
+An inaccessible packaged WindowsApps runtime must be resolved through Desktop's
+supported dependency/install flow. Do not change protected-directory permissions,
+disable isolation, substitute an unrelated source venv, or infer that packages
+present in a development checkout are available to the live gateway.
+
+These changes have synthetic tests; successful real Windows microphone/system
+capture and transcription remain unverified until the bounded consented test is
+completed in the actual supported runtime. Never call metadata-only probes a
+successful recording test.

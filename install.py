@@ -8,7 +8,7 @@ from pathlib import Path
 import shutil
 import sys
 
-FILES = ('host_default.py', 'runtime_loader.py', 'capture_preflight.py', 'transcript_snapshot.py', 'server.py', 'credentials.py', 'byok.py', 'knowledge.py', 'web_policy.py', 'audio.py', 'meetily.py',
+FILES = ('windows_preflight.py', 'windows_audio.py', 'windows_audio_worker.py', 'recording_session.py', 'recording_audio.py', 'host_default.py', 'runtime_loader.py', 'capture_preflight.py', 'transcript_snapshot.py', 'server.py', 'credentials.py', 'byok.py', 'knowledge.py', 'web_policy.py', 'audio.py', 'meetily.py',
          'macos_audio.py', 'audio_worker.py', 'native_runtime.py', 'model_selection.py', 'meta_models.py', 'meta_asr.py', 'google_asr.py', 'google_preview.py', 'google_fixture.py',
          'overlay_bridge.py', 'answer_core.py', 'hermes_adapters.py', 'ask.py', 'eval_retrieval.py',
          'demo_standalone.py',

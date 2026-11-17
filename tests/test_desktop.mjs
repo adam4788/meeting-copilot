@@ -4543,3 +4543,73 @@ test('review notes cap count and text, disclose truncation, and allow removal', 
   await button(tree, 'Remove note 1').props.onClick();
   assert.equal(nodes(ui.rerender()).filter(n => /^Review note \d+$/.test(n.props['aria-label'] || '')).length, 11);
 });
+
+function recordingControl(tree) {
+  return nodes(nodes(tree).find(n => n.props['data-save-recording'])).find(n => n.type === 'input');
+}
+function savedRecordingConsent(tree) {
+  return nodes(nodes(tree).find(n => n.type === 'label' && JSON.stringify(n.children).includes('I have permission to record and save'))).find(n => n.type === 'input');
+}
+function savedRecordingFixture(extra = {}, respond = {}) {
+  const state = { ...idleCaptureStatus(), ...extra };
+  state.capabilities = { ...idleCaptureStatus().capabilities, saved_recordings: 1, ...extra.capabilities };
+  const ui = pane('', true, false, '', { 3: true, 4: 'macos' }, respond, state);
+  return { ui, state };
+}
+test('saved recording requires fresh durable-storage consent and posts one new meeting', async () => {
+  const { ui } = savedRecordingFixture();
+  assert.equal(recordingControl(ui.tree).props.checked, false);
+  recordingControl(ui.tree).props.onChange({ target: { checked: true } });
+  let tree = ui.rerender();
+  assert.equal(savedRecordingConsent(tree).props.checked, false);
+  assert.equal(button(tree, 'Record').props.disabled, true);
+  assert.match(JSON.stringify(tree), /remain after Clear meeting/);
+  savedRecordingConsent(tree).props.onChange({ target: { checked: true } });
+  tree = ui.rerender();
+  assert.equal(button(tree, 'Record').props.disabled, false);
+  await button(tree, 'Record').props.onClick();
+  const starts = ui.requests.filter(r => r.path === '/start');
+  assert.equal(starts.length, 1);
+  assert.equal(starts[0].body.save_recording, true);
+  assert.equal(starts[0].body.new_meeting, true);
+});
+test('saved recording capability loss and stale checkbox cannot admit start', async () => {
+  const { ui, state } = savedRecordingFixture();
+  const toggle = recordingControl(ui.tree);
+  toggle.props.onChange({ target: { checked: true } });
+  let tree = ui.rerender();
+  savedRecordingConsent(tree).props.onChange({ target: { checked: true } });
+  tree = ui.rerender();
+  const record = button(tree, 'Record');
+  state.capabilities.saved_recordings = 0;
+  await record.props.onClick();
+  assert.equal(ui.requests.filter(r => r.path === '/start').length, 0);
+  toggle.props.onChange({ target: { checked: false } });
+  assert.equal(button(ui.rerender(), 'Record').props.disabled, true);
+});
+test('saved recording toggle revokes an old consent even when switched back', async () => {
+  const { ui } = savedRecordingFixture();
+  const staleStart = button(ui.tree, 'Start listening');
+  recordingControl(ui.tree).props.onChange({ target: { checked: true } });
+  recordingControl(ui.rerender()).props.onChange({ target: { checked: false } });
+  await staleStart.props.onClick();
+  assert.equal(ui.requests.filter(r => r.path === '/start').length, 0);
+  assert.equal(permissionControl(ui.rerender()).props.checked, false);
+});
+test('saved recording active stop saves while uncertain stop remains visibly uncertain', () => {
+  const { ui, state } = savedRecordingFixture({ listening: true, backend: 'macos', saved_recording: { state: 'recording', directory: '/synthetic/meeting-1' } });
+  assert.ok(button(ui.tree, 'Stop & save'));
+  assert.equal(recordingControl(ui.tree).props.disabled, true);
+  state.stopping = true;
+  assert.ok(button(ui.rerender(), 'Retry stop'));
+  assert.match(JSON.stringify(ui.rerender()), /audio may still be active/);
+  state.listening = false; state.stopping = false;
+  state.saved_recording = { state: 'saved', directory: '/synthetic/meeting-1' };
+  assert.match(JSON.stringify(ui.rerender()), /Local audio and transcript folder/);
+});
+test('Meetily stays attach-only and never offers the native record mode', () => {
+  // Independently mount the legacy bridge to ensure no misleading Record affordance.
+  const bridge = pane('', true, false, '', { 3: true, 4: 'meetily', 5: 'synthetic-id' }, {}, { capabilities: { ...idleCaptureStatus().capabilities, saved_recordings: 1 } });
+  assert.equal(recordingControl(bridge.tree), undefined);
+  assert.equal(button(bridge.tree, 'Record'), undefined);
+});

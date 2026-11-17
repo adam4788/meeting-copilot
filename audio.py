@@ -22,7 +22,7 @@ def windows_readiness():
         return {'ready': False, 'detail': 'Windows capture needs optional audio dependencies in the gateway interpreter: '
                 + ', '.join(missing) + '. See the Windows setup guide. Capture remains unavailable.'}
     return {'ready': True, 'detail': 'Experimental Windows capture: dependencies found; hardware unverified. '
-            'Complete device/privacy preflight is unavailable, so native Start remains blocked; use an active Meetily recording. System capture would include all audio on the default output.'}
+            'Start requires isolated WASAPI initialization and cached-model checks. System capture includes all audio on the default output.'}
 
 
 class AudioCapture:
@@ -50,8 +50,21 @@ class AudioCapture:
         self._stop = threading.Event()
         self._queue = queue.Queue(maxsize=queue_size)
         self._dropped = 0
+        self._sub_second_dropped = 0
+        self.require_first_frames = False
+        self._ready_sources = set()
+        self._recording_directory = None
+        self._archive = None
         self._on_segment = lambda segment: None
         self._on_status = lambda status: None
+
+    def set_recording_directory(self, directory):
+        from importlib import import_module
+        archive = import_module('.recording_audio', __package__) if __package__ else import_module('recording_audio')
+        with self._lock:
+            if any(t.is_alive() for t in self._threads):
+                raise RuntimeError('Stop capture before changing recording storage.')
+            self._recording_directory = archive.recording_directory(directory)
 
     def _audio_backend(self):
         if self._backend is None:
@@ -85,8 +98,10 @@ class AudioCapture:
                     'callback_error': self._callback_error,
                     'error': self._error, 'queued': self._queue.qsize(), 'dropped': self._dropped,
                     'worker_dropped_chunks': self._dropped,
-                    'warning': (f'Transcription queue dropped {self._dropped} chunk(s). Some words may be missing.'
-                                if self._dropped else None)}
+                    'sub_second_dropped_chunks': self._sub_second_dropped,
+                    'warning': ((f'Transcription dropped {self._dropped} chunk(s) and {self._sub_second_dropped} short tail(s). Some words may be missing.'
+                                 + (' Review the saved audio before reprocessing.' if self._archive is not None else ''))
+                                if self._dropped or self._sub_second_dropped else None)}
 
     def _publish_status(self):
         try:
@@ -109,17 +124,26 @@ class AudioCapture:
         with self._lock:
             if any(t.is_alive() for t in self._threads):
                 raise RuntimeError('AudioCapture is already active or still stopping')
+            if self._recording_directory is not None:
+                from importlib import import_module
+                archive = import_module('.recording_audio', __package__) if __package__ else import_module('recording_audio')
+                self._archive = archive.AudioArchive(self._recording_directory)
+            else:
+                self._archive = None
             self._on_segment = on_segment
             self._on_status = on_status or (lambda status: None)
             self._stop.clear()
             self._state, self._error = 'starting', None
+            self._ready_sources.clear()
             self._callback_error, self._dropped = None, 0
-            self._discard_pending()
+            self._sub_second_dropped = 0
+            self._discard_pending(account=False)
             worker = threading.Thread(target=self._run, name='meeting-transcription', daemon=True)
             self._threads = [worker]
             worker.start()
 
     def _run(self):
+        inflight = False
         try:
             self.warmup()
             if self._stop.is_set():
@@ -147,40 +171,62 @@ class AudioCapture:
                         return
                     self._threads.append(thread)
                     thread.start()
+            if self.require_first_frames:
+                deadline = time.monotonic() + 10.0
+                expected = {speaker for speaker, _ in sources}
+                while not self._stop.is_set():
+                    with self._lock:
+                        ready = expected <= self._ready_sources
+                    if ready:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError('Selected audio sources did not deliver frames.')
+                    self._stop.wait(.02)
+                if self._stop.is_set():
+                    return
             self._notify('running')
             while not self._stop.is_set():
                 try:
                     speaker, samples, timestamp = self._queue.get(timeout=.1)
                 except queue.Empty:
                     continue
+                inflight = True
                 segments, _ = self._model.transcribe(samples, language='en', beam_size=1,
                                                      vad_filter=True, condition_on_previous_text=False)
                 text = ' '.join(s.text.strip() for s in segments).strip()
                 if text and not self._stop.is_set():
                     self._on_segment({'speaker': speaker, 'text': text, 'timestamp': timestamp})
+                elif text:
+                    self._recording_loss()
+                inflight = False
         except Exception as exc:
             self._stop.set()
             self._notify('error', f'{type(exc).__name__}: {exc}')
         finally:
+            if inflight:
+                self._recording_loss()
             self._discard_pending()
 
     def _enqueue(self, item):
         report_loss = False
         with self._lock:
-            if self._stop.is_set():
-                return
-            if self._queue.full():
-                try:
-                    self._queue.get_nowait()
-                    self._dropped += 1
-                    report_loss = self._dropped == 1 or self._dropped % 4 == 0
-                except queue.Empty:
-                    pass
-            self._queue.put_nowait(item)
-        if report_loss:
+            rejected = self._stop.is_set()
+            if not rejected:
+                if self._queue.full():
+                    try:
+                        self._queue.get_nowait()
+                        self._dropped += 1
+                        report_loss = self._dropped == 1 or self._dropped % 4 == 0
+                    except queue.Empty:
+                        pass
+                self._queue.put_nowait(item)
+        if rejected:
+            self._recording_loss()
+        elif report_loss:
             self._publish_status()
 
     def _capture(self, speaker, device):
+        count = 0
         try:
             import numpy as np
             if self._stop.is_set():
@@ -191,6 +237,14 @@ class AudioCapture:
                 while not self._stop.is_set():
                     block = recorder.record(numframes=1600)
                     mono = np.asarray(block, dtype=np.float32).mean(axis=1)
+                    if mono.size == 0:
+                        continue
+                    if not np.isfinite(mono).all():
+                        raise ValueError('Audio source returned invalid samples.')
+                    if self._archive is not None:
+                        self._archive.write(speaker, mono, time.time())
+                    with self._lock:
+                        self._ready_sources.add(speaker)
                     parts.append(mono)
                     count += len(mono)
                     if count >= int(self.chunk_seconds * 16000):
@@ -199,11 +253,28 @@ class AudioCapture:
         except Exception as exc:
             self._stop.set()
             self._notify('error', f'{speaker}: {type(exc).__name__}: {exc}')
+        finally:
+            if count:
+                self._recording_loss(short_tail=count < 16000)
 
-    def _discard_pending(self):
+    def _recording_loss(self, *, short_tail=False):
+        # Live-only legacy mode remains unchanged. Durable recordings must not
+        # be labeled transcript-complete when stop discards captured speech.
+        if self._archive is None:
+            return
+        with self._lock:
+            if short_tail:
+                self._sub_second_dropped += 1
+            else:
+                self._dropped += 1
+        self._publish_status()
+
+    def _discard_pending(self, *, account=True):
         while True:
             try:
                 self._queue.get_nowait()
+                if account:
+                    self._recording_loss()
             except queue.Empty:
                 break
 
@@ -217,5 +288,10 @@ class AudioCapture:
             if thread is not threading.current_thread():
                 thread.join(timeout=max(0, deadline - time.monotonic()))
         self._discard_pending()
+        if not self.status()['running'] and self._archive is not None:
+            try:
+                self._archive.close()
+            except Exception:
+                self._notify('error', 'Audio recording finalization failed; partial files may remain.')
         if self._state != 'error':
             self._notify('stopping' if self.status()['running'] else 'stopped')

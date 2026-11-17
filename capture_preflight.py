@@ -2,7 +2,8 @@
 
 check() is read-only and never requests permission.
 
-The check subprocess only loads installed libraries and local model weights.
+The check subprocess only loads installed libraries/local model weights and, on
+Windows, initializes selected WASAPI streams without starting or reading audio.
 Explicit --prepare-model can download public weights; explicit permission setup
 can prompt. Neither action records audio or installs dependencies.
 """
@@ -110,20 +111,32 @@ def _prepare_model_worker(model):
 
 
 def prepare_model(model):
-    """Explicit macOS CLI recovery; no server route calls this function.
+    """Explicit CLI recovery; no server route calls this function.
 
     Uses the installed version's prepared interpreter, including legacy layouts.
     It can download public model weights into the normal Hugging Face cache.
     """
-    if model not in MODELS or sys.platform != 'darwin':
+    if model not in MODELS or sys.platform not in ('darwin', 'win32'):
         return {'version': 1, 'prepared': False,
-                'detail': 'Model preparation requires macOS and tiny.en, base.en or small.en.'}
+                'detail': 'Model preparation requires a supported Windows/macOS Python runtime and tiny.en, base.en or small.en.'}
     try:
         root = Path(__file__).resolve().parent
         mac = _module('macos_audio')
-        artifacts = _module('native_runtime').artifact_dir(root)
-        python = mac.worker_python(root, artifacts)
-        env = mac.worker_env('local')
+        if sys.platform == 'win32':
+            windows = _module('windows_audio')
+            python = windows.worker_python(root)
+            env = windows.worker_environment()
+            # Only this explicit preparation action may fetch public weights.
+            # Retain user-requested offline settings rather than force online.
+            for key in ('HF_HUB_OFFLINE', 'TRANSFORMERS_OFFLINE'):
+                if key in os.environ:
+                    env[key] = os.environ[key]
+                else:
+                    env.pop(key, None)
+        else:
+            artifacts = _module('native_runtime').artifact_dir(root)
+            python = mac.worker_python(root, artifacts)
+            env = mac.worker_env('local')
         env.update(HF_HUB_DISABLE_IMPLICIT_TOKEN='1', HF_HUB_DISABLE_TELEMETRY='1',
                    PYTHONDONTWRITEBYTECODE='1')
         # This separate explicit command may access the network; check() never
@@ -205,7 +218,8 @@ def check(backend, recording_id, transcription_model, audio_source,
     if not platform_ok:
         return finish()
     mac = _module('macos_audio')
-    env = mac.worker_env(transcription_provider)
+    env = (_module('windows_audio').worker_environment() if backend == 'native'
+           else mac.worker_env(transcription_provider))
     env.update(HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1', HF_HUB_DISABLE_IMPLICIT_TOKEN='1',
                HF_HUB_DISABLE_TELEMETRY='1', PYTHONDONTWRITEBYTECODE='1')
     root = Path(__file__).resolve().parent
@@ -246,8 +260,27 @@ def check(backend, recording_id, transcription_model, audio_source,
                 'Native runtime or permission check is unavailable. Prepare or rebuild the current macOS audio helper, then check again.', unknown=True)
             return finish()
     else:
-        add('windows_access', 'Windows audio access', False,
-            'Windows device and privacy readiness cannot yet be verified without capture. Check microphone privacy and default audio devices in Windows Settings; use an active Meetily recording until a supported readiness probe is available.', unknown=True)
+        try:
+            python = _module('windows_audio').worker_python(root)
+            probe = _json_command([python, '-B', str(root / 'windows_preflight.py'),
+                                   '--source', audio_source], env, timeout=10)
+            expected = {'microphone', 'system'} if audio_source == 'both' else {audio_source}
+            endpoints = probe.get('endpoints')
+            valid_probe = (probe.get('source') == audio_source and probe.get('capture_started') is False
+                           and probe.get('ready') is True and isinstance(endpoints, dict)
+                           and set(endpoints) == expected and all(isinstance(row, dict)
+                               and row.get('ready') is True and isinstance(row.get('id'), str) and row['id']
+                               for row in endpoints.values()))
+            add('windows_access', 'Windows audio initialization', valid_probe,
+                ('Selected Windows endpoints initialize in shared mode without starting or reading audio. '
+                 'Start rechecks them; permissions or devices may still change. System audio includes other apps on the selected output.')
+                if valid_probe else
+                'Windows endpoint initialization was not confirmed. Check default devices, microphone privacy, and Desktop-managed SoundCard 0.4.6; unknown or denied access blocks Start.',
+                unknown=not valid_probe)
+        except Exception:
+            add('windows_access', 'Windows audio initialization', False,
+                'The isolated Windows runtime or endpoint initialization is unavailable. Use the supported Desktop dependency resolver; do not change WindowsApps permissions or disable isolation.', unknown=True)
+            return finish()
     try:
         args = [python, '-B', str(root / 'capture_preflight.py'), '--runtime-probe', transcription_model, transcription_provider]
         if backend == 'native':
@@ -260,7 +293,7 @@ def check(backend, recording_id, transcription_model, audio_source,
             add('model_cache', 'Cached local transcription model', probe.get('model') is True,
                 'Selected Whisper weights load from the local cache.' if probe.get('model') is True else
                 (f'From the installed plugin runtime root, run python -B capture_preflight.py --prepare-model {transcription_model}, then reopen the pane and run Recheck required settings. Preparation may download public weights; this check never downloads them.' if backend == 'macos' else
-                 'Prepare the selected Whisper cache in the Windows gateway interpreter using the Windows setup guide. Native Windows access checks remain unsupported; use an active Meetily recording.'))
+                 'Prepare the selected Whisper cache in the Windows gateway interpreter using the Windows setup guide. A missing local model blocks Start; no automatic download occurs.'))
     except Exception:
         add('runtime', 'Audio runtime and model cache', False,
             'Audio runtime check failed or timed out. Prepare the runtime and selected local model, then check again.', unknown=True)

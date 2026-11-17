@@ -942,7 +942,10 @@ export default {
           const current = settingsAvailable ? effectiveCapture(preferences.get(), caps)
             : { ...captureInput.current.source, backend: captureInput.current.explicitBackend || defaultBackend(caps) };
           return !!(freshPreflight() && captureStatusIdle(latest) && !latest?.data?.overlay_cleanup_error && !actionLife.credentialShutdownUnconfirmed &&
-            consentPrefs.current && captureKey(current) === captureKey(renderedCapture) && captureInput.current.recording === recording &&
+            consentPrefs.current && (consentPrefs.current.saveRecording === true) === saveRecording &&
+            (captureInput.current.saveRecording === true && backend !== 'meetily') === saveRecording &&
+            (!saveRecording || (caps.saved_recordings === 1 && backend !== 'meetily')) &&
+            captureKey(current) === captureKey(renderedCapture) && captureInput.current.recording === recording &&
             captureRevision === renderedCaptureRevision && consentPrefs.current.revision === captureRevision && consentPrefs.current.key === captureKey(current) &&
             sourceVersion.current.revision === renderedSourceRevision && consentPrefs.current.sourceRevision === renderedSourceRevision &&
             !!backend && (backend !== 'meetily' || recording) && (backend !== 'macos' || (caps.macos_transcription && (transcriptionProvider !== 'meta' || caps.meta_asr) && (transcriptionProvider !== 'google' || (caps.google_asr && asrMode === 'ENDPOINTING')))) &&
@@ -960,10 +963,11 @@ export default {
             ? last.recording_id !== (recording || null)
             : last.transcription_model !== transcriptionModel || last.audio_source !== audioSource
               || (backend === 'macos' && ((last.transcription_provider || 'local') !== transcriptionProvider || (last.asr_mode || 'ENDPOINTING') !== asrMode))));
-        const message = newMeeting
+        const freshRecording = saveRecording;
+        const message = (newMeeting || freshRecording)
           ? 'Start a fresh meeting? The earlier transcript, answers, and retry data are cleared.'
           : 'These settings differ from the previous session, so starting begins a fresh meeting and clears the earlier transcript, answers, and retry data. Continue?';
-        if ((newMeeting || (retained && sourceChanged)) && typeof window !== 'undefined' && window.confirm && !window.confirm(message)) return false;
+        if ((newMeeting || (retained && (sourceChanged || freshRecording))) && typeof window !== 'undefined' && window.confirm && !window.confirm(message)) return false;
         if (!canStartCurrent()) return false;
         const life = overlayActionAt.current;
         const permission = consentPrefs.current, inputRevision = captureInput.current.revision, action = life.action;
@@ -978,10 +982,11 @@ export default {
           }
           posted = true;
           const ok = await act('/start', { pane, action: ++life.action, consent: true, backend, recording_id: recording || null,
-            transcription_model: transcriptionModel, audio_source: audioSource, new_meeting: newMeeting,
+            transcription_model: transcriptionModel, audio_source: audioSource, new_meeting: newMeeting || freshRecording,
+            ...(saveRecording ? { save_recording: true } : {}),
             transcription_provider: backend === 'native' ? 'local' : transcriptionProvider,
             asr_mode: backend === 'native' ? 'ENDPOINTING' : asrMode });
-          if (life.mounted && ok && (newMeeting || sourceChanged)) { resetMeetingInputs(); retireLocalOverlay(); }
+          if (life.mounted && ok && (newMeeting || sourceChanged || freshRecording)) { resetMeetingInputs(); retireLocalOverlay(); }
           return ok;
         } catch (e) {
           if (life.mounted) setError(lifecycleErrors.has(e) ? e.message : 'Start was not confirmed. Check the backend connection; close and reopen this pane to retry authorization.');
@@ -1251,6 +1256,7 @@ export default {
         captureInput.current.revision += 1;
         setter(value);
       };
+      const saveRecording = backend !== 'meetily' && captureInput.current.saveRecording === true;
       const [, setConsentRevision] = useState(0);
       useLayoutEffect(() => {
         // Query notifications may be batched into one React render. Fence every
@@ -1268,12 +1274,12 @@ export default {
         observeSource();
         return () => unsubscribe?.();
       }, [qc, actionLife]);
-      const consentValid = consent && consentPrefs.current?.key === captureKey(renderedCapture) && consentPrefs.current?.revision === renderedCaptureRevision && consentPrefs.current?.sourceRevision === renderedSourceRevision;
+      const consentValid = consent && (consentPrefs.current?.saveRecording === true) === saveRecording && consentPrefs.current?.key === captureKey(renderedCapture) && consentPrefs.current?.revision === renderedCaptureRevision && consentPrefs.current?.sourceRevision === renderedSourceRevision;
       const preflightBody = { consent: !!consentValid, backend, recording_id: recording || null,
         transcription_model: transcriptionModel, audio_source: audioSource,
         transcription_provider: backend === 'native' ? 'local' : transcriptionProvider,
         asr_mode: backend === 'native' ? 'ENDPOINTING' : asrMode };
-      const preflightSignature = JSON.stringify([preflightBody, renderedCaptureRevision, renderedSourceRevision, captureInput.current.revision]);
+      const preflightSignature = JSON.stringify([preflightBody, renderedCaptureRevision, renderedSourceRevision, captureInput.current.revision, saveRecording]);
       const preflightKey = [...cacheKey('preflight'), preflightSignature];
       const preflight = useQuery({ queryKey: preflightKey, enabled: !!backend && data.capabilities?.capture_preflight === 1 && !data.listening && !data.stopping && !status.error,
         queryFn: async () => {
@@ -1389,6 +1395,7 @@ export default {
         : `${backend === 'macos' ? 'macOS' : 'Windows'} · ${{ microphone: 'Microphone', system: 'System audio', both: 'Microphone + system audio' }[audioSource] || audioSource} · ${cloudAudioSelected ? (selectedCloudProvider === 'google' ? 'Google Gemini (60s preview · source labels)' : `Meta (${asrMode})`) : `Local transcription (${transcriptionModel})`}`;
       const captureBlocked = !freshPreflight() || !captureStatusIdle(status) || !backend || overlayNeedsHide || cloudUnavailable || windowsUnavailable || !consentValid || (backend === 'meetily' && !recording)
         || (settingsAvailable && !mayChangeCapture(qc, status, () => usable() && actionLife.mounted && overlayActionAt.current === actionLife))
+        || (saveRecording && data.capabilities?.saved_recordings !== 1)
         || (backend === 'macos' && !data.capabilities?.macos_transcription);
       const startReady = !pending && !captureBlocked;
       const hasRecentTranscript = Array.isArray(data.segments) && data.segments.slice(-40)
@@ -1408,7 +1415,7 @@ export default {
         h('div', null, h('strong', null, `${c.status === 'ready' ? 'Ready' : c.status === 'blocked' ? 'Needs setup' : 'Not verified'}: ${c.label}`), c.detail));
       const stopControl = data.stopping
         ? h(Button, { variant: 'secondary', disabled: pending, onClick: () => act('/pause', {}) }, 'Retry stop')
-        : data.listening ? h(Button, { variant: 'secondary', onClick: () => act('/pause', {}) }, data.backend === 'meetily' ? 'Detach' : 'Pause listening') : null;
+        : data.listening ? h(Button, { variant: 'secondary', onClick: () => act('/pause', {}) }, data.backend === 'meetily' ? 'Detach' : data.saved_recording?.state === 'recording' ? 'Stop & save' : 'Pause listening') : null;
       return h('div', { className: 'mc-workspace', style: { padding: 12, display: 'flex', flexDirection: 'column', gap: 10, height: '100%', minWidth: 0, width: '100%', boxSizing: 'border-box', overflowY: 'auto', overflowX: 'hidden', overflowWrap: 'anywhere', color: 'var(--ui-text-primary)' } },
         h('style', null, workspaceStyles),
         h('div', { className: 'mc-rail', 'data-capture-rail': true },
@@ -1428,20 +1435,37 @@ export default {
           (status.error || status.isPending || data.stopping) && h('p', { role: 'status', style: muted }, status.error ? 'Capture status unavailable. Check the backend connection.' : status.isPending ? 'Checking capture status…' : 'Stop is not confirmed — audio may still be active.'),
           cloudAudioDisclosed && h('p', { id: `${paneEntry.a11yId}-cloud-audio`, 'data-cloud-capture-disclosure': true, role: 'status', className: 'mc-notice' }, h(PaneIcon, { name: 'cloud' }), cloudAudioUnconfirmed ? `${cloudName} cloud transcription may still be active. Audio transmission is not confirmed stopped; retry stop.` : `Cloud transcription ${cloudAudioActive ? 'active' : 'selected'}: meeting audio is sent to ${cloudName} while listening. ${data.listening ? 'Pause to change.' : 'Next capture.'}`),
           (selectedCloudProvider === 'google' || activeCloudProvider === 'google') && h('p', { role: 'status', 'data-google-preview-disclosure': true, className: 'mc-notice' }, 'Google preview: 60 seconds per source, no speaker diarization. Free-tier audio may improve Google products; use a paid project for private meetings. Each source reserves $1 of the shared $4 local preview allowance, not an actual charge or guaranteed bill cap.'),
+          backend !== 'meetily' && data.capabilities?.saved_recordings === 1 && h('label', { className: 'mc-consent', 'data-save-recording': true },
+            h('input', { type: 'checkbox', checked: saveRecording,
+              disabled: pending || data.listening || data.stopping || data.capabilities?.saved_recordings !== 1,
+              onChange: e => {
+                if (pending || !mayChangeCapture(qc, status, () => usable() && actionLife.mounted && overlayActionAt.current === actionLife) ||
+                    (qc.getQueryState?.(cacheKey('status')) || status)?.data?.capabilities?.saved_recordings !== 1) return;
+                captureInput.current.saveRecording = e.target.checked;
+                captureInput.current.revision += 1;
+                consentPrefs.current = null;
+                setConsent(false);
+                setConsentRevision(value => value + 1);
+              } }), ' Save audio + transcript locally'),
+          saveRecording && h('p', { role: 'status', 'data-recording-disclosure': true, style: muted }, 'Record saves audio and transcript files on this computer for later processing. They remain after Clear meeting or closing Hermes. Only record with participant permission; delete saved files separately when no longer needed.'),
+          data.saved_recording && h('div', { role: 'status', 'data-saved-recording': true, style: muted },
+            h('strong', null, `Saved recording: ${data.saved_recording.state || 'status unknown'}`),
+            data.saved_recording.error && h('p', { role: 'alert' }, data.saved_recording.error),
+            data.saved_recording.directory && h('p', null, 'Local audio and transcript folder: ', h('code', null, data.saved_recording.directory))),
           h('label', { className: 'mc-consent', style: { display: 'flex', gap: 8, alignItems: 'flex-start', padding: '2px 0' } },
             h('input', { type: 'checkbox', checked: consentValid, disabled: data.listening, onChange: e => {
               if (e.target.checked && (!usable() || !actionLife.mounted || overlayActionAt.current !== actionLife ||
                   captureInput.current.recording !== recording || captureRevision !== renderedCaptureRevision || sourceVersion.current.revision !== renderedSourceRevision ||
                   (!settingsAvailable && captureKey(captureInput.current.source) !== captureKey(renderedCapture)) ||
                   (settingsAvailable && captureKey(effectiveCapture(preferences.get(), (qc.getQueryState?.(cacheKey('status')) || status)?.data?.capabilities)) !== captureKey(renderedCapture)))) return;
-              consentPrefs.current = e.target.checked ? { key: captureKey(renderedCapture), revision: renderedCaptureRevision, sourceRevision: renderedSourceRevision } : null;
+              consentPrefs.current = e.target.checked ? { key: captureKey(renderedCapture), revision: renderedCaptureRevision, sourceRevision: renderedSourceRevision, saveRecording } : null;
               setConsent(e.target.checked);
               setConsentRevision(value => value + 1);
             }, 'aria-describedby': cloudAudioDisclosed ? `${paneEntry.a11yId}-cloud-audio` : undefined }),
-            h('span', null, 'I have permission to capture/read this meeting and use its context with my configured model.')),
+            h('span', null, saveRecording ? 'I have permission to record and save this meeting’s audio and transcript, and use its context with my configured model.' : 'I have permission to capture/read this meeting and use its context with my configured model.')),
           h('div', { className: 'mc-actions' },
-            !data.listening && !data.stopping && h(Button, { disabled: pending || captureBlocked, onClick: () => startCapture() }, ((data.segments || []).length || result || (data.recent || []).length) ? (backend === 'meetily' ? 'Resume' : 'Resume listening') : (backend === 'meetily' ? 'Attach to Meetily' : 'Start listening')),
-            !data.listening && !data.stopping && !!((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending || captureBlocked, title: 'Starts a fresh meeting; the earlier transcript, answers, and retry data are cleared', onClick: () => startCapture(true) }, 'New meeting'),
+            !data.listening && !data.stopping && h(Button, { disabled: pending || captureBlocked, onClick: () => startCapture() }, saveRecording ? 'Record' : ((data.segments || []).length || result || (data.recent || []).length) ? (backend === 'meetily' ? 'Resume' : 'Resume listening') : (backend === 'meetily' ? 'Attach to Meetily' : 'Start listening')),
+            !saveRecording && !data.listening && !data.stopping && !!((data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending || captureBlocked, title: 'Starts a fresh meeting; the earlier transcript, answers, and retry data are cleared', onClick: () => startCapture(true) }, 'New meeting'),
             !!(data.overlay_cleanup_error || (data.segments || []).length || result || (data.recent || []).length) && h(Button, { variant: 'secondary', disabled: pending, title: 'Clears past Q&A, transcript segments, and cached snippets for this meeting', onClick: async () => { if (typeof window !== 'undefined' && window.confirm && !window.confirm('Clear this meeting? Past questions, answers, and transcript segments are removed from the pane.')) return; if (await act('/clear')) { setQuestion(''); setLastAsked(null); setLiveEntry(null); setTrackedRequest(null); setError(''); setAssistFailed(false); } } }, 'Clear meeting')),
           !data.listening && h('section', { className: 'mc-checks', 'aria-label': 'Required capture checks' },
             h('div', { className: 'mc-checks-head' },
@@ -1699,7 +1723,7 @@ export default {
         )),
         h('details', null, h('summary', { style: { cursor: 'pointer', ...muted } }, 'Help'),
           h('p', { style: muted }, 'The read-only macOS overlay shows transcript and detected questions; ask in this pane. Press ⌃⌥⌘O (Control + Option + Command + O) to interact temporarily, drag the header, use position presets, or toggle Show in recordings. It returns to click-through automatically.'),
-          h('p', { style: muted }, 'Closing the pane initiates pause or detach; check stop status before assuming audio is off. Pause may discard the last few seconds. Resume keeps this meeting; New meeting, different capture settings, or Clear starts fresh. No extra audio files are saved by Copilot.')));
+          h('p', { style: muted }, 'Closing the pane initiates pause or detach; check stop status before assuming audio is off. Pause may discard the last few seconds. Resume keeps this meeting; New meeting, different capture settings, or Clear starts fresh. Listening alone does not save audio files. Record mode saves local audio and transcripts that remain after Clear; delete saved files separately.')));
     }
     // Keep the pane bound to the activation on which it mounted. An epoch may
     // advance before an asynchronous source swap finishes, so auto-remounting

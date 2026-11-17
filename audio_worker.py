@@ -2,7 +2,7 @@
 
 Explicit offline verification (may download allowlisted weights):
   .venv-audio/bin/python audio_worker.py --file synthetic.wav --model tiny.en
-No audio or transcripts are written to disk. Model cache writes are expected.
+Audio is archived only with explicit --recording-directory. Model cache writes are expected.
 """
 import argparse
 import base64
@@ -17,6 +17,7 @@ import threading
 import time
 
 from macos_audio import MODELS, SOURCES, validate, error_message, clean_writer_timing
+from recording_audio import AudioArchive, RecordingAudioError, recording_directory
 
 MAX_FRAME = 100000
 CHUNK_SAMPLES = 64000  # Earliest utterance boundary, separately per source.
@@ -172,10 +173,11 @@ class AudioDiagnostics:
             emit(event)
 
 
-def run_capture(model, source, language, helper=None, stop=None):
+def run_capture(model, source, language, helper=None, stop=None, *, recording_directory=None):
     """Bounded reader queue. Helper inherits worker process group for gateway cleanup."""
     import numpy as np
     stop = stop or threading.Event()
+    archive = AudioArchive(recording_directory) if recording_directory is not None else None
     helper_proc = {}
     def _graceful_stop(signum, frame):
         # SIGTERM (adapter teardown) means flush-and-exit, not die-mid-chunk:
@@ -293,6 +295,8 @@ def run_capture(model, source, language, helper=None, stop=None):
                         pass
                 if (source == 'microphone' and speaker != 'you') or (source == 'system' and speaker != 'remote'):
                     raise ValueError('unexpected source')
+                if archive is not None:
+                    archive.write(speaker, samples, stamp)
                 diagnostics.receive(speaker, samples)
                 diagnostics.report()
                 if not counts[speaker]:
@@ -302,9 +306,17 @@ def run_capture(model, source, language, helper=None, stop=None):
                 if utterance_boundary(buffers[speaker], counts[speaker]):
                     enqueue((speaker, np.concatenate(buffers[speaker]), stamps[speaker]))
                     buffers[speaker], counts[speaker] = [], 0
+        except RecordingAudioError:
+            failure.append('recording')
+            _graceful_stop(None, None)
         except Exception:
             failure.append('protocol')
         finally:
+            if archive is not None:
+                try:
+                    archive.close()
+                except RecordingAudioError:
+                    failure.append('recording')
             # Hand sub-chunk buffers to the ordered tail list instead of
             # transcribing them here: the main flush transcribes queued
             # audio oldest-first, then these tails in timestamp order, so a
@@ -446,7 +458,7 @@ def run_capture(model, source, language, helper=None, stop=None):
                 break
 
 
-def run_capture_cloud(source, mode, api_key, model_id, helper=None, stop=None, *, provider='meta'):
+def run_capture_cloud(source, mode, api_key, model_id, helper=None, stop=None, *, provider='meta', recording_directory=None):
     """Stream helper PCM to Meta Muse Voice (opt-in cloud ASR).
 
     One realtime session per active source, so microphone audio keeps
@@ -461,6 +473,7 @@ def run_capture_cloud(source, mode, api_key, model_id, helper=None, stop=None, *
     asr = importlib.import_module('meta_asr' if provider == 'meta' else 'google_asr')
     stop = stop or threading.Event()
     helper = helper or Path(__file__).resolve().with_name('macos_capture')
+    archive = AudioArchive(recording_directory) if recording_directory is not None else None
     process = subprocess.Popen([str(helper), '--start', '--source', source],
                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL)
@@ -564,12 +577,23 @@ def run_capture_cloud(source, mode, api_key, model_id, helper=None, stop=None, *
                 name = 'microphone' if speaker == 'you' else 'system'
                 if name not in queues:
                     continue
+                if archive is not None:
+                    archive.write(speaker, samples, stamp)
                 frame = asr.resample_to_24k(samples) if provider == 'meta' else asr.pcm16(samples)
                 if not schedule(_offer, queues[name], frame):
                     break
+        except RecordingAudioError:
+            schedule(remember_native_error, 'recording')
+            stop.set()
+            terminate_helper()
         except Exception:
             pass
         finally:
+            if archive is not None:
+                try:
+                    archive.close()
+                except RecordingAudioError:
+                    schedule(remember_native_error, 'recording')
             schedule(_end_queues, queues)
 
     def _offer(target, frame):
@@ -777,8 +801,8 @@ async def _run_google_fixture(audio, api_key, stop, usage_callback):
             raise google_asr.GoogleAsrError()
 
 
-def run_capture_meta(source, mode, api_key, model_id, helper=None, stop=None):
-    return run_capture_cloud(source, mode, api_key, model_id, helper, stop, provider='meta')
+def run_capture_meta(source, mode, api_key, model_id, helper=None, stop=None, *, recording_directory=None):
+    return run_capture_cloud(source, mode, api_key, model_id, helper, stop, provider='meta', recording_directory=recording_directory)
 
 
 def _read_meta_worker_key(stream, provider='meta'):
@@ -812,7 +836,15 @@ def main(argv=None):
                         help='Transcription provider: local faster-whisper (default) or Meta Muse Voice cloud ASR')
     parser.add_argument('--asr-mode', choices=['ENDPOINTING', 'DIARIZATION', 'PUSH_TO_TALK'], default='ENDPOINTING')
     parser.add_argument('--asr-model', default=None, help='Meta ASR model id (default: ASR_MODEL or muse-voice-transcribe-1.0)')
+    parser.add_argument('--recording-directory', type=Path, help='Explicit private session directory for durable audio')
     args = parser.parse_args(argv)
+    try:
+        args.recording_directory = recording_directory(args.recording_directory)
+    except RecordingAudioError:
+        emit({'type': 'error', 'code': 'recording', 'message': error_message('recording')})
+        return 1
+    if args.recording_directory and (args.file or args.google_fixture_stdin):
+        parser.error('Recording storage is only supported for explicit live capture')
     validate(args.model, args.source, args.language, args.provider, args.asr_mode)
     if args.file and (args.file.suffix.lower() != '.wav' or not args.file.is_file()):
         parser.error('--file must be an existing WAV')
@@ -855,7 +887,7 @@ def main(argv=None):
                     if last_usage:
                         emit({'type': 'google_usage', 'usage': last_usage})
             elif not stop.is_set():
-                run_capture_cloud(args.source, args.asr_mode, api_key, google_asr.DEFAULT_MODEL, helper=helper, stop=stop, provider='google')
+                run_capture_cloud(args.source, args.asr_mode, api_key, google_asr.DEFAULT_MODEL, helper=helper, stop=stop, provider='google', recording_directory=args.recording_directory)
         except google_asr.GoogleAsrError as exc:
             emit({'type': 'error', 'code': exc.code, 'message': error_message(exc.code)})
             return 1
@@ -877,7 +909,7 @@ def main(argv=None):
                     if not stop.is_set():
                         emit(segment)
             elif not stop.is_set():
-                run_capture_meta(args.source, args.asr_mode, api_key, model_id, helper=helper, stop=stop)
+                run_capture_meta(args.source, args.asr_mode, api_key, model_id, helper=helper, stop=stop, recording_directory=args.recording_directory)
         except meta_asr.MetaAsrError:
             emit({'type': 'error', 'code': 'asr', 'message': error_message('asr')})
             return 1
@@ -898,7 +930,7 @@ def main(argv=None):
             if not stop.is_set():
                 emit(result)
         else:
-            run_capture(model, args.source, args.language, helper=helper, stop=stop)
+            run_capture(model, args.source, args.language, helper=helper, stop=stop, recording_directory=args.recording_directory)
     except Exception:
         emit({'type': 'error', 'code': 'capture', 'message': error_message('capture')})
         return 1

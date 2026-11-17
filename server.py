@@ -131,6 +131,7 @@ class CaptureRequest(LifecycleControlRequest):
     transcription_provider: Literal['local', 'meta', 'google'] = 'local'
     asr_mode: Literal['ENDPOINTING', 'DIARIZATION', 'PUSH_TO_TALK'] = 'ENDPOINTING'
     new_meeting: bool = False
+    save_recording: StrictBool = False
 
 
 class GoogleFixtureRequest(LifecycleControlRequest):
@@ -177,6 +178,7 @@ class MeetingState:
         self.session_key = None
         self.audio_factory = audio_factory
         self.audio = None
+        self.saved_recording = None
         self.capture_info = {}
         self.last_seen = time.monotonic()
         self.pane_seen = self.last_seen
@@ -283,8 +285,8 @@ class MeetingState:
                     self.audio = self.audio_factory()
                 else:
                     import importlib
-                    module = importlib.import_module(f'{__package__}.audio' if __package__ else 'audio')
-                    self.audio = module.AudioCapture(model_size=transcription_model, source=audio_source)
+                    module = importlib.import_module(f'{__package__}.windows_audio' if __package__ else 'windows_audio')
+                    self.audio = module.WindowsAudioCapture(model_size=transcription_model, source=audio_source)
                 self.audio_options = options
             return self.audio
 
@@ -317,7 +319,7 @@ class MeetingState:
         return {**report, 'checks': checks, 'ready': report.get('ready') is True and all(c.get('status') == 'ready' for c in checks)}
 
     def start(self, consent, backend='meetily', recording_id=None, transcription_model='base.en', audio_source='microphone',
-              new_meeting=False, transcription_provider='local', asr_mode='ENDPOINTING', *, pane=None, action=None):
+              new_meeting=False, transcription_provider='local', asr_mode='ENDPOINTING', *, pane=None, action=None, save_recording=False):
         # Serialize the actual backend operation, not merely the UI state transition.
         # Status/segment callbacks take only self.lock, so stop/join cannot deadlock them.
         with self.lifecycle_lock:
@@ -329,11 +331,15 @@ class MeetingState:
                         from fastapi import HTTPException
                         raise HTTPException(409, 'Capture pane was closed or superseded.')
             return self._start(consent, backend, recording_id, transcription_model, audio_source, new_meeting,
-                               transcription_provider, asr_mode)
+                               transcription_provider, asr_mode, save_recording=save_recording)
 
     def _start(self, consent, backend='meetily', recording_id=None, transcription_model='base.en', audio_source='microphone',
-               new_meeting=False, transcription_provider='local', asr_mode='ENDPOINTING', *, renew_lease=True):
+               new_meeting=False, transcription_provider='local', asr_mode='ENDPOINTING', *, renew_lease=True, save_recording=False):
         from fastapi import HTTPException
+        if self.saved_recording is not None and self.saved_recording.active and not self.listening:
+            stopped = self.pause()
+            if not stopped['stop_confirmed']:
+                raise HTTPException(409, 'Finish stopping the previous recording before starting another.')
         if self.fixture_test is not None:
             raise HTTPException(409, 'Pause the Google audio test before starting capture.')
         if self.pending_stop is not None:
@@ -343,6 +349,10 @@ class MeetingState:
             raise HTTPException(409, self.overlay_cleanup_error or 'Overlay shutdown is not confirmed. Retry Hide / Clear.')
         if not consent:
             raise HTTPException(400, 'Confirm participant consent and audio capture before starting.')
+        if save_recording and backend == 'meetily':
+            raise HTTPException(400, 'Copilot Record requires native capture. Meetily manages its own recordings.')
+        if save_recording:
+            new_meeting = True  # Each recording is one self-contained bundle, never append to an older file.
         if backend == 'meetily' and not recording_id:
             raise HTTPException(400, 'Start a recording in Meetily, then explicitly select it here.')
         # Re-run on the backend for every Start, under the lifecycle lock.
@@ -426,15 +436,51 @@ class MeetingState:
             self._touch_pane_seen()
         elif self._expire_capture():
             return {'listening': False}
+        recording = None
+        try:
+            if save_recording:
+                import importlib
+                module = importlib.import_module(f'{__package__}.recording_session' if __package__ else 'recording_session')
+                recording = module.RecordingSession(backend=backend, source=audio_source, provider=transcription_provider)
+                self.saved_recording = recording
+            if backend in ('native', 'macos'):
+                setter = getattr(self.audio, 'set_recording_directory', None)
+                if save_recording and not callable(setter):
+                    raise RuntimeError('Audio adapter does not support recording')
+                if callable(setter):
+                    setter(recording.directory if recording else None)
+        except Exception:
+            self.capture_error = 'Recording storage could not be prepared. Capture was not started.'
+            self.pause(retain_tail=False)
+            raise HTTPException(503, self.capture_error or 'Recording storage could not be prepared.') from None
+
+        def finish_recording_after_terminal():
+            # Never stop/join from an adapter callback or hold state lock while joining.
+            with self.lifecycle_lock:
+                if recording is not None and recording is self.saved_recording and recording.active:
+                    self.pause()
+
         def segment_callback(segment):
             with self.lock:
                 if self.listening and self.capture_generation == capture_generation:
                     self.add_segment(segment)
+                    if recording is not None:
+                        try:
+                            recording.append(segment)
+                        except Exception:
+                            self.capture_error = recording.error
+                            threading.Thread(target=finish_recording_after_terminal, daemon=True).start()
                 elif (capture_generation in self.retiring_generations
                         and time.monotonic() < self.retiring_generations[capture_generation]):
                     # Bounded tail of a retiring capture (pause flush): keep
                     # trailing speech instead of dropping the last seconds.
                     self.add_segment(segment)
+                    if recording is not None:
+                        try:
+                            recording.append(segment)
+                        except Exception:
+                            self.capture_error = recording.error
+                            threading.Thread(target=finish_recording_after_terminal, daemon=True).start()
         def status_callback(info):
             retry_sequence = None
             with self.lock:
@@ -474,6 +520,8 @@ class MeetingState:
                     retry_sequence = self.stop_sequence
             if retry_sequence is not None:
                 self._start_stop_retry_locked(retry_sequence)
+            if recording is not None and state in ('stopped', 'error'):
+                threading.Thread(target=finish_recording_after_terminal, daemon=True).start()
         try:
             with self._overlay_admission_guard(None if switching else ticket):
                 if backend == 'meetily':
@@ -631,6 +679,8 @@ class MeetingState:
                 raise RuntimeError('Adapter is still stopping')
         except Exception:
             with self.lock:
+                if self.saved_recording is not None and self.saved_recording.active:
+                    self.saved_recording.error = 'Capture shutdown was delayed; the saved transcript tail may be incomplete.'
                 self.stop_error = ('Capture stop is not confirmed; audio may still be active. '
                                    'Retry Pause / Retry stop. If it persists, quit the capture process or '
                                    'revoke microphone/system-audio permissions and verify the OS indicator. '
@@ -638,6 +688,8 @@ class MeetingState:
                 self.retiring_generations.clear()
             return False
         with self.lock:
+            if self.saved_recording is not None and self.saved_recording.active:
+                self.saved_recording.finish(dict(self.capture_info, error=self.capture_error))
             self.pending_stop = None
             self.stop_error = None
             self.capture_info = {**self.capture_info, 'state': 'stopped', 'running': False,
@@ -1896,11 +1948,12 @@ class MeetingState:
                     'capture': ({**self.capture_info, 'state': 'stopping', 'error': self.stop_error,
                                  'message': 'Capture stop is not confirmed; audio may still be active.'}
                                 if self.pending_stop is not None else self.capture_info),
+                    'saved_recording': self.saved_recording.status() if self.saved_recording else None,
                     'backend': self.backend, 'last_session': last_session,
                     'generation': self.generation, 'status_seq': self.status_seq,
                     'capture_generation': self.capture_generation, 'pane_seen': self.pane_seen,
                     'overlay_shown': None if uncertain_overlay else overlay is not None,
-                    'capabilities': {'all_projects': True, 'automatic_web_fallback': True, 'independent_models': True, 'history_opt_out': True, 'capture_preflight': 1, 'model_discovery': True,
+                    'capabilities': {'saved_recordings': 1, 'all_projects': True, 'automatic_web_fallback': True, 'independent_models': True, 'history_opt_out': True, 'capture_preflight': 1, 'model_discovery': True,
                                      'meta_asr': _meta_key_present(),
                                      'google_asr': _google_key_present(),
                                      'macos_transcription': bool(macos_ready),
@@ -2023,7 +2076,7 @@ def make_router(state):
         with state.control_boundary(body):
             return state.start(body.consent, body.backend, body.recording_id, body.transcription_model, body.audio_source,
                                new_meeting=body.new_meeting, transcription_provider=body.transcription_provider,
-                               asr_mode=body.asr_mode)
+                               asr_mode=body.asr_mode, save_recording=body.save_recording)
 
     @router.get('/recordings')
     def recordings():
@@ -2122,6 +2175,8 @@ def make_router(state):
     @router.post('/clear')
     def clear(body: LifecycleControlRequest | None = None):
         with state.control_boundary(body):
+            if state.saved_recording is not None and state.saved_recording.active:
+                state.pause()  # Finish durable bundle; Clear forgets memory, not the saved recording.
             if state.fixture_test is not None:
                 state.pause(retain_tail=False)
             return clear_authorized()

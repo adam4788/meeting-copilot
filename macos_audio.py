@@ -8,6 +8,9 @@ import time
 
 MAX_EVENT = 65536
 ERRORS = {
+    'windows_runtime': 'Windows audio needs the prepared gateway Python runtime and audited audio dependencies.',
+    'windows_capture': 'Windows audio could not capture the selected sources. Check Windows microphone privacy, default devices and audio setup; partial recordings may remain.',
+    'recording': 'Audio recording could not be saved. Check free disk space and recording limits; partial files may remain.',
     'microphone_usage': 'Native helper lacks NSMicrophoneUsageDescription. Rebuild with an embedded usage-description Info.plist before starting microphone capture.',
     'microphone_permission': 'Microphone permission denied. Allow Microphone access in System Settings > Privacy & Security, then restart capture.',
     'system_permission': 'System audio permission denied or unavailable. Allow Screen & System Audio Recording in System Settings > Privacy & Security, then restart the app.',
@@ -242,6 +245,15 @@ class MacOSAudioCapture:
         self._thread = None
         self._cancel = threading.Event()
         self._stopping = threading.Event()
+        self._recording_directory = None
+
+    def set_recording_directory(self, directory):
+        from importlib import import_module
+        archive = import_module('.recording_audio', __package__) if __package__ else import_module('recording_audio')
+        with self._lock:
+            if not self.status()['stop_confirmed']:
+                raise RuntimeError('Stop capture before changing recording storage.')
+            self._recording_directory = archive.recording_directory(directory)
 
     def devices(self):
         """Static capabilities only. Does not probe TCC or instantiate AV/SC APIs."""
@@ -295,6 +307,30 @@ class MacOSAudioCapture:
         except Exception:
             self._callback_error = 'Audio callback failed.'
 
+    def _worker_artifacts(self, root):
+        return _native_runtime().artifact_dir(root)
+
+    def _worker_environment(self):
+        environment = worker_env(self.provider)
+        if self.provider == 'local':
+            environment.update(HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1')
+        return environment
+
+    def _worker_command(self, root, artifacts):
+        return [worker_python(root, artifacts), '-u', str(root / 'audio_worker.py'),
+                '--helper', str(capture_helper(root, artifacts)),
+                '--model', self.model_size, '--source', self.source, '--language', self.language,
+                '--provider', self.provider, '--asr-mode', self.asr_mode]
+
+    def _worker_stdin(self, credential_frame):
+        return subprocess.PIPE if credential_frame else subprocess.DEVNULL
+
+    def _worker_process_options(self):
+        return {'start_new_session': True}
+
+    def _request_worker_stop(self, process):
+        process.terminate()
+
     def start(self, on_segment, on_status=None):
         """Explicit opt-in: live local capture requires prepared model weights.
 
@@ -310,7 +346,7 @@ class MacOSAudioCapture:
         # Resolve the active profile on the requesting thread. The worker thread
         # must not inherit unrelated request/credential context variables.
         root = Path(__file__).resolve().parent
-        artifacts = _native_runtime().artifact_dir(root)
+        artifacts = self._worker_artifacts(root)
         with self._lock:
             if not self.status()['stop_confirmed']:
                 raise RuntimeError('Audio capture is active or its cleanup is unconfirmed')
@@ -324,9 +360,7 @@ class MacOSAudioCapture:
             self._state, self._error, self._callback_error = 'starting', None, None
             self._last_loss = {}
             self._process = None
-            environment = worker_env(self.provider)
-            if self.provider == 'local':
-                environment.update(HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1')
+            environment = self._worker_environment()
             self._thread = threading.Thread(target=self._run, args=(environment, credential_frame, artifacts),
                                             daemon=True, name='macos-audio-worker')
             self._thread.start()
@@ -344,15 +378,13 @@ class MacOSAudioCapture:
         process = None
         try:
             root = Path(__file__).resolve().parent
-            command = [worker_python(root, artifacts), '-u', str(root / 'audio_worker.py'),
-                       '--helper', str(capture_helper(root, artifacts)),
-                       '--model', self.model_size, '--source', self.source, '--language', self.language,
-                       '--provider', self.provider, '--asr-mode', self.asr_mode]
+            command = self._worker_command(root, artifacts)
+            if self._recording_directory is not None:
+                command.extend(['--recording-directory', str(self._recording_directory)])
             if self._cancel.is_set():
                 return
-            process = subprocess.Popen(command, stdin=subprocess.PIPE if credential_frame else subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                       stderr=subprocess.DEVNULL, start_new_session=True,
-                                       env=environment)
+            process = subprocess.Popen(command, stdin=self._worker_stdin(credential_frame), stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, env=environment, **self._worker_process_options())
             with self._lock:
                 self._process = process
             if credential_frame:
@@ -467,7 +499,7 @@ class MacOSAudioCapture:
             # audio, and exits on its own. Callbacks stay live so the final
             # summary and tail segments reach the pane.
             try:
-                process.terminate()
+                self._request_worker_stop(process)
             except Exception:
                 pass
             # Honor the caller's stop budget (reserving 0.5s for forced

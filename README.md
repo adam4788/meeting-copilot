@@ -305,3 +305,13 @@ for retry, retention, timing and verification limits.
 ## Reviewed meeting notes
 
 Turn useful answers into an editable, review-first handoff with [Review notes](docs/review-notes.md). Notes stay in pane memory until you explicitly copy them; no automatic sharing or extra model call.
+
+### Save a meeting for later
+
+For native capture, enable **Save audio + transcript**, confirm permission, and press
+**Record**. **Stop & save** leaves a local bundle containing source WAV files, timestamped
+`transcript.jsonl`, an audio timeline, and `manifest.json`. The pane shows its folder.
+Record starts a fresh meeting; ordinary listening remains memory-only. This is a
+developer-preview capture feature, not proof of working audio devices. Windows native
+Start requires the isolated runtime, selected-device initialization and offline-model checks; Meetily attachment
+does not start or save a recording on your behalf. See [recording guide](docs/recording.md).

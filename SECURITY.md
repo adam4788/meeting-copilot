@@ -4,8 +4,15 @@
 
 - Microphone and loopback audio are processed locally after explicit consent when using native capture with local transcription. Optional explicit Meta or Google transcription sends audio off-device; local model preparation may download weights.
 - The optional, unofficial Meetily adapter reads only an explicitly attached active recording's live JSON snapshots. Meetily independently saves audio/transcripts according to its own settings; this project does not erase or change those files.
-- This project does not write additional raw audio or transcripts to disk. Transcripts and
-  answer results remain in bounded process memory until cleared or the process exits.
+- Ordinary **Start listening** keeps transcripts and answer results in bounded process memory.
+  Explicit **Save audio + transcript** / **Record** instead saves source WAVs and timestamped
+  transcript events locally under the active Hermes home in `meeting-copilot-recordings/`.
+  It requires participant consent; recording is off by default. Stop finalizes the bundle.
+  **Clear, closing the pane, and restarting do not delete saved files.** Delete unwanted
+  bundles using your file manager. These files are not encrypted by Copilot; OS account
+  access, disk encryption and backup/sync policies apply. Existing Meetily files are separate.
+  Recording has bounded per-session storage; storage failures stop capture and mark incomplete
+  results. An unfinalized manifest after a crash is not proof of a complete recording.
 - A configured answer provider receives the question, bounded recent transcript,
   and retrieved source snippets. This may be a hosted provider. Local transcription
   is **not** a promise that answer generation stays local.
@@ -141,3 +148,17 @@ and a separate clipboard confirmation. That copy includes edited note text, not
 source excerpts or hidden transcript snapshots. Review is the user's assessment,
 not independent verification by the application. Meeting-generation changes and
 pane closure/reload discard notes; exported copies are not erased by Clear.
+
+
+## Windows worker boundary
+
+Native Windows capture uses a fixed subprocess, not the credential-bearing
+Hermes gateway process. Its environment is limited to named OS/profile/cache
+settings, with implicit model-token use disabled and offline local model loading.
+The audited SoundCard 0.4.6 preflight calls WASAPI Initialize only, never Start or
+record; unknown runtimes, endpoint/access failures, versions and missing models
+fail closed. Start rechecks exact endpoints, then explicitly starts capture.
+This is not proof of successful hardware validation. Stop uses a private control
+pipe then bounded forced termination if needed; uncertain or incomplete output
+is visibly flagged. No WindowsApps permission changes or isolation bypasses are
+part of setup.
