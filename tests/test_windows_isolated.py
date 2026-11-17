@@ -21,7 +21,8 @@ class WindowsIsolationTests(unittest.TestCase):
                                      'OPENAI_API_KEY': 'synthetic', 'HF_TOKEN': 'synthetic',
                                      'PYTHONPATH': 'bad', 'PYTHONSTARTUP': 'bad',
                                      'HF_HUB_OTHER_TOKEN': 'bad', 'HTTP_PROXY': 'bad',
-                                     'HF_HUB_OFFLINE': '0', 'HF_HOME': 'public-cache'}, clear=True):
+                                     'HF_HUB_OFFLINE': '0', 'HF_HOME': 'public-cache',
+                                     'PATH': 'untrusted-tool-folder;secret-path'}, clear=True):
             env = windows_audio.worker_environment()
         self.assertEqual(env['SYSTEMROOT'], 'C:/Windows')
         self.assertEqual(env['HF_HOME'], 'public-cache')
@@ -29,6 +30,29 @@ class WindowsIsolationTests(unittest.TestCase):
         self.assertEqual(env['HF_HUB_DISABLE_IMPLICIT_TOKEN'], '1')
         for name in ('OPENAI_API_KEY', 'HF_TOKEN', 'PYTHONPATH', 'PYTHONSTARTUP', 'HF_HUB_OTHER_TOKEN', 'HTTP_PROXY'):
             self.assertNotIn(name, env)
+
+
+    def test_windows_path_contains_only_os_resolved_system_directory(self):
+        trusted = str(Path('C:/Windows/System32'))
+        with patch.dict(os.environ, {'PATH': 'untrusted-tool-folder;secret-path',
+                                     'SystemRoot': 'untrusted-root', 'OPENAI_API_KEY': 'synthetic'}, clear=True), \
+             patch.object(windows_audio, 'trusted_system_directory', return_value=trusted):
+            env = windows_audio.worker_environment()
+        self.assertEqual(env['PATH'], trusted)
+        self.assertNotIn('untrusted-tool-folder', str(env))
+        self.assertNotIn('OPENAI_API_KEY', env)
+
+    def test_system_directory_resolution_error_fails_closed(self):
+        with patch.object(windows_audio, 'trusted_system_directory', side_effect=RuntimeError('unavailable')):
+            with self.assertRaises(RuntimeError):
+                windows_audio.worker_environment()
+
+    @unittest.skipUnless(sys.platform == 'win32', 'Real Windows directory API')
+    def test_windows_system_directory_api_returns_existing_absolute_directory(self):
+        path = Path(windows_audio.trusted_system_directory())
+        self.assertTrue(path.is_absolute())
+        self.assertTrue(path.is_dir())
+        self.assertTrue((path / 'ole32.dll').is_file())
 
     def test_adapter_is_local_only_and_fixed_command(self):
         with self.assertRaises(ValueError):

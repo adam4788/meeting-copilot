@@ -11,6 +11,29 @@ except ImportError:
     from macos_audio import MacOSAudioCapture
 
 
+
+def trusted_system_directory():
+    """Resolve a single DLL search directory from Windows, never ambient PATH.
+
+    SoundCard/CFFI uses ctypes.util.find_library, which requires PATH to exist.
+    A system-only PATH supports ole32 discovery without exposing the gateway's
+    executable/plugin search paths. Unknown Windows resolution fails closed.
+    """
+    if sys.platform != 'win32':
+        return None  # Synthetic non-Windows process tests never load WASAPI.
+    import ctypes
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True, winmode=0x00000800)
+    get_directory = kernel.GetSystemDirectoryW
+    get_directory.argtypes = [ctypes.c_wchar_p, ctypes.c_uint]
+    get_directory.restype = ctypes.c_uint
+    buffer = ctypes.create_unicode_buffer(32768)
+    size = get_directory(buffer, len(buffer))
+    path = Path(buffer.value)
+    if not 0 < size < len(buffer) or not path.is_absolute() or not path.is_dir():
+        raise RuntimeError('The trusted Windows system directory is unavailable.')
+    return str(path)
+
+
 def worker_environment():
     # Exact names only: never forward host tokens, Python startup hooks, proxy
     # credentials, broad HF_HUB_* prefixes, or dynamic-loader configuration.
@@ -18,6 +41,9 @@ def worker_environment():
                'LOCALAPPDATA', 'APPDATA', 'HOME', 'LANG', 'LC_ALL',
                'HF_HOME', 'HF_HUB_CACHE'}
     env = {key.upper(): value for key, value in os.environ.items() if key.upper() in allowed}
+    system_directory = trusted_system_directory()
+    if system_directory is not None:
+        env['PATH'] = system_directory
     env.update(HF_HUB_DISABLE_IMPLICIT_TOKEN='1', HF_HUB_DISABLE_TELEMETRY='1',
                HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1', PYTHONNOUSERSITE='1',
                PYTHONDONTWRITEBYTECODE='1', TOKENIZERS_PARALLELISM='false')
