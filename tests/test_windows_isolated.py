@@ -34,9 +34,11 @@ class WindowsIsolationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             windows_audio.WindowsAudioCapture(provider='meta')
         capture = windows_audio.WindowsAudioCapture(source='both')
-        command = capture._worker_command(Path('/fixed/plugin'), None)
-        self.assertEqual(command[0], sys.executable)
-        self.assertEqual(command[1:4], ['-B', '-u', '/fixed/plugin/windows_audio_worker.py'])
+        root = Path.cwd() / 'fixed' / 'plugin'
+        command = capture._worker_command(root, None)
+        self.assertEqual(command, [sys.executable, '-B', '-u',
+                                   str(root / 'windows_audio_worker.py'),
+                                   '--model', 'base.en', '--source', 'both'])
         self.assertNotIn('--provider', command)
         self.assertEqual(capture._worker_stdin(None), subprocess.PIPE)
         with self.assertRaises(RuntimeError):

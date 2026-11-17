@@ -236,8 +236,9 @@ class WindowsInitializationGateTests(unittest.TestCase):
                  patch.object(preflight, '_json_command', side_effect=[devices, runtime]) as run:
                 result = preflight.check('native', None, 'base.en', 'both', 'local', 'ENDPOINTING')
             self.assertEqual(result['ready'], not missing_model)
-            self.assertTrue(run.call_args_list[0].args[0][-3:] == ['windows_preflight.py', '--source', 'both']
-                            or run.call_args_list[0].args[0][-3].endswith('/windows_preflight.py'))
+            expected_script = Path(preflight.__file__).resolve().parent / 'windows_preflight.py'
+            self.assertEqual(run.call_args_list[0].args[0],
+                             ['/prepared/python', '-B', str(expected_script), '--source', 'both'])
 
     def test_missing_source_or_started_capture_report_is_rejected(self):
         win = Mock()
